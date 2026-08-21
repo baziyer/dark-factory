@@ -4,6 +4,7 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 gate="$repository_root/scripts/local-ci.sh"
 contributing="$repository_root/CONTRIBUTING.md"
+ci="$repository_root/.github/workflows/ci.yml"
 
 fail() {
     echo "local-ci mode test failed: $*" >&2
@@ -14,7 +15,7 @@ grep -Fq 'cargo +1.88.0 fmt --all -- --check' "$gate" \
     || fail "Linux source mode lost rustfmt"
 grep -Fq 'cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings' "$gate" \
     || fail "Linux source mode lost clippy"
-grep -Fq 'cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1' "$gate" \
+grep -Fq 'cargo +1.88.0 test --locked --workspace -- --test-threads=1' "$gate" \
     || fail "Linux source mode lost workspace tests"
 grep -Fq 'git diff --check' "$gate" || fail "Linux source mode lost diff check"
 
@@ -32,6 +33,26 @@ for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-p
     printf '%s\n' "$macos_mode" | grep -Fq "$mac_fixture" \
         || fail "macOS mode lost fixture $mac_fixture"
 done
+
+linux_job=$(sed -n '/^  linux:/,$p' "$ci")
+line_of() {
+    printf '%s\n' "$linux_job" | grep -n -F "$1" | head -1 | cut -d: -f1
+}
+linux_gate_line=$(line_of 'name: Run the Linux authoritative gate')
+linux_build_line=$(line_of 'name: Build the workspace binaries')
+linux_smoke_line=$(line_of 'name: Run the source contributor smoke')
+[ -n "$linux_gate_line" ] && [ -n "$linux_build_line" ] && [ -n "$linux_smoke_line" ] \
+    || fail "Linux CI lost its gate, binary build, or smoke step"
+[ "$linux_gate_line" -lt "$linux_build_line" ] \
+    || fail "Linux CI rebuilds source-gate inputs after building smoke binaries"
+[ "$linux_build_line" -lt "$linux_smoke_line" ] \
+    || fail "Linux CI does not build its smoke binaries before using them"
+printf '%s\n' "$linux_job" \
+    | grep -Fq 'cargo +1.88.0 build --locked --workspace --bins' \
+    || fail "Linux CI does not limit its post-gate build to smoke binaries"
+if printf '%s\n' "$linux_job" | grep -Fq 'name: Check build headroom'; then
+    fail "Linux CI duplicates the authoritative gate's build-headroom check"
+fi
 
 grep -Fxq './scripts/local-ci.sh' "$contributing" \
     || fail "CONTRIBUTING lost the macOS gate command"
