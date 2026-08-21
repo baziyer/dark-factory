@@ -355,6 +355,16 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = load_candidate(&transaction, project_id, candidate_id)?
             .ok_or(StoreError::WorkCandidateNotFound)?;
+
+        let replay_revision = expected_revision.checked_add(1);
+        if candidate.status == WorkCandidateStatus::Rejected
+            && candidate.status_reason.as_deref() == Some(reason.as_str())
+            && replay_revision == Some(candidate.revision)
+        {
+            transaction.commit()?;
+            return Ok((candidate, Vec::new()));
+        }
+
         let current_candidate_id: Option<WorkCandidateId> = transaction
             .query_row(
                 "SELECT current_candidate_id
@@ -370,15 +380,6 @@ impl Store {
             .optional()?;
         if current_candidate_id.as_ref() != Some(candidate_id) {
             return Err(StoreError::InvalidWorkCandidateState);
-        }
-
-        let replay_revision = expected_revision.checked_add(1);
-        if candidate.status == WorkCandidateStatus::Rejected
-            && candidate.status_reason.as_deref() == Some(reason.as_str())
-            && replay_revision == Some(candidate.revision)
-        {
-            transaction.commit()?;
-            return Ok((candidate, Vec::new()));
         }
         if candidate.revision != expected_revision {
             return Err(StoreError::WorkCandidateRevisionConflict);
@@ -802,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_is_revision_bound_idempotent_and_cannot_materialize_work() {
+    fn rejection_is_revision_bound_idempotent_after_supersession_and_cannot_materialize_work() {
         let mut store = Store::open_in_memory().unwrap();
         let project_id = fixture(&mut store);
         let (receipt, _) = store
@@ -831,6 +832,32 @@ mod tests {
             .unwrap();
         assert_eq!(retried, rejected);
         assert!(retry_events.is_empty());
+
+        let mut superseding = input(&project_id, "delivery-2", "revision-2");
+        superseding.expected_current_candidate_id = Some(receipt.candidate.id.clone());
+        let (superseding, _) = store.receive_input(superseding, 5).unwrap();
+        assert_eq!(
+            superseding.candidate.status,
+            WorkCandidateStatus::Quarantined
+        );
+        assert_eq!(
+            store
+                .get_work_candidate(&project_id, &receipt.candidate.id)
+                .unwrap()
+                .status,
+            WorkCandidateStatus::Rejected
+        );
+        let (late_retry, late_retry_events) = store
+            .reject_work_candidate(
+                &project_id,
+                &receipt.candidate.id,
+                1,
+                "not approved".into(),
+                6,
+            )
+            .unwrap();
+        assert_eq!(late_retry, rejected);
+        assert!(late_retry_events.is_empty());
 
         for table in ["tasks", "agent_messages", "runs", "changes"] {
             let count: i64 = store

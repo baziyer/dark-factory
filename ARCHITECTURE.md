@@ -82,8 +82,10 @@ pretends the resource disappeared or rewrites the outcome.
    transaction may create an immutable `InputEnvelope`, one quarantined
    `WorkCandidate`, and bounded events. It cannot create a Task, Message, Run,
    Change, provider prompt, ProposedAction, or scheduling event. A changed
-   source revision advances an exact expected-current pointer and stales the
-   old candidate atomically; exact observation replay has no second effect.
+   source revision advances an exact expected-current pointer and stales an old
+   quarantined candidate atomically. A rejected predecessor keeps its durable
+   decision while losing current-source authority. Exact observation or
+   rejection replay has no second effect, even after that pointer advances.
 
 ## Process and resource ownership
 
