@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"
+test = false
+
 [dependencies]
 factory-core = { path = "../factory-core" }
 rustix.workspace = true

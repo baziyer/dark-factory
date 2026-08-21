@@ -108,13 +108,14 @@ kill_tree() {
 wait_bounded() {
     wait_phase=$1
     wait_pid=$2
+    wait_seconds=${3:-$wait_timeout_seconds}
     wait_timed_out=0
     wait_timer_pid=
     wait_alarm() {
         wait_timed_out=1
     }
     trap wait_alarm 14
-    ( sleep "$wait_timeout_seconds"; kill -14 "$$" ) &
+    ( sleep "$wait_seconds"; kill -14 "$$" ) &
     wait_timer_pid=$!
     if wait "$wait_pid"; then
         wait_status=0
@@ -125,7 +126,7 @@ wait_bounded() {
     kill "$wait_timer_pid" 2>/dev/null || true
     wait "$wait_timer_pid" 2>/dev/null || true
     if [ "$wait_timed_out" -ne 0 ]; then
-        echo "local-ci lease test failed: $wait_phase: timed out after ${wait_timeout_seconds}s waiting for child pid=$wait_pid" >&2
+        echo "local-ci lease test failed: $wait_phase: timed out after ${wait_seconds}s waiting for child pid=$wait_pid" >&2
         return 124
     fi
     return "$wait_status"
@@ -163,7 +164,8 @@ wait_checked() {
 wait_terminated() {
     phase=$1
     pid=$2
-    if wait_bounded "$phase" "$pid"; then
+    wait_seconds=${3:-$wait_timeout_seconds}
+    if wait_bounded "$phase" "$pid" "$wait_seconds"; then
         fail "$phase: killed process-tree root pid=$pid exited status=0"
     else
         status=$?
@@ -193,9 +195,11 @@ assert_absent() {
 # Exercise the internal deadline itself; the outer Perl alarm is only an
 # independent safety bound and must not be the phase's causal timeout.
 timeout_probe_stderr="$temporary/timeout-probe.stderr"
+timeout_probe_seconds=1
 sleep 30 &
 timeout_probe_pid=$!
-if wait_bounded "timeout probe" "$timeout_probe_pid" 2>"$timeout_probe_stderr"; then
+if wait_bounded "timeout probe" "$timeout_probe_pid" "$timeout_probe_seconds" \
+    2>"$timeout_probe_stderr"; then
     fail "bounded wait timeout probe unexpectedly completed"
 else
     timeout_probe_status=$?
@@ -212,6 +216,7 @@ terminated_timeout_stderr="$temporary/terminated-timeout-probe.stderr"
 sleep 30 &
 terminated_timeout_pid=$!
 if wait_terminated "terminated timeout probe" "$terminated_timeout_pid" \
+    "$timeout_probe_seconds" \
     2>"$terminated_timeout_stderr"; then
     fail "terminated wait timeout probe unexpectedly completed"
 else

@@ -585,6 +585,7 @@ cleanup() {
         cleanup_status=1
     fi
     if test -n "$verifier_descendant"; then
+        : >"$scratch/verifier-release"
         wait_for_record_exit "$verifier_descendant" "Rust verifier descendant" \
             || cleanup_status=1
     fi
@@ -641,7 +642,13 @@ EOF
 cat >"$repo/src/lib.rs" <<EOF
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write as _, path::Path, thread, time::{Duration, Instant}};
+    use std::{
+        fs,
+        io::Write as _,
+        path::Path,
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn immutable_prepared_binary_runs() {
@@ -657,19 +664,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(revision, "A\n");
-        if Path::new("controlled-verification").exists() {
+        // Both verifier scenarios use an explicit harness release. The first
+        // crosses the failed leader and daemon-restart boundary; the second
+        // holds a successful run in finalizing while its authority is tested.
+        let release = if Path::new("controlled-verification").exists() {
             fs::write(r#"$scratch/success-verifier-started"#, b"started").unwrap();
-            let release = Path::new(r#"$scratch/success-verifier-release"#);
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !release.exists() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert!(release.exists(), "controlled verifier was never released");
+            Path::new(r#"$scratch/success-verifier-release"#)
         } else {
-            // This descendant must outlive factoryd's five-second effect reap
-            // bound. The smoke kills only its group leader and proves no cache
-            // or temporary-root cleanup races this still-running writer.
-            thread::sleep(Duration::from_secs(20));
+            Path::new(r#"$scratch/verifier-release"#)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.exists() {
+            assert!(Instant::now() < deadline, "verifier release timed out");
+            thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(2 + 2, 4);
     }
@@ -684,7 +691,7 @@ test ! -f "$HOME/launches" \
 launch=$((launch + 1))
 echo "$launch" >>"$HOME/launches"
 case "$launch" in
-    1) test ! -e .git; ! git rev-parse --show-toplevel >/dev/null 2>&1; ! git worktree add ../x HEAD >/dev/null 2>&1; echo retained-mutation >>README.md; sleep 5; "$DARK_FACTORY_FACTORYCTL" task done --result outcome-before-exit; exit 42 ;;
+    1) test ! -e .git; ! git rev-parse --show-toplevel >/dev/null 2>&1; ! git worktree add ../x HEAD >/dev/null 2>&1; echo retained-mutation >>README.md; "$DARK_FACTORY_FACTORYCTL" task done --result outcome-before-exit; exit 42 ;;
     2) cp "$DARK_FACTORY_ATTEMPT_TOKEN_FILE" "$HOME/finalizing-token"; chmod 600 "$HOME/finalizing-token"; : >controlled-verification; "$DARK_FACTORY_FACTORYCTL" task done --result verified-success; exit 42 ;;
     3) cp "$DARK_FACTORY_ATTEMPT_TOKEN_FILE" "$HOME/exit-token"; chmod 600 "$HOME/exit-token"; exit 41 ;;
     4) : >"$HOME/provider-kill-ready"; exec sleep 30 ;;
@@ -796,7 +803,6 @@ run_has "$run_id" '"phase":"finalizing".*"outcome":{"type":"succeeded"' || {
     --body 'Exercise exact orchestrator cleanup.' >/dev/null
 god_run=$(wait_for_task_run linux-smoke-god)
 wait_for_file "$HOME/god-ready" "orchestrator provider"
-sleep 0.2
 god_provider=$(wait_for_process_record provider "$god_run")
 verifier=$(wait_for_verifier_record)
 verifier_pid=$(printf '%s\n' "$verifier" | cut -f1)
@@ -861,6 +867,7 @@ test -d "$temporary_root" || {
 }
 
 kill_exact_record "$god_provider" "orchestrator provider"
+: >"$scratch/verifier-release"
 wait_for_run_terminal "$god_run" failed
 wait_for_record_exit "$verifier_descendant" "Rust verifier descendant"
 wait_for_run_terminal "$run_id" failed

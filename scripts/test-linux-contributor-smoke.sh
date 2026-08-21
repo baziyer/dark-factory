@@ -48,6 +48,16 @@ for forbidden in kill_process_group kill_registered_processes kill_registered_gr
     ! grep -Eq "(^|[^[:alnum:]_])${forbidden}([^[:alnum:]_]|$)" "$execution" \
         || fail "factoryd execution retains numeric process-group signal authority: $forbidden"
 done
+grep -Fq 'verifier-release' "$smoke" \
+    || fail "verifier descendant has no causal release handshake"
+grep -Fq ': >"$scratch/verifier-release"' "$smoke" \
+    || fail "smoke never releases the verifier descendant after its assertions"
+grep -Fq 'Duration::from_secs(20)' "$smoke" \
+    && fail "verifier descendant still uses an arbitrary 20-second hold"
+grep -Fq '; sleep 5;' "$smoke" \
+    && fail "first provider uses an arbitrary five-second delay"
+grep -Fxq 'sleep 0.2' "$smoke" \
+    && fail "process discovery uses an arbitrary delay before bounded polling"
 
 set +e
 DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 "$smoke"

@@ -33,6 +33,8 @@ On Ubuntu x86-64, run the source-only gate and contributor smoke instead:
 The source gate runs `cargo +1.88.0 fmt --check`,
 `clippy --all-targets --all-features -D warnings` across the whole
 workspace, every test with `--test-threads=1`, and `git diff --check`.
+The test command uses Cargo's default workspace test targets; helper-only
+targets opt out instead of producing empty test harnesses.
 The macOS path additionally checks release-source, publisher, and package
 fixtures. CI requires both platform jobs through the aggregate `required`
 context, so contributors should run the command for their platform before

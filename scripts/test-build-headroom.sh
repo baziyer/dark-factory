@@ -142,10 +142,13 @@ clippy_line=$(line_of 'cargo +1.88.0 clippy' "$gate")
 ci=$repository_root/.github/workflows/ci.yml
 linux_job=$temporary/linux-job.yml
 sed -n '/^  linux:/,$p' "$ci" >"$linux_job"
-linux_preflight_line=$(line_of 'name: Check build headroom' "$linux_job")
-linux_build_line=$(line_of 'name: Build the workspace' "$linux_job")
-[ "$linux_preflight_line" -lt "$linux_build_line" ] \
-    || fail "Linux CI does not preflight before its build"
+linux_gate_line=$(line_of 'name: Run the Linux authoritative gate' "$linux_job")
+linux_build_line=$(line_of 'name: Build the workspace binaries' "$linux_job")
+[ "$linux_gate_line" -lt "$linux_build_line" ] \
+    || fail "Linux CI does not run its preflighting source gate before its build"
+if grep -Fq 'name: Check build headroom' "$linux_job"; then
+    fail "Linux CI duplicates the source gate's build-headroom preflight"
+fi
 
 release=$repository_root/.github/workflows/release.yml
 release_preflight_line=$(line_of 'name: Check build headroom' "$release")
