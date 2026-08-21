@@ -12,6 +12,8 @@ use axum::{
     response::{IntoResponse as _, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use url::Url;
 
 mod journal;
 pub mod maintainer;
@@ -20,23 +22,11 @@ use journal::DeliveryJournal;
 use maintainer::{MAX_BODY_BYTES, MaintainerState, SecretRevision, WebhookSecret};
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
+pub const RUNTIME_DATABASE_URL_ENV: &str = "DARK_FACTORY_BROKER_DATABASE_URL";
 pub const WEBHOOK_SECRET_ENV: &str = "DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET";
 pub const SECRET_REVISION_ENV: &str = "DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET_REVISION";
 pub const APP_ID_ENV: &str = "DARK_FACTORY_MAINTAINER_APP_ID";
-const AMBIENT_POSTGRES_ENV: [&str; 12] = [
-    "PGAPPNAME",
-    "PGDATABASE",
-    "PGHOST",
-    "PGHOSTADDR",
-    "PGOPTIONS",
-    "PGPASSFILE",
-    "PGPASSWORD",
-    "PGPORT",
-    "PGSSLCERT",
-    "PGSSLKEY",
-    "PGSSLMODE",
-    "PGUSER",
-];
+const VERCEL_ENV_ENV: &str = "VERCEL_ENV";
 
 #[derive(Clone, Copy)]
 enum Deployment {
@@ -109,13 +99,10 @@ impl BrokerState {
     }
 
     fn from_environment() -> Result<Self, ProductionOpenError> {
-        if AMBIENT_POSTGRES_ENV
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
-        {
-            return Err(ProductionOpenError::AmbientPostgresEnvironment);
+        if owner_database_environment_is_present() {
+            return Err(ProductionOpenError::OwnerDatabaseEnvironment);
         }
-        let database_url = required_environment(DATABASE_URL_ENV)?;
+        let database_url = required_environment(RUNTIME_DATABASE_URL_ENV)?;
         let webhook_secret = required_environment(WEBHOOK_SECRET_ENV)?;
         let secret_revision = required_environment(SECRET_REVISION_ENV)?;
         let expected_app_id = required_environment(APP_ID_ENV)?
@@ -139,11 +126,21 @@ fn required_environment(name: &'static str) -> Result<String, ProductionOpenErro
         .ok_or(ProductionOpenError::MissingEnvironment(name))
 }
 
+fn owner_database_environment_is_present() -> bool {
+    std::env::var_os(DATABASE_URL_ENV).is_some()
+        || std::env::var_os("DATABASE_URL_UNPOOLED").is_some()
+        || std::env::var_os("NEON_PROJECT_ID").is_some()
+        || std::env::vars_os().any(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| name.starts_with("PG") || name.starts_with("POSTGRES_"))
+        })
+}
+
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProductionOpenError {
     #[error("required production environment is missing: {0}")]
     MissingEnvironment(&'static str),
-    #[error("DATABASE_URL is not a valid PostgreSQL connection URL")]
+    #[error("database URL is not a valid PostgreSQL connection URL")]
     InvalidDatabaseUrl,
     #[error("maintainer webhook secret is invalid")]
     InvalidWebhookSecret,
@@ -151,16 +148,18 @@ pub enum ProductionOpenError {
     InvalidSecretRevision,
     #[error("maintainer App ID must be a positive integer")]
     InvalidAppId,
-    #[error("ambient PostgreSQL environment is forbidden")]
-    AmbientPostgresEnvironment,
+    #[error("provider owner database environment must be absent from the runtime")]
+    OwnerDatabaseEnvironment,
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum MigrationError {
-    #[error("migration database configuration is unavailable")]
+pub enum ProvisionError {
+    #[error("owner database configuration is unavailable")]
     Configuration,
-    #[error("control-plane migration failed")]
+    #[error("control-plane runtime provisioning failed")]
     Database,
+    #[error("runtime credential generation failed")]
+    Entropy,
 }
 
 #[cfg(feature = "development-sqlite")]
@@ -173,23 +172,44 @@ pub enum OpenError {
 }
 
 pub fn production_app_from_env() -> Router {
+    if std::env::var(VERCEL_ENV_ENV).as_deref() != Ok("production") {
+        return app(BrokerState::inactive());
+    }
     let state = BrokerState::from_environment().unwrap_or_else(|_| BrokerState::inactive());
     app(state)
 }
 
-pub async fn migrate_from_env() -> Result<(), MigrationError> {
-    if AMBIENT_POSTGRES_ENV
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
-    {
-        return Err(MigrationError::Configuration);
-    }
-    let database_url =
-        required_environment(DATABASE_URL_ENV).map_err(|_| MigrationError::Configuration)?;
-    let pool = journal::postgres_pool(&database_url).map_err(|_| MigrationError::Configuration)?;
+pub async fn provision_runtime_from_env() -> Result<String, ProvisionError> {
+    let owner_database_url =
+        required_environment(DATABASE_URL_ENV).map_err(|_| ProvisionError::Configuration)?;
+    let pool =
+        journal::postgres_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
     journal::migrate(&pool)
         .await
-        .map_err(|_| MigrationError::Database)
+        .map_err(|_| ProvisionError::Database)?;
+
+    let mut password = [0_u8; 32];
+    getrandom::fill(&mut password).map_err(|_| ProvisionError::Entropy)?;
+    let password = URL_SAFE_NO_PAD.encode(password);
+    let mut salt = [0_u8; 16];
+    getrandom::fill(&mut salt).map_err(|_| ProvisionError::Entropy)?;
+    let verifier = journal::scram_verifier(&password, &salt);
+    journal::provision_runtime(&pool, &verifier)
+        .await
+        .map_err(|_| ProvisionError::Database)?;
+
+    let mut runtime_url =
+        Url::parse(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
+    runtime_url
+        .set_username(journal::RUNTIME_ROLE)
+        .map_err(|_| ProvisionError::Configuration)?;
+    runtime_url
+        .set_password(Some(&password))
+        .map_err(|_| ProvisionError::Configuration)?;
+    journal::verify_runtime(runtime_url.as_str())
+        .await
+        .map_err(|_| ProvisionError::Database)?;
+    Ok(runtime_url.into())
 }
 
 pub fn app(state: BrokerState) -> Router {
@@ -253,8 +273,8 @@ fn json_response(status: StatusCode, body: &'static str) -> Response {
 mod tests {
     use super::*;
 
-    #[test]
-    fn production_configuration_rejects_partial_or_invalid_values() {
+    #[tokio::test]
+    async fn production_configuration_rejects_partial_or_invalid_values() {
         assert_eq!(
             BrokerState::open_production(
                 "not-a-postgres-url",
@@ -295,5 +315,32 @@ mod tests {
             .err(),
             Some(ProductionOpenError::InvalidAppId)
         );
+
+        let open = |database_url: &str| {
+            BrokerState::open_production(
+                database_url,
+                vec![b'x'; 32],
+                "maintainer-v1".to_owned(),
+                42,
+            )
+        };
+        assert!(
+            open(
+                "postgresql://runtime:password@database.example/control_plane?sslmode=require&channel_binding=require"
+            )
+            .is_ok()
+        );
+        for rejected in [
+            "postgresql://runtime:password@database.example/control_plane?sslmode=require&options=search_path%3Dpublic",
+            "postgresql://runtime:password@database.example/control_plane?sslmode=require&sslmode=require",
+            "postgresql://runtime:@database.example/control_plane?sslmode=require",
+            "postgresql://runtime:password@database.example/control_plane/extra?sslmode=require",
+            "postgresql://runtime:password@database.example/control_plane?sslmode=require#fragment",
+        ] {
+            assert_eq!(
+                open(rejected).err(),
+                Some(ProductionOpenError::InvalidDatabaseUrl)
+            );
+        }
     }
 }

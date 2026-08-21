@@ -16,4 +16,17 @@ cargo +1.88.0 test --locked --all-targets
 # clippy gate above; they must not silently replace this dedicated test lane.
 cargo +1.88.0 test --locked --all-targets --features development-sqlite
 
+for ignore_file in .gitignore .vercelignore; do
+    for pattern in .env '.env.*' '!.env.example' '.vercel/'; do
+        grep -Fqx -- "$pattern" "$ignore_file"
+    done
+done
+for ignored_path in .env .env.production .vercel/project.json; do
+    git check-ignore -q --no-index "$ignored_path"
+done
+if git check-ignore -q --no-index .env.example; then
+    echo ".env.example must remain trackable" >&2
+    exit 1
+fi
+
 git diff --check -- .

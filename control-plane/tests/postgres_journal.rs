@@ -3,9 +3,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use dark_factory_control_plane::{BrokerState, app, migrate_from_env};
+use dark_factory_control_plane::{BrokerState, app, provision_runtime_from_env};
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
+use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
 use tower::ServiceExt as _;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -14,37 +15,638 @@ const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 #[ignore = "requires an explicit disposable TLS Postgres DATABASE_URL"]
 async fn migrated_postgres_proves_readiness_concurrent_replay_and_conflict() {
     let database_url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL");
-    let state = || {
-        BrokerState::open_production(
-            &database_url,
-            SECRET.to_vec(),
-            "maintainer-v1".to_owned(),
-            5678,
-        )
-        .unwrap()
-    };
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let (owner_is_superuser, owner_can_create_roles): (bool, bool) = sqlx::query_as(
+        "SELECT rolsuper, rolcreaterole
+         FROM pg_catalog.pg_roles
+         WHERE rolname = current_user",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert!(
+        !owner_is_superuser && owner_can_create_roles,
+        "the disposable proof requires a non-superuser CREATEROLE owner"
+    );
 
-    let before = app(state())
+    let runtime_url = provision_runtime_from_env().await.unwrap();
+    let owner = runtime_router(&database_url)
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(before.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(owner.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    migrate_from_env().await.unwrap();
-    let router = app(state());
-    let ready = router
+    let router = runtime_router(&runtime_url);
+    assert_ready(&router, StatusCode::OK).await;
+
+    exact_concurrent_replay(router.clone()).await;
+    concurrent_conflict(router.clone()).await;
+
+    let set_database_read_only: String = sqlx::query_scalar(
+        "SELECT format(
+             'ALTER ROLE dark_factory_broker_runtime IN DATABASE %I SET default_transaction_read_only = on',
+             current_database()
+         )",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    owner_pool
+        .execute(
+            "ALTER ROLE dark_factory_broker_runtime CONNECTION LIMIT 2 VALID UNTIL '2099-01-01';
+             ALTER ROLE dark_factory_broker_runtime SET default_transaction_read_only = on",
+        )
+        .await
+        .unwrap();
+    owner_pool
+        .execute(set_database_read_only.as_str())
+        .await
+        .unwrap();
+
+    let rotated_runtime_url = provision_runtime_from_env().await.unwrap();
+    assert_ne!(runtime_url, rotated_runtime_url);
+    assert!(
+        PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(750))
+            .connect(&runtime_url)
+            .await
+            .is_err(),
+        "the first provisioned password still authenticated after rotation"
+    );
+    let router = runtime_router(&rotated_runtime_url);
+    assert_ready(&router, StatusCode::OK).await;
+    exact_concurrent_replay(router.clone()).await;
+
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&rotated_runtime_url)
+        .await
+        .unwrap();
+    assert_statement_log_excludes_runtime_credentials(&[&runtime_url, &rotated_runtime_url]);
+    forbidden_runtime_operations_fail(&runtime_pool, &owner_pool).await;
+    corrupted_schema_and_authority_fail_readiness(&router, &owner_pool, &rotated_runtime_url).await;
+}
+
+fn runtime_router(database_url: &str) -> Router {
+    app(BrokerState::open_production(
+        database_url,
+        SECRET.to_vec(),
+        "maintainer-v1".to_owned(),
+        5678,
+    )
+    .unwrap())
+}
+
+fn assert_statement_log_excludes_runtime_credentials(runtime_urls: &[&str]) {
+    let Ok(log_file) = std::env::var("DARK_FACTORY_POSTGRES_STATEMENT_LOG") else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let log = std::fs::read_to_string(log_file).unwrap();
+    for runtime_url in runtime_urls {
+        let parsed = url::Url::parse(runtime_url).unwrap();
+        assert!(!log.contains(parsed.password().unwrap()));
+        assert!(!log.contains(runtime_url));
+    }
+}
+
+async fn assert_ready(router: &Router, expected: StatusCode) {
+    let response = router
         .clone()
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(ready.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(ready.into_body(), 1024).await.unwrap().as_ref(),
-        br#"{"status":"ready","maintainer_webhook":"bootstrap_ping_only","product_webhook":"inactive","operator_api":"inactive"}"#
-    );
+    assert_eq!(response.status(), expected);
+    if expected == StatusCode::OK {
+        assert_eq!(
+            to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"status":"ready","maintainer_webhook":"bootstrap_ping_only","product_webhook":"inactive","operator_api":"inactive"}"#
+        );
+    }
+}
 
-    exact_concurrent_replay(router.clone()).await;
-    concurrent_conflict(router).await;
+async fn forbidden_runtime_operations_fail(runtime: &PgPool, owner: &PgPool) {
+    let owner_role: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(owner)
+        .await
+        .unwrap();
+    let set_owner_role: String = sqlx::query_scalar("SELECT format('SET ROLE %I', $1)")
+        .bind(owner_role)
+        .fetch_one(owner)
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE SCHEMA forbidden_runtime_schema",
+        "CREATE TABLE public.forbidden_runtime_table (id integer)",
+        "CREATE TEMPORARY TABLE forbidden_runtime_temp (id integer)",
+        "UPDATE public.maintainer_deliveries SET event = 'ping'",
+        "DELETE FROM public.maintainer_deliveries",
+        "TRUNCATE public.maintainer_deliveries",
+        "ALTER TABLE public.maintainer_deliveries ADD COLUMN forbidden integer",
+        "DROP TABLE public.maintainer_deliveries",
+        "CREATE ROLE forbidden_runtime_role",
+        "CREATE DATABASE forbidden_runtime_database",
+        &set_owner_role,
+    ] {
+        assert!(
+            runtime.execute(statement).await.is_err(),
+            "succeeded: {statement}"
+        );
+    }
+
+    // PostgreSQL reports an unauthorized GRANT as a successful no-op with a
+    // warning, so prove that it cannot change the ACL rather than expecting an
+    // error result.
+    runtime
+        .execute("GRANT SELECT ON public.maintainer_deliveries TO PUBLIC")
+        .await
+        .unwrap();
+    let public_select: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_class relation,
+                  LATERAL pg_catalog.aclexplode(
+                      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+                  ) acl
+             WHERE relation.oid = 'public.maintainer_deliveries'::regclass
+               AND acl.grantee = 0
+               AND acl.privilege_type = 'SELECT'
+         )",
+    )
+    .fetch_one(owner)
+    .await
+    .unwrap();
+    assert!(!public_select);
+}
+
+async fn corrupted_schema_and_authority_fail_readiness(
+    router: &Router,
+    owner: &PgPool,
+    runtime_url: &str,
+) {
+    let (grant_connect, revoke_connect): (String, String) = sqlx::query_as(
+        "SELECT
+             format(
+                 'GRANT CONNECT ON DATABASE %I TO dark_factory_broker_runtime WITH GRANT OPTION',
+                 current_database()
+             ),
+             format(
+                 'REVOKE GRANT OPTION FOR CONNECT ON DATABASE %I FROM dark_factory_broker_runtime',
+                 current_database()
+             )",
+    )
+    .fetch_one(owner)
+    .await
+    .unwrap();
+    owner.execute(grant_connect.as_str()).await.unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner.execute(revoke_connect.as_str()).await.unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "GRANT USAGE ON SCHEMA public
+             TO dark_factory_broker_runtime WITH GRANT OPTION",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "REVOKE GRANT OPTION FOR USAGE ON SCHEMA public
+             FROM dark_factory_broker_runtime",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("GRANT UPDATE ON public.maintainer_deliveries TO dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("REVOKE UPDATE ON public.maintainer_deliveries FROM dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("GRANT SELECT ON public.maintainer_deliveries TO PUBLIC")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("REVOKE SELECT ON public.maintainer_deliveries FROM PUBLIC")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("CREATE ROLE dark_factory_broker_forbidden_grantee NOLOGIN")
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "GRANT SELECT ON public.maintainer_deliveries
+             TO dark_factory_broker_forbidden_grantee",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "REVOKE SELECT ON public.maintainer_deliveries
+             FROM dark_factory_broker_forbidden_grantee",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute("DROP ROLE dark_factory_broker_forbidden_grantee")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("GRANT CREATE ON SCHEMA public TO dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("REVOKE CREATE ON SCHEMA public FROM dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "GRANT UPDATE (event) ON public.maintainer_deliveries
+             TO dark_factory_broker_runtime",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "REVOKE UPDATE (event) ON public.maintainer_deliveries
+             FROM dark_factory_broker_runtime",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE TABLE public.forbidden_runtime_relation (id integer);
+             GRANT SELECT ON public.forbidden_runtime_relation TO dark_factory_broker_runtime",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP TABLE public.forbidden_runtime_relation")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE TABLE public.forbidden_runtime_column_relation (id integer);
+             GRANT SELECT (id) ON public.forbidden_runtime_column_relation
+             TO dark_factory_broker_runtime",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP TABLE public.forbidden_runtime_column_relation")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE FUNCTION public.forbidden_runtime_function()
+             RETURNS integer LANGUAGE SQL IMMUTABLE AS 'SELECT 1'",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP FUNCTION public.forbidden_runtime_function()")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("ALTER TABLE public.maintainer_deliveries ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("ALTER TABLE public.maintainer_deliveries DISABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("ALTER TABLE public.maintainer_deliveries SET UNLOGGED")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("ALTER TABLE public.maintainer_deliveries SET LOGGED")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE SCHEMA dark_factory_broker_owner_test;
+             CREATE FUNCTION dark_factory_broker_owner_test.forbidden_trigger()
+             RETURNS trigger LANGUAGE plpgsql AS $function$
+             BEGIN
+                 RETURN NULL;
+             END
+             $function$;
+             CREATE TRIGGER forbidden_runtime_trigger
+             BEFORE INSERT ON public.maintainer_deliveries
+             FOR EACH ROW EXECUTE FUNCTION dark_factory_broker_owner_test.forbidden_trigger()",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "DROP TRIGGER forbidden_runtime_trigger ON public.maintainer_deliveries;
+             DROP SCHEMA dark_factory_broker_owner_test CASCADE",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE RULE forbidden_runtime_rule AS
+             ON INSERT TO public.maintainer_deliveries DO INSTEAD NOTHING",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP RULE forbidden_runtime_rule ON public.maintainer_deliveries")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE TABLE public.forbidden_delivery_child ()
+             INHERITS (public.maintainer_deliveries)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP TABLE public.forbidden_delivery_child")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "CREATE TABLE public.forbidden_migration_child ()
+             INHERITS (public.dark_factory_schema_migrations)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("DROP TABLE public.forbidden_migration_child")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             DROP CONSTRAINT maintainer_deliveries_pkey",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             ADD CONSTRAINT maintainer_deliveries_pkey PRIMARY KEY (delivery_id)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER TABLE public.dark_factory_schema_migrations
+             DROP CONSTRAINT dark_factory_schema_migrations_pkey",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "ALTER TABLE public.dark_factory_schema_migrations
+             ADD CONSTRAINT dark_factory_schema_migrations_pkey PRIMARY KEY (component)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER TABLE public.dark_factory_schema_migrations
+             DROP CONSTRAINT dark_factory_schema_migrations_digest_format;
+             ALTER TABLE public.dark_factory_schema_migrations
+             ADD CONSTRAINT dark_factory_schema_migrations_digest_format
+             CHECK (octet_length(digest) > 0)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "ALTER TABLE public.dark_factory_schema_migrations
+             DROP CONSTRAINT dark_factory_schema_migrations_digest_format;
+             ALTER TABLE public.dark_factory_schema_migrations
+             ADD CONSTRAINT dark_factory_schema_migrations_digest_format
+             CHECK (digest ~ '^[0-9a-f]{64}$')",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             DROP CONSTRAINT maintainer_deliveries_hook_id_positive;
+             ALTER TABLE public.maintainer_deliveries
+             ADD CONSTRAINT maintainer_deliveries_hook_id_positive CHECK (hook_id >= 0)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             DROP CONSTRAINT maintainer_deliveries_hook_id_positive;
+             ALTER TABLE public.maintainer_deliveries
+             ADD CONSTRAINT maintainer_deliveries_hook_id_positive CHECK (hook_id > 0)",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             ALTER COLUMN received_at SET DEFAULT statement_timestamp()",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(
+            "ALTER TABLE public.maintainer_deliveries
+             ALTER COLUMN received_at SET DEFAULT now()",
+        )
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime CREATEDB")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime NOCREATEDB")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime CONNECTION LIMIT 3")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime CONNECTION LIMIT -1")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime VALID UNTIL '2099-01-01'")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime VALID UNTIL 'infinity'")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute(
+            "ALTER ROLE dark_factory_broker_runtime
+             SET default_transaction_read_only = on",
+        )
+        .await
+        .unwrap();
+    assert_ready(
+        &runtime_router(runtime_url),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    owner
+        .execute("ALTER ROLE dark_factory_broker_runtime RESET ALL")
+        .await
+        .unwrap();
+    assert_ready(&runtime_router(runtime_url), StatusCode::OK).await;
+
+    let (set_database_read_only, reset_database_settings): (String, String) =
+        sqlx::query_as(
+            "SELECT
+                 format(
+                     'ALTER ROLE dark_factory_broker_runtime IN DATABASE %I SET default_transaction_read_only = on',
+                     current_database()
+                 ),
+                 format(
+                     'ALTER ROLE dark_factory_broker_runtime IN DATABASE %I RESET ALL',
+                     current_database()
+                 )",
+        )
+        .fetch_one(owner)
+        .await
+        .unwrap();
+    owner
+        .execute(set_database_read_only.as_str())
+        .await
+        .unwrap();
+    assert_ready(
+        &runtime_router(runtime_url),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    owner
+        .execute(reset_database_settings.as_str())
+        .await
+        .unwrap();
+    assert_ready(&runtime_router(runtime_url), StatusCode::OK).await;
+
+    owner
+        .execute("CREATE ROLE dark_factory_broker_forbidden_parent NOLOGIN")
+        .await
+        .unwrap();
+    owner
+        .execute("GRANT dark_factory_broker_forbidden_parent TO dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("REVOKE dark_factory_broker_forbidden_parent FROM dark_factory_broker_runtime")
+        .await
+        .unwrap();
+    owner
+        .execute("DROP ROLE dark_factory_broker_forbidden_parent")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
+    owner
+        .execute("CREATE ROLE dark_factory_broker_forbidden_member NOLOGIN")
+        .await
+        .unwrap();
+    owner
+        .execute("GRANT dark_factory_broker_runtime TO dark_factory_broker_forbidden_member")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute("REVOKE dark_factory_broker_runtime FROM dark_factory_broker_forbidden_member")
+        .await
+        .unwrap();
+    owner
+        .execute("DROP ROLE dark_factory_broker_forbidden_member")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
 }
 
 async fn exact_concurrent_replay(router: Router) {
