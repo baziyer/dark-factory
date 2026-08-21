@@ -17,9 +17,9 @@ use factory_core::{
     AgentId, AgentRole, ProjectId, Provider, RunFailureReason, RunId, RunPhase, RunnerInstanceId,
     TaskId, runner::RunnerEvent,
 };
-use rustix::process::{
-    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
-};
+#[cfg(not(target_os = "linux"))]
+use rustix::process::test_kill_process;
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
