@@ -36,17 +36,24 @@ grep -Fq '#[cfg(test)]' "$runner_library" \
 linux_mode=$(sed -n '/^[[:space:]]*--linux-source)/,/^[[:space:]]*;;/p' "$gate")
 printf '%s\n' "$linux_mode" | grep -Fq './scripts/check-toolchain-pins.sh' \
     || fail "Linux source mode lost toolchain pin validation"
-for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-package-release.sh; do
+for mac_fixture in test-prepare-release-source.sh test-publish-release.sh \
+    test-package-release.sh test-macos-launchd-release-proof.sh; do
     if printf '%s\n' "$linux_mode" | grep -Fq "$mac_fixture"; then
         fail "Linux source mode invokes macOS fixture $mac_fixture"
     fi
 done
 
 macos_mode=$(sed -n '/^[[:space:]]*macos)/,/^[[:space:]]*;;/p' "$gate")
-for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-package-release.sh; do
+for mac_fixture in test-prepare-release-source.sh test-publish-release.sh \
+    test-package-release.sh test-macos-launchd-release-proof.sh; do
     printf '%s\n' "$macos_mode" | grep -Fq "$mac_fixture" \
         || fail "macOS mode lost fixture $mac_fixture"
 done
+shared_gate=$(sed -n '/^# Measure after/,$p' "$gate")
+if printf '%s\n' "$shared_gate" \
+    | grep -Fq './scripts/test-macos-launchd-release-proof.sh'; then
+    fail "shared source gate invokes the macOS launchd fixture"
+fi
 
 linux_job=$(sed -n '/^  linux:/,$p' "$ci")
 line_of() {
