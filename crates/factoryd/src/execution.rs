@@ -16,7 +16,7 @@ use std::{
 
 use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, ChangeSnapshot, ProjectId, Provider,
-    RunFailureReason, RunId, RunPhase, RunnerInstanceId, TaskId, runner::RunnerEvent,
+    RunFailureReason, RunId, RunPhase, RunnerInstanceId, runner::RunnerEvent,
 };
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
@@ -80,7 +80,6 @@ pub struct Config {
 
 struct Admission {
     pub project_id: ProjectId,
-    pub task_id: TaskId,
     pub agent_id: AgentId,
 }
 
@@ -260,10 +259,6 @@ impl Handle {
             .await
             .map_err(|_| Error::ManagerStopped)?;
         Ok(removing)
-    }
-
-    pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.state.lock_assignment_slot().await
     }
 
     pub async fn begin_delete(&self, agent_id: &AgentId) -> Result<(), Error> {
@@ -638,12 +633,11 @@ async fn start_and_observe(
     }
     let result = start_run(&config, &state, input).await;
     agent_gate.end_write(&agent_id);
-    result.map(|started| {
-        let StartedProcess { run, child } = started;
-        let run_id = run.run.id.clone();
-        observed.insert(run_id);
+    if let Some(StartedProcess { run, child }) = result? {
+        observed.insert(run.run.id.clone());
         spawn_observer(state, commands, run, Some(child));
-    })
+    }
+    Ok(())
 }
 
 struct StartedProcess {
@@ -655,7 +649,7 @@ async fn start_run(
     config: &Config,
     state: &DaemonState,
     input: Admission,
-) -> Result<StartedProcess, Error> {
+) -> Result<Option<StartedProcess>, Error> {
     let run_id = new_run_id()?;
     let runner_instance_id = new_runner_instance_id()?;
     let runtime_nonce = Uuid::new_v4().simple().to_string();
@@ -664,55 +658,44 @@ async fn start_run(
     let policy_dir = runtime_dir.join("policy");
     let bearer = random_bearer();
     let digest = capability_digest(&bearer);
-    let lookup_project = input.project_id.clone();
-    let lookup_agent = input.agent_id.clone();
-    let (provider, role) = state
-        .with_store(move |store| {
-            let agent = store.agent_status(&lookup_project, &lookup_agent)?.agent;
-            Ok((agent.provider, agent.role))
-        })
-        .await?;
-    let change_reservation = if role == AgentRole::Worker {
-        let change_id = new_change_id()?;
-        let change_directory = parse_change_uuid(&change_id)?.simple().to_string();
-        Some(ChangeReservation {
-            source_root: config
-                .changes_root
-                .join(change_directory)
-                .to_string_lossy()
-                .into_owned(),
-            id: change_id,
-            max_factory_changes: MAX_RETAINED_CHANGES_FACTORY_WIDE,
-        })
-    } else {
-        None
+    let change_id = new_change_id()?;
+    let change_reservation = ChangeReservation {
+        source_root: config
+            .changes_root
+            .join(parse_change_uuid(&change_id)?.simple().to_string())
+            .to_string_lossy()
+            .into_owned(),
+        id: change_id,
+        max_factory_changes: MAX_RETAINED_CHANGES_FACTORY_WIDE,
     };
     let admission = NewRunAdmission {
         run_id: run_id.clone(),
         project_id: input.project_id,
-        task_id: input.task_id,
         agent_id: input.agent_id,
-        expected_provider: provider,
         capability_digest: digest,
         runtime_claim,
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         max_active_runs: config.max_active_runs,
         change_reservation,
-        policy_cwd: (role == AgentRole::Orchestrator)
-            .then(|| policy_dir.to_string_lossy().into_owned()),
+        policy_cwd: policy_dir.to_string_lossy().into_owned(),
     };
     let admitted_at_ms = now_ms()?;
     let admitted = state
         .commit_and_publish(move |store| {
-            let admitted = store.admit_run(admission, admitted_at_ms)?;
-            let events = admitted.events.clone();
+            let admitted = store.admit_next_run(admission, admitted_at_ms)?;
+            let events = admitted
+                .as_ref()
+                .map_or_else(Vec::new, |admitted| admitted.events.clone());
             Ok((admitted, events))
         })
         .await?;
+    let Some(admitted) = admitted else {
+        return Ok(None);
+    };
 
     match launch_admitted(config, state, admitted, bearer).await {
-        Ok(started) => Ok(started),
+        Ok(started) => Ok(Some(started)),
         Err((error, child, run)) => {
             cleanup_unactivated(state, &run, child).await;
             Err(error)
@@ -1133,26 +1116,6 @@ async fn dispatch_agent(
     project_id: ProjectId,
     agent_id: AgentId,
 ) -> Result<(), Error> {
-    let lookup_project = project_id.clone();
-    let lookup_agent = agent_id.clone();
-    let (auto, status) = state
-        .with_store(move |store| {
-            Ok((
-                store.auto_mode()?,
-                store.agent_status(&lookup_project, &lookup_agent)?,
-            ))
-        })
-        .await?;
-    if !auto || status.agent.paused || status.current_run.is_some() {
-        return Ok(());
-    }
-    let Some(task) = status
-        .queue
-        .into_iter()
-        .find(|task| task.status == factory_core::TaskStatus::Queued)
-    else {
-        return Ok(());
-    };
     let result = start_and_observe(
         config,
         state,
@@ -1161,7 +1124,6 @@ async fn dispatch_agent(
         agent_gate,
         Admission {
             project_id,
-            task_id: task.id,
             agent_id,
         },
     )

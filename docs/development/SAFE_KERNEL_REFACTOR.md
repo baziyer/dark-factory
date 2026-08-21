@@ -569,8 +569,8 @@ kernel; the second should wait for measured post-kernel evidence.
 
 ### Delete with the kernel
 
-- [x] Remove `StartTask` as a second admission model. Queue assignment plus one
-  automatic admission transaction is sufficient.
+- [x] Remove `StartTask` as a second admission model. One automatic Store transaction
+  selects the canonical queue head and derives provider and role.
 - Remove public session/run lifecycle commands in favor of attempt inspection,
   outcome, cancel intent, and resource status.
 - Remove the generic serialized `LocalRequest` outbox. If offline durability is

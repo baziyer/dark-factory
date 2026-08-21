@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use factory_core::EventEnvelope;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast};
+use tokio::sync::broadcast;
 
 use crate::store::{Store, StoreError};
 
@@ -14,9 +14,6 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct DaemonState {
     store: Arc<Mutex<Store>>,
     events: broadcast::Sender<EventEnvelope>,
-    /// Assignment mutations are infrequent and must be serialized with the
-    /// owner delivery barrier.
-    assignment_gate: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Error)]
@@ -36,14 +33,7 @@ impl DaemonState {
         Self {
             store: Arc::new(Mutex::new(store)),
             events,
-            assignment_gate: Arc::new(AsyncMutex::new(())),
         }
-    }
-
-    /// Serializes all assignment mutations, including moves between workers
-    /// and moves to the project backlog.
-    pub async fn lock_assignment_slot(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.assignment_gate).lock_owned().await
     }
 
     async fn run_with_store<T, F>(&self, operation: F) -> Result<T, DaemonStateError>

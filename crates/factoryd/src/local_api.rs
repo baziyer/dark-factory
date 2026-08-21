@@ -236,10 +236,7 @@ impl ApiFailure {
             ),
             Self::Store(
                 error @ (StoreError::TaskNotQueued
-                | StoreError::TaskAssignmentMismatch
                 | StoreError::TaskNotRetryable
-                | StoreError::AgentProviderMismatch
-                | StoreError::AgentUnavailable
                 | StoreError::CapacityReached { .. }
                 | StoreError::ChangeCapacityReached { .. }
                 | StoreError::RustStorageCapacityReached { .. }
@@ -1324,7 +1321,6 @@ async fn handle_request(
             task_id,
             agent_id,
         } => {
-            let _assignment_slot = execution.lock_assignment_slot().await;
             let wake_project_id = project_id.clone();
             let authority_run_id = mutation_attempt(principal);
             let task = state

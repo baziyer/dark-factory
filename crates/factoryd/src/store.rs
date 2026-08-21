@@ -192,8 +192,6 @@ pub enum StoreError {
     MissingTaskCursorRevision,
     #[error("task page revision requires its cursor")]
     UnexpectedTaskCursorRevision,
-    #[error("agent provider does not match the requested execution provider")]
-    AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
     #[error("agent model policy rejected the profile: {0}")]
@@ -208,8 +206,6 @@ pub enum StoreError {
     InvalidAgentMessage,
     #[error("task is not queued in the requested project")]
     TaskNotQueued,
-    #[error("task is not assigned to the requesting agent")]
-    TaskAssignmentMismatch,
     #[error("task is not retryable in the requested project")]
     TaskNotRetryable,
     #[error("task result exceeds its bound")]
@@ -218,8 +214,6 @@ pub enum StoreError {
     InvalidTaskInput,
     #[error("task blocked reason is empty or exceeds its bound")]
     InvalidBlockedReason,
-    #[error("agent already has an active run")]
-    AgentUnavailable,
     #[error("execution concurrency must be greater than zero")]
     InvalidConcurrencyLimit,
     #[error("factory execution capacity is {limit} active runs")]
