@@ -1,4 +1,4 @@
-use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
+use std::{env, error::Error, ffi::OsStr, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factory_core::local::RequestCredential;
 use factoryd::{
@@ -15,11 +15,14 @@ const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
 
 #[derive(Eq, PartialEq)]
 struct Config {
+    factoryd: PathBuf,
     database: PathBuf,
     socket: PathBuf,
     runner: PathBuf,
     factoryctl: PathBuf,
+    git: PathBuf,
     runtime_root: PathBuf,
+    changes_root: PathBuf,
     /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
     /// `factory_core::paths`).
     guidance_root: PathBuf,
@@ -29,6 +32,12 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if let Some(path) = materializer_invocation_path()? {
+        return match factoryd::run_change_materializer(&path) {
+            Ok(never) => match never {},
+            Err(error) => Err(error.into()),
+        };
+    }
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
@@ -67,9 +76,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
+            factoryd_program: config.factoryd,
             runner_program: config.runner,
             factoryctl_path: config.factoryctl,
+            git_program: config.git,
             runtime_root: config.runtime_root,
+            changes_root: config.changes_root,
             guidance_root: config.guidance_root,
             socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
@@ -130,6 +142,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     result?;
     Ok(())
+}
+
+fn materializer_invocation_path() -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let mut arguments = env::args_os().skip(1);
+    let Some(first) = arguments.next() else {
+        return Ok(None);
+    };
+    if first != "--materialize-change" {
+        return Ok(None);
+    }
+    let path = arguments
+        .next()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or("--materialize-change requires one invocation path")?;
+    if arguments.next().is_some() {
+        return Err("--materialize-change accepts exactly one invocation path".into());
+    }
+    Ok(Some(path))
 }
 
 async fn serve_control_planes(
@@ -237,13 +268,16 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
     let factoryctl = sibling_dir.join("factoryctl");
     let default_webhook_config = home.join("webhooks.json");
     let config = Config {
+        factoryd: current_executable,
         database: home.join("factory.db"),
         socket: env::var_os("DARK_FACTORY_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("f.sock")),
         runner,
         factoryctl,
+        git: resolve_executable_on_path("git")?,
         runtime_root: home.join("runs"),
+        changes_root: home.join("changes"),
         guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
         webhook_config: None,
@@ -258,6 +292,23 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         default_webhook_config.is_file(),
     );
     Ok(config)
+}
+
+fn resolve_executable_on_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = env::var_os("PATH").ok_or("PATH is not set")?;
+    resolve_executable_in_path(name, &path).map_err(Into::into)
+}
+
+fn resolve_executable_in_path(name: &str, path: &OsStr) -> Result<PathBuf, String> {
+    for directory in env::split_paths(path) {
+        let candidate = directory.join(name);
+        if let Ok(executable) =
+            factoryd::runner_process::checked_executable(&candidate, "source materializer")
+        {
+            return Ok(executable);
+        }
+    }
+    Err(format!("{name} was not found as an executable on PATH"))
 }
 
 fn resolve_webhook_config(
@@ -349,8 +400,10 @@ fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
 /// duplicated).
 fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
     for (role, path) in [
+        ("daemon materializer", &config.factoryd),
         ("runner", &config.runner),
         ("factoryctl", &config.factoryctl),
+        ("git source reader", &config.git),
     ] {
         if let Err(error) = factoryd::runner_process::checked_executable(path, role) {
             return Err(format!(
@@ -363,17 +416,25 @@ fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::PathBuf,
+    };
 
-    use super::{Config, parse_arguments, resolve_webhook_config};
+    use super::{Config, parse_arguments, resolve_executable_in_path, resolve_webhook_config};
 
     fn config() -> Config {
         Config {
+            factoryd: PathBuf::from("/bin/factoryd"),
             database: PathBuf::from("/state/factory.db"),
             socket: PathBuf::from("/state/f.sock"),
             runner: PathBuf::from("/bin/factory-runner"),
             factoryctl: PathBuf::from("/bin/factoryctl"),
+            git: PathBuf::from("/usr/bin/git"),
             runtime_root: PathBuf::from("/state/runs"),
+            changes_root: PathBuf::from("/state/changes"),
             guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
             webhook_config: None,
@@ -386,6 +447,27 @@ mod tests {
             .map(|value| OsString::from(*value))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn path_resolution_preserves_the_checked_canonical_executable() {
+        let current = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&current).unwrap();
+        let bin = root.path().join("bin");
+        let cellar = root.path().join("cellar");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&cellar).unwrap();
+        let executable = cellar.join("git");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("../cellar/git", bin.join("git")).unwrap();
+        let relative_bin = bin.strip_prefix(&current).unwrap();
+        let path = std::env::join_paths([relative_bin]).unwrap();
+
+        assert_eq!(
+            resolve_executable_in_path("git", &path).unwrap(),
+            executable.canonicalize().unwrap()
+        );
     }
 
     #[test]

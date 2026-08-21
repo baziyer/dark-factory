@@ -9,15 +9,16 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
-    RunPhase,
+    AgentId, AgentRole, ChangeStorageSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, RunId, RunPhase,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
-        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
-        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS,
-        MAX_TASK_TITLE_BYTES, ProjectDetail as LocalProjectDetail, RequestCredential,
-        RequestEnvelope, ServerFrame, normalize_task_title,
+        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
+        MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS,
+        MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
+        ProjectDetail as LocalProjectDetail, RequestCredential, RequestEnvelope, ServerFrame,
+        normalize_task_title,
     },
     status,
 };
@@ -36,8 +37,8 @@ use crate::{
     execution::{self, StartTask},
     guidance::{self, GuidanceError},
     store::{
-        AgentMessage, AttemptPrincipal, NewAgent, NewAgentMessage, NewProject, NewTask,
-        RepositoryAuthority, Store, StoreError, UpdateAgentProfile,
+        AgentMessage, AttemptPrincipal, NewAgent, NewAgentMessage, NewProject, NewTask, Store,
+        StoreError, UpdateAgentProfile,
     },
 };
 
@@ -62,9 +63,9 @@ mod protocol_tests {
             role: AgentRole::Orchestrator,
             provider: Provider::Shell,
             phase: RunPhase::Running,
-            worktree: "/private/runtime/policy".into(),
+            source_root: "/private/runtime/policy".into(),
             change_id: None,
-            branch: None,
+            change_phase: None,
         }
     }
 
@@ -206,6 +207,10 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "task blocked reason is empty or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidChangeMetadata | StoreError::InvalidChangeCapacity) => (
+                ErrorCode::InvalidRequest,
+                "change metadata or retention capacity is invalid".into(),
+            ),
             Self::Store(StoreError::InvalidHookToken) => (
                 ErrorCode::Unauthorized,
                 "attempt credential is invalid".into(),
@@ -216,6 +221,7 @@ impl ApiFailure {
                 | StoreError::TaskNotFound
                 | StoreError::RunNotFound
                 | StoreError::ChangeNotFound
+                | StoreError::LegacySourceNotFound
                 | StoreError::ResourceNotFound),
             ) => (ErrorCode::NotFound, error.to_string()),
             Self::Store(StoreError::StaleTaskCursor) => (
@@ -228,15 +234,20 @@ impl ApiFailure {
                 "task cursor and queue revision must be supplied together".into(),
             ),
             Self::Store(
-                error @ (StoreError::RepositoryAuthorityMissing
-                | StoreError::RepositoryAuthorityRequiresIdleProject
-                | StoreError::TaskNotQueued
+                error @ (StoreError::TaskNotQueued
                 | StoreError::TaskAssignmentMismatch
                 | StoreError::TaskNotRetryable
                 | StoreError::AgentProviderMismatch
                 | StoreError::AgentUnavailable
                 | StoreError::CapacityReached { .. }
-                | StoreError::SourceProvisioningUnavailable
+                | StoreError::ChangeCapacityReached { .. }
+                | StoreError::ChangeRevisionConflict
+                | StoreError::InvalidChangeState
+                | StoreError::ChangeIdentityMismatch
+                | StoreError::ChangeLeased
+                | StoreError::TaskHasChanges
+                | StoreError::TaskChangeUnavailable
+                | StoreError::ProjectHasChanges
                 | StoreError::RunResourcesUnreleased { .. }
                 | StoreError::ResourceIdentityMismatch
                 | StoreError::InvalidRunState
@@ -532,7 +543,6 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         | LocalRequest::GetProject { .. }
         | LocalRequest::ListProjects { .. }
         | LocalRequest::UpdateProjectGuidance { .. }
-        | LocalRequest::SetProjectRepositoryAuthority { .. }
         | LocalRequest::CreateAgent { .. }
         | LocalRequest::GetAgent { .. }
         | LocalRequest::AgentStatus { .. }
@@ -548,6 +558,10 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         | LocalRequest::DeleteAgent { .. }
         | LocalRequest::DeleteProject { .. }
         | LocalRequest::CancelRun { .. }
+        | LocalRequest::ListChanges { .. }
+        | LocalRequest::RemoveChange { .. }
+        | LocalRequest::ListLegacySources { .. }
+        | LocalRequest::ForgetLegacySource { .. }
         | LocalRequest::EventsAfter { .. }
         | LocalRequest::LatestEventSequence
         | LocalRequest::Subscribe { .. } => false,
@@ -859,16 +873,15 @@ async fn handle_request(
                         .into(),
                 ));
             }
-            if let Some(parent) = &created_parent_agent_id {
-                if !execution.try_begin_agent_write(parent) {
-                    execution.end_agent_write(&created_agent_id);
-                    execution.end_project_write(&created_project_id);
-                    return Err(ApiFailure::Conflict(
-                        "the parent agent is currently being deleted; wait for the delete to \
-                         finish"
-                            .into(),
-                    ));
-                }
+            if let Some(parent) = &created_parent_agent_id
+                && !execution.try_begin_agent_write(parent)
+            {
+                execution.end_agent_write(&created_agent_id);
+                execution.end_project_write(&created_project_id);
+                return Err(ApiFailure::Conflict(
+                    "the parent agent is currently being deleted; wait for the delete to finish"
+                        .into(),
+                ));
             }
             let create_result = create_agent_locked(
                 state,
@@ -1004,24 +1017,6 @@ async fn handle_request(
             write_guidance_file(guidance_path.clone(), text.clone()).await?;
             Ok(LocalResponse::ProjectGuidanceUpdated {
                 project: local_project_detail(project, text, guidance_path),
-            })
-        }
-        LocalRequest::SetProjectRepositoryAuthority {
-            project_id,
-            remote_url,
-            base_branch,
-        } => {
-            let authority = validate_repository_authority(remote_url, base_branch)?;
-            let response_project_id = project_id.clone();
-            state
-                .commit_and_publish(move |store| {
-                    let event =
-                        store.set_repository_authority(&project_id, &authority, now_ms()?)?;
-                    Ok(((), vec![event]))
-                })
-                .await?;
-            Ok(LocalResponse::ProjectRepositoryAuthoritySet {
-                project_id: response_project_id,
             })
         }
         LocalRequest::SendAgentMessage {
@@ -1191,12 +1186,12 @@ async fn handle_request(
                     })
                 })
                 .transpose()?;
-            if let Some(body) = body.as_ref() {
-                if body.len() > MAX_TASK_BODY_BYTES {
-                    return Err(ApiFailure::Invalid(format!(
-                        "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
-                    )));
-                }
+            if let Some(body) = body.as_ref()
+                && body.len() > MAX_TASK_BODY_BYTES
+            {
+                return Err(ApiFailure::Invalid(format!(
+                    "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
+                )));
             }
             let authority_run_id = mutation_attempt(principal);
             let task = state
@@ -1414,7 +1409,7 @@ async fn handle_request(
                     "provider hooks require an active attempt".into(),
                 ));
             };
-            let decision = crate::policy::decide(&payload, Path::new(&attempt.worktree));
+            let decision = crate::policy::decide(&payload, Path::new(&attempt.source_root));
             let project_id = attempt.project_id.clone();
             let agent_id = attempt.agent_id.clone();
             let authority_run_id = attempt.run_id.clone();
@@ -1483,6 +1478,101 @@ async fn handle_request(
             Ok(LocalResponse::Runs {
                 runs,
                 next_after_id,
+            })
+        }
+        LocalRequest::ListChanges {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("change", limit, MAX_CHANGE_PAGE_ITEMS)?;
+            let (mut changes, project_summary, factory_summary) = state
+                .with_store(move |store| {
+                    Ok((
+                        store.list_changes(&project_id, after_id.as_ref(), limit + 1)?,
+                        store.change_storage_summary(Some(&project_id))?,
+                        store.change_storage_summary(None)?,
+                    ))
+                })
+                .await?;
+            let next_after_id = next_cursor(&mut changes, limit, |change| change.id.clone());
+            Ok(LocalResponse::Changes {
+                changes,
+                next_after_id,
+                project_storage: ChangeStorageSnapshot {
+                    retained_count: project_summary.retained_count,
+                    measured_bytes: project_summary
+                        .complete
+                        .then_some(project_summary.measured_bytes),
+                    measured_at_ms: project_summary
+                        .complete
+                        .then_some(project_summary.measured_at_ms)
+                        .flatten(),
+                    active_leases: project_summary.active_leases,
+                    complete: project_summary.complete,
+                },
+                factory_storage: ChangeStorageSnapshot {
+                    retained_count: factory_summary.retained_count,
+                    measured_bytes: factory_summary
+                        .complete
+                        .then_some(factory_summary.measured_bytes),
+                    measured_at_ms: factory_summary
+                        .complete
+                        .then_some(factory_summary.measured_at_ms)
+                        .flatten(),
+                    active_leases: factory_summary.active_leases,
+                    complete: factory_summary.complete,
+                },
+                hard_factory_count_cap: execution.max_retained_changes_factory_wide() as u64,
+            })
+        }
+        LocalRequest::RemoveChange {
+            project_id,
+            change_id,
+            expected_revision,
+        } => {
+            let change = execution
+                .remove_change(project_id, change_id, expected_revision)
+                .await?;
+            Ok(LocalResponse::ChangeRemovalStarted { change })
+        }
+        LocalRequest::ListLegacySources {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("legacy source", limit, MAX_LEGACY_SOURCE_PAGE_ITEMS)?;
+            let mut sources = state
+                .with_store(move |store| {
+                    store.list_legacy_sources(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id = next_cursor(&mut sources, limit, |source| source.id.clone());
+            Ok(LocalResponse::LegacySources {
+                sources,
+                next_after_id,
+            })
+        }
+        LocalRequest::ForgetLegacySource {
+            project_id,
+            legacy_source_id,
+        } => {
+            let response_project = project_id.clone();
+            let response_source = legacy_source_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let forgotten_at_ms = now_ms()?;
+                    let event = store.forget_legacy_source(
+                        &project_id,
+                        &legacy_source_id,
+                        forgotten_at_ms,
+                    )?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::LegacySourceForgotten {
+                project_id: response_project,
+                legacy_source_id: response_source,
             })
         }
         LocalRequest::EventsAfter { sequence, limit } => {
@@ -2072,64 +2162,6 @@ fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> I
     }
     items.pop();
     items.last().map(id)
-}
-
-fn validate_repository_authority(
-    remote_url: String,
-    base_branch: String,
-) -> Result<RepositoryAuthority, ApiFailure> {
-    let valid_branch = !base_branch.is_empty()
-        && !base_branch.starts_with('-')
-        && !base_branch.starts_with('/')
-        && !base_branch.ends_with('/')
-        && !base_branch.contains("..")
-        && !base_branch.contains("@{")
-        && base_branch
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte));
-    if !valid_branch {
-        return Err(ApiFailure::Invalid("invalid base branch".into()));
-    }
-
-    let remote_url = if let Some(tail) = remote_url.strip_prefix("https://github.com/") {
-        let slug = tail.strip_suffix(".git").unwrap_or(tail);
-        let mut parts = slug.split('/');
-        let owner = parts.next().unwrap_or_default();
-        let repository = parts.next().unwrap_or_default();
-        let valid_slug = parts.next().is_none()
-            && !owner.is_empty()
-            && !repository.is_empty()
-            && owner
-                .bytes()
-                .chain(repository.bytes())
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
-        if !valid_slug {
-            return Err(ApiFailure::Invalid("invalid GitHub remote".into()));
-        }
-        format!("https://github.com/{owner}/{repository}.git")
-    } else {
-        let path = remote_url
-            .strip_prefix("file://")
-            .map(PathBuf::from)
-            .or_else(|| {
-                Path::new(&remote_url)
-                    .is_absolute()
-                    .then(|| PathBuf::from(&remote_url))
-            })
-            .ok_or_else(|| {
-                ApiFailure::Invalid(
-                    "remote must be GitHub HTTPS or an absolute local test path".into(),
-                )
-            })?;
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|_| ApiFailure::Invalid("local remote does not exist".into()))?;
-        format!("file://{}", canonical.display())
-    };
-
-    Ok(RepositoryAuthority {
-        remote_url,
-        base_branch,
-    })
 }
 
 fn now_ms() -> Result<i64, StoreError> {

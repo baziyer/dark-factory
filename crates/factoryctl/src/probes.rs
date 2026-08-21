@@ -278,17 +278,17 @@ fn validate_managed_health(
     {
         return Err("managed job answered with unexpected runtime paths".to_owned());
     }
-    if let Some(expected) = expected_version {
-        if health.version != expected {
-            return Err(format!(
-                "a daemon answers, but it is {} rather than {expected}",
-                if health.version.is_empty() {
-                    "an older version"
-                } else {
-                    health.version
-                }
-            ));
-        }
+    if let Some(expected) = expected_version
+        && health.version != expected
+    {
+        return Err(format!(
+            "a daemon answers, but it is {} rather than {expected}",
+            if health.version.is_empty() {
+                "an older version"
+            } else {
+                health.version
+            }
+        ));
     }
     Ok(())
 }

@@ -138,7 +138,9 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         | FactoryEvent::PolicyDecision { .. }
         | FactoryEvent::AgentBudgetChanged { .. }
         | FactoryEvent::LegacyRepositoryOperation { .. }
-        | FactoryEvent::RepositoryAuthorityChanged { .. }
+        | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
+        | FactoryEvent::ChangeChanged { .. }
+        | FactoryEvent::LegacySourceForgotten { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
     };

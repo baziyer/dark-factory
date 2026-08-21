@@ -32,9 +32,12 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
     let state = DaemonState::new(Store::open_in_memory().unwrap());
     let (execution, manager) = execution::spawn(
         execution::Config {
+            factoryd_program: "/bin/false".into(),
             runner_program: "/bin/false".into(),
             factoryctl_path: "/bin/false".into(),
+            git_program: "/bin/false".into(),
             runtime_root,
+            changes_root: directory.path().join("changes"),
             guidance_root: directory.path().join("guidance"),
             socket_path: socket.clone(),
             max_active_runs: 1,

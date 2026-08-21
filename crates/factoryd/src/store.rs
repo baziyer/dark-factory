@@ -15,7 +15,12 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod changes;
 mod kernel;
+pub use changes::{
+    Change, ChangeBaseIdentity, ChangeMaterialization, ChangeMutation, ChangeRemovalKind,
+    ChangeReservation, ChangeSourceIdentity, ChangeStorageSummary,
+};
 pub use kernel::{
     AdmittedRun, AttemptPrincipal, AttemptTarget, KernelResource, KernelResourceKind,
     KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
@@ -31,7 +36,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -267,12 +272,6 @@ pub struct WebhookDocument {
     pub content: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RepositoryAuthority {
-    pub remote_url: String,
-    pub base_branch: String,
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("SQLite error: {0}")]
@@ -296,6 +295,11 @@ pub enum StoreError {
         nonterminal_runs: i64,
         taskless_runs: i64,
     },
+    #[error(
+        "daemon-owned Change migration requires an empty schema-30 Change authority \
+         (runs linked to Changes: {linked_runs})"
+    )]
+    ChangeMigrationRequiresEmptyAuthority { linked_runs: i64 },
     #[error("migration left a foreign key violation behind")]
     ForeignKeyViolation,
     #[error("event page size must be between 1 and {MAX_EVENT_PAGE}")]
@@ -314,10 +318,6 @@ pub enum StoreError {
     EventSequenceGap { expected: i64, found: i64 },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
-    #[error("project repository authority is not configured")]
-    RepositoryAuthorityMissing,
-    #[error("project repository authority must be configured before any attempt starts")]
-    RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
     #[error("task page cursor is stale; restart the listing")]
@@ -358,10 +358,30 @@ pub enum StoreError {
     InvalidConcurrencyLimit,
     #[error("factory execution capacity is {limit} active runs")]
     CapacityReached { limit: usize },
-    #[error("Stage 1 source provisioning is disabled until factoryd owns Changes")]
-    SourceProvisioningUnavailable,
     #[error("change was not found in the requested project")]
     ChangeNotFound,
+    #[error("legacy source metadata was not found in the requested project")]
+    LegacySourceNotFound,
+    #[error("change metadata is invalid or exceeds its bound")]
+    InvalidChangeMetadata,
+    #[error("change retention capacity must be greater than zero")]
+    InvalidChangeCapacity,
+    #[error("factory Change retention capacity is {limit}")]
+    ChangeCapacityReached { limit: usize },
+    #[error("change revision is stale")]
+    ChangeRevisionConflict,
+    #[error("change is not in the required state")]
+    InvalidChangeState,
+    #[error("change source identity no longer matches the registered source")]
+    ChangeIdentityMismatch,
+    #[error("change is leased by a nonterminal run")]
+    ChangeLeased,
+    #[error("task owns retained Change metadata")]
+    TaskHasChanges,
+    #[error("task incarnation has a Change that is being removed or was removed")]
+    TaskChangeUnavailable,
+    #[error("project owns retained Change or legacy-source metadata")]
+    ProjectHasChanges,
     #[error("run was not found")]
     RunNotFound,
     #[error("run still owns {count} unreleased resources")]
@@ -747,9 +767,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO agents (
-                id, project_id, parent_agent_id, role, provider, paused, worktree,
+                id, project_id, parent_agent_id, role, provider, paused,
                 created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, ?6)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
             params![
                 agent.id.as_str(),
                 agent.project_id.as_str(),
@@ -1517,50 +1537,6 @@ impl Store {
             .ok_or(StoreError::ProjectNotFound)
     }
 
-    pub fn set_repository_authority(
-        &mut self,
-        project_id: &ProjectId,
-        authority: &RepositoryAuthority,
-        now_ms: i64,
-    ) -> Result<EventEnvelope> {
-        self.get_project(project_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let has_active_run: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id = ?1 AND phase <> 'terminal')",
-            params![project_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if has_active_run {
-            return Err(StoreError::RepositoryAuthorityRequiresIdleProject);
-        }
-        transaction.execute(
-            "INSERT INTO project_repository_authority (project_id, remote_url, base_branch, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![project_id.as_str(), authority.remote_url, authority.base_branch, now_ms],
-        )?;
-        let event = FactoryEvent::RepositoryAuthorityChanged {
-            project_id: project_id.clone(),
-        };
-        let sequence = append_event(&transaction, now_ms, &event)?;
-        transaction.commit()?;
-        Ok(EventEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            sequence,
-            occurred_at_ms: now_ms,
-            event,
-        })
-    }
-
-    pub fn repository_authority(&self, project_id: &ProjectId) -> Result<RepositoryAuthority> {
-        self.connection.query_row(
-            "SELECT remote_url, base_branch FROM project_repository_authority WHERE project_id = ?1",
-            params![project_id.as_str()],
-            |row| Ok(RepositoryAuthority { remote_url: row.get(0)?, base_branch: row.get(1)? }),
-        ).optional()?.ok_or(StoreError::RepositoryAuthorityMissing)
-    }
-
     pub fn list_projects(
         &self,
         after_id: Option<&ProjectId>,
@@ -1755,6 +1731,20 @@ impl Store {
             TaskStatus::Blocked | TaskStatus::Failed | TaskStatus::Cancelled
         ) {
             return Err(StoreError::TaskNotRetryable);
+        }
+        let unavailable_change: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM changes c
+                 JOIN tasks t ON t.id = c.task_id AND t.project_id = c.project_id
+                 WHERE c.project_id = ?1 AND c.task_id = ?2
+                   AND c.task_incarnation_id = t.incarnation_id
+                   AND c.phase IN ('removing', 'removed')
+             )",
+            params![project_id.as_str(), task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if unavailable_change {
+            return Err(StoreError::TaskChangeUnavailable);
         }
         let changed = transaction.execute(
             "UPDATE tasks
@@ -1961,6 +1951,17 @@ impl Store {
         if has_active_run {
             return Err(StoreError::TaskHasActiveRun);
         }
+        let has_change: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM changes
+                 WHERE task_id = ?1 AND project_id = ?2 AND phase <> 'removed'
+             )",
+            params![task_id.as_str(), project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_change {
+            return Err(StoreError::TaskHasChanges);
+        }
         let has_subtasks: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM tasks WHERE parent_task_id = ?1 AND project_id = ?2
@@ -2015,6 +2016,13 @@ impl Store {
         )?;
         transaction.execute(
             "DELETE FROM runs WHERE task_id = ?1 AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        // Removed rows are tombstone metadata, not retained source authority.
+        // Their immutable ChangeChanged events remain in the audit ledger.
+        transaction.execute(
+            "DELETE FROM changes
+             WHERE task_id = ?1 AND project_id = ?2 AND phase = 'removed'",
             params![task_id.as_str(), project_id.as_str()],
         )?;
         let deleted = transaction.execute(
@@ -2193,8 +2201,10 @@ impl Store {
             "DELETE FROM runs WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
+        // Project deletion discards terminal tombstone metadata only after
+        // every referencing run has gone; durable events remain append-only.
         transaction.execute(
-            "DELETE FROM changes WHERE project_id = ?1",
+            "DELETE FROM changes WHERE project_id = ?1 AND phase = 'removed'",
             params![project_id.as_str()],
         )?;
         transaction.execute(
@@ -3080,6 +3090,18 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     if has_active_run {
         return Err(StoreError::ProjectHasActiveRun);
     }
+    let has_change_metadata: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM changes WHERE project_id = ?1 AND phase <> 'removed'
+             UNION ALL
+             SELECT 1 FROM legacy_sources WHERE project_id = ?1
+         )",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_change_metadata {
+        return Err(StoreError::ProjectHasChanges);
+    }
     Ok(())
 }
 
@@ -3295,7 +3317,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 }
 
 fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
-    debug_assert!(matches!(target, 29 | SCHEMA_VERSION));
+    debug_assert!(matches!(target, 29 | 30 | SCHEMA_VERSION));
     let mut current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current < 0 {
         return Err(StoreError::InvalidSchemaVersion(current));
@@ -3563,7 +3585,7 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
         current = 29;
     }
-    if current == 29 && target == SCHEMA_VERSION {
+    if current == 29 && target >= 30 {
         ensure_kernel_migration_quiescent(connection)?;
         connection.pragma_update(None, "foreign_keys", false)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3572,6 +3594,29 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_no_foreign_key_violations(connection)?;
+        current = 30;
+    }
+    if current == 30 && target == SCHEMA_VERSION {
+        ensure_change_migration_empty_authority(connection)?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0031_daemon_owned_changes.sql"))?;
+        transaction.pragma_update(None, "user_version", 31)?;
+        transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
+    }
+    Ok(())
+}
+
+fn ensure_change_migration_empty_authority(connection: &Connection) -> Result<()> {
+    let linked_runs = connection.query_row(
+        "SELECT COUNT(*) FROM runs WHERE change_id IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if linked_runs != 0 {
+        return Err(StoreError::ChangeMigrationRequiresEmptyAuthority { linked_runs });
     }
     Ok(())
 }
@@ -3773,7 +3818,7 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             agent_id: Some(agent_id),
             run_id: Some(run_id),
         },
-        FactoryEvent::RepositoryAuthorityChanged { project_id } => EventMetadata {
+        FactoryEvent::LegacyRepositoryAuthorityChanged { project_id } => EventMetadata {
             project_id: Some(project_id),
             task_id: None,
             agent_id: None,
@@ -3802,6 +3847,18 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             task_id: Some(&run.task_id),
             agent_id: Some(&run.agent_id),
             run_id: Some(&run.id),
+        },
+        FactoryEvent::ChangeChanged { change } => EventMetadata {
+            project_id: Some(&change.project_id),
+            task_id: Some(&change.task_id),
+            agent_id: None,
+            run_id: None,
+        },
+        FactoryEvent::LegacySourceForgotten { project_id, .. } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: None,
+            run_id: None,
         },
         FactoryEvent::LegacyRunChanged {
             project_id,
@@ -4330,7 +4387,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_migration_preserves_every_shared_legacy_source_association() {
+    fn change_migration_quarantines_every_shared_legacy_source_association() {
         let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
         migrate(&mut store.connection).unwrap();
 
@@ -4340,13 +4397,172 @@ mod tests {
                 "SELECT COUNT(*),
                         COUNT(*) FILTER (WHERE project_id = 'project-1'),
                         COUNT(*) FILTER (WHERE project_id = 'project-2')
-                 FROM changes
-                 WHERE worktree = '/tmp/shared-legacy-source'",
+                 FROM legacy_sources
+                 WHERE source_path = '/tmp/shared-legacy-source'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(migrated, (3, 2, 1));
+    }
+
+    #[test]
+    fn actual_chain_preserves_max_valid_agent_id_in_bounded_legacy_metadata() {
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        let max_agent_id = "a".repeat(128);
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents (
+                    id, project_id, role, provider, paused, worktree,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'project-1', 'worker', 'shell', 0,
+                           '/tmp/max-id-legacy-source', 3, 3)",
+                [&max_agent_id],
+            )
+            .unwrap();
+
+        migrate(&mut store.connection).unwrap();
+
+        let project_id = ProjectId::try_from("project-1").unwrap();
+        let migrated = store
+            .list_legacy_sources(&project_id, None, MAX_STATE_PAGE)
+            .unwrap()
+            .into_iter()
+            .find(|source| {
+                source
+                    .former_agent_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == max_agent_id)
+            })
+            .unwrap();
+        assert!(migrated.id.as_str().len() <= 128);
+        assert_eq!(migrated.source_path, "/tmp/max-id-legacy-source");
+    }
+
+    #[test]
+    fn legacy_source_listing_is_bounded_and_cursor_paginated() {
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        migrate(&mut store.connection).unwrap();
+        let project_id = ProjectId::try_from("project-1").unwrap();
+
+        let first = store.list_legacy_sources(&project_id, None, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = store
+            .list_legacy_sources(&project_id, Some(&first[0].id), 1)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(first[0].id < second[0].id);
+        assert!(matches!(
+            store.list_legacy_sources(&project_id, None, 0),
+            Err(StoreError::InvalidStateLimit)
+        ));
+        assert!(matches!(
+            store.list_legacy_sources(&project_id, None, MAX_STATE_PAGE + 1),
+            Err(StoreError::InvalidStateLimit)
+        ));
+    }
+
+    #[test]
+    fn forgetting_legacy_metadata_never_touches_its_source_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("preserved-source");
+        std::fs::write(&source, b"preserve me").unwrap();
+        let source = source.to_string_lossy().into_owned();
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET worktree = ?1 WHERE id = 'worker-1'",
+                [&source],
+            )
+            .unwrap();
+        migrate(&mut store.connection).unwrap();
+        let project_id = ProjectId::try_from("project-1").unwrap();
+        assert!(matches!(
+            store.check_project_deletable(&project_id),
+            Err(StoreError::ProjectHasChanges)
+        ));
+        let sources = store
+            .list_legacy_sources(&project_id, None, MAX_STATE_PAGE)
+            .unwrap();
+        let retained_id = sources
+            .iter()
+            .find(|item| {
+                item.former_agent_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "worker-1")
+            })
+            .unwrap()
+            .id
+            .clone();
+        let event = store
+            .forget_legacy_source(&project_id, &retained_id, 11)
+            .unwrap();
+        assert!(matches!(
+            &event.event,
+            FactoryEvent::LegacySourceForgotten {
+                project_id: event_project,
+                legacy_source_id,
+            } if event_project == &project_id && legacy_source_id == &retained_id
+        ));
+        assert_eq!(
+            store.events_after(event.sequence - 1, 1).unwrap(),
+            vec![event]
+        );
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"preserve me");
+        assert!(
+            store
+                .list_legacy_sources(&project_id, None, MAX_STATE_PAGE)
+                .unwrap()
+                .iter()
+                .all(|item| item.id != retained_id)
+        );
+    }
+
+    #[test]
+    fn change_migration_refuses_schema_30_linked_authority() {
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        migrate_to(&mut store.connection, 30).unwrap();
+        let incarnation: String = store
+            .connection
+            .query_row(
+                "SELECT incarnation_id FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO changes (
+                    id, project_id, task_id, task_incarnation_id, branch, worktree,
+                    ready_at_ms, retained_reason, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'linked-change', 'project-1', 'task-1', ?1, NULL,
+                    '/tmp/linked-change', 20, NULL, 20, 20
+                 )",
+                [incarnation],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET change_id = 'linked-change' WHERE id = 'run-1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate(&mut store.connection),
+            Err(StoreError::ChangeMigrationRequiresEmptyAuthority { linked_runs: 1 })
+        ));
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 30);
     }
 
     #[test]
@@ -4459,7 +4675,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        for table in ["changes", "runs", "resources"] {
+        for table in ["changes", "legacy_sources", "runs", "resources"] {
             let exists: bool = store
                 .connection
                 .query_row(
@@ -4470,7 +4686,12 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing kernel table {table}");
         }
-        for table in ["sessions", "session_work", "delivery_attempts"] {
+        for table in [
+            "sessions",
+            "session_work",
+            "delivery_attempts",
+            "project_repository_authority",
+        ] {
             let exists: bool = store
                 .connection
                 .query_row(
@@ -4481,5 +4702,14 @@ mod tests {
                 .unwrap();
             assert!(!exists, "legacy authority table {table} survived");
         }
+        let agent_worktree_columns: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'worktree'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_worktree_columns, 0);
     }
 }

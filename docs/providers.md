@@ -4,10 +4,9 @@ A provider is a small adapter that describes how to launch one supported
 coding-agent CLI for one admitted run. Claude Code, Codex, and the deterministic
 shell adapter implement the same boundary.
 
-> Stage 1 is frozen for live use and deliberately refuses worker admission
-> until daemon-owned Changes arrive in Stage 2. Provider tests use temporary
-> directories and fake/shell processes; do not send a real paid prompt while
-> developing this refactor.
+> The safe-kernel refactor is frozen for live use until Stage 3 and the boot
+> review. Provider tests use temporary directories and fake/shell processes;
+> do not send a real paid prompt while developing it.
 
 ## Contract
 
@@ -132,12 +131,11 @@ requirement instead of widening the kernel.
 
 ## Source and repository boundary
 
-Stage 1 passes a source path only in private causal fixtures; production worker
-admission refuses because Stage 2 has not yet created daemon-owned Changes.
-After Stage 2, the provider will receive a leased source view and no Git
-administrative locator. Repository status, diff, commit, push, and PR
-operations remain daemon-owned and target the Change derived from the attempt
-credential. A provider adapter must not run `git worktree`, accept a worktree
+Before worker execution, the daemon materializes one exact committed tree into
+the attempt's leased Change. The provider receives that plain writable source
+view with no Git administrative locator. Status, diff, commit, push,
+pull-request, and publication operations do not exist in the product. A
+provider adapter must not run `git worktree`, accept a caller-selected source
 argument, or add another credential route.
 
 ## Testing

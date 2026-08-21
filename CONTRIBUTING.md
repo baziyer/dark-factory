@@ -6,8 +6,9 @@ file is just the shortest path to a useful first change.
 
 Dark Factory is currently frozen for the
 [safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not run
-provider work, install a development build, or use `~/.dark-factory`. Stage 1
-deliberately refuses worker admission.
+real provider work, install a development build, or use `~/.dark-factory`. Stage 1
+and Stage 2 fixtures must use only isolated temporary homes and deterministic
+shell providers; Stage 3 and the boot review remain incomplete.
 
 ## Before you send a change
 

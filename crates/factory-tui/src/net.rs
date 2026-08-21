@@ -15,7 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, ServerFrame};
+use factory_core::local::{
+    LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame,
+};
 use factory_core::status::FleetStatus;
 use factory_core::{
     AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, TaskDetail, TaskId,
@@ -44,7 +46,7 @@ const SAFE_STATE_PAGE_SIZE: u32 = 100;
 /// client otherwise starts with empty history even though the daemon retains everything. Bounded,
 /// not "everything ever": a busy fleet emits far more than this in an hour, so this is "recent",
 /// not "complete".
-const REPLAY_BACKFILL_EVENTS: u32 = 200;
+const REPLAY_BACKFILL_EVENTS: u32 = MAX_EVENT_PAGE_ITEMS;
 
 /// Resolves the control socket path using the same three-step rule as `factoryctl`
 /// (`crates/factoryctl/src/main.rs::resolve_socket_path`, not exported from its `lib.rs`, so

@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +108,8 @@ id_type!(AgentId);
 id_type!(MessageId);
 id_type!(RunId);
 id_type!(RunnerInstanceId);
+id_type!(ChangeId);
+id_type!(LegacySourceId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +139,71 @@ pub enum RunPhase {
     Running,
     Finalizing,
     Terminal,
+}
+
+/// Durable lifecycle of one daemon-owned writable source tree.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangePhase {
+    Provisioning,
+    Available,
+    Removing,
+    Removed,
+}
+
+/// Bounded operator projection of one retained Change. Filesystem identity is
+/// deliberately private to factoryd; callers select only this typed ID and an
+/// exact revision when requesting removal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChangeSnapshot {
+    pub id: ChangeId,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub task_incarnation_id: String,
+    pub phase: ChangePhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
+    pub revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_at_ms: Option<i64>,
+}
+
+/// One coherent storage projection for either a project or the whole factory.
+/// Measurements are absent unless every retained Change in the scope is
+/// quiescent and measured.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChangeStorageSnapshot {
+    pub retained_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<i64>,
+    pub active_leases: u64,
+    pub complete: bool,
+}
+
+/// Metadata-only record for a source path retained from the pre-kernel
+/// architecture. Factoryd never adopts, stats, measures, leases, renames, or
+/// deletes this path; an operator may only forget the database record by ID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LegacySourceSnapshot {
+    pub id: LegacySourceId,
+    pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub former_agent_id: Option<AgentId>,
+    pub source_path: String,
+    pub retained_reason: String,
+    pub recorded_at_ms: i64,
 }
 
 impl RunPhase {
@@ -436,7 +503,10 @@ pub enum FactoryEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reference: Option<String>,
     },
-    RepositoryAuthorityChanged {
+    /// Decode-only compatibility for the deleted project repository-authority
+    /// setting. Stage 2 has no constructor for this historical event.
+    #[serde(rename = "repository_authority_changed")]
+    LegacyRepositoryAuthorityChanged {
         project_id: ProjectId,
     },
     ProjectChanged {
@@ -450,6 +520,15 @@ pub enum FactoryEvent {
     },
     RunChanged {
         run: Box<RunSnapshot>,
+    },
+    /// A daemon-owned source Change was reserved or durably advanced.
+    ChangeChanged {
+        change: ChangeSnapshot,
+    },
+    /// Metadata-only removal of one quarantined pre-kernel source record.
+    LegacySourceForgotten {
+        project_id: ProjectId,
+        legacy_source_id: LegacySourceId,
     },
     /// Decode-only projection for `run_changed` events written before the
     /// attempt-kernel wire change. The store derives these identities from

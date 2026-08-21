@@ -5,7 +5,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
+    AgentId, AgentRole, AgentSnapshot, ChangeId, ChangeSnapshot, ChangeStorageSnapshot,
+    EventEnvelope, LegacySourceId, LegacySourceSnapshot, MessageId, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, TaskDetail, TaskId,
 };
 
@@ -129,7 +130,14 @@ pub const MAX_PROJECT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_PAGE_ITEMS: u32 = 10;
 pub const MAX_AGENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
-pub const MAX_EVENT_PAGE_ITEMS: u32 = 1000;
+/// A Change may carry a 4 KiB failure whose JSON escaping expands sixfold.
+/// Sixteen worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
+pub const MAX_CHANGE_PAGE_ITEMS: u32 = 16;
+/// A legacy row may contain two 4 KiB strings whose JSON escaping expands
+/// substantially. Sixteen worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
+pub const MAX_LEGACY_SOURCE_PAGE_ITEMS: u32 = 16;
+/// Durable event pages can carry the same worst-case Change projection.
+pub const MAX_EVENT_PAGE_ITEMS: u32 = 16;
 pub const MAX_TASK_TITLE_BYTES: usize = 240;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
@@ -246,11 +254,6 @@ pub enum LocalRequest {
     UpdateProjectGuidance {
         project_id: ProjectId,
         text: String,
-    },
-    SetProjectRepositoryAuthority {
-        project_id: ProjectId,
-        remote_url: String,
-        base_branch: String,
     },
     CreateTask {
         id: TaskId,
@@ -432,6 +435,33 @@ pub enum LocalRequest {
         after_id: Option<RunId>,
         limit: u32,
     },
+    ListChanges {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<ChangeId>,
+        limit: u32,
+    },
+    /// Requests identity-safe removal of one retained Change. The caller can
+    /// name no source path; a stale inventory revision fails explicitly.
+    RemoveChange {
+        project_id: ProjectId,
+        change_id: ChangeId,
+        expected_revision: i64,
+    },
+    /// Lists quarantined metadata for pre-kernel source paths. These records
+    /// are never filesystem ownership claims.
+    ListLegacySources {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<LegacySourceId>,
+        limit: u32,
+    },
+    /// Forgets only one legacy metadata row. No filesystem path is accepted
+    /// and factoryd performs no filesystem operation for this request.
+    ForgetLegacySource {
+        project_id: ProjectId,
+        legacy_source_id: LegacySourceId,
+    },
     EventsAfter {
         sequence: i64,
         limit: u32,
@@ -496,9 +526,6 @@ pub enum LocalResponse {
     },
     ProjectGuidanceUpdated {
         project: ProjectDetail,
-    },
-    ProjectRepositoryAuthoritySet {
-        project_id: ProjectId,
     },
     TaskCreated {
         task: TaskDetail,
@@ -586,6 +613,26 @@ pub enum LocalResponse {
         runs: Vec<RunSnapshot>,
         #[serde(skip_serializing_if = "Option::is_none")]
         next_after_id: Option<RunId>,
+    },
+    Changes {
+        changes: Vec<ChangeSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<ChangeId>,
+        project_storage: ChangeStorageSnapshot,
+        factory_storage: ChangeStorageSnapshot,
+        hard_factory_count_cap: u64,
+    },
+    ChangeRemovalStarted {
+        change: ChangeSnapshot,
+    },
+    LegacySources {
+        sources: Vec<LegacySourceSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<LegacySourceId>,
+    },
+    LegacySourceForgotten {
+        project_id: ProjectId,
+        legacy_source_id: LegacySourceId,
     },
     Events {
         events: Vec<EventEnvelope>,

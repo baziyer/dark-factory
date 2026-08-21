@@ -11,7 +11,7 @@ Read durable events from the daemon.
 
 Options:
   --after N                Read events after this sequence (default 0)
-  --limit N                 Page size (default and max: 100; not with --follow)
+  --limit N                 Page size (default and max: 16; not with --follow)
   --follow                   Stream events as they occur
   -h, --help                  Show this help";
 

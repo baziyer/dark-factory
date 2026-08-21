@@ -103,7 +103,7 @@ mod tests {
     fn context(directory: &std::path::Path) -> SpawnContext {
         SpawnContext {
             run_id: RunId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
-            worktree: directory.join("worktree"),
+            source_root: directory.join("source"),
             startup_input: b"fix the admitted task".to_vec(),
             model: None,
             reasoning_effort: None,

@@ -8,8 +8,9 @@ clients of the same private local API.
 > **Development freeze:** `main` is part-way through the
 > [safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not
 > install or start this revision, enable auto mode, submit provider work, or
-> point it at `~/.dark-factory`. Stage 1 intentionally refuses worker
-> admission until Stage 2 supplies daemon-owned Changes and worktrees.
+> point it at `~/.dark-factory`. Stages 1 and 2 are implemented on the current
+> refactor branch; the bounded build cache, immutable executable bundles, and
+> independent boot review are still incomplete.
 
 ## The smaller runtime model
 
@@ -41,26 +42,30 @@ queued task -> admitted -> running -> finalizing -> terminal
   is checked as that attempt and refused rather than upgraded to operator
   authority.
 - God/orchestrators may propose priority and assignment. They do not own
-  admission, source, processes, repository writes, finalization, capacity, or
-  administration.
+  admission, source, processes, finalization, capacity, or administration.
 
-Stage 1 removes PTY attach, terminal input, provider resume, delivery replay,
+The safe kernel removes PTY attach, terminal input, provider resume, delivery replay,
 session outboxes, message-only provider turns, and per-agent worktree
 creation. Historical session events may still decode for old databases, but
 the live runtime does not create sessions.
 
 ## Current stage boundary
 
-Worker source mutation is unavailable in Stage 1. Legacy worktrees are
-preserved as unlinked retained Change records during migration; they are not
-adopted, inspected, moved, or deleted. A worker cannot be admitted until
-Stage 2 gives `factoryd` exclusive ownership of Change worktree creation and
-leases.
+`factoryd` now reserves one Change for an exact task incarnation and
+materializes a plain writable source tree from one exact local commit before
+the worker can execute. The provider view contains no `.git` locator and is
+not a linked Git worktree. Provider mutations remain in that retained Change;
+status, commit, push, pull-request, and publication operations are deliberately
+absent.
+
+Paths retained from the pre-kernel architecture are metadata-only
+`legacy_sources`. Factoryd never stats, adopts, measures, leases, renames, or
+deletes them. An operator may forget only the metadata record by its typed ID.
 
 Orchestrator policy runs may use their bounded guidance/project policy
-context, but this intermediate revision is still not a boot candidate. Stage
-3 must add the bounded project build cache, immutable prepared executable
-bundles, and storage reclamation before the factory can be reviewed for
+context, but this revision is still not a boot candidate. Stage 3 must add the
+bounded project build cache, immutable prepared executable bundles, and
+regenerable-storage reclamation before the factory can be reviewed for
 re-enablement.
 
 ## Repository layout

@@ -5,7 +5,7 @@
 //! session or delivery state.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     os::unix::{fs::DirBuilderExt, fs::MetadataExt},
     path::{Path, PathBuf},
@@ -14,8 +14,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, ProjectId, Provider, RunFailureReason, RunId, RunPhase, RunnerInstanceId,
-    TaskId, runner::RunnerEvent,
+    AgentId, AgentRole, ChangeId, ChangePhase, ChangeSnapshot, ProjectId, Provider,
+    RunFailureReason, RunId, RunPhase, RunnerInstanceId, TaskId, runner::RunnerEvent,
 };
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
@@ -25,12 +25,13 @@ use thiserror::Error;
 use tokio::{
     process::Child,
     sync::{mpsc, oneshot, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::{Instant, sleep, sleep_until, timeout},
 };
 use uuid::Uuid;
 
 use crate::{
+    change_source::{self, DirectoryIdentity, MaterializerInvocation, SourceLimits},
     daemon_state::{DaemonState, DaemonStateError},
     providers::{self, SpawnContext, hooks},
     runner_client::{
@@ -38,8 +39,10 @@ use crate::{
     },
     runner_process::{self, LaunchSpec, ProviderEnvironment},
     store::{
-        AdmittedRun, KernelResource, KernelResourceKind, KernelResourceState, NewRunAdmission,
-        PreparedProcessIdentity, RecoverableKernelRun, StoreError,
+        AdmittedRun, Change, ChangeBaseIdentity, ChangeMaterialization, ChangeRemovalKind,
+        ChangeReservation, ChangeSourceIdentity, KernelResource, KernelResourceKind,
+        KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
+        StoreError,
     },
 };
 
@@ -53,11 +56,17 @@ const DEFAULT_FINALIZE_GRACE_MS: u64 = 5_000;
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
 const STATE_PAGE: usize = 100;
+pub const MAX_RETAINED_CHANGES_FACTORY_WIDE: usize = 64;
+const CHANGE_SCAN_MAX_ENTRIES: u64 = 2_000_000;
+const CHANGE_SCAN_MAX_BYTES: u64 = 1_099_511_627_776;
 
 pub struct Config {
+    pub factoryd_program: PathBuf,
     pub runner_program: PathBuf,
     pub factoryctl_path: PathBuf,
+    pub git_program: PathBuf,
     pub runtime_root: PathBuf,
+    pub changes_root: PathBuf,
     pub guidance_root: PathBuf,
     pub socket_path: PathBuf,
     pub max_active_runs: usize,
@@ -104,6 +113,10 @@ pub enum Error {
     Runtime { path: PathBuf, source: io::Error },
     #[error("process identity was unavailable for pid {0}")]
     ProcessIdentityUnavailable(u32),
+    #[error("change source operation failed: {0}")]
+    ChangeSource(#[from] change_source::Error),
+    #[error("change filesystem task failed: {0}")]
+    ChangeTask(#[from] tokio::task::JoinError),
 }
 
 enum Command {
@@ -118,6 +131,10 @@ enum Command {
     ReconcileRun {
         run_id: RunId,
         grace_ms: u64,
+    },
+    ReconcileChange {
+        project_id: ProjectId,
+        change_id: ChangeId,
     },
     ObserverFinished(RunId),
 }
@@ -146,6 +163,11 @@ impl Handle {
     #[must_use]
     pub fn max_active_runs(&self) -> usize {
         self.config.max_active_runs
+    }
+
+    #[must_use]
+    pub const fn max_retained_changes_factory_wide(&self) -> usize {
+        MAX_RETAINED_CHANGES_FACTORY_WIDE
     }
 
     pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
@@ -202,6 +224,49 @@ impl Handle {
             .send(Command::ReconcileRun { run_id, grace_ms })
             .await
             .map_err(|_| Error::ManagerStopped)
+    }
+
+    pub async fn remove_change(
+        &self,
+        project_id: ProjectId,
+        change_id: ChangeId,
+        expected_revision: i64,
+    ) -> Result<ChangeSnapshot, Error> {
+        let lookup_project = project_id.clone();
+        let lookup_change = change_id.clone();
+        let change = self
+            .state
+            .with_store(move |store| {
+                store
+                    .change(&lookup_project, &lookup_change)?
+                    .ok_or(StoreError::ChangeNotFound)
+            })
+            .await?;
+        verify_managed_change_path(&self.config.changes_root, &change)?;
+        let begin_project = project_id.clone();
+        let begin_change = change_id.clone();
+        let at_ms = now_ms()?;
+        let removing = self
+            .state
+            .commit_and_publish(move |store| {
+                let mutation = store.begin_change_removal(
+                    &begin_project,
+                    &begin_change,
+                    expected_revision,
+                    at_ms,
+                )?;
+                let (change, events) = mutation.into_parts();
+                Ok((change.snapshot(), events))
+            })
+            .await?;
+        self.commands
+            .send(Command::ReconcileChange {
+                project_id,
+                change_id,
+            })
+            .await
+            .map_err(|_| Error::ManagerStopped)?;
+        Ok(removing)
     }
 
     pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -276,6 +341,8 @@ pub fn spawn(
         return Err(Error::InvalidConcurrency);
     }
     prepare_runtime_root(&config.runtime_root)?;
+    prepare_runtime_root(&config.changes_root)?;
+    prepare_runtime_root(&config.changes_root.join(".checkpoints"))?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::ManagerStopped)?;
     let config = Arc::new(config);
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
@@ -312,7 +379,10 @@ async fn run_manager(
     agent_gate: Arc<DeleteGate<AgentId>>,
 ) -> Result<(), Error> {
     let mut observed = HashSet::new();
+    let mut change_finalizer = ChangeFinalizer::new();
     reconcile_runs(&state, &commands, &mut observed).await?;
+    schedule_recoverable_changes(&state, &mut change_finalizer).await;
+    change_finalizer.start_next(Arc::clone(&config), state.clone());
     let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -347,19 +417,104 @@ async fn run_manager(
                             tracing::warn!(%error, "attempt reconciliation paused");
                         }
                     }
+                    Command::ReconcileChange { project_id, change_id } => {
+                        change_finalizer.schedule(project_id, change_id);
+                        change_finalizer.start_next(Arc::clone(&config), state.clone());
+                    }
                     Command::ObserverFinished(run_id) => {
                         observed.remove(&run_id);
                     }
                 }
             }
+            completed = change_finalizer.join_next(), if change_finalizer.is_active() => {
+                change_finalizer.finish(completed);
+                change_finalizer.start_next(Arc::clone(&config), state.clone());
+            }
             _ = tick.tick() => {
                 reconcile_runs(&state, &commands, &mut observed).await?;
+                schedule_recoverable_changes(&state, &mut change_finalizer).await;
+                change_finalizer.start_next(Arc::clone(&config), state.clone());
                 if let Err(error) = reconcile_agents(
                     Arc::clone(&config), state.clone(), commands.clone(),
                     &mut observed, Arc::clone(&agent_gate),
                 ).await {
                     tracing::warn!(%error, "automatic dispatch reconciliation paused");
                 }
+            }
+        }
+    }
+}
+
+type ChangeKey = (ProjectId, ChangeId);
+
+/// Runs at most one filesystem finalizer without blocking the manager loop.
+/// Durable Change state remains the retry queue across ticks and restarts.
+struct ChangeFinalizer {
+    pending: VecDeque<ChangeKey>,
+    scheduled: HashSet<ChangeKey>,
+    active: Option<ChangeKey>,
+    tasks: JoinSet<Result<(), Error>>,
+}
+
+impl ChangeFinalizer {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            scheduled: HashSet::new(),
+            active: None,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn schedule(&mut self, project_id: ProjectId, change_id: ChangeId) {
+        let key = (project_id, change_id);
+        if self.scheduled.contains(&key) {
+            return;
+        }
+        if self.scheduled.len() >= MAX_RETAINED_CHANGES_FACTORY_WIDE {
+            tracing::warn!("Change finalization queue is at its durable Change bound");
+            return;
+        }
+        self.scheduled.insert(key.clone());
+        self.pending.push_back(key);
+    }
+
+    fn start_next(&mut self, config: Arc<Config>, state: DaemonState) {
+        if self.active.is_some() {
+            return;
+        }
+        let Some((project_id, change_id)) = self.pending.pop_front() else {
+            return;
+        };
+        self.active = Some((project_id.clone(), change_id.clone()));
+        self.tasks
+            .spawn(async move { reconcile_change(&config, &state, project_id, change_id).await });
+    }
+
+    const fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    async fn join_next(&mut self) -> Option<Result<Result<(), Error>, tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    fn finish(&mut self, completed: Option<Result<Result<(), Error>, tokio::task::JoinError>>) {
+        let Some((project_id, change_id)) = self.active.take() else {
+            return;
+        };
+        self.scheduled
+            .remove(&(project_id.clone(), change_id.clone()));
+        match completed {
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(error))) => {
+                tracing::warn!(%project_id, %change_id, %error, "Change finalization paused");
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%project_id, %change_id, %error, "Change finalizer task failed");
+            }
+            None => {
+                tracing::warn!(%project_id, %change_id, "Change finalizer task disappeared");
             }
         }
     }
@@ -408,14 +563,27 @@ async fn start_run(
     let digest = capability_digest(&bearer);
     let lookup_project = input.project_id.clone();
     let lookup_agent = input.agent_id.clone();
-    let provider = state
+    let (provider, role) = state
         .with_store(move |store| {
-            Ok(store
-                .agent_status(&lookup_project, &lookup_agent)?
-                .agent
-                .provider)
+            let agent = store.agent_status(&lookup_project, &lookup_agent)?.agent;
+            Ok((agent.provider, agent.role))
         })
         .await?;
+    let change_reservation = if role == AgentRole::Worker {
+        let change_id = new_change_id()?;
+        let change_directory = parse_change_uuid(&change_id)?.simple().to_string();
+        Some(ChangeReservation {
+            source_root: config
+                .changes_root
+                .join(change_directory)
+                .to_string_lossy()
+                .into_owned(),
+            id: change_id,
+            max_factory_changes: MAX_RETAINED_CHANGES_FACTORY_WIDE,
+        })
+    } else {
+        None
+    };
     let admission = NewRunAdmission {
         run_id: run_id.clone(),
         project_id: input.project_id,
@@ -427,8 +595,9 @@ async fn start_run(
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         max_active_runs: config.max_active_runs,
-        change_id: None,
-        policy_cwd: Some(policy_dir.to_string_lossy().into_owned()),
+        change_reservation,
+        policy_cwd: (role == AgentRole::Orchestrator)
+            .then(|| policy_dir.to_string_lossy().into_owned()),
     };
     let admitted_at_ms = now_ms()?;
     let admitted = state
@@ -486,10 +655,12 @@ async fn launch_admitted(
     {
         return Err((error.into(), None, recovery));
     }
-    if admitted.target.role == AgentRole::Orchestrator {
-        let policy_dir = PathBuf::from(&admitted.target.worktree);
-        if let Err(error) = ensure_private_directory(&policy_dir) {
-            return Err((error, None, recovery));
+    let provisioning = admitted.target.change_phase == Some(ChangePhase::Provisioning);
+    let policy_dir = runtime_dir.join("policy");
+    if admitted.target.role == AgentRole::Orchestrator || provisioning {
+        match ensure_private_directory(&policy_dir) {
+            Ok(()) => {}
+            Err(error) => return Err((error, None, recovery)),
         }
     }
     let hook_token_path = runtime_dir.join("attempt.token");
@@ -510,7 +681,7 @@ async fn launch_admitted(
     let provider = select_provider(admitted.target.provider);
     let context = SpawnContext {
         run_id: admitted.run.id.clone(),
-        worktree: PathBuf::from(&admitted.target.worktree),
+        source_root: PathBuf::from(&admitted.target.source_root),
         startup_input,
         model: admitted.target.model.clone(),
         reasoning_effort: admitted.target.reasoning_effort.clone(),
@@ -520,10 +691,61 @@ async fn launch_admitted(
         factoryctl_path: config.factoryctl_path.clone(),
         agent_dir: runtime_dir.join("provider"),
     };
-    let launch = match provider.spawn_spec(&context) {
+    let mut launch = match provider.spawn_spec(&context) {
         Ok(launch) => launch,
         Err(error) => return Err((error.into(), None, recovery)),
     };
+    if provisioning {
+        let change_id = match admitted.target.change_id.as_ref() {
+            Some(change_id) => change_id,
+            None => return Err((Error::InvalidId, None, recovery)),
+        };
+        let change_uuid = match parse_change_uuid(change_id) {
+            Ok(value) => value,
+            Err(error) => return Err((error, None, recovery)),
+        };
+        let lookup_project = admitted.target.project_id.clone();
+        let repository_root = match state
+            .with_store(move |store| Ok(store.get_project(&lookup_project)?.root))
+            .await
+        {
+            Ok(root) => PathBuf::from(root),
+            Err(error) => return Err((error.into(), None, recovery)),
+        };
+        let provider_program = match runner_process::resolve_provider_executable(&launch.program) {
+            Ok(program) => program,
+            Err(error) => return Err((error.into(), None, recovery)),
+        };
+        let invocation_path = runtime_dir.join("materializer.json");
+        let limits = match SourceLimits::new(CHANGE_SCAN_MAX_ENTRIES, CHANGE_SCAN_MAX_BYTES) {
+            Ok(limits) => limits,
+            Err(error) => return Err((error.into(), None, recovery)),
+        };
+        let invocation = MaterializerInvocation {
+            git_program: config.git_program.clone(),
+            repository_root,
+            changes_root: config.changes_root.clone(),
+            change_id: change_uuid,
+            limits,
+            selection_record_path: selection_record_path(&config.changes_root, change_uuid),
+            selection_activation_path: runtime_dir.join("source.selection.activate"),
+            ready_record_path: runtime_dir.join("source.ready.json"),
+            provider_activation_path: runtime_dir.join("source.provider.activate"),
+            activation_poll_ms: 50,
+            provider_program,
+            provider_arguments: launch.args,
+        };
+        if let Err(error) =
+            change_source::write_materializer_invocation(&invocation_path, &invocation)
+        {
+            return Err((error.into(), None, recovery));
+        }
+        launch.program = config.factoryd_program.clone();
+        launch.args = vec![
+            "--materialize-change".into(),
+            invocation_path.to_string_lossy().into_owned(),
+        ];
+    }
     let (provider_environment, attempt_environment) = provider_environment(launch.env);
     let spec = LaunchSpec {
         runner_program: config.runner_program.clone(),
@@ -535,7 +757,12 @@ async fn launch_admitted(
         run_id: admitted.run.id.clone(),
         runner_instance_id: admitted.target.runner_instance_id.clone(),
         runtime_dir: runtime_dir.clone(),
-        cwd: PathBuf::from(&admitted.target.worktree),
+        cwd: if provisioning {
+            policy_dir
+        } else {
+            PathBuf::from(&admitted.target.source_root)
+        },
+        source_root: PathBuf::from(&admitted.target.source_root),
         startup_input: launch.startup_input,
     };
     let prepared_runner = match runner_process::prepare_runner(spec).await {
@@ -617,6 +844,8 @@ async fn launch_admitted(
     Ok(StartedProcess {
         run: RecoverableKernelRun {
             run: activated_run,
+            change_id: admitted.target.change_id,
+            source_root: admitted.target.source_root,
             runner_instance_id: admitted.target.runner_instance_id,
             runner_runtime: admitted.target.runner_runtime,
             resources,
@@ -628,6 +857,8 @@ async fn launch_admitted(
 fn recovery_from_admission(admitted: &AdmittedRun) -> RecoverableKernelRun {
     RecoverableKernelRun {
         run: admitted.run.clone(),
+        change_id: admitted.target.change_id.clone(),
+        source_root: admitted.target.source_root.clone(),
         runner_instance_id: admitted.target.runner_instance_id.clone(),
         runner_runtime: admitted.target.runner_runtime.clone(),
         resources: Vec::new(),
@@ -828,13 +1059,21 @@ async fn dispatch_agent(
         },
     )
     .await;
-    if let Err(Error::State(DaemonStateError::Store(
-        StoreError::SourceProvisioningUnavailable | StoreError::CapacityReached { .. },
-    ))) = result
+    if let Err(error) = &result
+        && is_admission_capacity(error)
     {
         return Ok(());
     }
     result.map(|_| ())
+}
+
+fn is_admission_capacity(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::State(DaemonStateError::Store(
+            StoreError::CapacityReached { .. } | StoreError::ChangeCapacityReached { .. }
+        ))
+    )
 }
 
 async fn reconcile_agents(
@@ -864,7 +1103,7 @@ async fn reconcile_agents(
                 let next_agent =
                     (agents.len() > STATE_PAGE).then(|| agents.swap_remove(STATE_PAGE).id);
                 for agent in agents {
-                    dispatch_agent(
+                    if let Err(error) = dispatch_agent(
                         Arc::clone(&config),
                         state.clone(),
                         commands.clone(),
@@ -873,7 +1112,10 @@ async fn reconcile_agents(
                         project.id.clone(),
                         agent.id,
                     )
-                    .await?;
+                    .await
+                    {
+                        tracing::warn!(%error, "agent dispatch paused");
+                    }
                 }
                 match next_agent {
                     Some(cursor) => agent_cursor = Some(cursor),
@@ -918,6 +1160,226 @@ async fn reconcile_runs(
         }
     }
     Ok(())
+}
+
+async fn schedule_recoverable_changes(state: &DaemonState, finalizer: &mut ChangeFinalizer) {
+    let changes = match state.with_store(|store| store.recoverable_changes()).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            tracing::warn!(%error, "Change reconciliation paused");
+            return;
+        }
+    };
+    for change in changes {
+        finalizer.schedule(change.project_id, change.id);
+    }
+}
+
+async fn reconcile_change(
+    config: &Config,
+    state: &DaemonState,
+    project_id: ProjectId,
+    change_id: ChangeId,
+) -> Result<(), Error> {
+    let lookup_project = project_id.clone();
+    let lookup_change = change_id.clone();
+    let change = state
+        .with_store(move |store| {
+            store
+                .change(&lookup_project, &lookup_change)?
+                .ok_or(StoreError::ChangeNotFound)
+        })
+        .await?;
+    verify_managed_change_path(&config.changes_root, &change)?;
+    match change.phase {
+        ChangePhase::Provisioning if change.size_bytes.is_none() => {
+            measure_provisioning_change(&config.changes_root, state, change).await
+        }
+        ChangePhase::Provisioning | ChangePhase::Removed => Ok(()),
+        ChangePhase::Available if change.size_bytes.is_none() => {
+            measure_change(&config.changes_root, state, change).await
+        }
+        ChangePhase::Available => Ok(()),
+        ChangePhase::Removing => remove_change_source(&config.changes_root, state, change).await,
+    }
+}
+
+async fn measure_provisioning_change(
+    changes_root: &Path,
+    state: &DaemonState,
+    change: Change,
+) -> Result<(), Error> {
+    let change_uuid = parse_change_uuid(&change.id)?;
+    let changes_root = changes_root.to_owned();
+    let checkpoint_path = selection_record_path(&changes_root, change_uuid);
+    let limits = SourceLimits::new(CHANGE_SCAN_MAX_ENTRIES, CHANGE_SCAN_MAX_BYTES)?;
+    let measurement = tokio::task::spawn_blocking(move || {
+        let selection = change_source::read_selection_record(&checkpoint_path)?;
+        change_source::measure_quiescent_provisioning_source(
+            &changes_root,
+            change_uuid,
+            &selection,
+            limits,
+        )
+    })
+    .await??;
+    let measured_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let mutation = store.record_provisioning_measurement(
+                &change.project_id,
+                &change.id,
+                change.revision,
+                measurement.allocated_bytes,
+                measured_at_ms,
+            )?;
+            Ok(((), mutation.into_parts().1))
+        })
+        .await?;
+    Ok(())
+}
+
+async fn measure_change(
+    changes_root: &Path,
+    state: &DaemonState,
+    change: Change,
+) -> Result<(), Error> {
+    let identity = change_source_identity(&change)?;
+    let change_uuid = parse_change_uuid(&change.id)?;
+    let changes_root = changes_root.to_owned();
+    let limits = SourceLimits::new(CHANGE_SCAN_MAX_ENTRIES, CHANGE_SCAN_MAX_BYTES)?;
+    let expected = DirectoryIdentity {
+        device: identity.device,
+        inode: identity.inode,
+    };
+    let measured = tokio::task::spawn_blocking(move || {
+        change_source::measure_quiescent_source(&changes_root, change_uuid, expected, limits)
+    })
+    .await??;
+    let measurement = ChangeSourceIdentity {
+        size_bytes: measured.allocated_bytes,
+        ..identity
+    };
+    let measured_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let mutation = store.record_change_measurement(
+                &change.project_id,
+                &change.id,
+                change.revision,
+                &measurement,
+                measured_at_ms,
+            )?;
+            Ok(((), mutation.into_parts().1))
+        })
+        .await?;
+    Ok(())
+}
+
+async fn remove_change_source(
+    changes_root: &Path,
+    state: &DaemonState,
+    change: Change,
+) -> Result<(), Error> {
+    let change_uuid = parse_change_uuid(&change.id)?;
+    let changes_root = changes_root.to_owned();
+    let removal_kind = change.removal_kind().map_err(DaemonStateError::Store)?;
+    let removal = tokio::task::spawn_blocking(move || match removal_kind {
+        ChangeRemovalKind::Published(identity) => {
+            let expected = DirectoryIdentity {
+                device: identity.device,
+                inode: identity.inode,
+            };
+            change_source::remove_quiescent_source(&changes_root, change_uuid, expected)
+        }
+        ChangeRemovalKind::Provisioning => {
+            let checkpoint_path = selection_record_path(&changes_root, change_uuid);
+            let checkpoint = match fs::symlink_metadata(&checkpoint_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Ok(_) => Some(change_source::read_selection_record(&checkpoint_path)?),
+                Err(source) => {
+                    return Err(change_source::Error::Io {
+                        path: checkpoint_path,
+                        source,
+                    });
+                }
+            };
+            change_source::remove_provisioning_source(
+                &changes_root,
+                change_uuid,
+                checkpoint.as_ref(),
+            )?;
+            if let Some(checkpoint) = checkpoint {
+                change_source::remove_selection_record(&checkpoint_path, &checkpoint)?;
+            }
+            Ok(change_source::RemovalOutcome::Removed)
+        }
+    })
+    .await?;
+    match removal {
+        Ok(_) => {
+            let removed_at_ms = now_ms()?;
+            state
+                .commit_and_publish(move |store| {
+                    let mutation = store.mark_change_removed(
+                        &change.project_id,
+                        &change.id,
+                        change.revision,
+                        removed_at_ms,
+                    )?;
+                    Ok(((), mutation.into_parts().1))
+                })
+                .await?;
+            Ok(())
+        }
+        Err(error) => {
+            let failure = error.to_string();
+            let failed_at_ms = now_ms()?;
+            state
+                .commit_and_publish(move |store| {
+                    let mutation = store.record_change_failure(
+                        &change.project_id,
+                        &change.id,
+                        change.revision,
+                        &failure,
+                        failed_at_ms,
+                    )?;
+                    Ok(((), mutation.into_parts().1))
+                })
+                .await?;
+            Err(error.into())
+        }
+    }
+}
+
+fn parse_change_uuid(change_id: &ChangeId) -> Result<Uuid, Error> {
+    Uuid::parse_str(change_id.as_str()).map_err(|_| Error::InvalidId)
+}
+
+fn selection_record_path(changes_root: &Path, change_id: Uuid) -> PathBuf {
+    changes_root
+        .join(".checkpoints")
+        .join(format!("{}.selection.json", change_id.simple()))
+}
+
+fn verify_managed_change_path(changes_root: &Path, change: &Change) -> Result<(), Error> {
+    let change_uuid = parse_change_uuid(&change.id)?;
+    let expected = changes_root.join(change_uuid.simple().to_string());
+    if Path::new(&change.source_root) == expected {
+        Ok(())
+    } else {
+        Err(DaemonStateError::Store(StoreError::ChangeIdentityMismatch).into())
+    }
+}
+
+fn change_source_identity(change: &Change) -> Result<ChangeSourceIdentity, Error> {
+    let invalid = || DaemonStateError::Store(StoreError::InvalidChangeMetadata);
+    Ok(ChangeSourceIdentity {
+        source_root: change.source_root.clone(),
+        device: change.source_dev.ok_or_else(invalid)?,
+        inode: change.source_inode.ok_or_else(invalid)?,
+        size_bytes: change.size_bytes.unwrap_or(0),
+    })
 }
 
 async fn reconcile_one(
@@ -1007,6 +1469,8 @@ async fn recover_admitted_run(
     }
     let recovered = RecoverableKernelRun {
         run: activated_run,
+        change_id: run.change_id,
+        source_root: run.source_root,
         runner_instance_id: run.runner_instance_id,
         runner_runtime: run.runner_runtime,
         resources,
@@ -1163,7 +1627,10 @@ async fn observe_run(
             return Err(error.into());
         }
     };
-    let observed = consume_until_exit(&mut subscription).await?;
+    let observed = match drive_change_activation(state, run, &mut subscription).await? {
+        Some(exit) => exit,
+        None => consume_until_exit(&mut subscription).await?,
+    };
     let observe_run_id = run.run.id.clone();
     let observed_at_ms = now_ms()?;
     state
@@ -1217,29 +1684,259 @@ async fn consume_until_exit(
     subscription: &mut RunnerSubscription,
 ) -> Result<ObservedExit, RunnerClientError> {
     loop {
-        match subscription.next_item().await? {
-            RunnerStreamItem::CaughtUp { .. } => {}
-            RunnerStreamItem::Event(event) => match event.event {
-                RunnerEvent::Exited { exit_code, signal } => {
-                    return Ok(ObservedExit {
-                        terminal_sequence: event.sequence,
-                        exit_code,
-                        exit_signal: signal,
-                        failure_reason: None,
-                    });
-                }
-                RunnerEvent::SpawnFailed { .. } => {
-                    return Ok(ObservedExit {
-                        terminal_sequence: event.sequence,
-                        exit_code: None,
-                        exit_signal: None,
-                        failure_reason: Some(RunFailureReason::Spawn),
-                    });
-                }
-                RunnerEvent::Started { .. } => {}
-            },
+        if let Some(exit) = runner_stream_exit(subscription.next_item().await?) {
+            return Ok(exit);
         }
     }
+}
+
+fn runner_stream_exit(item: RunnerStreamItem) -> Option<ObservedExit> {
+    let RunnerStreamItem::Event(event) = item else {
+        return None;
+    };
+    match event.event {
+        RunnerEvent::Exited { exit_code, signal } => Some(ObservedExit {
+            terminal_sequence: event.sequence,
+            exit_code,
+            exit_signal: signal,
+            failure_reason: None,
+        }),
+        RunnerEvent::SpawnFailed { .. } => Some(ObservedExit {
+            terminal_sequence: event.sequence,
+            exit_code: None,
+            exit_signal: None,
+            failure_reason: Some(RunFailureReason::Spawn),
+        }),
+        RunnerEvent::Started { .. } => None,
+    }
+}
+
+enum Checkpoint<T> {
+    Record(T),
+    Exit(ObservedExit),
+}
+
+async fn drive_change_activation(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+    subscription: &mut RunnerSubscription,
+) -> Result<Option<ObservedExit>, Error> {
+    let Some(change_id) = run.change_id.as_ref() else {
+        return Ok(None);
+    };
+    let invocation_path = Path::new(&run.runner_runtime).join("materializer.json");
+    match fs::symlink_metadata(&invocation_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::Runtime {
+                path: invocation_path,
+                source,
+            });
+        }
+        Ok(_) => {}
+    }
+    let invocation = change_source::read_materializer_invocation(&invocation_path)?;
+    if invocation.change_id != parse_change_uuid(change_id)?
+        || Path::new(&run.source_root)
+            != invocation
+                .changes_root
+                .join(invocation.change_id.simple().to_string())
+    {
+        return Err(DaemonStateError::Store(StoreError::ChangeIdentityMismatch).into());
+    }
+    let lookup_project = run.run.project_id.clone();
+    let lookup_change = change_id.clone();
+    let mut change = state
+        .with_store(move |store| {
+            store
+                .change(&lookup_project, &lookup_change)?
+                .ok_or(StoreError::ChangeNotFound)
+        })
+        .await?;
+
+    let selection = if change.phase == ChangePhase::Provisioning {
+        let selection =
+            match wait_for_selection_record(&invocation.selection_record_path, subscription).await?
+            {
+                Checkpoint::Record(selection) => selection,
+                Checkpoint::Exit(exit) => {
+                    record_provisioning_exit(state, &change, &exit).await?;
+                    return Ok(Some(exit));
+                }
+            };
+        let base_identity = ChangeBaseIdentity {
+            repository_root: selection.repository_root.to_string_lossy().into_owned(),
+            device: selection.repository_device,
+            inode: selection.repository_inode,
+        };
+        let project_id = change.project_id.clone();
+        let exact_change_id = change.id.clone();
+        let base_oid = selection.base_oid.as_str().to_owned();
+        let revision = change.revision;
+        let recorded_at_ms = now_ms()?;
+        change = state
+            .commit_and_publish(move |store| {
+                let mutation = store.record_change_base(
+                    &project_id,
+                    &exact_change_id,
+                    revision,
+                    &base_oid,
+                    &base_identity,
+                    recorded_at_ms,
+                )?;
+                let (change, events) = mutation.into_parts();
+                Ok((change, events))
+            })
+            .await?;
+        change_source::activate_checkpoint(&invocation.selection_activation_path)?;
+        selection
+    } else if change.phase == ChangePhase::Available {
+        match change_source::read_selection_record(&invocation.selection_record_path) {
+            Ok(selection) => change_source::remove_selection_record(
+                &invocation.selection_record_path,
+                &selection,
+            )?,
+            Err(change_source::Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        change_source::activate_checkpoint(&invocation.provider_activation_path)?;
+        return Ok(None);
+    } else {
+        return Err(DaemonStateError::Store(StoreError::InvalidChangeState).into());
+    };
+
+    let ready = match wait_for_ready_record(&invocation.ready_record_path, subscription).await? {
+        Checkpoint::Record(ready) => ready,
+        Checkpoint::Exit(exit) => {
+            record_provisioning_exit(state, &change, &exit).await?;
+            return Ok(Some(exit));
+        }
+    };
+    if ready.base_oid != selection.base_oid {
+        return Err(DaemonStateError::Store(StoreError::ChangeIdentityMismatch).into());
+    }
+    let expected = DirectoryIdentity {
+        device: ready.device,
+        inode: ready.inode,
+    };
+    let changes_root = invocation.changes_root.clone();
+    let change_uuid = invocation.change_id;
+    let limits = invocation.limits;
+    let measured = tokio::task::spawn_blocking(move || {
+        change_source::measure_quiescent_source(&changes_root, change_uuid, expected, limits)
+    })
+    .await??;
+    if measured.logical_bytes != ready.size {
+        return Err(DaemonStateError::Store(StoreError::ChangeIdentityMismatch).into());
+    }
+    let source_identity = ChangeSourceIdentity {
+        source_root: run.source_root.clone(),
+        device: ready.device,
+        inode: ready.inode,
+        size_bytes: measured.allocated_bytes,
+    };
+    let base_identity = ChangeBaseIdentity {
+        repository_root: selection.repository_root.to_string_lossy().into_owned(),
+        device: selection.repository_device,
+        inode: selection.repository_inode,
+    };
+    let project_id = change.project_id.clone();
+    let exact_change_id = change.id.clone();
+    let revision = change.revision;
+    let materialization = ChangeMaterialization {
+        base_oid: selection.base_oid.as_str().to_owned(),
+        base: base_identity,
+        source: source_identity,
+    };
+    let available_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let mutation = store.mark_change_available(
+                &project_id,
+                &exact_change_id,
+                revision,
+                &materialization,
+                available_at_ms,
+            )?;
+            Ok(((), mutation.into_parts().1))
+        })
+        .await?;
+    change_source::remove_selection_record(&invocation.selection_record_path, &selection)?;
+    change_source::activate_checkpoint(&invocation.provider_activation_path)?;
+    Ok(None)
+}
+
+async fn wait_for_selection_record(
+    path: &Path,
+    subscription: &mut RunnerSubscription,
+) -> Result<Checkpoint<change_source::SelectionRecord>, Error> {
+    loop {
+        match change_source::read_selection_record(path) {
+            Ok(record) => return Ok(Checkpoint::Record(record)),
+            Err(change_source::Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::select! {
+            item = subscription.next_item() => {
+                if let Some(exit) = runner_stream_exit(item?) {
+                    return Ok(Checkpoint::Exit(exit));
+                }
+            }
+            () = sleep(CONNECT_RETRY) => {}
+        }
+    }
+}
+
+async fn wait_for_ready_record(
+    path: &Path,
+    subscription: &mut RunnerSubscription,
+) -> Result<Checkpoint<change_source::ReadyRecord>, Error> {
+    loop {
+        match change_source::read_ready_record(path) {
+            Ok(record) => return Ok(Checkpoint::Record(record)),
+            Err(change_source::Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::select! {
+            item = subscription.next_item() => {
+                if let Some(exit) = runner_stream_exit(item?) {
+                    return Ok(Checkpoint::Exit(exit));
+                }
+            }
+            () = sleep(CONNECT_RETRY) => {}
+        }
+    }
+}
+
+async fn record_provisioning_exit(
+    state: &DaemonState,
+    change: &Change,
+    exit: &ObservedExit,
+) -> Result<(), Error> {
+    let failure = format!(
+        "materializer exited before source activation (code {:?}, signal {:?})",
+        exit.exit_code, exit.exit_signal
+    );
+    let project_id = change.project_id.clone();
+    let change_id = change.id.clone();
+    let revision = change.revision;
+    let failed_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let mutation = store.record_change_failure(
+                &project_id,
+                &change_id,
+                revision,
+                &failure,
+                failed_at_ms,
+            )?;
+            Ok(((), mutation.into_parts().1))
+        })
+        .await?;
+    Ok(())
 }
 
 struct ObservedExit {
@@ -1826,6 +2523,10 @@ fn new_run_id() -> Result<RunId, Error> {
     RunId::try_from(Uuid::new_v4().hyphenated().to_string()).map_err(|_| Error::InvalidId)
 }
 
+fn new_change_id() -> Result<ChangeId, Error> {
+    ChangeId::try_from(Uuid::new_v4().hyphenated().to_string()).map_err(|_| Error::InvalidId)
+}
+
 fn new_runner_instance_id() -> Result<RunnerInstanceId, Error> {
     RunnerInstanceId::try_from(Uuid::new_v4().hyphenated().to_string())
         .map_err(|_| Error::InvalidId)
@@ -1976,6 +2677,19 @@ mod tests {
         assert_eq!(bearer.len(), 64);
         assert!(bearer.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(capability_digest(&bearer).len(), 64);
+    }
+
+    #[test]
+    fn both_attempt_and_change_capacity_pause_only_the_current_dispatch() {
+        for error in [
+            StoreError::CapacityReached { limit: 8 },
+            StoreError::ChangeCapacityReached { limit: 64 },
+        ] {
+            assert!(is_admission_capacity(&Error::State(
+                DaemonStateError::Store(error)
+            )));
+        }
+        assert!(!is_admission_capacity(&Error::InvalidId));
     }
 
     #[tokio::test]
