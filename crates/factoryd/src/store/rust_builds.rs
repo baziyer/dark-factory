@@ -657,6 +657,70 @@ impl Store {
         }
     }
 
+    /// Hands an exact bound-but-unmeasured cache from a failed completion
+    /// check to the normal crash-recoverable reclamation path. Exact retries
+    /// preserve the first failure evidence; a different check, cache identity,
+    /// or failure cannot adopt or rewrite the row.
+    pub fn begin_failed_rust_cache_reclaim(
+        &mut self,
+        run_id: &RunId,
+        expected_check_revision: i64,
+        cache: &RustBuildCache,
+        failure: &str,
+        now_ms: i64,
+    ) -> Result<RustBuildCache> {
+        validate_failure(failure)?;
+        let inode = cache.inode.ok_or(StoreError::InvalidRustBuildMetadata)?;
+        validate_bound_identity(&cache.path, inode)?;
+        let dev = cache.dev.ok_or(StoreError::InvalidRustBuildMetadata)?;
+        if cache.bytes.is_some() {
+            return Err(StoreError::InvalidRustBuildMetadata);
+        }
+        let changed = self.connection.execute(
+            "UPDATE rust_build_caches AS cache
+             SET lifecycle = 'reclaiming',
+                 failure = CASE WHEN cache.lifecycle = 'available' THEN ?1 ELSE cache.failure END,
+                 updated_at_ms = CASE
+                    WHEN cache.lifecycle = 'available' THEN ?2 ELSE cache.updated_at_ms
+                 END
+             WHERE cache.project_id = ?3
+               AND cache.project_incarnation_id = ?4 AND cache.cache_key = ?5
+               AND cache.path = ?6 AND cache.dev = ?7 AND cache.inode = ?8
+               AND cache.bytes IS NULL
+               AND (cache.lifecycle = 'available'
+                    OR (cache.lifecycle = 'reclaiming' AND cache.failure = ?1))
+               AND EXISTS (
+                    SELECT 1 FROM rust_completion_checks check_row
+                    WHERE check_row.run_id = ?9 AND check_row.phase = 'failed'
+                      AND check_row.revision = ?10
+                      AND check_row.project_id = cache.project_id
+                      AND check_row.project_incarnation_id = cache.project_incarnation_id
+                      AND check_row.cache_key = cache.cache_key
+               )",
+            params![
+                failure,
+                now_ms,
+                cache.project_id.as_str(),
+                cache.project_incarnation_id,
+                cache.cache_key,
+                cache.path,
+                to_i64(dev)?,
+                to_i64(inode)?,
+                run_id.as_str(),
+                expected_check_revision,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidRustBuildMetadata);
+        }
+        load_cache(
+            &self.connection,
+            &cache.project_incarnation_id,
+            &cache.cache_key,
+        )?
+        .ok_or(StoreError::InvalidRustBuildMetadata)
+    }
+
     pub fn finish_rust_cache_reclaim(
         &mut self,
         incarnation_id: &str,
@@ -1407,6 +1471,115 @@ mod tests {
                 .phase,
             RustCompletionPhase::Passed
         );
+    }
+
+    #[test]
+    fn failed_check_hands_only_its_exact_unmeasured_cache_to_reclamation() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project_id, incarnation) = project(&mut store);
+        let run_id = RunId::try_from("77777777-7777-4777-8777-777777777777").unwrap();
+        insert_test_check(
+            &store,
+            &run_id,
+            &project_id,
+            &incarnation,
+            RustCompletionPhase::Running,
+            Some(CACHE_A),
+        );
+        store
+            .declare_rust_cache(&run_id, "/tmp/cache-a", 3)
+            .unwrap();
+        let cache = store
+            .bind_rust_cache_identity(&run_id, "/tmp/cache-a", 1, 2, 4)
+            .unwrap();
+
+        assert!(matches!(
+            store.begin_failed_rust_cache_reclaim(&run_id, 0, &cache, "measurement failed", 5),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        let failed = store
+            .fail_rust_completion_check(&run_id, 0, "measurement failed", 6)
+            .unwrap();
+
+        let mut wrong_key = cache.clone();
+        wrong_key.cache_key = CACHE_B.to_owned();
+        assert!(matches!(
+            store.begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &wrong_key,
+                "measurement failed",
+                7,
+            ),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        let mut stale_identity = cache.clone();
+        stale_identity.inode = Some(3);
+        assert!(matches!(
+            store.begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &stale_identity,
+                "measurement failed",
+                7,
+            ),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        assert!(matches!(
+            store.begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision - 1,
+                &cache,
+                "measurement failed",
+                7,
+            ),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+
+        let reclaiming = store
+            .begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &cache,
+                "measurement failed",
+                8,
+            )
+            .unwrap();
+        assert_eq!(reclaiming.lifecycle, RustCacheLifecycle::Reclaiming);
+        assert_eq!(reclaiming.failure.as_deref(), Some("measurement failed"));
+        assert_eq!(reclaiming.updated_at_ms, 8);
+        let retry = store
+            .begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &reclaiming,
+                "measurement failed",
+                9,
+            )
+            .unwrap();
+        assert_eq!(retry, reclaiming);
+        assert!(matches!(
+            store.begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &reclaiming,
+                "different failure",
+                9,
+            ),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+
+        assert_eq!(
+            store.rust_storage_summary().unwrap(),
+            RustStorageSummary {
+                cache_count: 1,
+                cache_bytes: None,
+                protected_count: 0,
+                reclaimable_count: 0,
+                failed_count: 1,
+            }
+        );
+        assert_eq!(store.recoverable_rust_reclaims().unwrap(), vec![reclaiming]);
     }
 
     #[test]
