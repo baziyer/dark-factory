@@ -4,8 +4,8 @@ use factory_core::{
     AgentId, AgentRole, ChangeId, FactoryEvent, ProjectId, Provider, ProviderHookEvent, RunId,
     RunnerInstanceId, TaskId, WorkCandidateStatus,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_PROVIDER_HOOK_PAYLOAD_BYTES, RequestCredential,
-        RequestEnvelope, ServerFrame,
+        ErrorCode, LocalRequest, LocalResponse, MAX_PROVIDER_HOOK_PAYLOAD_BYTES,
+        MAX_WORK_CANDIDATE_PAGE_ITEMS, RequestCredential, RequestEnvelope, ServerFrame,
     },
 };
 use factoryd::{
@@ -345,7 +345,7 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
                 LocalRequest::ListWorkCandidates {
                     project_id: project_id.clone(),
                     after_id: None,
-                    limit: 100,
+                    limit: MAX_WORK_CANDIDATE_PAGE_ITEMS,
                 },
                 operator.clone(),
             ),
