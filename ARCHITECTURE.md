@@ -104,10 +104,14 @@ provider-blind effect host, not a second lifecycle owner.
 
 The resource ledger records process, process group, runner, runtime root, and
 other external effects before use. Each record contains enough identity to
-refuse PID, path, or job-label reuse. Rust `Drop` and shell traps may accelerate
-cleanup, but correctness comes from the durable daemon finalizer, including
-after restart. On platforms without a stable process birth identity, a live or
-reused PID remains unresolved: weak presence can never authorize signalling or
+refuse PID, path, or job-label reuse, but stored numeric identities never grant
+signal authority. The daemon requests shutdown through the authenticated live
+runner; the runner may signal its provider group only while it still owns the
+unreaped leader child. A live-child guard preserves that authority across
+runner cancellation or unwind, then disarms immediately after a successful
+wait; it never authorizes terminalization. After leader or runner loss, the
+durable finalizer only observes exact absence. A live, reused, or weak identity
+remains unresolved and cannot authorize signalling, runtime removal, or
 terminalization.
 
 ## Provider boundary
@@ -181,8 +185,10 @@ Each project has one operator-selected verification policy: `None` or one fixed
 `RustWorkspaceTest`. There is no provider-visible generic build operation or
 Cargo shim. For a Rust-policy worker, `factoryctl task done` is the single
 completion boundary: the daemon moves the run to `finalizing`, revokes its
-authority, reaps every provider process group, and only then snapshots source
-and starts verification. Orchestrator runs are not verified this way.
+authority, asks the live runner to reap the provider process group, and only
+after exact resource absence snapshots source and starts verification. A lost
+runner leaves finalization pending; stored PIDs are not a fallback. Orchestrator
+runs are not verified this way.
 
 The source snapshot is a canonical scan/copy/scan of the plain Change;
 it is published only when the manifests agree. This deliberately replaces the
@@ -210,8 +216,10 @@ is neither signal authority nor proof that the effect is gone.
 
 Regenerable cache storage has a hard entry count and a measured byte policy.
 Starting a writer makes byte status incomplete; after its exact process group
-is reaped, factoryd remeasures allocated bytes and reclaims unprotected caches
-until the policy converges. A measured over-limit cache cannot be claimed for
+is absent, factoryd remeasures allocated bytes and reclaims unprotected caches
+until the policy converges. Healthy verifier shutdown is cooperative: factoryd
+publishes a private finish marker and the live leader terminates its own group.
+A measured over-limit cache cannot be claimed for
 another verification. Status reports aggregate measured bytes, protected entry
 count, and recoverable failure count, not an invented protected-byte subtotal.
 An ordinary directory

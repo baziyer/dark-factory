@@ -51,8 +51,34 @@ preserve_failure=$(printenv DARK_FACTORY_SMOKE_PRESERVE_FAILURE || printf 0)
 
 daemon_pid=
 verifier_descendant=
+runner_loss_orphan=
 tracked_processes="$scratch/runner-processes"
 crash_processes="$scratch/crash-processes"
+
+process_start_ticks() {
+    ticks_pid=$1
+    if test -r "/proc/$ticks_pid/stat"; then
+        ticks_stat=$(cat "/proc/$ticks_pid/stat") || return 1
+        ticks_tail=${ticks_stat##*) }
+        set -- $ticks_tail
+        test "$#" -ge 20 || return 1
+        shift 19
+        printf '%s\n' "$1"
+        return
+    fi
+    # The teardown fixture also runs on macOS. Linux always takes the /proc
+    # branch above; this stable no-whitespace token is only its local fallback.
+    ps -p "$ticks_pid" -o lstart= 2>/dev/null | tr -d '[:space:]'
+}
+
+record_process() {
+    record_pid=$1
+    shift
+    record_command=$*
+    record_ticks=$(process_start_ticks "$record_pid")
+    test -n "$record_ticks" && test -n "$record_command" || return 1
+    printf '%s\t%s\t%s\n' "$record_pid" "$record_ticks" "$record_command"
+}
 
 run_list() {
     "$factoryctl" --socket "$socket" run list \
@@ -167,7 +193,9 @@ snapshot_runner_processes() {
             }
         }
         END { walk(root) }
-    ' >"$process_file"
+    ' | while IFS="$(printf '\t')" read -r process_pid process_command; do
+        record_process "$process_pid" "$process_command" || true
+    done >"$process_file"
 }
 
 runner_record() {
@@ -192,7 +220,9 @@ provider_record() {
             print pid "\t" $0
             exit
         }
-    '
+    ' | while IFS="$(printf '\t')" read -r process_pid process_command; do
+        record_process "$process_pid" "$process_command" || true
+    done
 }
 
 verifier_record() {
@@ -211,7 +241,9 @@ verifier_descendant_record() {
             print pid "\t" $0
             exit
         }
-    '
+    ' | while IFS="$(printf '\t')" read -r process_pid process_command; do
+        record_process "$process_pid" "$process_command" || true
+    done
 }
 
 wait_for_process_record() {
@@ -281,10 +313,15 @@ wait_for_verifier_descendant() {
 record_is_alive() {
     record=$1
     process_pid=$(printf '%s\n' "$record" | cut -f1)
-    expected=$(printf '%s\n' "$record" | cut -f2-)
+    expected_ticks=$(printf '%s\n' "$record" | cut -f2)
+    expected=$(printf '%s\n' "$record" | cut -f3-)
+    current_ticks=$(process_start_ticks "$process_pid" || true)
     current=$(ps -p "$process_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+    confirmed_ticks=$(process_start_ticks "$process_pid" || true)
     process_state=$(ps -p "$process_pid" -o stat= 2>/dev/null | sed 's/[[:space:]].*//' || true)
-    test -n "$current" && test "$current" = "$expected" \
+    test -n "$current_ticks" && test "$current_ticks" = "$expected_ticks" \
+        && test "$confirmed_ticks" = "$expected_ticks" \
+        && test "$current" = "$expected" \
         && ! printf '%s\n' "$process_state" | grep -q '^Z'
 }
 
@@ -306,9 +343,7 @@ kill_exact_record() {
     record=$1
     label=$2
     process_pid=$(printf '%s\n' "$record" | cut -f1)
-    expected=$(printf '%s\n' "$record" | cut -f2-)
-    current=$(ps -p "$process_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-    test -n "$current" && test "$current" = "$expected" || {
+    record_is_alive "$record" || {
         echo "$label identity changed before exact kill: pid $process_pid" >&2
         return 1
     }
@@ -322,10 +357,10 @@ wait_for_tracked_processes() {
     attempt=0
     while :; do
         survivor=
-        while IFS="$(printf '\t')" read -r pid expected; do
+        while IFS="$(printf '\t')" read -r pid ticks expected; do
             test -n "$pid" || continue
-            current=$(ps -p "$pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-            if test -n "$current" && test "$current" = "$expected"; then
+            checked_record=$(printf '%s\t%s\t%s\n' "$pid" "$ticks" "$expected")
+            if record_is_alive "$checked_record"; then
                 survivor="$pid $expected"
                 break
             fi
@@ -388,6 +423,15 @@ cleanup() {
     status=$?
     trap - EXIT HUP INT TERM
     cleanup_status=0
+    if test -n "$runner_loss_orphan"; then
+        if record_is_alive "$runner_loss_orphan"; then
+            kill_exact_record "$runner_loss_orphan" "runner-loss orphan" \
+                || cleanup_status=1
+        fi
+        wait_for_record_exit "$runner_loss_orphan" "runner-loss orphan" \
+            || cleanup_status=1
+        runner_loss_orphan=
+    fi
     if test -n "$daemon_pid" && kill -0 "$daemon_pid" 2>/dev/null; then
         if test -n "$(open_run_ids || true)"; then
             snapshot_runner_processes || cleanup_status=1
@@ -540,6 +584,8 @@ fi
     --mode rust-workspace-test >/dev/null
 if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
     shell_command='sleep 30'
+elif test "${DARK_FACTORY_SMOKE_FORCE_RUNNER_LOSS_FAILURE:-0}" = 1; then
+    shell_command=': >"$HOME/runner-kill-ready"; exec sleep 120'
 else
     shell_command='exec ./smoke-agent.sh'
 fi
@@ -571,6 +617,20 @@ if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
     wait_for_task_run linux-smoke-task >/dev/null
     echo "intentional Linux smoke interruption after run admission" >&2
     exit 23
+fi
+if test "${DARK_FACTORY_SMOKE_FORCE_RUNNER_LOSS_FAILURE:-0}" = 1; then
+    runner_loss_run=$(wait_for_task_run linux-smoke-task)
+    wait_for_file "$HOME/runner-kill-ready" "runner-kill target"
+    runner_loss_runner=$(wait_for_process_record runner "$runner_loss_run")
+    runner_loss_orphan=$(wait_for_process_record provider "$runner_loss_run")
+    kill_exact_record "$runner_loss_runner" "worker runner"
+    wait_for_record_exit "$runner_loss_runner" "worker runner"
+    record_is_alive "$runner_loss_orphan" || {
+        echo "runner-loss orphan did not survive its runner" >&2
+        exit 1
+    }
+    echo "intentional Linux smoke interruption with a runner-loss orphan" >&2
+    exit 24
 fi
 
 # Success is durable before the provider's later exit 42. Kill the verifier
@@ -725,12 +785,43 @@ test "$1" = "$provider_change_id" && test "$2" -gt "$provider_change_revision" |
     exit 1
 }
 
-# Kill the exact runner and prove its provider group converges.
+# Kill the exact runner while its provider survives. Stored PIDs and PGIDs are
+# observation metadata, never fallback signal authority: the run and runtime
+# must remain nonterminal until the harness independently removes the exact
+# provider process it captured while the runner was still its parent.
 add_worker_task linux-smoke-runner-kill
 runner_kill_run=$(wait_for_task_run linux-smoke-runner-kill)
 wait_for_file "$HOME/runner-kill-ready" "runner-kill target"
 runner=$(wait_for_process_record runner "$runner_kill_run")
+runner_loss_orphan=$(wait_for_process_record provider "$runner_kill_run")
+runner_runtime=$(find "$home/runs" -mindepth 1 -maxdepth 1 -type d -print -quit)
+test -n "$runner_runtime" || {
+    echo "runner-loss runtime root was not found" >&2
+    exit 1
+}
 kill_exact_record "$runner" "worker runner"
+wait_for_record_exit "$runner" "worker runner"
+attempt=0
+while test "$attempt" -lt 65; do
+    record_is_alive "$runner_loss_orphan" || {
+        echo "factoryd signalled a provider after losing its runner authority" >&2
+        exit 1
+    }
+    run_has "$runner_kill_run" '"phase":"finalizing"' || {
+        cat "$scratch/runs.json" >&2
+        echo "runner loss terminalized before provider-group absence" >&2
+        exit 1
+    }
+    test -d "$runner_runtime" || {
+        echo "runner loss released its runtime while the provider survived" >&2
+        exit 1
+    }
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+kill_exact_record "$runner_loss_orphan" "orphaned worker provider"
+wait_for_record_exit "$runner_loss_orphan" "orphaned worker provider"
+runner_loss_orphan=
 wait_for_run_terminal "$runner_kill_run" failed
 run_has "$runner_kill_run" '"reason":"process"' || exit 1
 wait_for_tracked_processes
@@ -763,4 +854,4 @@ test ! -d "$home/artifacts/tmp" \
     exit 1
 }
 
-echo "Linux source smoke passed: outcome-before-exit, fail-closed leader-loss verifier recovery, exact provider/runner/God death, retained-Change retry, active cancellation, and resource teardown"
+echo "Linux source smoke passed: outcome-before-exit, fail-closed verifier and runner leader loss, exact provider/God death, retained-Change retry, active cancellation, and resource teardown"

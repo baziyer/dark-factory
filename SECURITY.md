@@ -75,12 +75,13 @@ identities and transitions the run to `running` may the child execute.
 
 Success, block, failure, cancellation, and exit converge through
 `finalizing`. A restartable daemon finalizer is the only writer of `terminal`.
-It matches exact resource identities before signalling, deleting, or
-acknowledging them. Reused PIDs, paths, runner identities, and job labels are
-reported as unresolved rather than touched.
-
-Rust `Drop`, shell traps, provider exit handlers, and test harnesses may perform
-fast cleanup but are not trusted for correctness. A run remains visibly
+It uses the authenticated runner while that runner is live; only the runner may
+signal a provider group, and only before it reaps the leader child it directly
+owns. Its live-child guard retains that bounded cleanup authority across
+cancellation or unwind and disarms immediately after a successful wait; it is
+not terminal authority. Stored numeric process identities are observation
+evidence, never signal authority. Reused PIDs, paths, runner identities, and job
+labels are reported as unresolved rather than touched. A run remains visibly
 `finalizing` while any ephemeral resource is active or unresolved.
 
 ## Provider and tool boundary
@@ -183,9 +184,10 @@ container.
 
 Resource reclamation may remove only exact, registered, unleased regenerable
 cache data; unique retained Changes are never automatic cleanup targets. A
-writer makes byte status incomplete. Its exact process group is reaped before
-remeasurement, after which the byte policy converges; an already measured
-over-limit cache is refused for a new verification. The daemon reports total
+writer makes byte status incomplete. The daemon publishes a private finish
+marker and a healthy verifier leader terminates its own group. Only after exact
+group absence may remeasurement and byte-policy convergence proceed; an already
+measured over-limit cache is refused for a new verification. The daemon reports total
 measured bytes plus protected entry count and recoverable failure count, and
 does not claim an instantaneous filesystem byte ceiling while Cargo is writing.
 If a verifier group leader disappears while descendants remain, finalization

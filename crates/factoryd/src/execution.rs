@@ -20,7 +20,7 @@ use factory_core::{
 };
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, test_kill_process_group};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -1500,7 +1500,7 @@ async fn run_rust_worker_effect(
         Ok(child) => child,
         Err(error) => {
             let result = failed_worker_result(&error.to_string());
-            return match terminate_effect_group(state, &check.run_id, None, &finish_path).await {
+            return match request_effect_finish(state, &check.run_id, None, &finish_path).await {
                 Ok(()) => Ok(RustWorkerEffectOutcome::Released(result)),
                 Err(cleanup_error) => {
                     tracing::warn!(
@@ -1516,7 +1516,7 @@ async fn run_rust_worker_effect(
     let worker_result =
         wait_for_worker_result(&mut child, &result_path, RUST_VERIFICATION_TIMEOUT).await;
     if let Err(error) =
-        terminate_effect_group(state, &check.run_id, Some(&mut child), &finish_path).await
+        request_effect_finish(state, &check.run_id, Some(&mut child), &finish_path).await
     {
         tracing::warn!(
             run_id = %check.run_id,
@@ -1881,72 +1881,19 @@ async fn remeasure_rust_cache(
     Ok(())
 }
 
-async fn terminate_effect_group(
+async fn request_effect_finish(
     state: &DaemonState,
     run_id: &RunId,
     mut child: Option<&mut Child>,
-    _finish_path: &Path,
+    finish_path: &Path,
 ) -> Result<(), Error> {
-    let _resources = state
-        .with_store({
-            let run_id = run_id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await?;
-    #[cfg(target_os = "linux")]
-    if let Some(group) = _resources.iter().find(|resource| {
-        resource.kind == KernelResourceKind::EffectGroup
-            && resource.state != KernelResourceState::Released
-    }) {
-        kill_registered_effect_group(group)?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    write_finish_signal(_finish_path)?;
+    write_finish_signal(finish_path)?;
     if let Some(child) = child.as_mut() {
         let _ = timeout(RUNNER_EXIT_GRACE, child.wait()).await;
     }
     release_effect_resources(state, run_id).await
 }
 
-#[cfg(target_os = "linux")]
-fn kill_registered_effect_group(resource: &KernelResource) -> Result<(), Error> {
-    let pgid = locator_number(&resource.locator, "pgid").ok_or(DaemonStateError::Store(
-        StoreError::InvalidExecutionMetadata,
-    ))?;
-    let expected = resource
-        .birth_fingerprint
-        .as_deref()
-        .ok_or(DaemonStateError::Store(
-            StoreError::InvalidExecutionMetadata,
-        ))?;
-    if !exact_effect_group_leader(Some(expected), process_birth_fingerprint(pgid)?.as_deref()) {
-        if process_group_absent(resource)? {
-            return Ok(());
-        }
-        // A process group may outlive its leader. Without that leader's exact
-        // birth identity, signalling the numeric PGID could hit a reused
-        // group. Keep the check and its cache nonterminal until group absence
-        // is independently proven.
-        return Err(Error::ProcessIdentityUnavailable(pgid));
-    }
-    let Some(pid) = Pid::from_raw(pgid as i32) else {
-        return Ok(());
-    };
-    match kill_process_group(pid, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(error) => Err(Error::Runtime {
-            path: PathBuf::from(format!("effect-group:{pgid}")),
-            source: io::Error::from_raw_os_error(error.raw_os_error()),
-        }),
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn exact_effect_group_leader(expected: Option<&str>, current: Option<&str>) -> bool {
-    expected.is_some() && expected == current
-}
-
-#[cfg(not(target_os = "linux"))]
 fn write_finish_signal(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -2245,7 +2192,7 @@ async fn recover_prior_rust_effect(
         let finish_path = locator_named_path(&effect.locator, "finish").ok_or(
             DaemonStateError::Store(StoreError::InvalidExecutionMetadata),
         )?;
-        terminate_effect_group(state, &check.run_id, None, &finish_path).await?;
+        request_effect_finish(state, &check.run_id, None, &finish_path).await?;
     }
 
     let temporary = match prepare_completion_temporary_root(config, state, &check).await {
@@ -2700,8 +2647,7 @@ async fn reconcile_one(
             run.runner_instance_id.clone(),
         );
         if let Err(error) = client.stop(grace_ms).await {
-            tracing::debug!(run_id = %run.run.id, %error, "exact runner stop deferred to finalizer");
-            kill_registered_processes(&run.resources)?;
+            tracing::debug!(run_id = %run.run.id, %error, "exact runner stop deferred until resource absence is observed");
         }
     }
     if release_absent_resources(state, &run).await? {
@@ -2807,7 +2753,6 @@ async fn fail_unrecoverable_admission(
             Ok(((), events))
         })
         .await?;
-    kill_registered_processes(&run.resources)?;
     let refreshed = state
         .with_store({
             let run_id = run.run.id.clone();
@@ -2863,8 +2808,7 @@ async fn observe_run(
     if run.run.phase == RunPhase::Finalizing
         && let Err(error) = client.stop(DEFAULT_FINALIZE_GRACE_MS).await
     {
-        tracing::debug!(run_id = %run.run.id, %error, "runner stop failed; using registered identities");
-        kill_registered_processes(&run.resources)?;
+        tracing::debug!(run_id = %run.run.id, %error, "runner stop failed; awaiting exact resource absence");
     }
     let mut subscription = match subscribe_with_grace(&client).await {
         Ok(subscription) => subscription,
@@ -2906,12 +2850,6 @@ async fn observe_run(
                     })
                     .await?;
             }
-            if matches!(
-                refreshed.run.phase,
-                RunPhase::Running | RunPhase::Finalizing
-            ) {
-                kill_registered_processes(&refreshed.resources)?;
-            }
             return Err(error.into());
         }
     };
@@ -2936,10 +2874,8 @@ async fn observe_run(
         .await?;
     client.acknowledge_exit(observed.terminal_sequence).await?;
     if let Some(child) = child.as_mut() {
-        if timeout(RUNNER_EXIT_GRACE, child.wait()).await.is_err()
-            && let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32))
-        {
-            let _ = kill_process_group(pid, Signal::KILL);
+        if timeout(RUNNER_EXIT_GRACE, child.wait()).await.is_err() {
+            let _ = child.kill().await;
             let _ = child.wait().await;
         }
     } else {
@@ -3240,9 +3176,7 @@ async fn cleanup_unactivated(
     mut child: Option<Child>,
 ) {
     if let Some(child) = child.as_mut() {
-        if let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32)) {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
+        let _ = child.kill().await;
         let _ = child.wait().await;
     }
     let run_id = run.run.id.clone();
@@ -3346,9 +3280,6 @@ async fn release_absent_resources(
                 Ok(((), events))
             })
             .await?;
-        kill_registered_group(&resources)?;
-    } else if runner_released && run.run.phase == RunPhase::Finalizing {
-        kill_registered_group(&resources)?;
     }
     if processes_released && run.run.phase == RunPhase::Finalizing {
         for resource in resources.iter().filter(|resource| {
@@ -3378,7 +3309,7 @@ async fn release_absent_resources(
             }) {
                 let finish_path = locator_named_path(&effect.locator, "finish")
                     .ok_or(Error::InvalidRuntimeRoot)?;
-                terminate_effect_group(state, &run.run.id, None, &finish_path).await?;
+                request_effect_finish(state, &run.run.id, None, &finish_path).await?;
             }
             release_completion_temporary_root(state, &run.run.id).await?;
         }
@@ -3484,87 +3415,6 @@ fn remove_runtime_if_claimed(
     remove_runtime_if_exact(path, quarantine, Some(&current))
 }
 
-#[cfg(target_os = "linux")]
-fn kill_registered_group(resources: &[KernelResource]) -> Result<(), Error> {
-    for group in registered_process_groups(resources) {
-        let Some(pgid) = locator_number(&group.locator, "pgid") else {
-            continue;
-        };
-        // A reused process-group number must never authorize a signal. The
-        // group leader's birth fingerprint is the durable proof that this is
-        // still the group factoryd registered before execution began.
-        if process_birth_fingerprint(pgid)?.as_deref() != group.birth_fingerprint.as_deref() {
-            continue;
-        }
-        let Some(pid) = Pid::from_raw(pgid as i32) else {
-            continue;
-        };
-        match kill_process_group(pid, Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-            Err(error) => {
-                return Err(Error::Runtime {
-                    path: PathBuf::from(format!("process-group:{pgid}")),
-                    source: io::Error::from_raw_os_error(error.raw_os_error()),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn registered_process_groups(
-    resources: &[KernelResource],
-) -> impl Iterator<Item = &KernelResource> {
-    resources.iter().filter(|resource| {
-        resource.kind == KernelResourceKind::ProcessGroup
-            && resource.state != KernelResourceState::Released
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn kill_registered_group(_resources: &[KernelResource]) -> Result<(), Error> {
-    // macOS exposes only second-resolution process start time through the
-    // safe APIs available here. That is sufficient to remain unresolved,
-    // never to authorize a destructive signal across a check/kill race.
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn kill_registered_processes(resources: &[KernelResource]) -> Result<(), Error> {
-    kill_registered_group(resources)?;
-    let Some(runner) = resources.iter().find(|resource| {
-        resource.kind == KernelResourceKind::RunnerProcess
-            && resource.state != KernelResourceState::Released
-    }) else {
-        return Ok(());
-    };
-    let Some(pid_number) = locator_number(&runner.locator, "pid") else {
-        return Ok(());
-    };
-    if process_birth_fingerprint(pid_number)?.as_deref() != runner.birth_fingerprint.as_deref() {
-        return Ok(());
-    }
-    let Some(pid) = Pid::from_raw(pid_number as i32) else {
-        return Ok(());
-    };
-    match kill_process_group(pid, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(error) => Err(Error::Runtime {
-            path: PathBuf::from(format!("runner-process-group:{pid_number}")),
-            source: io::Error::from_raw_os_error(error.raw_os_error()),
-        }),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn kill_registered_processes(_resources: &[KernelResource]) -> Result<(), Error> {
-    // Finalization first uses the authenticated runner socket. If that fails,
-    // weak PID metadata cannot authorize a fallback signal; the durable
-    // resources remain unresolved until absence can be established.
-    Ok(())
-}
-
 async fn release_resource(state: &DaemonState, resource: &KernelResource) -> Result<(), Error> {
     let id = resource.id.clone();
     let locator = resource.locator.clone();
@@ -3659,18 +3509,14 @@ fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
     let Some(pgid) = locator_number(&resource.locator, "pgid") else {
         return Ok(false);
     };
-    let Some(pid) = Pid::from_raw(pgid as i32) else {
-        return Ok(true);
-    };
+    let pid = i32::try_from(pgid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(DaemonStateError::Store(
+            StoreError::InvalidExecutionMetadata,
+        ))?;
     match test_kill_process_group(pid) {
-        Ok(()) | Err(rustix::io::Errno::PERM) => {
-            #[cfg(not(target_os = "linux"))]
-            return Ok(false);
-            #[cfg(target_os = "linux")]
-            let current = process_birth_fingerprint(pgid)?;
-            #[cfg(target_os = "linux")]
-            Ok(current.is_some() && current.as_deref() != resource.birth_fingerprint.as_deref())
-        }
+        Ok(()) | Err(rustix::io::Errno::PERM) => Ok(false),
         Err(rustix::io::Errno::SRCH) => Ok(true),
         Err(error) => Err(Error::Runtime {
             path: PathBuf::from(format!("process-group:{pgid}")),
@@ -3995,7 +3841,15 @@ impl<Id: Eq + std::hash::Hash + Clone> DeleteGate<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use rustix::process::test_kill_process;
+    use std::{
+        os::unix::{
+            fs::{DirBuilderExt, PermissionsExt},
+            process::CommandExt as _,
+        },
+        process::Stdio,
+        thread,
+    };
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -4005,6 +3859,14 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    struct ReleaseOnDrop(PathBuf);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
     }
 
     fn rust_check(phase: RustCompletionPhase) -> RustCompletionCheck {
@@ -4113,50 +3975,179 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_selects_every_unreleased_process_group() {
-        let run_id = RunId::try_from("run-1").unwrap();
-        let resource = |id: &str, kind, state| KernelResource {
-            id: id.to_owned(),
-            run_id: run_id.clone(),
-            kind,
-            state,
-            locator: serde_json::json!({ "pgid": 42 }).to_string(),
-            birth_fingerprint: Some("fingerprint".to_owned()),
+    fn daemon_execution_has_no_numeric_process_group_signal() {
+        let forbidden = ["kill", "process", "group"].join("_");
+        assert!(
+            !include_str!("execution.rs")
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| token == forbidden)
+        );
+    }
+
+    #[test]
+    fn invalid_process_group_ids_fail_closed_before_the_presence_probe() {
+        for pgid in [0, i32::MAX as u32 + 1] {
+            let resource = KernelResource {
+                id: "provider-group".to_owned(),
+                run_id: RunId::try_from("run-1").unwrap(),
+                kind: KernelResourceKind::ProcessGroup,
+                state: KernelResourceState::Releasing,
+                locator: serde_json::json!({ "pgid": pgid }).to_string(),
+                birth_fingerprint: None,
+                retry_count: 0,
+                last_failure: None,
+                declared_at_ms: 1,
+                updated_at_ms: 2,
+                released_at_ms: None,
+            };
+            assert!(matches!(
+                process_group_absent(&resource),
+                Err(Error::State(DaemonStateError::Store(
+                    StoreError::InvalidExecutionMetadata
+                )))
+            ));
+        }
+    }
+
+    #[test]
+    fn leader_exit_with_live_descendant_keeps_group_resource_nonterminal() {
+        let directory = private_tempdir();
+        let marker = directory.path().join("descendant.pid");
+        let release = directory.path().join("release-descendant");
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("(while [ ! -e \"$2\" ]; do sleep 0.02; done) & echo $! > \"$1\"; sleep 0.2")
+            .arg("sh")
+            .arg(&marker)
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id();
+        let birth = process_birth_fingerprint(pgid).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let descendant = loop {
+            if let Ok(pid) = fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                break Pid::from_raw(pid).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant PID was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(leader.wait().unwrap().success());
+        assert!(test_kill_process(descendant).is_ok());
+
+        let resource = KernelResource {
+            id: "provider-group".to_owned(),
+            run_id: RunId::try_from("run-1").unwrap(),
+            kind: KernelResourceKind::ProcessGroup,
+            state: KernelResourceState::Releasing,
+            locator: serde_json::json!({ "pgid": pgid }).to_string(),
+            birth_fingerprint: Some(birth),
             retry_count: 0,
             last_failure: None,
             declared_at_ms: 1,
-            updated_at_ms: 1,
+            updated_at_ms: 2,
             released_at_ms: None,
         };
-        let resources = vec![
-            resource(
-                "provider-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Releasing,
-            ),
-            resource(
-                "secondary-provider-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Active,
-            ),
-            resource(
-                "released-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Released,
-            ),
-            resource(
-                "runtime",
-                KernelResourceKind::RuntimeRoot,
-                KernelResourceState::Releasing,
-            ),
-        ];
-
-        assert_eq!(
-            registered_process_groups(&resources)
-                .map(|resource| resource.id.as_str())
-                .collect::<Vec<_>>(),
-            ["provider-group", "secondary-provider-group"]
+        assert!(
+            !process_group_absent(&resource).unwrap(),
+            "leader loss must not release a group while its descendant lives"
         );
+
+        fs::write(&release, b"release").unwrap();
+        drop(release_on_drop);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while test_kill_process(descendant) != Err(rustix::io::Errno::SRCH) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant did not exit cooperatively"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn live_group_with_mismatched_leader_birth_is_not_observed_absent() {
+        let directory = private_tempdir();
+        let release = directory.path().join("release-leader");
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.02; done")
+            .arg("sh")
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id();
+        let resource = KernelResource {
+            id: "provider-group".to_owned(),
+            run_id: RunId::try_from("run-1").unwrap(),
+            kind: KernelResourceKind::ProcessGroup,
+            state: KernelResourceState::Releasing,
+            locator: serde_json::json!({ "pgid": pgid }).to_string(),
+            birth_fingerprint: Some("stale-leader-birth".to_owned()),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 2,
+            released_at_ms: None,
+        };
+        assert!(
+            !process_group_absent(&resource).unwrap(),
+            "an observed group must stay nonterminal despite leader PID reuse"
+        );
+
+        fs::write(&release, b"release").unwrap();
+        drop(release_on_drop);
+        assert!(leader.wait().unwrap().success());
+    }
+
+    #[test]
+    fn healthy_verifier_finish_marker_triggers_cooperative_group_exit() {
+        let directory = private_tempdir();
+        let finish = directory.path().join("finish");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.05; done; kill -KILL 0")
+            .arg("sh")
+            .arg(&finish)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut worker = command.spawn().unwrap();
+
+        write_finish_signal(&finish).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = worker.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "healthy verifier ignored its cooperative finish marker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        write_finish_signal(&finish).unwrap();
     }
 
     #[test]
@@ -4375,14 +4366,6 @@ mod tests {
             "durable evidence of any prior verifier must prevent setup replay"
         );
         assert!(!rust_effect_was_attempted(&[]));
-    }
-
-    #[test]
-    fn verifier_group_kill_requires_the_exact_live_leader() {
-        assert!(exact_effect_group_leader(Some("birth-a"), Some("birth-a")));
-        assert!(!exact_effect_group_leader(Some("birth-a"), None));
-        assert!(!exact_effect_group_leader(Some("birth-a"), Some("birth-b")));
-        assert!(!exact_effect_group_leader(None, None));
     }
 
     #[test]

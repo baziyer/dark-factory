@@ -101,8 +101,10 @@ Launch uses register-before-exec gates:
 5. only then may the same child execute the provider.
 
 The resource ledger owns processes, process groups, runners, runtime roots,
-temporary roots, and verification effects. Recovery signals or removes only
-an exact recorded identity. Reused or weak identities stay unresolved.
+temporary roots, and verification effects. Stored process numbers support
+absence checks, not signalling. The authenticated live runner may signal its
+provider group only while it owns the unreaped leader child; recovery otherwise
+waits for exact absence. Reused or weak identities stay unresolved.
 
 A process group may outlive its leader. If the recorded leader disappears
 while descendants remain, its numeric group ID is not signal authority and is
@@ -110,8 +112,10 @@ not proof of absence. Finalization, temporary-root cleanup, and cache
 remeasurement remain pending until exact group absence is independently
 established.
 
-`Drop`, shell traps, and provider exit handlers may accelerate cleanup. They
-are never correctness authority.
+The runner's live-child guard preserves its bounded group authority across
+cancellation or unwind and disarms immediately after a successful wait. Its
+`Drop`, shell traps, and provider exit handlers may accelerate cleanup; none is
+terminal authority.
 
 ## Change and repository ownership
 
@@ -149,9 +153,10 @@ configuration, toolchain, identities, and digests. The daemon re-verifies each
 copy before launch and rechecks the stable source snapshot before and after
 each test. Mutable Cargo output is never a top-level launch target.
 
-The verifier is one registered effect with bounded output and time. Restart
-reaps that exact effect and consumes only its atomically published result; it
-does not rebuild against later Change contents. The same leader-loss rule
+The verifier is one registered effect with bounded output and time. Shutdown
+publishes a private finish marker; a healthy live verifier kills its own group.
+Recovery consumes only an atomically published result after exact group absence
+and never rebuilds against later Change contents. The same leader-loss rule
 above prevents premature completion or cache handoff.
 
 Cache count is checked before effects. A writer makes measured bytes

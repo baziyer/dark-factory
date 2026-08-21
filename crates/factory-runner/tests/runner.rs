@@ -1021,17 +1021,8 @@ fn stop_is_idempotent_and_terminates_the_owned_process_group() {
     runner.wait_for_clean_exit();
 }
 
-/// The leader here exits entirely on its own — no `Stop` is ever sent — so
-/// the group cleanup reaches this descendant with `DEFAULT_GROUP_GRACE`
-/// (2s), not the shorter `GROUP_CLEANUP_GRACE`: this straggler's TERM is its
-/// first and only grace period, not a mop-up of one already spent (see
-/// `GROUP_CLEANUP_GRACE`'s doc comment). That grace is still capped at 2s,
-/// same as before this fix, but the cleanup now polls instead of blindly
-/// waiting it out: `sleep`, with no trap, dies from that first TERM almost
-/// immediately, so this should complete in well under a second, not the ~2s
-/// the pre-fix blind wait took for this exact scenario.
 #[test]
-fn natural_leader_exit_terminates_a_descendant_that_retains_output_pipes() {
+fn leader_exit_records_terminal_without_signalling_a_descendant() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("background.pid");
     let runner = RunningRunner::spawn_program(
@@ -1044,16 +1035,12 @@ fn natural_leader_exit_terminates_a_descendant_that_retains_output_pipes() {
         ],
     );
     let descendant_pid = wait_for_pid_file(&marker);
-    let started = Instant::now();
     runner.wait_for_terminal_spool();
-    let elapsed = started.elapsed();
+    let descendant = Pid::from_raw(descendant_pid).unwrap();
     assert!(
-        elapsed < Duration::from_secs(1),
-        "reaping a well-behaved descendant after the leader's natural exit took {elapsed:?}; \
-         group cleanup should poll and notice the group is empty almost immediately, not wait \
-         out a multi-second grace it doesn't need"
+        rustix::process::test_kill_process(descendant).is_ok(),
+        "runner signalled a descendant after reaping its group leader"
     );
-    wait_for_process_exit(descendant_pid);
     let frames = subscribe_through_terminal(&runner, 0);
     assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
         event,
@@ -1064,10 +1051,16 @@ fn natural_leader_exit_terminates_a_descendant_that_retains_output_pipes() {
     )));
     let terminal = terminal_sequence(&frames);
     assert_command_ack(
-        acknowledge(&runner, terminal, "descendants-finished"),
-        "descendants-finished",
+        acknowledge(&runner, terminal, "leader-exit-persisted"),
+        "leader-exit-persisted",
     );
     runner.wait_for_clean_exit();
+    assert!(
+        rustix::process::test_kill_process(descendant).is_ok(),
+        "terminal acknowledgement signalled the surviving descendant"
+    );
+    kill_process(descendant, Signal::KILL).unwrap();
+    wait_for_process_exit(descendant_pid);
 }
 
 #[test]
