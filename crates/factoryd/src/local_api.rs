@@ -240,6 +240,7 @@ impl ApiFailure {
                 | StoreError::RunResourcesUnreleased { .. }
                 | StoreError::ResourceIdentityMismatch
                 | StoreError::InvalidRunState
+                | StoreError::AttemptOutcomeConflict
                 | StoreError::TaskNotCancellable
                 | StoreError::TaskNotEditable
                 | StoreError::TaskHasActiveRun

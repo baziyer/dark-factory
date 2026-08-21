@@ -7,6 +7,7 @@ use factory_core::{
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::{
     AgentMessage, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES, MAX_TASK_RESULT_BYTES,
@@ -27,6 +28,7 @@ pub struct NewRunAdmission {
     pub agent_id: AgentId,
     pub expected_provider: Provider,
     pub capability_digest: String,
+    pub runtime_claim: String,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub max_active_runs: usize,
@@ -59,6 +61,7 @@ pub struct AttemptTarget {
     pub auto_mode: bool,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
+    pub runtime_claim: String,
 }
 
 #[derive(Clone)]
@@ -163,6 +166,7 @@ impl Store {
     pub fn admit_run(&mut self, input: NewRunAdmission, now_ms: i64) -> Result<AdmittedRun> {
         validate_capability_digest(&input.capability_digest)?;
         validate_absolute_path(&input.runner_runtime)?;
+        validate_runtime_claim(&input.runtime_claim)?;
         if input.max_active_runs == 0 {
             return Err(StoreError::InvalidConcurrencyLimit);
         }
@@ -307,6 +311,7 @@ impl Store {
             &input.run_id,
             KernelResourceKind::RuntimeRoot,
             &runtime_locator,
+            Some(&input.runtime_claim),
             now_ms,
         )?;
         insert_resource(
@@ -315,6 +320,7 @@ impl Store {
             &input.run_id,
             KernelResourceKind::RunnerProcess,
             &runner_locator,
+            None,
             now_ms,
         )?;
 
@@ -365,6 +371,7 @@ impl Store {
                 auto_mode,
                 runner_instance_id: input.runner_instance_id,
                 runner_runtime: input.runner_runtime,
+                runtime_claim: input.runtime_claim,
             },
             events: vec![
                 EventEnvelope {
@@ -474,9 +481,11 @@ impl Store {
         &mut self,
         run_id: &RunId,
         runtime_locator: &str,
+        expected_claim: &str,
         runtime_birth_fingerprint: &str,
         now_ms: i64,
     ) -> Result<()> {
+        validate_resource_identity(runtime_locator, expected_claim)?;
         validate_resource_identity(runtime_locator, runtime_birth_fingerprint)?;
         let transaction = self
             .connection
@@ -485,11 +494,11 @@ impl Store {
         if run.phase != RunPhase::Admitted {
             return Err(StoreError::InvalidRunState);
         }
-        activate_or_confirm_resource(
+        bind_claimed_runtime(
             &transaction,
             run_id,
-            KernelResourceKind::RuntimeRoot,
             runtime_locator,
+            expected_claim,
             runtime_birth_fingerprint,
             now_ms,
         )?;
@@ -579,7 +588,17 @@ impl Store {
         let run = load_kernel_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
         match run.phase {
             RunPhase::Running => {}
-            RunPhase::Finalizing | RunPhase::Terminal => return Ok((run, Vec::new())),
+            RunPhase::Finalizing | RunPhase::Terminal => {
+                let stored_result: Option<String> = transaction.query_row(
+                    "SELECT outcome_result FROM runs WHERE id = ?1",
+                    params![run_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if run.outcome.as_ref() == Some(outcome) && stored_result.as_deref() == result {
+                    return Ok((run, Vec::new()));
+                }
+                return Err(StoreError::AttemptOutcomeConflict);
+            }
             RunPhase::Admitted => return Err(StoreError::InvalidRunState),
         }
         let (kind, detail) = outcome_parts(outcome);
@@ -1122,19 +1141,60 @@ fn insert_resource(
     run_id: &RunId,
     kind: KernelResourceKind,
     locator: &str,
+    birth_fingerprint: Option<&str>,
     now_ms: i64,
 ) -> Result<()> {
     if locator.len() < 2 || locator.len() > MAX_RESOURCE_LOCATOR_BYTES {
+        return Err(StoreError::InvalidExecutionMetadata);
+    }
+    if birth_fingerprint.is_some_and(|fingerprint| {
+        fingerprint.is_empty() || fingerprint.len() > MAX_RESOURCE_FINGERPRINT_BYTES
+    }) {
         return Err(StoreError::InvalidExecutionMetadata);
     }
     transaction.execute(
         "INSERT INTO resources (
             id, run_id, kind, state, locator, birth_fingerprint,
             retry_count, last_failure, declared_at_ms, updated_at_ms, released_at_ms
-         ) VALUES (?1, ?2, ?3, 'declared', ?4, NULL, 0, NULL, ?5, ?5, NULL)",
-        params![id, run_id.as_str(), kind.as_str(), locator, now_ms],
+         ) VALUES (?1, ?2, ?3, 'declared', ?4, ?5, 0, NULL, ?6, ?6, NULL)",
+        params![
+            id,
+            run_id.as_str(),
+            kind.as_str(),
+            locator,
+            birth_fingerprint,
+            now_ms
+        ],
     )?;
     Ok(())
+}
+
+fn bind_claimed_runtime(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    locator: &str,
+    expected_claim: &str,
+    fingerprint: &str,
+    now_ms: i64,
+) -> Result<()> {
+    let changed = transaction.execute(
+        "UPDATE resources
+         SET state = 'active', birth_fingerprint = ?1, updated_at_ms = ?2
+         WHERE run_id = ?3 AND kind = 'runtime_root' AND state = 'declared'
+           AND locator = ?4 AND birth_fingerprint = ?5",
+        params![
+            fingerprint,
+            now_ms,
+            run_id.as_str(),
+            locator,
+            expected_claim
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::ResourceIdentityMismatch)
+    }
 }
 
 fn validate_resource_identity(locator: &str, fingerprint: &str) -> Result<()> {
@@ -1146,6 +1206,18 @@ fn validate_resource_identity(locator: &str, fingerprint: &str) -> Result<()> {
         Err(StoreError::InvalidExecutionMetadata)
     } else {
         Ok(())
+    }
+}
+
+fn validate_runtime_claim(claim: &str) -> Result<()> {
+    let nonce = claim
+        .strip_prefix("runtime-claim:")
+        .ok_or(StoreError::InvalidExecutionMetadata)?;
+    let parsed = Uuid::parse_str(nonce).map_err(|_| StoreError::InvalidExecutionMetadata)?;
+    if parsed.simple().to_string() == nonce {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidExecutionMetadata)
     }
 }
 
@@ -1487,6 +1559,7 @@ mod tests {
                     agent_id,
                     expected_provider: Provider::Shell,
                     capability_digest: capability_digest(BEARER),
+                    runtime_claim: "runtime-claim:55555555555545558555555555555555".into(),
                     runner_instance_id: RunnerInstanceId::try_from(
                         "22222222-2222-4222-8222-222222222222",
                     )
@@ -1563,7 +1636,12 @@ mod tests {
         for resource in store.kernel_resources(&run_id).unwrap() {
             assert_eq!(resource.state, KernelResourceState::Releasing);
             store
-                .mark_resource_released(&resource.id, &resource.locator, None, 7)
+                .mark_resource_released(
+                    &resource.id,
+                    &resource.locator,
+                    resource.birth_fingerprint.as_deref(),
+                    7,
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -1687,6 +1765,41 @@ mod tests {
     }
 
     #[test]
+    fn first_attempt_outcome_wins_and_only_exact_retries_are_idempotent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        store
+            .request_attempt_outcome(&run_id, &RunOutcome::Succeeded, Some("done"), 7)
+            .unwrap();
+
+        assert!(
+            store
+                .request_attempt_outcome(&run_id, &RunOutcome::Succeeded, Some("done"), 8)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(matches!(
+            store.request_attempt_outcome(
+                &run_id,
+                &RunOutcome::Blocked {
+                    reason: "opposite result".to_owned()
+                },
+                None,
+                9,
+            ),
+            Err(StoreError::AttemptOutcomeConflict)
+        ));
+        assert_eq!(
+            store.kernel_run(&run_id).unwrap().unwrap().outcome,
+            Some(RunOutcome::Succeeded)
+        );
+    }
+
+    #[test]
     fn finalizer_refuses_a_different_task_incarnation_and_revision() {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker(&mut store);
@@ -1756,6 +1869,7 @@ mod tests {
                     agent_id,
                     expected_provider: Provider::Shell,
                     capability_digest: capability_digest("retry-secret"),
+                    runtime_claim: "runtime-claim:66666666666646668666666666666666".into(),
                     runner_instance_id: RunnerInstanceId::try_from(
                         "44444444-4444-4444-8444-444444444444",
                     )
@@ -1786,6 +1900,11 @@ mod tests {
         assert_eq!(recovered[0].run.id, run_id);
         assert_eq!(recovered[0].run.phase, RunPhase::Admitted);
         assert_eq!(recovered[0].resources.len(), 2);
+        assert!(recovered[0].resources.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RuntimeRoot
+                && resource.birth_fingerprint.as_deref()
+                    == Some("runtime-claim:55555555555545558555555555555555")
+        }));
         assert!(store.authenticate_attempt(BEARER).unwrap().is_some());
     }
 
@@ -1801,6 +1920,7 @@ mod tests {
                 .register_admitted_runtime(
                     &run_id,
                     &identity.runtime_locator,
+                    "runtime-claim:55555555555545558555555555555555",
                     &identity.runtime_birth_fingerprint,
                     6,
                 )

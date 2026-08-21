@@ -1122,6 +1122,8 @@ async fn supervise_piped(
     command
         .arg("--exec-gate")
         .arg(&gate_path)
+        .arg("--expected-parent-pid")
+        .arg(rustix::process::getpid().as_raw_nonzero().get().to_string())
         .arg("--")
         .arg(&config.program)
         .args(&config.arguments)

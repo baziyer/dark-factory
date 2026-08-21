@@ -28,7 +28,7 @@ if grep -Eq '(^|[[:space:];])kill[[:space:]]+(-[A-Z]+[[:space:]]+)?[^"$]+' "$smo
     | grep -v '"\$daemon_pid"'; then
     fail "smoke contains a non-owned process signal"
 fi
-grep -Fq 'session stop' "$smoke" || fail "smoke does not stop its owned session"
+grep -Fq 'run stop' "$smoke" || fail "smoke does not stop its owned run"
 grep -Fq 'wait_for_tracked_processes' "$smoke" || fail "smoke lacks bounded runner proof"
 grep -Fq 'DARK_FACTORY_SMOKE_FORCE_FAILURE' "$smoke" \
     || fail "smoke lacks interrupted cleanup exercise"

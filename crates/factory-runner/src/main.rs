@@ -34,6 +34,22 @@ fn exec_gate(mut arguments: impl Iterator<Item = String>) -> ! {
         eprintln!("factory-runner exec gate: missing activation path");
         process::exit(125);
     };
+    if arguments.next().as_deref() != Some("--expected-parent-pid") {
+        eprintln!("factory-runner exec gate: missing expected parent PID");
+        process::exit(125);
+    }
+    let Some(raw_pid) = arguments.next() else {
+        eprintln!("factory-runner exec gate: missing expected parent PID");
+        process::exit(125);
+    };
+    let Ok(raw_pid) = raw_pid.parse::<i32>() else {
+        eprintln!("factory-runner exec gate: invalid expected parent PID");
+        process::exit(125);
+    };
+    let Some(expected_parent) = rustix::process::Pid::from_raw(raw_pid) else {
+        eprintln!("factory-runner exec gate: invalid expected parent PID");
+        process::exit(125);
+    };
     if arguments.next().as_deref() != Some("--") {
         eprintln!("factory-runner exec gate: missing separator");
         process::exit(125);
@@ -42,12 +58,21 @@ fn exec_gate(mut arguments: impl Iterator<Item = String>) -> ! {
         eprintln!("factory-runner exec gate: missing provider program");
         process::exit(125);
     };
-    let parent = rustix::process::getppid();
+    // The parent supplies its PID from before spawn. Checking it before the
+    // wait closes the otherwise unavoidable race where the parent dies before
+    // this process first calls `getppid` and the gate mistakes its reaper for
+    // the original parent.
+    if rustix::process::getppid() != Some(expected_parent) {
+        process::exit(0);
+    }
     while !gate_path.exists() {
-        if rustix::process::getppid() != parent {
+        if rustix::process::getppid() != Some(expected_parent) {
             process::exit(0);
         }
         thread::sleep(Duration::from_millis(10));
+    }
+    if rustix::process::getppid() != Some(expected_parent) {
+        process::exit(0);
     }
     if let Err(error) = fs::remove_file(&gate_path) {
         eprintln!("factory-runner exec gate: activation could not be consumed: {error}");

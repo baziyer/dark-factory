@@ -106,7 +106,9 @@ new schema and manually deleting objects.
 The Stage 1 cutover migration refuses a schema-29 database containing live
 sessions, active/uncertain delivery, nonterminal runs, or other work whose
 external effect cannot be proven. It preserves legacy worktrees as unlinked
-retained Changes. Before any future schema-30 boot, take an explicit database
+retained Changes, including separate records when agents or projects shared an
+exact path; it never invents one owner for that path. Before any future
+schema-30 boot, take an explicit database
 backup and rollback decision; the refactor itself does not boot it.
 
 ## CI and GitHub

@@ -4,17 +4,13 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::PermissionsExt},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
 };
 
 use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
-use tokio::{
-    io::AsyncWriteExt,
-    process::{Child, Command},
-};
+use tokio::process::{Child, Command};
 
 const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
     "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
@@ -98,27 +94,61 @@ pub enum Error {
     },
     #[error("could not spawn factory-runner: {0}")]
     Spawn(std::io::Error),
-    #[error("could not write factory-runner startup input: {0}")]
+    #[error("could not prepare factory-runner startup input: {0}")]
     StartupInput(std::io::Error),
-    #[error("factory-runner did not consume startup input before the deadline")]
-    StartupInputTimedOut,
+    #[error("factory-runner exec gate path already exists")]
+    ActivationPathExists,
+    #[error("could not activate factory-runner: {0}")]
+    Activate(std::io::Error),
+    #[error("spawned factory-runner exec gate has no process ID")]
+    MissingProcessId,
     #[error("provider environment is invalid")]
     InvalidProviderEnvironment,
     #[error("attempt environment variable {name:?} is not in the allowed set")]
     InvalidAttemptEnvironment { name: String },
 }
 
-struct StartupChild {
+/// A stable factory-runner PID that has not executed runner code yet.
+///
+/// The caller must durably register [`Self::child_pid`] before calling
+/// [`Self::activate`]. Dropping this value kills the inert exec gate, so there
+/// is no unregistered runner to outlive the daemon.
+pub struct PreparedRunnerProcess {
     child: Option<Child>,
+    activation_path: PathBuf,
 }
 
-impl StartupChild {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+impl PreparedRunnerProcess {
+    fn new(child: Child, activation_path: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            activation_path,
+        }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("startup child is present")
+    /// The exact PID retained when the gate execs the real runner.
+    #[must_use]
+    pub fn child_pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("prepared runner process has a PID")
+    }
+
+    /// Releases the private activation gate after durable registration.
+    ///
+    /// The returned handle identifies the same process. It intentionally uses
+    /// Tokio's default no-kill-on-drop behavior so the registered runner can
+    /// outlive a restarting daemon.
+    pub async fn activate(mut self) -> Result<Child, Error> {
+        if let Err(error) = release_exec_gate(&self.activation_path) {
+            self.kill_and_reap().await;
+            return Err(error);
+        }
+        Ok(self
+            .child
+            .take()
+            .expect("prepared runner process is present"))
     }
 
     async fn kill_and_reap(&mut self) {
@@ -127,13 +157,9 @@ impl StartupChild {
             let _ = child.wait().await;
         }
     }
-
-    fn into_child(mut self) -> Child {
-        self.child.take().expect("startup child is present")
-    }
 }
 
-impl Drop for StartupChild {
+impl Drop for PreparedRunnerProcess {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
@@ -165,7 +191,7 @@ impl CapturedEnvironment {
     }
 }
 
-/// Starts one stable runner after checking its trusted absolute path and
+/// Prepares one stable runner PID after checking its trusted absolute path and
 /// resolving the provider to a canonical executable file.
 ///
 /// Ambient environment is restricted to `HOME`, `USER`, `LOGNAME`, `SHELL`,
@@ -173,44 +199,26 @@ impl CapturedEnvironment {
 /// explicit `CODEX_HOME` is the only provider-specific addition. The child
 /// also gets fixed non-interactive values for `NO_COLOR`, `TERM`, and
 /// `GIT_TERMINAL_PROMPT`. Task bytes are bounded by [`MAX_STARTUP_STDIN_BYTES`],
-/// written only to the runner's piped stdin, and the pipe is closed before this
-/// function returns.
+/// spooled to an anonymous file before spawn, avoiding both argv/environment
+/// disclosure and a pipe-capacity deadlock while the runner is gated.
 ///
-/// The returned child retains Tokio's default no-kill-on-drop behavior. Its
-/// caller owns subsequent observation and reaping; dropping it must not stop an
-/// independently running agent.
+/// The returned gate must be durably registered and then activated. Until
+/// activation it exits when its exact parent disappears; dropping the prepared
+/// value kills it. Its PID is retained across `exec` into the real runner.
 ///
 /// # Errors
 ///
 /// Returns an error before spawning when task bytes are oversized, either
 /// executable is missing or unusable, or the explicit provider environment is
-/// invalid. A spawn or startup-input write failure is also returned; a spawned
-/// child is explicitly killed and reaped after a write failure or timeout.
-/// Cancellation synchronously kills a child that has not yet received its
-/// complete input; the stable runner cannot have launched the provider at that
-/// point.
-pub async fn spawn_runner(spec: LaunchSpec, startup_timeout: Duration) -> Result<Child, Error> {
-    spawn_runner_with_environment_and_timeout(
-        spec,
-        CapturedEnvironment::capture(),
-        Some(startup_timeout),
-    )
-    .await
+/// invalid. Startup-input preparation and spawn failures are also returned.
+pub async fn prepare_runner(spec: LaunchSpec) -> Result<PreparedRunnerProcess, Error> {
+    prepare_runner_with_environment(spec, CapturedEnvironment::capture()).await
 }
 
-#[cfg(test)]
-async fn spawn_runner_with_environment(
+async fn prepare_runner_with_environment(
     spec: LaunchSpec,
     environment: CapturedEnvironment,
-) -> Result<Child, Error> {
-    spawn_runner_with_environment_and_timeout(spec, environment, None).await
-}
-
-async fn spawn_runner_with_environment_and_timeout(
-    spec: LaunchSpec,
-    environment: CapturedEnvironment,
-    startup_timeout: Option<Duration>,
-) -> Result<Child, Error> {
+) -> Result<PreparedRunnerProcess, Error> {
     if spec.startup_input.len() > MAX_STARTUP_STDIN_BYTES {
         return Err(Error::StartupInputTooLarge {
             actual_bytes: spec.startup_input.len(),
@@ -231,7 +239,11 @@ async fn spawn_runner_with_environment_and_timeout(
     let runner = checked_executable(&spec.runner_program, "runner")?;
     let provider = resolve_executable(&spec.provider_program, &environment, "provider")?;
     let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
-    let mut command = Command::new(runner);
+    let activation_path = spec.runtime_dir.join("runner-exec.activate");
+    ensure_exec_gate_absent(&activation_path)?;
+    let startup_input = prepare_startup_input(&spec.startup_input)?;
+    let expected_parent = rustix::process::getpid();
+    let mut command = Command::new(&runner);
     // The runner is its own process-group leader: an attempt must outlive
     // whatever started the daemon. Without this, launchd's default
     // behaviour on `bootout`/`kickstart -k` (and a terminal's Ctrl-C) kills
@@ -242,6 +254,12 @@ async fn spawn_runner_with_environment_and_timeout(
     // update" process fixture).
     command.process_group(0);
     command
+        .arg("--exec-gate")
+        .arg(&activation_path)
+        .arg("--expected-parent-pid")
+        .arg(expected_parent.as_raw_nonzero().get().to_string())
+        .arg("--")
+        .arg(&runner)
         .arg("--run-id")
         .arg(spec.run_id.as_str())
         .arg("--runner-instance-id")
@@ -257,39 +275,61 @@ async fn spawn_runner_with_environment_and_timeout(
         .arg("--")
         .arg(provider)
         .args(spec.provider_arguments)
-        .stdin(Stdio::piped());
+        .stdin(startup_input);
     apply_runner_environment(&mut command, &environment, &spec.factoryctl_path);
     apply_provider_environment(&mut command, provider_environment.as_deref());
     for (name, value) in &spec.attempt_environment {
         command.env(name, value);
     }
 
-    let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
-    let mut stdin = child
-        .child_mut()
-        .stdin
-        .take()
-        .expect("factory-runner was configured with piped stdin");
-    let write_result = match startup_timeout {
-        Some(limit) => {
-            match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    drop(stdin);
-                    child.kill_and_reap().await;
-                    return Err(Error::StartupInputTimedOut);
-                }
-            }
-        }
-        None => stdin.write_all(&spec.startup_input).await,
-    };
-    if let Err(error) = write_result {
-        drop(stdin);
-        child.kill_and_reap().await;
-        return Err(Error::StartupInput(error));
+    let child = command.spawn().map_err(Error::Spawn)?;
+    if child.id().is_none() {
+        return Err(Error::MissingProcessId);
     }
-    drop(stdin);
-    Ok(child.into_child())
+    Ok(PreparedRunnerProcess::new(child, activation_path))
+}
+
+#[cfg(test)]
+async fn spawn_runner_with_environment(
+    spec: LaunchSpec,
+    environment: CapturedEnvironment,
+) -> Result<Child, Error> {
+    prepare_runner_with_environment(spec, environment)
+        .await?
+        .activate()
+        .await
+}
+
+fn ensure_exec_gate_absent(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::ActivationPathExists),
+        Err(error) => Err(Error::Activate(error)),
+    }
+}
+
+fn release_exec_gate(path: &Path) -> Result<(), Error> {
+    use std::fs::OpenOptions;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(Error::Activate)?;
+    file.sync_all().map_err(Error::Activate)
+}
+
+fn prepare_startup_input(input: &[u8]) -> Result<Stdio, Error> {
+    use std::io::{Seek as _, Write as _};
+
+    let mut file = tempfile::tempfile().map_err(Error::StartupInput)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(Error::StartupInput)?;
+    file.write_all(input).map_err(Error::StartupInput)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(Error::StartupInput)?;
+    Ok(Stdio::from(file))
 }
 
 fn apply_runner_environment(
@@ -490,8 +530,7 @@ mod tests {
     use super::{
         CapturedEnvironment, Error, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
         apply_runner_environment, has_dot_or_dot_dot_component, is_owned_directory,
-        resolve_executable, spawn_runner_with_environment,
-        spawn_runner_with_environment_and_timeout,
+        prepare_runner_with_environment, resolve_executable, spawn_runner_with_environment,
     };
 
     fn id<T>(value: &str) -> T
@@ -544,6 +583,23 @@ mod tests {
             &directory.join("runner-probe"),
             r#"#!/bin/sh
 set -eu
+if [ "${1:-}" = "--exec-gate" ]; then
+    gate_path=$2
+    shift 2
+    [ "${1:-}" = "--expected-parent-pid" ] || exit 125
+    expected_parent=$2
+    shift 2
+    [ "${1:-}" = "--" ] || exit 125
+    shift
+    [ "$PPID" = "$expected_parent" ] || exit 0
+    printf '%s\n' "$$" > "$TMPDIR/outer-gate-pid"
+    while [ ! -e "$gate_path" ]; do
+        [ "$PPID" = "$expected_parent" ] || exit 0
+        sleep 0.01
+    done
+    rm "$gate_path"
+    exec "$@"
+fi
 : > "$TMPDIR/runner-argv"
 for item in "$@"; do
     printf '%s\n' "$item" >> "$TMPDIR/runner-argv"
@@ -570,6 +626,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
     }
 
     fn spec(directory: &Path, task: Vec<u8>) -> LaunchSpec {
+        fs::create_dir_all(directory.join("runtime")).unwrap();
         LaunchSpec {
             runner_program: directory.join("runner-probe"),
             factoryctl_path: directory.join("factoryctl-probe"),
@@ -1084,60 +1141,85 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
     }
 
     #[tokio::test]
-    async fn startup_write_failure_is_reaped_and_never_echoes_prompt() {
+    async fn maximum_startup_input_is_spooled_without_waiting_for_activation() {
         let directory = tempfile::tempdir().unwrap();
-        executable(
-            &directory.path().join("runner-probe"),
-            "#!/bin/sh\nexit 0\n",
-        );
-        executable(
-            &directory.path().join("provider-probe"),
-            "#!/bin/sh\nexit 0\n",
-        );
+        scripts(directory.path());
         let captured = probe_environment(directory.path(), directory.path());
-        let task = "write-failure-secret".repeat(MAX_STARTUP_STDIN_BYTES / 20);
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(2),
+            prepare_runner_with_environment(
+                spec(directory.path(), vec![b'x'; MAX_STARTUP_STDIN_BYTES]),
+                captured,
+            ),
+        )
+        .await
+        .expect("preparation must not block on a gated stdin pipe")
+        .unwrap();
+        assert!(!directory.path().join("runner-argv").exists());
+        assert!(!directory.path().join("provider-stdin").exists());
 
-        let error =
-            spawn_runner_with_environment(spec(directory.path(), task.into_bytes()), captured)
-                .await
-                .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("startup input"));
-        assert!(!message.contains("write-failure-secret"));
+        let mut child = prepared.activate().await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(
+            fs::metadata(directory.path().join("provider-stdin"))
+                .unwrap()
+                .len(),
+            u64::try_from(MAX_STARTUP_STDIN_BYTES).unwrap()
+        );
     }
 
     #[tokio::test]
-    async fn cancelling_startup_input_kills_the_not_yet_ready_runner() {
+    async fn dropping_prepared_runner_kills_gate_without_launching_runner() {
         let directory = tempfile::tempdir().unwrap();
-        executable(
-            &directory.path().join("runner-probe"),
-            "#!/bin/sh\necho $$ > \"$TMPDIR/runner-pid\"\nwhile :; do :; done\n",
-        );
-        executable(
-            &directory.path().join("provider-probe"),
-            "#!/bin/sh\nexit 0\n",
-        );
+        scripts(directory.path());
         let captured = probe_environment(directory.path(), directory.path());
-        let launch = tokio::spawn(spawn_runner_with_environment_and_timeout(
-            spec(directory.path(), vec![b'x'; MAX_STARTUP_STDIN_BYTES]),
+        let prepared = prepare_runner_with_environment(
+            spec(directory.path(), b"private task".to_vec()),
             captured,
-            None,
-        ));
-        let marker = directory.path().join("runner-pid");
+        )
+        .await
+        .unwrap();
+        let child_pid = prepared.child_pid();
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap()).unwrap();
+        let marker = directory.path().join("outer-gate-pid");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !marker.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let raw_pid = fs::read_to_string(marker).unwrap().trim().parse().unwrap();
-        let pid = Pid::from_raw(raw_pid).unwrap();
+        assert_eq!(
+            fs::read_to_string(marker)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap(),
+            child_pid
+        );
 
-        launch.abort();
-        assert!(launch.await.unwrap_err().is_cancelled());
+        drop(prepared);
         let deadline = Instant::now() + Duration::from_secs(2);
         while test_kill_process(pid).is_ok() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(test_kill_process(pid).is_err());
+        assert!(!directory.path().join("runner-argv").exists());
+        assert!(!directory.path().join("provider-stdin").exists());
+    }
+
+    #[tokio::test]
+    async fn activation_retains_the_exact_prepared_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let prepared =
+            prepare_runner_with_environment(spec(directory.path(), Vec::new()), captured)
+                .await
+                .unwrap();
+        let prepared_pid = prepared.child_pid();
+
+        let mut child = prepared.activate().await.unwrap();
+        assert_eq!(child.id(), Some(prepared_pid));
+        assert!(child.wait().await.unwrap().success());
+        assert!(directory.path().join("runner-argv").exists());
     }
 
     #[tokio::test]
