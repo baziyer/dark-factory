@@ -69,8 +69,12 @@ SQLite transaction that writes the message, task, revision, and event.
 ## Process and cleanup safety
 
 Before provider execution, `factoryd` durably records the admitted run and its
-resources. `factory-runner` prepares a child blocked before `exec`, reports its
-PID and process group, and waits. Only after the daemon records those exact
+resources. Before the outer runner gate is spawned, the daemon records the
+exact identity of a locked private startup file inherited as the gate's stdin.
+After a crash, that lock proves whether a gate not yet bound to a PID can still
+exist; a missing or replaced bound file is unresolved, never absent.
+`factory-runner` then prepares a child blocked before `exec`, reports its PID
+and process group, and waits. Only after the daemon records those exact
 identities and transitions the run to `running` may the child execute.
 
 Success, block, failure, cancellation, and exit converge through

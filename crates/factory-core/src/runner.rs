@@ -12,6 +12,9 @@ pub const MAX_RUNNER_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_RUNNER_ERROR_BYTES: usize = 16 * 1024;
 /// Maximum task bytes transferred from the daemon to a new runner over stdin.
 pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
+/// Private startup-input file whose advisory lock proves whether an outer
+/// runner gate created before durable PID registration can still exist.
+pub const RUNNER_STARTUP_LEASE_FILE: &str = "runner-startup.lease";
 /// One authenticated, newline-delimited request sent to a runner.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {

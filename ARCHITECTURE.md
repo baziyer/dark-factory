@@ -91,9 +91,13 @@ Launch is one nested register-before-exec handshake:
 1. `factoryd` records the admitted run with a random runtime claim. The
    claim-derived path is durable before `mkdir`; its inode replaces the claim
    before any credential, configuration, or process is created inside it.
-2. `factoryd` spawns an inert runner exec gate tied to the exact daemon parent,
-   persists its stable PID, then activates the same PID into `factory-runner`.
-3. The runner creates a second parent-bound child gate before provider `exec`
+2. `factoryd` creates and locks a private startup file, persists its exact
+   filesystem identity, then maps that lock to the inert runner gate's stdin.
+   A restart can prove that a gate spawned before PID registration is gone only
+   by acquiring the same lock; missing or replaced identities stay unresolved.
+3. `factoryd` persists the inert gate's stable PID, then activates that same
+   PID into `factory-runner`. The runner creates a second parent-bound child
+   gate before provider `exec`
    and reports the stable provider PID and process group.
 4. `factoryd` persists those identities and moves the run to `running`.
 5. The runner releases the child to provider `exec`.

@@ -94,11 +94,13 @@ PTY attach/input, prompt replay, delivery journal, or provider-process resume.
 Launch uses register-before-exec gates:
 
 1. factoryd records the run, runtime claim, and declared resources;
-2. an inert runner child reports a stable identity before activation;
-3. the runner prepares a provider child blocked before `exec`;
-4. factoryd records the provider PID, process group, and birth identity and
+2. factoryd records an exact locked startup-file identity before an inert
+   runner gate can inherit that lock and spawn;
+3. factoryd records the gate's stable PID before activation;
+4. the runner prepares a provider child blocked before `exec`;
+5. factoryd records the provider PID, process group, and birth identity and
    moves the run to `running`; and
-5. only then may the same child execute the provider.
+6. only then may the same child execute the provider.
 
 The resource ledger owns processes, process groups, runners, runtime roots,
 temporary roots, and verification effects. Stored process numbers support

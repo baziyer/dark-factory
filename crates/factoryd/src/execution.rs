@@ -16,7 +16,8 @@ use std::{
 
 use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, ChangeSnapshot, ProjectId, Provider,
-    RunFailureReason, RunId, RunPhase, RunnerInstanceId, runner::RunnerEvent,
+    RunFailureReason, RunId, RunPhase, RunnerInstanceId,
+    runner::{RUNNER_STARTUP_LEASE_FILE, RunnerEvent},
 };
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
@@ -860,7 +861,38 @@ async fn launch_admitted(
         source_root: PathBuf::from(&admitted.target.source_root),
         startup_input: launch.startup_input,
     };
-    let prepared_runner = match runner_process::prepare_runner(spec).await {
+    let prepared_setup = match runner_process::prepare_runner(spec).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
+    let setup_locator = runner_setup_locator(
+        prepared_setup.setup_path(),
+        &admitted.target.runner_instance_id,
+    );
+    let setup_birth =
+        runner_setup_birth_fingerprint(prepared_setup.setup_device(), prepared_setup.setup_inode());
+    let setup_run_id = admitted.run.id.clone();
+    let registered_setup_locator = setup_locator.clone();
+    let registered_setup_birth = setup_birth.clone();
+    let setup_registered_at_ms = match now_ms() {
+        Ok(value) => value,
+        Err(error) => return Err((error, None, recovery)),
+    };
+    if let Err(error) = state
+        .commit_and_publish(move |store| {
+            store.register_admitted_runner_setup(
+                &setup_run_id,
+                &registered_setup_locator,
+                &registered_setup_birth,
+                setup_registered_at_ms,
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await
+    {
+        return Err((error.into(), None, recovery));
+    }
+    let prepared_runner = match prepared_setup.spawn() {
         Ok(prepared) => prepared,
         Err(error) => return Err((error.into(), None, recovery)),
     };
@@ -869,32 +901,55 @@ async fn launch_admitted(
     let runner_birth = match process_birth_fingerprint(runner_pid) {
         Ok(Some(fingerprint)) => fingerprint,
         Ok(None) => {
+            prepared_runner.terminate().await;
             return Err((
                 Error::ProcessIdentityUnavailable(runner_pid),
                 None,
                 recovery,
             ));
         }
-        Err(error) => return Err((error, None, recovery)),
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error, None, recovery));
+        }
     };
     let register_run_id = admitted.run.id.clone();
     let registered_at_ms = match now_ms() {
         Ok(value) => value,
-        Err(error) => return Err((error, None, recovery)),
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error, None, recovery));
+        }
     };
-    if let Err(error) = state
+    let register_setup_locator = setup_locator.clone();
+    let register_setup_birth = setup_birth.clone();
+    let registered_phase = match state
         .commit_and_publish(move |store| {
-            store.register_admitted_runner(
+            let phase = store.register_admitted_runner(
                 &register_run_id,
+                &register_setup_locator,
+                &register_setup_birth,
                 &runner_locator,
                 &runner_birth,
                 registered_at_ms,
             )?;
-            Ok(((), Vec::new()))
+            Ok((phase, Vec::new()))
         })
         .await
     {
-        return Err((error.into(), None, recovery));
+        Ok(phase) => phase,
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error.into(), None, recovery));
+        }
+    };
+    if registered_phase == RunPhase::Finalizing {
+        prepared_runner.terminate().await;
+        return Err((
+            Error::State(DaemonStateError::Store(StoreError::InvalidRunState)),
+            None,
+            recovery,
+        ));
     }
     let child = match prepared_runner.activate().await {
         Ok(child) => child,
@@ -2766,16 +2821,6 @@ async fn fail_unrecoverable_admission(
             }
         })
         .await?;
-    // A declared runner has no process identity and never passed Prepare.
-    // The bounded authenticated connection failure above is the authority to
-    // abandon that declaration; active identities still require absence.
-    for resource in refreshed.resources.iter().filter(|resource| {
-        resource.kind == KernelResourceKind::RunnerProcess
-            && resource.state == KernelResourceState::Releasing
-            && resource.birth_fingerprint.is_none()
-    }) {
-        release_resource(state, resource).await?;
-    }
     let _ = release_absent_resources(state, &refreshed).await?;
     Ok(())
 }
@@ -3189,21 +3234,6 @@ async fn cleanup_unactivated(
             })
             .await;
     }
-    if let Ok(resources) = state
-        .with_store({
-            let run_id = run.run.id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await
-    {
-        for resource in resources.iter().filter(|resource| {
-            resource.kind == KernelResourceKind::RunnerProcess
-                && resource.birth_fingerprint.is_none()
-                && resource.state != KernelResourceState::Released
-        }) {
-            let _ = release_resource(state, resource).await;
-        }
-    }
     let _ = release_completed_resources(state, run).await;
 }
 
@@ -3237,9 +3267,17 @@ async fn release_absent_resources(
             continue;
         }
         let absent = match resource.kind {
-            KernelResourceKind::RunnerProcess
-            | KernelResourceKind::ProviderProcess
-            | KernelResourceKind::EffectProcess => process_resource_absent(resource)?,
+            KernelResourceKind::RunnerProcess => match runner_resource_status(run, resource)? {
+                RunnerResourceStatus::Present => false,
+                RunnerResourceStatus::Absent => true,
+                RunnerResourceStatus::Unresolved(failure) => {
+                    mark_resource_unresolved(state, resource, failure).await?;
+                    false
+                }
+            },
+            KernelResourceKind::ProviderProcess | KernelResourceKind::EffectProcess => {
+                process_resource_absent(resource)?
+            }
             KernelResourceKind::ProcessGroup | KernelResourceKind::EffectGroup => {
                 process_group_absent(resource)?
             }
@@ -3505,6 +3543,102 @@ fn process_resource_absent(resource: &KernelResource) -> Result<bool, Error> {
     Ok(false)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerResourceStatus {
+    Present,
+    Absent,
+    Unresolved(&'static str),
+}
+
+fn runner_resource_status(
+    run: &RecoverableKernelRun,
+    resource: &KernelResource,
+) -> Result<RunnerResourceStatus, Error> {
+    if locator_number(&resource.locator, "pid").is_some() {
+        return Ok(if process_resource_absent(resource)? {
+            RunnerResourceStatus::Absent
+        } else {
+            RunnerResourceStatus::Present
+        });
+    }
+    let Some(setup_path) = locator_named_path(&resource.locator, "setup_path") else {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner has neither a durable process identity nor a setup lease",
+        ));
+    };
+    let expected_setup_path = Path::new(&run.runner_runtime).join(RUNNER_STARTUP_LEASE_FILE);
+    let locator_instance = serde_json::from_str::<serde_json::Value>(&resource.locator)
+        .ok()
+        .and_then(|locator| {
+            locator
+                .get("runner_instance_id")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    if setup_path != expected_setup_path
+        || locator_instance.as_deref() != Some(run.runner_instance_id.as_str())
+    {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup locator does not match its run",
+        ));
+    }
+
+    let descriptor = match rustix::fs::open(
+        &setup_path,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) if resource.birth_fingerprint.is_none() => {
+            // This locator shape is the durable pre-spawn checkpoint. The
+            // revised launcher cannot spawn until it replaces `None` with the
+            // exact file identity, so absence here proves no gate ever began.
+            return Ok(RunnerResourceStatus::Absent);
+        }
+        Err(rustix::io::Errno::NOENT) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "registered runner setup lease is missing",
+            ));
+        }
+        Err(_) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "runner setup lease could not be opened safely",
+            ));
+        }
+    };
+    let file = fs::File::from(descriptor);
+    let metadata = file.metadata().map_err(|source| Error::Runtime {
+        path: setup_path.clone(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup lease is not an owner-only regular file",
+        ));
+    }
+    let current = runner_setup_birth_fingerprint(metadata.dev(), metadata.ino());
+    if resource
+        .birth_fingerprint
+        .as_deref()
+        .is_some_and(|expected| expected != current)
+    {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup lease identity changed",
+        ));
+    }
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(RunnerResourceStatus::Absent),
+        Err(rustix::io::Errno::AGAIN) => Ok(RunnerResourceStatus::Present),
+        Err(source) => Err(Error::Runtime {
+            path: setup_path,
+            source: source.into(),
+        }),
+    }
+}
+
 fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
     let Some(pgid) = locator_number(&resource.locator, "pgid") else {
         return Ok(false);
@@ -3560,6 +3694,18 @@ fn runner_locator(pid: u32, runner_instance_id: &RunnerInstanceId) -> String {
         "runner_instance_id": runner_instance_id.as_str(),
     })
     .to_string()
+}
+
+fn runner_setup_locator(path: &Path, runner_instance_id: &RunnerInstanceId) -> String {
+    serde_json::json!({
+        "runner_instance_id": runner_instance_id.as_str(),
+        "setup_path": path,
+    })
+    .to_string()
+}
+
+fn runner_setup_birth_fingerprint(device: u64, inode: u64) -> String {
+    format!("unix-device:{device}:inode:{inode}")
 }
 
 fn runtime_birth_fingerprint(path: &Path) -> Result<Option<String>, Error> {
@@ -3844,12 +3990,14 @@ mod tests {
     use rustix::process::test_kill_process;
     use std::{
         os::unix::{
-            fs::{DirBuilderExt, PermissionsExt},
+            fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt as _,
         },
         process::Stdio,
         thread,
     };
+
+    use crate::store::{NewAgent, NewProject, NewTask, Store};
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -3903,6 +4051,187 @@ mod tests {
             socket_path: root.join("factory.sock"),
             max_active_runs: 1,
         }
+    }
+
+    fn executable(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn outer_gate_probe(root: &Path) -> PathBuf {
+        let runner = root.join("runner-probe");
+        executable(
+            &runner,
+            r#"#!/bin/sh
+set -eu
+[ "${1:-}" = "--exec-gate" ] || exit 64
+gate_path=$2
+shift 2
+[ "${1:-}" = "--expected-parent-pid" ] || exit 64
+expected_parent=$2
+shift 2
+[ "${1:-}" = "--" ] || exit 64
+[ "$PPID" = "$expected_parent" ] || exit 0
+while [ ! -e "$gate_path" ]; do
+    [ "$PPID" = "$expected_parent" ] || exit 0
+    sleep 0.01
+done
+exit 125
+"#,
+        );
+        runner
+    }
+
+    fn admit_shell_attempt(store: &mut Store, root: &Path) -> AdmittedRun {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("worker").unwrap();
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let project_root = root.join("project");
+        ensure_private_directory(&project_root).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id,
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "task".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+                agent_id.clone(),
+                3,
+            )
+            .unwrap();
+        let runtime = root.join("runs/11111111111141118111111111111111");
+        store
+            .admit_next_run(
+                NewRunAdmission {
+                    run_id: RunId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+                    project_id,
+                    agent_id,
+                    capability_digest: capability_digest("test-bearer"),
+                    runtime_claim: "runtime-claim:11111111111141118111111111111111".into(),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: runtime.to_string_lossy().into_owned(),
+                    max_active_runs: 1,
+                    change_reservation: ChangeReservation {
+                        id: ChangeId::try_from("change-1").unwrap(),
+                        source_root: root.join("change-1").to_string_lossy().into_owned(),
+                        max_factory_changes: 1,
+                    },
+                    policy_cwd: runtime.join("policy").to_string_lossy().into_owned(),
+                },
+                4,
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn runner_launch_spec(admitted: &AdmittedRun, root: &Path) -> LaunchSpec {
+        LaunchSpec {
+            runner_program: outer_gate_probe(root),
+            factoryctl_path: PathBuf::from("/usr/bin/true"),
+            provider_program: PathBuf::from("/usr/bin/true"),
+            provider_arguments: Vec::new(),
+            provider_environment: ProviderEnvironment::Inherited,
+            attempt_environment: Vec::new(),
+            run_id: admitted.run.id.clone(),
+            runner_instance_id: admitted.target.runner_instance_id.clone(),
+            runtime_dir: PathBuf::from(&admitted.target.runner_runtime),
+            cwd: root.to_owned(),
+            source_root: root.to_owned(),
+            startup_input: b"private task".to_vec(),
+        }
+    }
+
+    async fn register_runtime(state: &DaemonState, admitted: &AdmittedRun) {
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        ensure_private_directory(&runtime).unwrap();
+        let locator = runtime_locator(&runtime);
+        let birth = runtime_birth_fingerprint(&runtime).unwrap().unwrap();
+        let run_id = admitted.run.id.clone();
+        let claim = admitted.target.runtime_claim.clone();
+        state
+            .commit_and_publish(move |store| {
+                store.register_admitted_runtime(&run_id, &locator, &claim, &birth, 5)?;
+                Ok(((), Vec::new()))
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn register_setup(
+        state: &DaemonState,
+        admitted: &AdmittedRun,
+        setup: &runner_process::PreparedRunnerSetup,
+    ) -> (String, String) {
+        let locator = runner_setup_locator(setup.setup_path(), &admitted.target.runner_instance_id);
+        let birth = runner_setup_birth_fingerprint(setup.setup_device(), setup.setup_inode());
+        let run_id = admitted.run.id.clone();
+        let stored_locator = locator.clone();
+        let stored_birth = birth.clone();
+        state
+            .commit_and_publish(move |store| {
+                store.register_admitted_runner_setup(&run_id, &stored_locator, &stored_birth, 6)?;
+                Ok(((), Vec::new()))
+            })
+            .await
+            .unwrap();
+        (locator, birth)
+    }
+
+    async fn cancel_attempt(state: &DaemonState, run_id: &RunId) {
+        let run_id = run_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let (_, events) = store.cancel_admitted_or_running_run(
+                    &run_id,
+                    "operator cancelled".into(),
+                    7,
+                )?;
+                Ok(((), events))
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn recover_run(state: &DaemonState, run_id: &RunId) -> RecoverableKernelRun {
+        let run_id = run_id.clone();
+        state
+            .with_store(move |store| {
+                store
+                    .recoverable_kernel_runs()?
+                    .into_iter()
+                    .find(|candidate| candidate.run.id == run_id)
+                    .ok_or(StoreError::RunNotFound)
+            })
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -3965,6 +4294,225 @@ mod tests {
         assert!(!gate.wait_for_drain(&id, Duration::ZERO).await);
         gate.end_write(&id);
         assert!(gate.wait_for_drain(&id, Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_a_spawned_unregistered_gate_before_terminal() {
+        let root = private_tempdir();
+        let database = root.path().join("state.db");
+        let mut store = Store::open(&database).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let child_pid = prepared.child_pid();
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap()).unwrap();
+        let mut detached_gate = prepared.into_unactivated_child();
+        cancel_attempt(&state, &run_id).await;
+        drop(state);
+
+        let restarted = DaemonState::new(Store::open(&database).unwrap());
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert_eq!(recovered.run.phase, RunPhase::Finalizing);
+        assert!(
+            !release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        let still_finalizing = recover_run(&restarted, &run_id).await;
+        assert_eq!(still_finalizing.run.phase, RunPhase::Finalizing);
+        assert!(still_finalizing.resources.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Releasing
+        }));
+        assert!(rustix::process::test_kill_process(pid).is_ok());
+
+        detached_gate.kill().await.unwrap();
+        detached_gate.wait().await.unwrap();
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert!(
+            release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        let terminal = restarted
+            .with_store({
+                let run_id = run_id.clone();
+                move |store| store.kernel_run(&run_id)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.phase, RunPhase::Terminal);
+        assert_eq!(
+            terminal.outcome,
+            Some(factory_core::RunOutcome::Cancelled {
+                reason: "operator cancelled".into()
+            })
+        );
+        assert!(rustix::process::test_kill_process(pid).is_err());
+        assert!(!runtime.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_spawn_and_pid_registration_binds_then_reaps_exact_gate() {
+        let root = private_tempdir();
+        let database = root.path().join("state.db");
+        let mut store = Store::open(&database).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        let (setup_locator, setup_birth) = register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let runner_pid = prepared.child_pid();
+        let runner_birth = process_birth_fingerprint(runner_pid).unwrap().unwrap();
+        let runner_locator = runner_locator(runner_pid, &admitted.target.runner_instance_id);
+        cancel_attempt(&state, &run_id).await;
+
+        let register_run_id = run_id.clone();
+        let phase = state
+            .commit_and_publish(move |store| {
+                let phase = store.register_admitted_runner(
+                    &register_run_id,
+                    &setup_locator,
+                    &setup_birth,
+                    &runner_locator,
+                    &runner_birth,
+                    8,
+                )?;
+                Ok((phase, Vec::new()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(phase, RunPhase::Finalizing);
+        prepared.terminate().await;
+        drop(state);
+
+        let restarted = DaemonState::new(Store::open(&database).unwrap());
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert!(recovered.resources.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Releasing
+                && locator_number(&resource.locator, "pid") == Some(runner_pid)
+                && resource.birth_fingerprint.is_some()
+        }));
+        assert!(
+            release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            restarted
+                .with_store({
+                    let run_id = run_id.clone();
+                    move |store| store.kernel_run(&run_id)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            RunPhase::Terminal
+        );
+    }
+
+    #[test]
+    fn setup_recovery_rejects_malformed_missing_and_replaced_bound_identity() {
+        let root = private_tempdir();
+        let runtime = root.path().join("runtime");
+        ensure_private_directory(&runtime).unwrap();
+        let run_id = RunId::try_from("run-1").unwrap();
+        let runner_instance_id = RunnerInstanceId::try_from("runner-1").unwrap();
+        let run = RecoverableKernelRun {
+            run: factory_core::RunSnapshot {
+                id: run_id.clone(),
+                project_id: ProjectId::try_from("project").unwrap(),
+                agent_id: AgentId::try_from("agent").unwrap(),
+                task_id: factory_core::TaskId::try_from("task").unwrap(),
+                provider: Provider::Shell,
+                phase: RunPhase::Finalizing,
+                outcome: Some(factory_core::RunOutcome::Cancelled {
+                    reason: "cancelled".into(),
+                }),
+                runner_instance_id: Some(runner_instance_id.clone()),
+                runtime_model: None,
+                runtime_reasoning_effort: None,
+                runtime_execution_mode: None,
+                runtime_control_mode: None,
+                activity: None,
+                wait_reason: None,
+                observer_health: factory_core::ObserverHealth::Unknown,
+                observer_reason: None,
+                admitted_at_ms: 1,
+                started_at_ms: None,
+                phase_since_ms: 2,
+                updated_at_ms: 2,
+                ended_at_ms: None,
+                exit_code: None,
+                exit_signal: None,
+            },
+            change_id: None,
+            source_root: root.path().to_string_lossy().into_owned(),
+            runner_instance_id: runner_instance_id.clone(),
+            runner_runtime: runtime.to_string_lossy().into_owned(),
+            resources: Vec::new(),
+        };
+        let resource = |locator: String, birth_fingerprint: Option<String>| KernelResource {
+            id: "run-1:runner".into(),
+            run_id: run_id.clone(),
+            kind: KernelResourceKind::RunnerProcess,
+            state: KernelResourceState::Releasing,
+            locator,
+            birth_fingerprint,
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 2,
+            released_at_ms: None,
+        };
+        assert!(matches!(
+            runner_resource_status(&run, &resource("{}".into(), None)).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+
+        let setup_path = runtime.join(RUNNER_STARTUP_LEASE_FILE);
+        let setup_locator = runner_setup_locator(&setup_path, &runner_instance_id);
+        assert_eq!(
+            runner_resource_status(&run, &resource(setup_locator.clone(), None)).unwrap(),
+            RunnerResourceStatus::Absent
+        );
+        let setup_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&setup_path)
+            .unwrap();
+        let metadata = setup_file.metadata().unwrap();
+        let exact_birth = runner_setup_birth_fingerprint(metadata.dev(), metadata.ino());
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some("replacement".into()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        drop(setup_file);
+        fs::remove_file(&setup_path).unwrap();
+        assert!(matches!(
+            runner_resource_status(&run, &resource(setup_locator, Some(exact_birth))).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
     }
 
     #[test]
