@@ -128,8 +128,10 @@ private source snapshot only when canonical before/copy/after manifests agree,
 then builds through one project-incarnation/toolchain cache. It copies Cargo's
 top-level test executables into content-addressed staging under the run's
 registered temporary root, records exact identity and digest, and verifies
-both before launch. The immutable snapshot supplies the working tree; fixtures
-are not copied into staging and doctests are not run. Mutable Cargo sibling
+both before launch. The stable snapshot supplies the working tree and is
+rechecked before and after every top-level test; mutation fails verification
+before another test launches. Fixtures are not copied into staging and doctests
+are not run. Mutable Cargo sibling
 discovery and one target per checkout are not accepted top-level launch paths.
 Cargo dependency resolution may use the network through the registered
 verifier process. Its registry, Git, and target data live inside the bounded
@@ -145,8 +147,8 @@ cache data; unique retained Changes are never automatic cleanup targets. A
 writer makes byte status incomplete. Its exact process group is reaped before
 remeasurement, after which the byte policy converges; an already measured
 over-limit cache is refused for a new verification. The daemon reports total
-measured bytes plus protected entry count and does not claim an instantaneous
-filesystem byte ceiling while Cargo is writing.
+measured bytes plus protected entry count and recoverable failure count, and
+does not claim an instantaneous filesystem byte ceiling while Cargo is writing.
 
 ## Bounded inputs and durable data
 

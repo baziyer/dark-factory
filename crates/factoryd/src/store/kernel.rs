@@ -371,8 +371,7 @@ impl Store {
             "INSERT INTO runs (
                 id, project_id, agent_id, task_id, task_incarnation_id,
                 admitted_task_work_revision, change_id, parent_run_id, source_root,
-                phase, requested_outcome, requested_outcome_detail,
-                requested_outcome_result, capability_digest,
+                phase, outcome, outcome_detail, outcome_result, capability_digest,
                 provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
                 runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
                 runner_instance_id, runner_runtime, runner_protocol_version,
@@ -655,7 +654,7 @@ impl Store {
                  FROM runs r
                  JOIN agents a ON a.id = r.agent_id AND a.project_id = r.project_id
                  LEFT JOIN changes c ON c.id = r.change_id AND c.project_id = r.project_id
-                WHERE r.capability_digest = ?1 AND r.phase <> 'terminal'
+                WHERE r.capability_digest = ?1 AND r.phase = 'running'
                    AND (a.role = 'orchestrator' OR c.phase = 'available')",
                 params![digest],
                 attempt_principal_from_row,
@@ -686,7 +685,7 @@ impl Store {
             RunPhase::Running => {}
             RunPhase::Finalizing | RunPhase::Terminal => {
                 let stored_result: Option<String> = transaction.query_row(
-                    "SELECT requested_outcome_result FROM runs WHERE id = ?1",
+                    "SELECT outcome_result FROM runs WHERE id = ?1",
                     params![run_id.as_str()],
                     |row| row.get(0),
                 )?;
@@ -700,9 +699,9 @@ impl Store {
         let (kind, detail) = outcome_parts(outcome);
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', requested_outcome = ?1,
-                 requested_outcome_detail = ?2, requested_outcome_result = ?3,
-                 capability_digest = NULL, stop_requested_at_ms = ?4,
+             SET phase = 'finalizing', outcome = ?1,
+                 outcome_detail = ?2, outcome_result = ?3,
+                 stop_requested_at_ms = ?4,
                  finalizing_at_ms = ?4, phase_since_ms = ?4, updated_at_ms = ?4
              WHERE id = ?5 AND phase = 'running'",
             params![kind, detail, result, now_ms, run_id.as_str()],
@@ -779,8 +778,8 @@ impl Store {
         };
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', requested_outcome = 'failed',
-                 requested_outcome_detail = ?1, capability_digest = NULL,
+             SET phase = 'finalizing', outcome = 'failed',
+                 outcome_detail = ?1,
                  stop_requested_at_ms = ?2, finalizing_at_ms = ?2,
                  phase_since_ms = ?2, updated_at_ms = ?2
              WHERE id = ?3 AND phase = ?4",
@@ -830,8 +829,8 @@ impl Store {
         }
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', requested_outcome = 'cancelled',
-                 requested_outcome_detail = ?1, capability_digest = NULL,
+             SET phase = 'finalizing', outcome = 'cancelled',
+                 outcome_detail = ?1,
                  stop_requested_at_ms = ?2, finalizing_at_ms = ?2,
                  phase_since_ms = ?2, updated_at_ms = ?2
              WHERE id = ?3 AND phase IN ('admitted', 'running')",
@@ -881,8 +880,8 @@ impl Store {
             });
             transaction.execute(
                 "UPDATE runs
-                 SET phase = 'finalizing', requested_outcome = 'failed',
-                     requested_outcome_detail = ?1, capability_digest = NULL,
+                 SET phase = 'finalizing', outcome = 'failed',
+                     outcome_detail = ?1,
                      finalizing_at_ms = ?2, phase_since_ms = ?2,
                      stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?2),
                      updated_at_ms = ?2
@@ -892,8 +891,8 @@ impl Store {
         } else if run.phase == RunPhase::Admitted {
             transaction.execute(
                 "UPDATE runs
-                 SET phase = 'finalizing', requested_outcome = 'failed',
-                     requested_outcome_detail = 'spawn', capability_digest = NULL,
+                 SET phase = 'finalizing', outcome = 'failed',
+                     outcome_detail = 'spawn',
                      finalizing_at_ms = ?1, phase_since_ms = ?1,
                      stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?1),
                      updated_at_ms = ?1
@@ -951,12 +950,14 @@ impl Store {
     ) -> Result<()> {
         let changed = self.connection.execute(
             "UPDATE resources
-             SET state = 'released', released_at_ms = ?1, updated_at_ms = ?1,
-                 last_failure = NULL
+             SET state = 'released',
+                 released_at_ms = COALESCE(released_at_ms, ?1),
+                 updated_at_ms = CASE WHEN state = 'released' THEN updated_at_ms ELSE ?1 END,
+                 last_failure = CASE WHEN state = 'released' THEN last_failure ELSE NULL END
              WHERE id = ?2 AND locator = ?3
                AND ((?4 IS NULL AND birth_fingerprint IS NULL)
                     OR birth_fingerprint = ?4)
-               AND state IN ('declared', 'active', 'releasing', 'unresolved')",
+               AND state IN ('declared', 'active', 'releasing', 'released', 'unresolved')",
             params![
                 now_ms,
                 resource_id,
@@ -1155,15 +1156,15 @@ impl Store {
         if unreleased != 0 {
             return Err(StoreError::RunResourcesUnreleased { count: unreleased });
         }
-        let requested_outcome = run.outcome.as_ref().ok_or(StoreError::InvalidRunState)?;
-        let requested_result: Option<String> = transaction.query_row(
-            "SELECT requested_outcome_result FROM runs WHERE id = ?1",
+        let proposal = run.outcome.as_ref().ok_or(StoreError::InvalidRunState)?;
+        let proposed_result: Option<String> = transaction.query_row(
+            "SELECT outcome_result FROM runs WHERE id = ?1",
             params![run_id.as_str()],
             |row| row.get(0),
         )?;
-        let outcome = actual_outcome(&transaction, run_id, requested_outcome)?;
+        let outcome = actual_outcome(&transaction, run_id, proposal)?;
         let outcome_result = matches!(outcome, RunOutcome::Succeeded)
-            .then_some(requested_result.as_deref())
+            .then_some(proposed_result.as_deref())
             .flatten();
         let (task_status, blocked_reason, result) = task_projection(&outcome, outcome_result);
         if matches!(
@@ -1419,10 +1420,10 @@ fn outcome_parts(outcome: &RunOutcome) -> (&'static str, Option<String>) {
 fn actual_outcome(
     transaction: &Transaction<'_>,
     run_id: &RunId,
-    requested: &RunOutcome,
+    proposal: &RunOutcome,
 ) -> Result<RunOutcome> {
-    if !matches!(requested, RunOutcome::Succeeded) {
-        return Ok(requested.clone());
+    if !matches!(proposal, RunOutcome::Succeeded) {
+        return Ok(proposal.clone());
     }
     let phase: Option<String> = transaction
         .query_row(
@@ -1715,11 +1716,7 @@ pub(super) fn load_kernel_run(
     connection
         .query_row(
             "SELECT id, project_id, agent_id, task_id, provider, phase,
-                    CASE WHEN phase = 'terminal' THEN outcome ELSE requested_outcome END,
-                    CASE WHEN phase = 'terminal' THEN outcome_detail
-                         ELSE requested_outcome_detail END,
-                    CASE WHEN phase = 'terminal' THEN outcome_result
-                         ELSE requested_outcome_result END,
+                    outcome, outcome_detail, outcome_result,
                     runner_instance_id,
                     runtime_model, runtime_reasoning_effort, runtime_permission_mode,
                     runtime_control_mode, activity, wait_reason,
@@ -2010,13 +2007,14 @@ mod tests {
         }
     }
 
-    fn request_rust_success(store: &mut Store, run_id: &RunId) {
+    fn request_rust_success(store: &mut Store, run_id: &RunId) -> Vec<EventEnvelope> {
         store
             .activate_prepared_run(run_id, prepared_identity(), 7)
             .unwrap();
         store
             .request_attempt_outcome(run_id, &RunOutcome::Succeeded, Some("verified"), 8)
-            .unwrap();
+            .unwrap()
+            .1
     }
 
     fn pass_rust_check(store: &mut Store, run_id: &RunId) {
@@ -2030,7 +2028,18 @@ mod tests {
             .declare_rust_cache(run_id, "/tmp/factory-rust-cache", 9)
             .unwrap();
         store
-            .bind_rust_cache(run_id, "/tmp/factory-rust-cache", 1, 2, 100, 9)
+            .bind_rust_cache_identity(run_id, "/tmp/factory-rust-cache", 1, 2, 9)
+            .unwrap();
+        store
+            .record_rust_cache_measurement(
+                run_id,
+                check.revision,
+                "/tmp/factory-rust-cache",
+                1,
+                2,
+                100,
+                12,
+            )
             .unwrap();
         store
             .pass_rust_completion_check(run_id, check.revision, &source_digest, &bundle_digest, 13)
@@ -2042,6 +2051,10 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker(&mut store);
         assert!(store.authenticate_attempt("wrong").unwrap().is_none());
+        assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
         let principal = store.authenticate_attempt(BEARER).unwrap().unwrap();
         assert_eq!(principal.run_id, run_id);
         assert_eq!(
@@ -2073,9 +2086,19 @@ mod tests {
             .project_execution_policy(&project_id)
             .unwrap()
             .incarnation_id;
-        request_rust_success(&mut store, &run_id);
+        let _ = request_rust_success(&mut store, &run_id);
 
         assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
+        assert!(
+            store
+                .connection
+                .query_row(
+                    "SELECT capability_digest IS NOT NULL FROM runs WHERE id = ?1",
+                    [run_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
         assert_eq!(
             store.rust_completion_check(&run_id).unwrap().unwrap().phase,
             super::super::RustCompletionPhase::Pending
@@ -2096,28 +2119,44 @@ mod tests {
         pass_rust_check(&mut store, &run_id);
         let (terminal, _) = store.finalize_run(&run_id, 14).unwrap();
         assert_eq!(terminal.outcome, Some(RunOutcome::Succeeded));
-        let (requested, actual): (String, String) = store
+        assert!(
+            !store
+                .connection
+                .query_row(
+                    "SELECT capability_digest IS NOT NULL FROM runs WHERE id = ?1",
+                    [run_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        let (actual, result): (String, String) = store
             .connection
             .query_row(
-                "SELECT requested_outcome, outcome FROM runs WHERE id = ?1",
+                "SELECT outcome, outcome_result FROM runs WHERE id = ?1",
                 [run_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(
-            (requested.as_str(), actual.as_str()),
-            ("succeeded", "succeeded")
+            (actual.as_str(), result.as_str()),
+            ("succeeded", "verified")
         );
     }
 
     #[test]
-    fn failed_rust_completion_projects_unverifiable_not_requested_success() {
+    fn failed_rust_completion_preserves_success_proposal_in_event_history() {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker_with_verification(
             &mut store,
             factory_core::CompletionVerification::RustWorkspaceTest,
         );
-        request_rust_success(&mut store, &run_id);
+        let proposal_events = request_rust_success(&mut store, &run_id);
+        assert!(proposal_events.iter().any(|event| matches!(
+            &event.event,
+            FactoryEvent::RunChanged { run }
+                if run.phase == RunPhase::Finalizing
+                    && run.outcome == Some(RunOutcome::Succeeded)
+        )));
         release_all(&mut store, &run_id, 9);
         let check = store
             .claim_rust_completion_check(&run_id, &"d".repeat(64), 9)
@@ -2126,7 +2165,7 @@ mod tests {
             .fail_rust_completion_check(&run_id, check.revision, "cargo failed", 10)
             .unwrap();
 
-        let (terminal, _) = store.finalize_run(&run_id, 11).unwrap();
+        let (terminal, terminal_events) = store.finalize_run(&run_id, 11).unwrap();
         assert_eq!(
             terminal.outcome,
             Some(RunOutcome::Failed {
@@ -2144,16 +2183,22 @@ mod tests {
                 .status,
             factory_core::TaskStatus::Failed
         );
-        let (requested, actual, detail): (String, String, String) = store
+        assert!(terminal_events.iter().any(|event| matches!(
+            &event.event,
+            FactoryEvent::RunChanged { run }
+                if run.phase == RunPhase::Terminal
+                    && run.outcome == Some(RunOutcome::Failed {
+                        reason: RunFailureReason::Unverifiable
+                    })
+        )));
+        let (actual, detail): (String, String) = store
             .connection
             .query_row(
-                "SELECT requested_outcome, outcome, outcome_detail
-                 FROM runs WHERE id = ?1",
+                "SELECT outcome, outcome_detail FROM runs WHERE id = ?1",
                 [run_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(requested, "succeeded");
         assert_eq!(
             (actual.as_str(), detail.as_str()),
             ("failed", "unverifiable")
@@ -2171,7 +2216,7 @@ mod tests {
                 &mut store,
                 factory_core::CompletionVerification::RustWorkspaceTest,
             );
-            request_rust_success(&mut store, &run_id);
+            let _ = request_rust_success(&mut store, &run_id);
             release_all(&mut store, &run_id, 9);
             pass_rust_check(&mut store, &run_id);
             store.finalize_run(&run_id, 14).unwrap();
@@ -2282,7 +2327,7 @@ mod tests {
             factory_core::CompletionVerification::RustWorkspaceTest,
         );
         let project_id = ProjectId::try_from("factory").unwrap();
-        request_rust_success(&mut store, &first_run);
+        let _ = request_rust_success(&mut store, &first_run);
         let cache_key = "f".repeat(64);
         store
             .claim_rust_completion_check(&first_run, &cache_key, 9)
@@ -2538,6 +2583,40 @@ mod tests {
     }
 
     #[test]
+    fn exact_resource_release_is_idempotent_without_rewriting_first_release() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        let resource = store.kernel_resources(&run_id).unwrap().remove(0);
+
+        store
+            .mark_resource_released(
+                &resource.id,
+                &resource.locator,
+                resource.birth_fingerprint.as_deref(),
+                7,
+            )
+            .unwrap();
+        store
+            .mark_resource_released(
+                &resource.id,
+                &resource.locator,
+                resource.birth_fingerprint.as_deref(),
+                11,
+            )
+            .unwrap();
+
+        let released = store
+            .kernel_resources(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == resource.id)
+            .unwrap();
+        assert_eq!(released.state, KernelResourceState::Released);
+        assert_eq!(released.released_at_ms, Some(7));
+        assert_eq!(released.updated_at_ms, 7);
+    }
+
+    #[test]
     fn activated_gate_loss_fails_without_inventing_a_terminal_event() {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker(&mut store);
@@ -2757,7 +2836,7 @@ mod tests {
                 && resource.birth_fingerprint.as_deref()
                     == Some("runtime-claim:55555555555545558555555555555555")
         }));
-        assert!(store.authenticate_attempt(BEARER).unwrap().is_some());
+        assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
     }
 
     #[test]

@@ -156,6 +156,9 @@ pub struct RustStorageSnapshot {
     pub cache_bytes: Option<u64>,
     pub protected_count: u64,
     pub reclaimable_count: u64,
+    /// Live cache rows whose last external reconciliation attempt failed.
+    /// They remain in a recoverable lifecycle and keep totals incomplete.
+    pub failed_count: u64,
     pub cache_count_over_limit: bool,
     pub cache_bytes_over_limit: bool,
     pub complete: bool,

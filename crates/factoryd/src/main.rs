@@ -216,31 +216,33 @@ fn run_rust_worker(worker: RustWorkerInvocation) -> Result<(), Box<dyn Error>> {
     let finish_watch = worker.finish.clone();
     thread::spawn(move || {
         loop {
-            if finish_watch.exists() {
-                return;
-            }
-            if rustix::process::getppid() != Some(expected_parent) {
-                let _ = rustix::process::kill_process_group(
-                    rustix::process::getpid(),
-                    rustix::process::Signal::KILL,
-                );
-                return;
+            if rust_worker_must_terminate(&finish_watch, expected_parent) {
+                terminate_own_process_group();
             }
             thread::sleep(Duration::from_millis(50));
         }
     });
-    factoryd::run_rust_verifier_worker(&worker.invocation, &worker.result)?;
-    while !worker.finish.exists() {
-        if rustix::process::getppid() != Some(expected_parent) {
-            let _ = rustix::process::kill_process_group(
-                rustix::process::getpid(),
-                rustix::process::Signal::KILL,
-            );
-            return Err("Rust worker parent identity changed".into());
+    if factoryd::run_rust_verifier_worker(&worker.invocation, &worker.result).is_err() {
+        terminate_own_process_group();
+    }
+    loop {
+        if rust_worker_must_terminate(&worker.finish, expected_parent) {
+            terminate_own_process_group();
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
+}
+
+fn rust_worker_must_terminate(finish: &Path, expected_parent: rustix::process::Pid) -> bool {
+    finish.exists() || rustix::process::getppid() != Some(expected_parent)
+}
+
+fn terminate_own_process_group() -> ! {
+    let _ = rustix::process::kill_process_group(
+        rustix::process::getpid(),
+        rustix::process::Signal::KILL,
+    );
+    std::process::abort()
 }
 
 fn materializer_invocation_path() -> Result<Option<PathBuf>, Box<dyn Error>> {
@@ -633,7 +635,7 @@ mod tests {
 
     use super::{
         Config, parse_arguments, resolve_cargo_in_path, resolve_executable_in_path,
-        resolve_webhook_config,
+        resolve_webhook_config, rust_worker_must_terminate,
     };
 
     fn config() -> Config {
@@ -798,5 +800,16 @@ mod tests {
             ),
             Some(PathBuf::from("/explicit/webhooks.json"))
         );
+    }
+
+    #[test]
+    fn rust_worker_finish_signal_requires_group_termination() {
+        let current = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&current).unwrap();
+        let finish = root.path().join("finish");
+        let parent = rustix::process::getppid().unwrap();
+        assert!(!rust_worker_must_terminate(&finish, parent));
+        fs::write(&finish, b"").unwrap();
+        assert!(rust_worker_must_terminate(&finish, parent));
     }
 }

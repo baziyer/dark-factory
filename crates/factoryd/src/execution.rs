@@ -338,7 +338,6 @@ pub fn spawn(
     prepare_runtime_root(&config.changes_root.join(".checkpoints"))?;
     prepare_runtime_root(&config.artifacts_root)?;
     prepare_runtime_root(&config.artifacts_root.join("cache"))?;
-    prepare_runtime_root(&config.artifacts_root.join("bundles"))?;
     prepare_runtime_root(&config.artifacts_root.join("tmp"))?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::ManagerStopped)?;
     let config = Arc::new(config);
@@ -486,15 +485,31 @@ impl RustMaintenance {
         if self.active.is_some() {
             return;
         }
-        if let Some(run_id) = self.pending.pop_front() {
-            self.active = Some(RustMaintenanceWork::Completion(run_id.clone()));
-            self.tasks
-                .spawn(async move { reconcile_rust_completion(&config, &state, run_id).await });
-        } else if self.storage_pending {
+        let Some(work) = self.take_next() else {
+            return;
+        };
+        match &work {
+            RustMaintenanceWork::Completion(run_id) => {
+                let run_id = run_id.clone();
+                self.tasks
+                    .spawn(async move { reconcile_rust_completion(&config, &state, run_id).await });
+            }
+            RustMaintenanceWork::Storage => {
+                self.tasks
+                    .spawn(async move { reconcile_rust_storage(&config, &state).await });
+            }
+        }
+        self.active = Some(work);
+    }
+
+    fn take_next(&mut self) -> Option<RustMaintenanceWork> {
+        if self.storage_pending {
             self.storage_pending = false;
-            self.active = Some(RustMaintenanceWork::Storage);
-            self.tasks
-                .spawn(async move { reconcile_rust_storage(&config, &state).await });
+            Some(RustMaintenanceWork::Storage)
+        } else {
+            self.pending
+                .pop_front()
+                .map(RustMaintenanceWork::Completion)
         }
     }
 
@@ -1313,9 +1328,7 @@ async fn reconcile_rust_completion(
     }
     match check.phase {
         RustCompletionPhase::Pending => start_rust_completion(config, state, check, change).await,
-        RustCompletionPhase::Running => {
-            recover_rust_completion(config, state, check, change, &run.resources).await
-        }
+        RustCompletionPhase::Running => recover_rust_completion(config, state, check, change).await,
         RustCompletionPhase::Passed | RustCompletionPhase::Failed => Ok(()),
     }
 }
@@ -1354,6 +1367,12 @@ async fn start_rust_completion(
     let cache_key =
         tokio::task::spawn_blocking(move || rust_verify::cache_key(&incarnation, &key_cargo))
             .await??;
+    let temporary = match prepare_completion_temporary_root(config, state, &check).await {
+        Ok(temporary) => temporary,
+        Err(error) => {
+            return fail_and_release_rust_setup(state, &check, &error.to_string()).await;
+        }
+    };
     let claim_run = check.run_id.clone();
     let claim_key = cache_key.clone();
     let claimed_at_ms = now_ms()?;
@@ -1363,8 +1382,34 @@ async fn start_rust_completion(
             Ok((check, Vec::new()))
         })
         .await?;
-    let temporary = create_completion_temporary_root(config, state, &check).await?;
-    let cache = prepare_rust_cache(config, state, &check, &cache_key).await?;
+    if let Err(error) =
+        prepare_rust_worker_invocation(config, state, &check, &change, &temporary).await
+    {
+        return fail_claimed_rust_setup(config, state, &check, &error).await;
+    }
+
+    let worker_result = run_rust_worker_effect(config, state, &check, &temporary.path).await?;
+    let persisted = persist_rust_worker_result(state, &check, worker_result).await;
+    if persisted.is_ok() {
+        release_completion_temporary_root(state, &check.run_id).await?;
+    }
+    persisted
+}
+
+async fn prepare_rust_worker_invocation(
+    config: &Config,
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    change: &Change,
+    temporary: &CompletionTemporaryRoot,
+) -> Result<(), Error> {
+    let cargo = config.cargo_program.clone().ok_or(DaemonStateError::Store(
+        StoreError::InvalidRustBuildMetadata,
+    ))?;
+    let cache_key = check.cache_key.as_deref().ok_or(DaemonStateError::Store(
+        StoreError::InvalidRustBuildMetadata,
+    ))?;
+    let cache = prepare_rust_cache(config, state, check, cache_key).await?;
     let change_identity = rust_verify::ExactDirectoryIdentity {
         device: change.source_dev.ok_or(DaemonStateError::Store(
             StoreError::InvalidRustBuildMetadata,
@@ -1399,13 +1444,7 @@ async fn start_rust_completion(
         rust_verify::write_worker_invocation(&write_path, &invocation)
     })
     .await??;
-
-    let worker_result = run_rust_worker_effect(config, state, &check, &temporary.path).await?;
-    let persisted = persist_rust_worker_result(state, &check, worker_result).await;
-    if persisted.is_ok() {
-        release_completion_temporary_root(state, &check.run_id).await?;
-    }
-    persisted
+    Ok(())
 }
 
 async fn run_rust_worker_effect(
@@ -1470,45 +1509,102 @@ struct CompletionTemporaryRoot {
     identity: rust_verify::ExactDirectoryIdentity,
 }
 
-async fn create_completion_temporary_root(
+struct CompletionTemporarySpec {
+    path: PathBuf,
+    locator: String,
+    resource_id: String,
+    claim: String,
+}
+
+fn completion_temporary_spec(
     config: &Config,
-    state: &DaemonState,
     check: &RustCompletionCheck,
-) -> Result<CompletionTemporaryRoot, Error> {
-    let nonce = Uuid::new_v4().simple().to_string();
+) -> Result<CompletionTemporarySpec, Error> {
+    let nonce = Uuid::parse_str(check.run_id.as_str())
+        .map_err(|_| Error::InvalidId)?
+        .simple()
+        .to_string();
     let claim = format!("temp-claim:{nonce}");
     let path = config.artifacts_root.join("tmp").join(&nonce);
     let locator = runtime_locator(&path);
     let resource_id = format!("{}:rust-temp", check.run_id.as_str());
-    let declare_run = check.run_id.clone();
-    let declare_id = resource_id.clone();
-    let declare_locator = locator.clone();
-    let declare_claim = claim.clone();
-    let declared_at_ms = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            store.declare_finalizing_resource(
-                &declare_run,
-                &declare_id,
-                KernelResourceKind::TemporaryRoot,
-                &declare_locator,
-                Some(&declare_claim),
-                declared_at_ms,
-            )?;
-            Ok(((), Vec::new()))
+    Ok(CompletionTemporarySpec {
+        path,
+        locator,
+        resource_id,
+        claim,
+    })
+}
+
+async fn prepare_completion_temporary_root(
+    config: &Config,
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+) -> Result<CompletionTemporaryRoot, Error> {
+    let spec = completion_temporary_spec(config, check)?;
+    let resources = state
+        .with_store({
+            let run_id = check.run_id.clone();
+            move |store| store.kernel_resources(&run_id)
         })
         .await?;
-    ensure_private_directory(&path)?;
-    let fingerprint = runtime_birth_fingerprint(&path)?.ok_or(Error::InvalidRuntimeRoot)?;
-    let identity = rust_verify::exact_directory_identity(&path)?;
-    let bind_run = check.run_id.clone();
-    let bind_id = resource_id;
-    let bind_locator = locator;
+    if resources.iter().any(|resource| {
+        resource.kind == KernelResourceKind::TemporaryRoot
+            && resource.id != spec.resource_id
+            && resource.state != KernelResourceState::Released
+    }) {
+        return Err(DaemonStateError::Store(StoreError::InvalidExecutionMetadata).into());
+    }
+    let existing = resources
+        .iter()
+        .find(|resource| resource.id == spec.resource_id);
+    if let Some(resource) = existing {
+        if resource.kind != KernelResourceKind::TemporaryRoot
+            || resource.locator != spec.locator
+            || resource.state == KernelResourceState::Released
+        {
+            return Err(DaemonStateError::Store(StoreError::ResourceIdentityMismatch).into());
+        }
+        if resource.state == KernelResourceState::Active {
+            return validate_active_completion_temporary(spec, resource);
+        }
+        if resource.state != KernelResourceState::Declared
+            || resource.birth_fingerprint.as_deref() != Some(spec.claim.as_str())
+        {
+            return Err(DaemonStateError::Store(StoreError::ResourceIdentityMismatch).into());
+        }
+    } else {
+        let declare_run = check.run_id.clone();
+        let declare_id = spec.resource_id.clone();
+        let declare_locator = spec.locator.clone();
+        let declare_claim = spec.claim.clone();
+        let declared_at_ms = now_ms()?;
+        state
+            .commit_and_publish(move |store| {
+                store.declare_finalizing_resource(
+                    &declare_run,
+                    &declare_id,
+                    KernelResourceKind::TemporaryRoot,
+                    &declare_locator,
+                    Some(&declare_claim),
+                    declared_at_ms,
+                )?;
+                Ok(((), Vec::new()))
+            })
+            .await?;
+    }
+    ensure_empty_private_directory(&spec.path)?;
+    let fingerprint = runtime_birth_fingerprint(&spec.path)?.ok_or(Error::InvalidRuntimeRoot)?;
+    let identity = rust_verify::exact_directory_identity(&spec.path)?;
+    let declare_run = check.run_id.clone();
+    let bind_id = spec.resource_id;
+    let bind_locator = spec.locator;
+    let claim = spec.claim;
     let bound_at_ms = now_ms()?;
     state
         .commit_and_publish(move |store| {
             store.bind_claimed_finalizing_root(
-                &bind_run,
+                &declare_run,
                 &bind_id,
                 &bind_locator,
                 &claim,
@@ -1518,7 +1614,44 @@ async fn create_completion_temporary_root(
             Ok(((), Vec::new()))
         })
         .await?;
-    Ok(CompletionTemporaryRoot { path, identity })
+    Ok(CompletionTemporaryRoot {
+        path: spec.path,
+        identity,
+    })
+}
+
+fn validate_active_completion_temporary(
+    spec: CompletionTemporarySpec,
+    resource: &KernelResource,
+) -> Result<CompletionTemporaryRoot, Error> {
+    let fingerprint = runtime_birth_fingerprint(&spec.path)?.ok_or(Error::InvalidRuntimeRoot)?;
+    if resource.birth_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        return Err(DaemonStateError::Store(StoreError::ResourceIdentityMismatch).into());
+    }
+    Ok(CompletionTemporaryRoot {
+        identity: rust_verify::exact_directory_identity(&spec.path)?,
+        path: spec.path,
+    })
+}
+
+fn ensure_empty_private_directory(path: &Path) -> Result<(), Error> {
+    ensure_private_directory(path)?;
+    let mut entries = fs::read_dir(path).map_err(|source| Error::Runtime {
+        path: path.to_owned(),
+        source,
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|source| Error::Runtime {
+            path: path.to_owned(),
+            source,
+        })?
+        .is_some()
+    {
+        return Err(DaemonStateError::Store(StoreError::InvalidExecutionMetadata).into());
+    }
+    Ok(())
 }
 
 async fn prepare_rust_cache(
@@ -1554,12 +1687,11 @@ async fn prepare_rust_cache(
     let bound_at_ms = now_ms()?;
     state
         .commit_and_publish(move |store| {
-            let cache = store.bind_rust_cache(
+            let cache = store.bind_rust_cache_identity(
                 &bind_run,
                 &bind_path,
                 measurement.device,
                 measurement.inode,
-                measurement.allocated_bytes,
                 bound_at_ms,
             )?;
             Ok((cache, Vec::new()))
@@ -1698,11 +1830,13 @@ async fn remeasure_rust_cache(
     let cache =
         tokio::task::spawn_blocking(move || rust_verify::measure_exact_tree(&cache_path)).await??;
     let cache_run = check.run_id.clone();
+    let expected_revision = check.revision;
     let measured_at_ms = now_ms()?;
     state
         .commit_and_publish(move |store| {
-            store.bind_rust_cache(
+            store.record_rust_cache_measurement(
                 &cache_run,
+                expected_revision,
                 &cache_text,
                 cache.device,
                 cache.inode,
@@ -1903,6 +2037,30 @@ async fn fail_rust_completion(
     Ok(())
 }
 
+async fn fail_and_release_rust_setup(
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    failure: &str,
+) -> Result<(), Error> {
+    fail_rust_completion(state, check, failure).await?;
+    release_completion_temporary_root(state, &check.run_id).await
+}
+
+async fn fail_claimed_rust_setup(
+    config: &Config,
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    error: &Error,
+) -> Result<(), Error> {
+    let failure = match remeasure_rust_cache(config, state, check).await {
+        Ok(()) => error.to_string(),
+        Err(measurement_error) => format!(
+            "{error}; Rust cache could not be measured after setup failure: {measurement_error}"
+        ),
+    };
+    fail_and_release_rust_setup(state, check, &failure).await
+}
+
 fn bounded_completion_failure(failure: &str) -> String {
     let failure = if failure.is_empty() {
         "Rust completion verification failed"
@@ -1920,25 +2078,26 @@ async fn recover_rust_completion(
     config: &Config,
     state: &DaemonState,
     check: RustCompletionCheck,
-    _change: Change,
-    resources: &[KernelResource],
+    change: Change,
 ) -> Result<(), Error> {
-    let temporary = resources.iter().find(|resource| {
-        resource.kind == KernelResourceKind::TemporaryRoot
-            && resource.state != KernelResourceState::Released
-    });
-    let Some(temporary) = temporary else {
-        return fail_rust_completion(
-            state,
-            &check,
-            "daemon restarted before the Rust verifier temporary root was registered",
-        )
-        .await;
+    let temporary = match prepare_completion_temporary_root(config, state, &check).await {
+        Ok(temporary) => temporary,
+        Err(error) => {
+            return fail_and_release_rust_setup(state, &check, &error.to_string()).await;
+        }
     };
-    let Some(path) = locator_path(&temporary.locator) else {
-        return fail_rust_completion(state, &check, "Rust verifier temporary locator is invalid")
-            .await;
-    };
+    if let Err(error) =
+        prepare_rust_worker_invocation(config, state, &check, &change, &temporary).await
+    {
+        return fail_claimed_rust_setup(config, state, &check, &error).await;
+    }
+    let path = temporary.path;
+    let resources = state
+        .with_store({
+            let run_id = check.run_id.clone();
+            move |store| store.kernel_resources(&run_id)
+        })
+        .await?;
     let result_path = path.join("result.json");
     if let Some(effect) = resources.iter().find(|resource| {
         matches!(
@@ -1955,9 +2114,17 @@ async fn recover_rust_completion(
             .await;
         };
         terminate_effect_group(state, &check.run_id, None, &finish_path).await?;
-        remeasure_rust_cache(config, state, &check).await?;
     }
-    let result = if result_path.try_exists().unwrap_or(false) {
+    // A daemon crash may occur after the effect exits but before its resources
+    // are released. Whether or not recovery found an active resource above,
+    // restore the authoritative measured-byte state before consuming a result
+    // or starting the next bounded effect.
+    remeasure_rust_cache(config, state, &check).await?;
+    let result_exists = result_path.try_exists().map_err(|source| Error::Runtime {
+        path: result_path.clone(),
+        source,
+    })?;
+    let result = if result_exists {
         let read_path = result_path;
         match tokio::task::spawn_blocking(move || rust_verify::read_worker_result(&read_path))
             .await?
@@ -2057,7 +2224,7 @@ async fn reconcile_rust_storage(config: &Config, state: &DaemonState) -> Result<
     } else {
         tracing::warn!(
             artifacts_root = %config.artifacts_root.display(),
-            "Rust storage exceeds policy but every exact artifact is protected or unresolved"
+            "Rust storage exceeds policy but every exact cache is protected or has failed reconciliation"
         );
     }
     Ok(())
@@ -2079,7 +2246,7 @@ async fn reconcile_declared_rust_cache(
         .commit_and_publish(move |store| {
             if present {
                 let failure = "declared Rust cache exists without a durable exact identity";
-                store.mark_rust_cache_unresolved(&incarnation, &digest, failure, at_ms)?;
+                store.record_rust_cache_failure(&incarnation, &digest, failure, at_ms)?;
             } else {
                 store.finish_absent_declared_rust_cache(&incarnation, &digest, at_ms)?;
             }
@@ -2129,7 +2296,7 @@ async fn reclaim_rust_artifact(
             let failure = bounded_completion_failure(&error.to_string());
             state
                 .commit_and_publish(move |store| {
-                    store.mark_rust_cache_unresolved(&incarnation, &digest, &failure, at_ms)?;
+                    store.record_rust_cache_failure(&incarnation, &digest, &failure, at_ms)?;
                     Ok(((), Vec::new()))
                 })
                 .await?;
@@ -3038,10 +3205,13 @@ async fn release_absent_resources(
                 move |store| store.rust_completion_check(&run_id)
             })
             .await?;
-        if completion
-            .as_ref()
-            .is_some_and(|check| check.phase.is_terminal())
-        {
+        if !rust_completion_allows_finalization(completion.as_ref()) {
+            // Every provider resource is already gone. The verifier is now
+            // the only owner with work to do, so a dead runner socket must
+            // not manufacture another observer or a process failure.
+            return Ok(true);
+        }
+        if completion.is_some() {
             if let Some(effect) = resources.iter().find(|resource| {
                 matches!(
                     resource.kind,
@@ -3077,6 +3247,10 @@ async fn release_absent_resources(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn rust_completion_allows_finalization(completion: Option<&RustCompletionCheck>) -> bool {
+    completion.is_none_or(|check| check.phase.is_terminal())
 }
 
 async fn release_registered_runtime(
@@ -3675,6 +3849,40 @@ mod tests {
         directory
     }
 
+    fn rust_check(phase: RustCompletionPhase) -> RustCompletionCheck {
+        RustCompletionCheck {
+            run_id: RunId::try_from("22222222-2222-4222-8222-222222222222").unwrap(),
+            project_id: ProjectId::try_from("project").unwrap(),
+            project_incarnation_id: "incarnation".to_owned(),
+            change_id: ChangeId::try_from("change").unwrap(),
+            phase,
+            cache_key: None,
+            source_digest: None,
+            bundle_digest: None,
+            failure: None,
+            revision: 0,
+            requested_at_ms: 1,
+            updated_at_ms: 1,
+            terminal_at_ms: None,
+        }
+    }
+
+    fn execution_config(root: &Path) -> Config {
+        Config {
+            factoryd_program: PathBuf::from("/bin/factoryd"),
+            runner_program: PathBuf::from("/bin/factory-runner"),
+            factoryctl_path: PathBuf::from("/bin/factoryctl"),
+            git_program: PathBuf::from("/usr/bin/git"),
+            cargo_program: Some(PathBuf::from("/usr/bin/cargo")),
+            runtime_root: root.join("runs"),
+            changes_root: root.join("changes"),
+            artifacts_root: root.join("artifacts"),
+            guidance_root: root.join("guidance"),
+            socket_path: root.join("factory.sock"),
+            max_active_runs: 1,
+        }
+    }
+
     #[test]
     fn bearer_is_lowercase_hex_with_the_store_digest_shape() {
         let bearer = random_bearer();
@@ -3694,6 +3902,23 @@ mod tests {
             )));
         }
         assert!(!is_admission_capacity(&Error::InvalidId));
+    }
+
+    #[test]
+    fn rust_maintenance_runs_pending_storage_before_more_completions() {
+        let mut maintenance = RustMaintenance::new();
+        let run_id = RunId::try_from("run-1").unwrap();
+        maintenance.schedule(run_id.clone());
+        maintenance.schedule_storage();
+
+        assert!(matches!(
+            maintenance.take_next(),
+            Some(RustMaintenanceWork::Storage)
+        ));
+        assert!(matches!(
+            maintenance.take_next(),
+            Some(RustMaintenanceWork::Completion(next)) if next == run_id
+        ));
     }
 
     #[tokio::test]
@@ -3856,6 +4081,81 @@ mod tests {
                 StoreError::InvalidRustBuildMetadata
             )))
         ));
+    }
+
+    #[test]
+    fn completion_temporary_root_is_deterministic_and_declared_recovery_requires_empty() {
+        let directory = private_tempdir();
+        let check = rust_check(RustCompletionPhase::Pending);
+        let config = execution_config(directory.path());
+
+        let first = completion_temporary_spec(&config, &check).unwrap();
+        let second = completion_temporary_spec(&config, &check).unwrap();
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            first.path.file_name().and_then(|name| name.to_str()),
+            Some("22222222222242228222222222222222")
+        );
+        ensure_empty_private_directory(&first.path).unwrap();
+        fs::write(first.path.join("unregistered-effect"), b"contents").unwrap();
+        assert!(matches!(
+            ensure_empty_private_directory(&first.path),
+            Err(Error::State(DaemonStateError::Store(
+                StoreError::InvalidExecutionMetadata
+            )))
+        ));
+    }
+
+    #[test]
+    fn running_recovery_refuses_a_replacement_temporary_root() {
+        let directory = private_tempdir();
+        let check = rust_check(RustCompletionPhase::Running);
+        let config = execution_config(directory.path());
+        let spec = completion_temporary_spec(&config, &check).unwrap();
+        ensure_empty_private_directory(&spec.path).unwrap();
+        let fingerprint = runtime_birth_fingerprint(&spec.path).unwrap().unwrap();
+        let resource = KernelResource {
+            id: spec.resource_id.clone(),
+            run_id: check.run_id.clone(),
+            kind: KernelResourceKind::TemporaryRoot,
+            state: KernelResourceState::Active,
+            locator: spec.locator.clone(),
+            birth_fingerprint: Some(fingerprint),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 1,
+            released_at_ms: None,
+        };
+        validate_active_completion_temporary(spec, &resource).unwrap();
+
+        let replacement = completion_temporary_spec(&config, &check).unwrap();
+        fs::rename(
+            &replacement.path,
+            replacement.path.with_extension("original"),
+        )
+        .unwrap();
+        ensure_empty_private_directory(&replacement.path).unwrap();
+        assert!(matches!(
+            validate_active_completion_temporary(replacement, &resource),
+            Err(Error::State(DaemonStateError::Store(
+                StoreError::ResourceIdentityMismatch
+            )))
+        ));
+    }
+
+    #[test]
+    fn pending_rust_completion_prevents_premature_run_finalization() {
+        assert!(!rust_completion_allows_finalization(Some(&rust_check(
+            RustCompletionPhase::Pending
+        ))));
+        assert!(!rust_completion_allows_finalization(Some(&rust_check(
+            RustCompletionPhase::Running
+        ))));
+        assert!(rust_completion_allows_finalization(Some(&rust_check(
+            RustCompletionPhase::Passed
+        ))));
+        assert!(rust_completion_allows_finalization(None));
     }
 
     #[test]

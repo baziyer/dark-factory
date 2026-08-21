@@ -29,6 +29,7 @@ fn run_id(value: &str) -> RunId {
 
 #[test]
 fn request_envelope_has_a_stable_tagged_shape() {
+    assert_eq!(PROTOCOL_VERSION, 5);
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         credential: None,
@@ -301,6 +302,7 @@ fn agent_profile_is_available_only_through_private_local_detail() {
 
 #[test]
 fn server_frames_version_responses_and_events_at_the_outer_boundary() {
+    assert_eq!(PROTOCOL_VERSION, 5);
     let frame = ServerFrame::Response {
         protocol_version: PROTOCOL_VERSION,
         response: LocalResponse::Projects {
@@ -335,6 +337,7 @@ fn rust_storage_status_keeps_incomplete_measurements_explicit() {
                 cache_bytes: None,
                 protected_count: 1,
                 reclaimable_count: 2,
+                failed_count: 1,
                 cache_count_over_limit: false,
                 cache_bytes_over_limit: false,
                 complete: false,
@@ -348,6 +351,7 @@ fn rust_storage_status_keeps_incomplete_measurements_explicit() {
     assert!(storage.get("bundle_bytes").is_none());
     assert_eq!(storage["complete"], false);
     assert_eq!(storage["max_cache_count"], 8);
+    assert_eq!(storage["failed_count"], 1);
 }
 
 #[test]

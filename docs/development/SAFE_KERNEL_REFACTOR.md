@@ -83,11 +83,13 @@ The transition and projection contract is exhaustive:
 The first durable transition to `finalizing` freezes the requested outcome and
 revokes authority. A request received before exit is preserved; exit received
 first requests failure; late requests, exits, and cancellations are idempotent
-no-ops. The public run outcome remains unset until the durable finalizer has
-released resources and, for requested Rust success, obtained the verification
-result. Verification may therefore turn only a requested success into the
-typed `failed(unverifiable)` outcome. Cleanup failure does not invent an
-outcome: it leaves the run visibly `finalizing` with an unresolved resource.
+no-ops. While the run is `finalizing`, the public outcome is the immutable
+proposal; the later terminal event and projection carry the finalizer-selected
+actual outcome. The append-only event history therefore preserves both facts
+without duplicating them as competing columns in the current run row.
+Verification may turn only a proposed success into the typed
+`failed(unverifiable)` outcome. Cleanup failure does not invent an outcome: it
+leaves the run visibly `finalizing` with a recoverable resource failure.
 Retry is an explicit, post-terminal operation that increments the task work
 revision, returns that exact task incarnation to `queued`, and later admits a
 new `RunId`; there is no implicit retry or reuse of run authority.
@@ -397,7 +399,9 @@ approval.
 - [x] Make the durable completion check the one cache-writer lease. Hold it
   through snapshot creation, `cargo test --no-run`, executable discovery,
   copy, digest, sync, and prepared execution. Compilation reads only the
-  private snapshot, never the writable Change.
+  private snapshot, never the writable Change. Recheck that snapshot before
+  and after each top-level test; mutation fails verification before any later
+  test can launch.
 - [x] Prepare a content-addressed executable directory inside the run's
   registered temporary root. Its manifest records source digest, `Cargo.lock`,
   closed build configuration, toolchain identity, and each copied top-level
@@ -419,8 +423,9 @@ approval.
   byte policy that converges after each writer releases. A running writer makes
   byte status incomplete; its exact group is reaped before allocated bytes are
   remeasured. An already measured over-limit cache cannot be claimed again.
-  Status reports aggregate measured bytes and protected count, not a fictional
-  protected-byte subtotal or instantaneous compiler-write ceiling.
+  Status reports aggregate measured bytes, protected count, and recoverable
+  failure count, not a fictional protected-byte subtotal or instantaneous
+  compiler-write ceiling.
 - [x] Reclaim only registered, identity-matched, unleased regenerable caches.
   Snapshots and executable staging are attempt resources removed by the durable
   finalizer. Unique retained Changes are never automatic reclamation targets.
@@ -449,6 +454,9 @@ Stage and boot checkpoint still pending exact-head proof:
 - Replacing a mutable Cargo output after preparation cannot change the selected
   top-level executable; launch re-verifies the attempt-owned staging identity
   and digest.
+- A top-level test that mutates the private snapshot fails verification before
+  another test can launch; the recorded source digest never certifies later
+  execution against changed fixture content.
 - Regenerable cache pressure converges when safe entries suffice. Running
   writers make byte status incomplete; measured over-limit cache reuse is
   refused until reclamation converges. Unique retained Changes are untouched.

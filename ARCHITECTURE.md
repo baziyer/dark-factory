@@ -38,9 +38,10 @@ The run outcome is distinct from its phase: succeeded, blocked with a reason,
 failed with a typed reason, or cancelled with a reason. The first durable move
 to `finalizing` freezes its requested outcome. Later completion, block, cancel,
 or exit observations are idempotent and cannot replace that request. The
-public outcome remains unset until the finalizer completes. For a configured
+`finalizing` projection exposes that proposal; the terminal projection exposes
+the actual result, while append-only events preserve both. For a configured
 Rust check, failed verification is the one documented refinement: it converts
-requested success into `failed(unverifiable)` rather than claiming success.
+proposed success into `failed(unverifiable)` rather than claiming success.
 
 Only the finalizer writes `terminal`. It may do so only when every ephemeral
 resource is released and every retained artifact is durably transferred to
@@ -168,9 +169,11 @@ fixed Cargo/rustc identity and configuration, not per Change or source
 revision. It compiles only the private snapshot, copies the top-level Cargo
 test executables into a content-addressed directory under the run's registered
 temporary root, verifies its manifest/identity/digest, and launches those
-copies. The immutable snapshot is the test working directory; fixtures are not
-copied into the executable directory, doctests are not run, and test code may
-still launch other same-UID processes. Mutable `target/debug` or
+copies. The stable snapshot is the test working directory and is rechecked
+before and after every top-level test; a mutation fails verification before a
+later test can launch. Fixtures are not copied into the executable directory,
+doctests are not run, and test code may still launch other same-UID processes.
+Mutable `target/debug` or
 `target/release` top-level launch is forbidden. These checks prevent confused
 or cooperative replacement; they are not a sandbox against hostile same-UID
 code.
@@ -179,8 +182,9 @@ Regenerable cache storage has a hard entry count and a measured byte policy.
 Starting a writer makes byte status incomplete; after its exact process group
 is reaped, factoryd remeasures allocated bytes and reclaims unprotected caches
 until the policy converges. A measured over-limit cache cannot be claimed for
-another verification. Status reports aggregate measured bytes and protected
-entry count, not an invented protected-byte subtotal. An ordinary directory
+another verification. Status reports aggregate measured bytes, protected entry
+count, and recoverable failure count, not an invented protected-byte subtotal.
+An ordinary directory
 cannot promise a portable instantaneous byte ceiling while Cargo is writing,
 so the architecture does not claim one.
 

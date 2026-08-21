@@ -230,6 +230,7 @@ fn storage_status_is_concise_by_default_and_json_preserves_the_frame() {
         cache_bytes: None,
         protected_count: 1,
         reclaimable_count: 4,
+        failed_count: 0,
         cache_count_over_limit: false,
         cache_bytes_over_limit: false,
         complete: false,
@@ -265,7 +266,7 @@ fn storage_status_is_concise_by_default_and_json_preserves_the_frame() {
     assert!(human.status.success(), "{human:?}");
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "Rust storage: caches 2/8 (unknown / 1024 bytes), protected 1, reclaimable 4, measurement incomplete\n"
+        "Rust storage: caches 2/8 (unknown / 1024 bytes), protected 1, reclaimable 4, failed 0, measurement incomplete\n"
     );
 
     let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
