@@ -1,8 +1,11 @@
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
-    Provider, ProviderHookEvent, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, ChangeId, ChangePhase, ChangeSnapshot,
+    ChangeStorageSnapshot, EventEnvelope, FactoryEvent, LegacySourceId, LegacySourceSnapshot,
+    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskDetail,
+    TaskId, TaskSnapshot, TaskStatus,
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS,
         MAX_LOCAL_FRAME_BYTES, MAX_REQUEST_CREDENTIAL_BYTES, MAX_TASK_BODY_BYTES,
         RequestCredential, RequestEnvelope, ServerFrame,
     },
@@ -400,6 +403,49 @@ fn collection_requests_and_responses_have_stable_cursors() {
     assert_eq!(request["data"]["limit"], 10);
     let response = serde_json::to_value(response).unwrap();
     assert_eq!(response["data"]["next_after_id"], "task-19");
+
+    let legacy_cursor = LegacySourceId::try_from("legacy-0000000000000001").unwrap();
+    let request = serde_json::to_value(LocalRequest::ListLegacySources {
+        project_id: project_id("project-1"),
+        after_id: Some(legacy_cursor.clone()),
+        limit: 25,
+    })
+    .unwrap();
+    assert_eq!(request["data"]["after_id"], legacy_cursor.as_str());
+    assert_eq!(request["data"]["limit"], 25);
+    let response = serde_json::to_value(LocalResponse::LegacySources {
+        sources: Vec::new(),
+        next_after_id: Some(legacy_cursor.clone()),
+    })
+    .unwrap();
+    assert_eq!(response["data"]["next_after_id"], legacy_cursor.as_str());
+
+    let changes = serde_json::to_value(LocalResponse::Changes {
+        changes: Vec::new(),
+        next_after_id: None,
+        project_storage: ChangeStorageSnapshot {
+            retained_count: 2,
+            measured_bytes: None,
+            measured_at_ms: None,
+            active_leases: 1,
+            complete: false,
+        },
+        factory_storage: ChangeStorageSnapshot {
+            retained_count: 7,
+            measured_bytes: Some(4096),
+            measured_at_ms: Some(12),
+            active_leases: 0,
+            complete: true,
+        },
+        hard_factory_count_cap: 64,
+    })
+    .unwrap();
+    assert_eq!(changes["data"]["project_storage"]["retained_count"], 2);
+    assert_eq!(changes["data"]["factory_storage"]["retained_count"], 7);
+    assert_eq!(changes["data"]["factory_storage"]["measured_bytes"], 4096);
+    assert_eq!(changes["data"]["hard_factory_count_cap"], 64);
+    assert!(changes["data"].get("retained_count").is_none());
+    assert!(changes["data"].get("hard_count_cap").is_none());
 }
 
 #[test]
@@ -528,6 +574,84 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
     };
 
     assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+}
+
+#[test]
+fn the_largest_valid_legacy_source_page_fits_one_local_frame() {
+    let escaped = "\u{0001}".repeat(4095);
+    let sources = (0..MAX_LEGACY_SOURCE_PAGE_ITEMS)
+        .map(|index| LegacySourceSnapshot {
+            id: LegacySourceId::try_from(format!("legacy-{index:016x}")).unwrap(),
+            project_id: project_id("project-1"),
+            former_agent_id: Some(agent_id("agent-1")),
+            source_path: format!("/{escaped}"),
+            retained_reason: format!("x{escaped}"),
+            recorded_at_ms: i64::MAX,
+        })
+        .collect();
+    let frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::LegacySources {
+            sources,
+            next_after_id: Some(LegacySourceId::try_from("legacy-next").unwrap()),
+        },
+    };
+
+    assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+}
+
+fn worst_case_change(index: u32) -> ChangeSnapshot {
+    ChangeSnapshot {
+        id: ChangeId::try_from(format!("change-{index:016x}")).unwrap(),
+        project_id: project_id("project-1"),
+        task_id: task_id(&format!("task-{index:016x}")),
+        task_incarnation_id: "00000000-0000-4000-8000-000000000000".into(),
+        phase: ChangePhase::Provisioning,
+        base_oid: Some("f".repeat(64)),
+        revision: i64::MAX,
+        measured_bytes: None,
+        measured_at_ms: None,
+        failure: Some("\u{0001}".repeat(4096)),
+        created_at_ms: i64::MAX,
+        updated_at_ms: i64::MAX,
+        available_at_ms: None,
+        removed_at_ms: None,
+    }
+}
+
+#[test]
+fn the_largest_valid_change_and_event_pages_fit_one_local_frame() {
+    let changes = (0..MAX_CHANGE_PAGE_ITEMS)
+        .map(worst_case_change)
+        .collect::<Vec<_>>();
+    let change_frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::Changes {
+            changes: changes.clone(),
+            next_after_id: Some(ChangeId::try_from("change-next").unwrap()),
+            project_storage: ChangeStorageSnapshot::default(),
+            factory_storage: ChangeStorageSnapshot::default(),
+            hard_factory_count_cap: 64,
+        },
+    };
+    assert!(serde_json::to_vec(&change_frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+
+    let events = changes
+        .into_iter()
+        .take(usize::try_from(MAX_EVENT_PAGE_ITEMS).unwrap())
+        .enumerate()
+        .map(|(index, change)| EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: i64::try_from(index + 1).unwrap(),
+            occurred_at_ms: i64::MAX,
+            event: FactoryEvent::ChangeChanged { change },
+        })
+        .collect();
+    let event_frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::Events { events },
+    };
+    assert!(serde_json::to_vec(&event_frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
 }
 
 #[test]

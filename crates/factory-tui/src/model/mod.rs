@@ -682,7 +682,9 @@ impl Board {
             FactoryEvent::AutoModeChanged { .. }
             | FactoryEvent::PolicyDecision { .. }
             | FactoryEvent::LegacyRepositoryOperation { .. }
-            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
+            | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::ProjectChanged { .. } => {}
         }
 
@@ -696,7 +698,9 @@ impl Board {
                 }
             }
             FactoryEvent::LegacyRepositoryOperation { .. }
-            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
+            | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::LegacyRunChanged { .. }
             | FactoryEvent::LegacySessionChanged { .. } => {}
             FactoryEvent::ProjectChanged { project } => {
@@ -1005,7 +1009,9 @@ impl Board {
             )),
             FactoryEvent::AgentDeleted { .. }
             | FactoryEvent::LegacyRepositoryOperation { .. }
-            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
+            | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::AutoModeChanged { .. }
             | FactoryEvent::TaskDeleted { .. }
             | FactoryEvent::ProjectChanged { .. }

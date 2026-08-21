@@ -1,6 +1,6 @@
 # Dark Factory roadmap
 
-Status: safe-kernel refactor, 20 August 2026
+Status: safe-kernel refactor, 21 August 2026
 
 Dark Factory is frozen. The
 [safe-kernel epic](docs/development/SAFE_KERNEL_REFACTOR.md) is the only active
@@ -13,12 +13,12 @@ boundaries.
 1. **Attempt and resource authority.** Replace resident sessions with one fresh
    process per admitted run; enforce exact attempt bearers; converge every
    outcome through `Finalizing`; let one durable daemon finalizer own cleanup
-   and terminalization. Stage 1 is implemented on its branch and pending its
-   PR, independent review, and merge.
+   and terminalization. Stage 1 is merged.
 2. **Change and source ownership.** Make `factoryd` exclusively create and
-   lease retained Change worktrees. Give providers a source view without a Git
-   administrative locator. Refuse shared-root/non-Git mutation and bound
-   unique retained Changes without deleting them automatically.
+   lease retained plain Change trees from exact local commits. Give providers
+   a source view without a Git administrative locator or publication surface.
+   Bound unique retained Changes without deleting them automatically. Stage 2
+   is implemented on its branch and pending review and merge.
 3. **Build, bundle, and storage ownership.** Use one bounded mutable Cargo cache
    per project/build configuration, build from an immutable exact-source
    snapshot, publish digest-verified executable bundles, and reclaim only

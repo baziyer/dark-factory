@@ -12,7 +12,7 @@ pub struct Decision {
     pub denied_by: Option<&'static str>,
 }
 
-pub fn decide(payload: &Value, worktree: &Path) -> Decision {
+pub fn decide(payload: &Value, source_root: &Path) -> Decision {
     let tool_name = payload
         .get("tool_name")
         .and_then(Value::as_str)
@@ -30,14 +30,10 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
-    } else if changes_capacity(commands.as_deref().unwrap_or_default()) {
-        Some("capacity_operator_only")
-    } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
-        Some("repository_authority_operator_only")
-    } else if destructive_git(commands.as_deref().unwrap_or_default()) {
-        Some("destructive_git")
-    } else if recursive_force_delete_outside(commands.as_deref().unwrap_or_default(), worktree) {
-        Some("recursive_delete_outside_worktree")
+    } else if disallowed_git(commands.as_deref().unwrap_or_default()) {
+        Some("destructive_or_publication_git")
+    } else if recursive_force_delete_outside(commands.as_deref().unwrap_or_default(), source_root) {
+        Some("recursive_delete_outside_source")
     } else if paths.any(secret_path)
         || shell_accesses_secret(commands.as_deref().unwrap_or_default())
     {
@@ -51,72 +47,65 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
     }
 }
 
-fn changes_capacity(commands: &[Vec<ShellWord>]) -> bool {
-    commands.iter().any(|words| {
-        let Some((program, args)) = resolve_command(words) else {
-            return false;
-        };
-        program == "factoryctl" && args.windows(2).any(|words| words == ["capacity", "set"])
-    })
-}
-
-fn changes_repository_authority(commands: &[Vec<ShellWord>]) -> bool {
-    commands.iter().any(|words| {
-        let Some((program, args)) = resolve_command(words) else {
-            return false;
-        };
-        program == "factoryctl"
-            && args
-                .windows(3)
-                .any(|words| words == ["project", "repository", "set"])
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ShellWord {
     Arg(String),
     Redirect(String),
 }
 
-fn destructive_git(commands: &[Vec<ShellWord>]) -> bool {
+fn disallowed_git(commands: &[Vec<ShellWord>]) -> bool {
     commands.iter().any(|words| {
         let Some((program, args)) = resolve_command(words) else {
             return false;
         };
-        program == "git"
-            && (args.windows(2).any(|w| w == ["reset", "--hard"])
-                || destructive_push(&args)
-                || args
-                    .windows(2)
-                    .any(|w| w[0] == "branch" && matches!(w[1].as_str(), "-D" | "-d" | "--delete")))
+        if program != "git" {
+            return false;
+        }
+        let Some((subcommand, args)) = git_subcommand(&args) else {
+            return false;
+        };
+        match subcommand {
+            "push" => true,
+            "reset" => args.iter().any(|arg| arg == "--hard"),
+            "branch" => args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete")),
+            _ => false,
+        }
     })
 }
 
-fn destructive_push(args: &[String]) -> bool {
-    let Some(push_index) = args.iter().position(|word| word == "push") else {
-        return false;
-    };
-    args[push_index + 1..].iter().any(|arg| {
-        force_push_option(arg)
-            || delete_push_option(arg)
-            || (!arg.starts_with('-') && (arg.starts_with('+') || arg.starts_with(':')))
-    })
+fn git_subcommand(args: &[String]) -> Option<(&str, &[String])> {
+    let mut cursor = 0;
+    while let Some(argument) = args.get(cursor) {
+        match argument.as_str() {
+            "--" => {
+                cursor += 1;
+                break;
+            }
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+            | "--config-env" => cursor += 2,
+            _ if argument.starts_with("-C") || argument.starts_with("-c") => cursor += 1,
+            _ if argument.starts_with("--git-dir=")
+                || argument.starts_with("--work-tree=")
+                || argument.starts_with("--namespace=")
+                || argument.starts_with("--super-prefix=")
+                || argument.starts_with("--config-env=") =>
+            {
+                cursor += 1;
+            }
+            _ if argument.starts_with('-') => cursor += 1,
+            _ => break,
+        }
+    }
+    let subcommand = args.get(cursor)?;
+    Some((subcommand, &args[cursor + 1..]))
 }
 
-fn force_push_option(argument: &str) -> bool {
-    argument.starts_with("--force") || (argument.starts_with("-f") && !argument.starts_with("--"))
-}
-
-fn delete_push_option(argument: &str) -> bool {
-    argument == "--delete"
-        || argument.starts_with("--delete=")
-        || (argument.starts_with("-d") && !argument.starts_with("--"))
-}
-
-fn recursive_force_delete_outside(commands: &[Vec<ShellWord>], worktree: &Path) -> bool {
+fn recursive_force_delete_outside(commands: &[Vec<ShellWord>], source_root: &Path) -> bool {
     commands.iter().enumerate().any(|(index, words)| {
         resolve_command(words).is_some_and(|(program, args)| {
-            program == "rm" && unsafe_recursive_delete(index, &args, commands.len(), worktree)
+            program == "rm" && unsafe_recursive_delete(index, &args, commands.len(), source_root)
         })
     })
 }
@@ -125,7 +114,7 @@ fn unsafe_recursive_delete(
     index: usize,
     args: &[String],
     command_count: usize,
-    worktree: &Path,
+    source_root: &Path,
 ) -> bool {
     let recursive = args
         .iter()
@@ -157,7 +146,7 @@ fn unsafe_recursive_delete(
             }
             let path = Path::new(target);
             if path.is_absolute() {
-                path.starts_with(worktree)
+                path.starts_with(source_root)
                     && path.components().all(|component| {
                         matches!(
                             component,
@@ -509,35 +498,35 @@ mod tests {
 
     #[test]
     fn denies_explicit_dangerous_commands_and_secret_paths() {
-        let root = Path::new("/tmp/worktree");
-        assert_eq!(
-            decide(&bash("git push --force origin main"), root).denied_by,
-            Some("destructive_git")
-        );
+        let root = Path::new("/tmp/change");
         for command in [
+            "git push origin feature",
+            "git push --force origin main",
             "git push --force-with-lease origin main",
-            "git push --force-with-lease=main origin main",
-            "git push --force-if-includes origin main",
-            "git push -fHEAD origin main",
             "git push origin +main:main",
             "git push --delete origin obsolete",
-            "git push -d origin obsolete",
-            "git push --delete=obsolete origin",
-            "git push -dobsolete origin",
-            "git push origin :obsolete",
-            "/usr/bin/git push --force origin main",
-            "cd repo && git push --force origin main",
-            "gh issue comment 80 --body 'literal << EOF'\ngit push --force origin main",
+            "/usr/bin/git push origin main",
+            "git -C source push origin main",
+            "git -Csource push origin main",
+            "git --no-pager push origin main",
+            "env FOO=1 git -c push.default=current push origin main",
+            "FOO=1 git push origin main",
+            "command git reset --hard HEAD",
+            "sudo git branch -D obsolete",
+            "g\\it push origin main",
+            "echo ready | git push origin main",
+            "git reset --hard HEAD",
+            "git branch -D obsolete",
         ] {
             assert_eq!(
                 decide(&bash(command), root).denied_by,
-                Some("destructive_git"),
+                Some("destructive_or_publication_git"),
                 "{command}"
             );
         }
         assert_eq!(
             decide(&bash("rm -rf /tmp/other"), root).denied_by,
-            Some("recursive_delete_outside_worktree")
+            Some("recursive_delete_outside_source")
         );
         assert_eq!(
             decide(
@@ -558,17 +547,19 @@ mod tests {
     }
 
     #[test]
-    fn permits_reversible_worktree_operations() {
-        let root = Path::new("/tmp/worktree");
-        assert_eq!(decide(&bash("git status --short"), root).denied_by, None);
-        assert_eq!(
-            decide(&bash("git push origin feature"), root).denied_by,
-            None
-        );
-        assert_eq!(
-            decide(&bash("git push origin HEAD:feature"), root).denied_by,
-            None
-        );
+    fn permits_operations_inside_the_change_source() {
+        let root = Path::new("/tmp/change");
+        for command in [
+            "git status --short",
+            "git diff -- src/lib.rs",
+            "git apply update.patch",
+            "git add src/lib.rs",
+            "git mv old.rs new.rs",
+            "git rm obsolete.rs",
+            "git commit -m push",
+        ] {
+            assert_eq!(decide(&bash(command), root).denied_by, None, "{command}");
+        }
         assert_eq!(decide(&bash("echo git push --force"), root).denied_by, None);
         assert_eq!(
             decide(
@@ -589,23 +580,23 @@ mod tests {
             None
         );
         assert_eq!(
-            decide(&bash("rm -rf /tmp/worktree/target"), root).denied_by,
+            decide(&bash("rm -rf /tmp/change/target"), root).denied_by,
             None
         );
         assert_eq!(decide(&bash("rm -rf target"), root).denied_by, None);
         assert_eq!(
             decide(&bash("rm -rf ../other"), root).denied_by,
-            Some("recursive_delete_outside_worktree")
+            Some("recursive_delete_outside_source")
         );
         for command in [
-            "rm -rf /tmp/worktree/../other",
+            "rm -rf /tmp/change/../other",
             "cd /tmp && rm -rf other",
             "rm -rf target && echo done",
             "echo preparing; rm -rf /tmp/other",
         ] {
             assert_eq!(
                 decide(&bash(command), root).denied_by,
-                Some("recursive_delete_outside_worktree"),
+                Some("recursive_delete_outside_source"),
                 "{command}"
             );
         }
@@ -613,31 +604,15 @@ mod tests {
 
     #[test]
     fn accepted_shell_grammar_is_table_driven() {
-        let root = Path::new("/tmp/worktree");
+        let root = Path::new("/tmp/change");
         let cases = [
-            ("env git push --force origin main", Some("destructive_git")),
-            (
-                "FOO=1 git push --force origin main",
-                Some("destructive_git"),
-            ),
-            ("command git reset --hard HEAD", Some("destructive_git")),
-            ("sudo git branch -D main", Some("destructive_git")),
-            (
-                "sudo FOO=1 git push --force origin main",
-                Some("destructive_git"),
-            ),
-            ("g\\it push --force origin main", Some("destructive_git")),
-            (
-                "echo ok | git push --force origin main",
-                Some("destructive_git"),
-            ),
             (
                 "env rm -rf /tmp/other",
-                Some("recursive_delete_outside_worktree"),
+                Some("recursive_delete_outside_source"),
             ),
             (
                 "r\\m -rf /tmp/other",
-                Some("recursive_delete_outside_worktree"),
+                Some("recursive_delete_outside_source"),
             ),
             ("command cat ~/.ssh/id_ed25519", Some("secret_path")),
             ("echo replacement>~/.aws/credentials", Some("secret_path")),
@@ -696,29 +671,5 @@ mod tests {
                 "{command}"
             );
         }
-    }
-
-    #[test]
-    fn capacity_mutation_is_denied_for_every_supported_command_wrapper() {
-        let root = Path::new("/tmp/worktree");
-        for command in [
-            "factoryctl capacity set 8",
-            "FOO=1 factoryctl capacity set 8",
-            "env FOO=1 factoryctl capacity set 8",
-            "command factoryctl capacity set 8",
-            "exec factoryctl capacity set 8",
-            "printf ready; factoryctl capacity set 8",
-            "printf ready | factoryctl capacity set 8",
-        ] {
-            assert_eq!(
-                decide(&bash(command), root).denied_by,
-                Some("capacity_operator_only"),
-                "{command}"
-            );
-        }
-        assert_eq!(
-            decide(&bash("factoryctl capacity status"), root).denied_by,
-            None
-        );
     }
 }

@@ -37,8 +37,9 @@ pub fn capabilities_for(kind: factory_core::Provider) -> Capabilities {
 pub struct SpawnContext {
     /// The exact durable attempt that authorizes this process.
     pub run_id: RunId,
-    /// Absolute path to the run's daemon-owned worktree; the process `cwd`.
-    pub worktree: PathBuf,
+    /// Absolute path to the run's daemon-owned `.git`-free Change source; the
+    /// provider process `cwd`.
+    pub source_root: PathBuf,
     /// The one input delivered when the process starts.
     pub startup_input: Vec<u8>,
     /// An explicit provider model, or `None` for the provider's default.

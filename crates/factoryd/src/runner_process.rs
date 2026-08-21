@@ -55,7 +55,11 @@ pub struct LaunchSpec {
     pub run_id: RunId,
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
+    /// Initial cwd for the trusted wrapper or direct provider process.
     pub cwd: PathBuf,
+    /// Exact daemon-owned source boundary inherited by the eventual provider,
+    /// even when a trusted provisioning wrapper starts from a private cwd.
+    pub source_root: PathBuf,
     pub startup_input: Vec<u8>,
 }
 
@@ -215,6 +219,13 @@ pub async fn prepare_runner(spec: LaunchSpec) -> Result<PreparedRunnerProcess, E
     prepare_runner_with_environment(spec, CapturedEnvironment::capture()).await
 }
 
+/// Resolves one provider program through the same captured, bounded PATH and
+/// executable checks used by [`prepare_runner`]. The materializer wrapper
+/// receives only this absolute path, never a second ambient lookup.
+pub fn resolve_provider_executable(program: &Path) -> Result<PathBuf, Error> {
+    resolve_executable(program, &CapturedEnvironment::capture(), "provider")
+}
+
 async fn prepare_runner_with_environment(
     spec: LaunchSpec,
     environment: CapturedEnvironment,
@@ -242,6 +253,8 @@ async fn prepare_runner_with_environment(
     let activation_path = spec.runtime_dir.join("runner-exec.activate");
     ensure_exec_gate_absent(&activation_path)?;
     let startup_input = prepare_startup_input(&spec.startup_input)?;
+    let cwd = spec.cwd;
+    let source_root = spec.source_root;
     let expected_parent = rustix::process::getpid();
     let mut command = Command::new(&runner);
     // The runner is its own process-group leader: an attempt must outlive
@@ -267,7 +280,7 @@ async fn prepare_runner_with_environment(
         .arg("--runtime-dir")
         .arg(spec.runtime_dir)
         .arg("--cwd")
-        .arg(spec.cwd);
+        .arg(&cwd);
     command
         .arg("--stdin-bytes")
         .arg(spec.startup_input.len().to_string());
@@ -276,7 +289,12 @@ async fn prepare_runner_with_environment(
         .arg(provider)
         .args(spec.provider_arguments)
         .stdin(startup_input);
-    apply_runner_environment(&mut command, &environment, &spec.factoryctl_path);
+    apply_runner_environment(
+        &mut command,
+        &environment,
+        &spec.factoryctl_path,
+        &source_root,
+    );
     apply_provider_environment(&mut command, provider_environment.as_deref());
     for (name, value) in &spec.attempt_environment {
         command.env(name, value);
@@ -336,6 +354,7 @@ fn apply_runner_environment(
     command: &mut Command,
     environment: &CapturedEnvironment,
     factoryctl_path: &Path,
+    source_root: &Path,
 ) {
     command.env_clear();
     for (name, value) in &environment.values {
@@ -351,10 +370,14 @@ fn apply_runner_environment(
         );
     }
     command.env("NO_COLOR", "1").env("TERM", "dumb");
-    // Attempts may inspect and edit their worktree, but cannot use the
-    // operator's remote credentials. Reset credential helpers, disable SSH,
-    // hide gh configuration, and forbid prompts.
+    // Attempts may inspect and edit only their daemon-owned source. Stop
+    // ordinary repository discovery at that exact `.git`-free root, reset
+    // credential helpers, disable SSH, hide gh configuration, and forbid
+    // prompts. Ambient Git locator variables are already removed by
+    // `env_clear` above.
     command
+        .env("GIT_CEILING_DIRECTORIES", source_root)
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "/usr/bin/false")
         .env("GIT_SSH_COMMAND", "/usr/bin/false")
@@ -638,6 +661,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             runner_instance_id: id::<RunnerInstanceId>("runner-safe-launch"),
             runtime_dir: directory.join("runtime"),
             cwd: directory.to_owned(),
+            source_root: directory.to_owned(),
             startup_input: task,
         }
     }
@@ -674,6 +698,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             &mut command,
             &captured,
             Path::new("/opt/dark-factory/bin/factoryctl"),
+            Path::new("/opt/dark-factory/changes/change-1"),
         );
         let output = command.output().await.unwrap();
         assert!(output.status.success());
@@ -682,6 +707,11 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(output.lines().any(|line| line == "HOME=/safe/home"));
         assert!(output.lines().any(|line| line == "USER=safe-user"));
         assert!(output.lines().any(|line| line == "SHELL=/bin/sh"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "GIT_CEILING_DIRECTORIES=/opt/dark-factory/changes/change-1")
+        );
         assert!(
             output
                 .lines()
@@ -911,6 +941,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             &mut command,
             &captured,
             Path::new("/opt/dark-factory/bin/factoryctl"),
+            Path::new("/opt/dark-factory/changes/change-1"),
         );
         let output = command.output().await.unwrap();
         assert!(output.status.success());

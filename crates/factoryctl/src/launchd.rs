@@ -207,10 +207,10 @@ impl ExistingJob {
         }
         let mut arguments = self.program_arguments.iter();
         while let Some(argument) = arguments.next() {
-            if argument == "--database" {
-                if let Some(parent) = arguments.next().and_then(|db| Path::new(db).parent()) {
-                    return parent.to_path_buf();
-                }
+            if argument == "--database"
+                && let Some(parent) = arguments.next().and_then(|db| Path::new(db).parent())
+            {
+                return parent.to_path_buf();
             }
         }
         user_home.join(".dark-factory")

@@ -60,7 +60,7 @@ const DEFAULT_APPROVAL_POLICY: &str = "on-request";
 ///   dev server that is not there.
 /// - `projects`: the operator's own per-repo trust decisions (which repos
 ///   *they* have approved running Codex against unprompted) have no
-///   bearing on an attempt's own worktree, which
+///   bearing on an attempt's own daemon-owned source, which
 ///   `rewrite_config_block` already grants trust to explicitly, every
 ///   spawn, on its own terms.
 /// - `hooks`: covers both `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]`
@@ -186,7 +186,7 @@ impl Provider for CodexProvider {
         let codex_home = ctx.agent_dir.join("codex-home");
         seed_codex_home_once(&codex_home, self.source_home.as_deref())?;
         rewrite_hooks_block(&codex_home, &ctx.factoryctl_path, &ctx.hook_token_path)?;
-        rewrite_config_block(&codex_home, &ctx.worktree)?;
+        rewrite_config_block(&codex_home, &ctx.source_root)?;
 
         let mut args = vec![
             "exec".to_owned(),
@@ -416,9 +416,9 @@ fn rewrite_hooks_block(
     })
 }
 
-/// Rewrites the generated trust block for the exact attempt worktree.
-fn rewrite_config_block(codex_home: &Path, worktree: &Path) -> Result<(), ProviderError> {
-    let worktree = canonicalize_or_given(worktree);
+/// Rewrites the generated trust block for the exact attempt source root.
+fn rewrite_config_block(codex_home: &Path, source_root: &Path) -> Result<(), ProviderError> {
+    let source_root = canonicalize_or_given(source_root);
 
     let config_path = codex_home.join("config.toml");
     let existing = fs::read_to_string(&config_path).map_err(|source| ProviderError::Seed {
@@ -433,7 +433,7 @@ fn rewrite_config_block(codex_home: &Path, worktree: &Path) -> Result<(), Provid
             .trim_end()
             .to_owned();
     rewritten.push_str("\n\n");
-    rewritten.push_str(&config_block_toml(&worktree));
+    rewritten.push_str(&config_block_toml(&source_root));
     hooks::write_private_file(&config_path, rewritten.as_bytes()).map_err(|source| {
         ProviderError::Seed {
             path: config_path.clone(),
@@ -446,13 +446,13 @@ fn canonicalize_or_given(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-fn config_block_toml(worktree: &Path) -> String {
+fn config_block_toml(source_root: &Path) -> String {
     let mut block = String::new();
     block.push_str(CONFIG_BEGIN_MARKER);
     block.push('\n');
     block.push_str(&format!(
         "[projects.{}]\n",
-        toml_string(&worktree.to_string_lossy())
+        toml_string(&source_root.to_string_lossy())
     ));
     block.push_str("trust_level = \"trusted\"\n");
     block.push_str(CONFIG_END_MARKER);
@@ -605,7 +605,7 @@ mod provider_tests {
     fn context(directory: &Path) -> SpawnContext {
         SpawnContext {
             run_id: RunId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
-            worktree: directory.join("worktree"),
+            source_root: directory.join("source"),
             startup_input: b"fix the admitted task".to_vec(),
             model: None,
             reasoning_effort: None,
@@ -986,11 +986,11 @@ mod provider_tests {
 
     #[test]
     fn config_block_toml_has_the_exact_designed_shape() {
-        let block = config_block_toml(Path::new("/abs/worktrees/worker-1"));
+        let block = config_block_toml(Path::new("/abs/changes/change-1"));
         assert_eq!(
             block,
             "# --- dark-factory config BEGIN ---\n\
-             [projects.\"/abs/worktrees/worker-1\"]\n\
+             [projects.\"/abs/changes/change-1\"]\n\
              trust_level = \"trusted\"\n\
              # --- dark-factory config END ---\n"
         );
@@ -1021,7 +1021,7 @@ mod provider_tests {
         assert!(!contents.contains("network_access"));
         assert!(contents.contains(&format!(
             "[projects.{}]",
-            toml_string(&canonicalize_or_given(&ctx.worktree).to_string_lossy())
+            toml_string(&canonicalize_or_given(&ctx.source_root).to_string_lossy())
         )));
         assert!(contents.contains("trust_level = \"trusted\""));
         // sandbox_mode is a root-table key, positioned before every
@@ -1127,12 +1127,12 @@ mod provider_tests {
         // factory attempt.
         assert!(!contents.contains("/Users/op/other-repo"));
         assert!(!contents.contains("/Users/op/another-repo"));
-        // This attempt's own worktree still gains a trust entry, from
+        // This attempt's own daemon-owned source still gains a trust entry, from
         // `rewrite_config_block` -- unrelated to what was (or wasn't)
         // seeded.
         assert!(contents.contains(&format!(
             "[projects.{}]",
-            toml_string(&ctx.worktree.to_string_lossy())
+            toml_string(&ctx.source_root.to_string_lossy())
         )));
 
         if !codex_is_installed() {

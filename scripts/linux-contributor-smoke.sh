@@ -3,10 +3,11 @@ set -eu
 
 # A short, provider-free contributor check for Ubuntu. The workspace tests
 # exercise the deeper attempt/resource lifecycle; this script proves that a
-# fresh source checkout can bring up the real binaries and complete one
-# orchestrator task through the public CLI and one-shot shell provider.
+# fresh source checkout can bring up the real binaries, materialize one exact
+# `.git`-free Change, and complete one worker task through the public CLI and
+# one-shot shell provider.
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 target_root=${CARGO_TARGET_DIR:-"$repo_root/target"}
 bin_dir="$target_root/debug"
 factoryd="$bin_dir/factoryd"
@@ -30,7 +31,7 @@ if test -n "${DARK_FACTORY_SMOKE_ROOT:-}"; then
 else
     scratch=$(mktemp -d /tmp/dark-factory-linux-smoke.XXXXXX)
 fi
-scratch=$(CDPATH= cd -- "$scratch" && pwd -P)
+scratch=$(CDPATH='' cd -- "$scratch" && pwd -P)
 home="$scratch/home"
 repo="$scratch/repo"
 socket="$home/f.sock"
@@ -48,13 +49,7 @@ export HOME="$scratch/user"
 daemon_pid=
 run_id=
 tracked_processes="$scratch/runner-processes"
-provider_launches="$scratch/provider-launches"
-
-shell_quote() {
-    printf "'"
-    printf '%s' "$1" | sed "s/'/'\\\\''/g"
-    printf "'"
-}
+provider_launches="$HOME/launches"
 
 run_list() {
     "$factoryctl" --socket "$socket" run list \
@@ -304,15 +299,17 @@ fi
 if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
     shell_command='sleep 30'
 else
-    launch_path=$(shell_quote "$provider_launches")
-    shell_command="printf '%s\\n' launch >> $launch_path; sleep 5; exec \"\$DARK_FACTORY_FACTORYCTL\" task done --result \"Linux source smoke complete\""
+    shell_command='test ! -e .git; ! git rev-parse --show-toplevel >/dev/null 2>&1; ! git worktree add ../x HEAD >/dev/null 2>&1; echo retained-mutation >>README.md; echo launch >>"$HOME/launches"; sleep 5; exec "$DARK_FACTORY_FACTORYCTL" task done --result done'
 fi
-"$factoryctl" agent add \
+if ! "$factoryctl" agent add \
     --id linux-smoke-agent \
     --project linux-smoke-project \
-    --role orchestrator \
+    --role worker \
     --provider shell \
-    --model "$shell_command" >/dev/null
+    --model "$shell_command" >"$scratch/agent-add.json"; then
+    cat "$scratch/agent-add.json" >&2
+    exit 1
+fi
 "$factoryctl" task add \
     --id linux-smoke-task \
     --project linux-smoke-project \
@@ -356,14 +353,14 @@ test "$(wc -l <"$provider_launches" | tr -d '[:space:]')" = 1 || {
     exit 1
 }
 run_list
-test "$(grep -o '"id":"[^"]*"' "$scratch/runs.json" | wc -l | tr -d '[:space:]')" = 1 \
-    && grep -Fq "\"id\":\"$run_id\"" "$scratch/runs.json" \
-    && grep -Fq '"phase":"terminal"' "$scratch/runs.json" \
-    && grep -Fq '"outcome":{"type":"succeeded"' "$scratch/runs.json" || {
+if ! test "$(grep -o '"id":"[^"]*"' "$scratch/runs.json" | wc -l | tr -d '[:space:]')" = 1 \
+    || ! grep -Fq "\"id\":\"$run_id\"" "$scratch/runs.json" \
+    || ! grep -Fq '"phase":"terminal"' "$scratch/runs.json" \
+    || ! grep -Fq '"outcome":{"type":"succeeded"' "$scratch/runs.json"; then
     cat "$scratch/runs.json" >&2
     echo "daemon restart did not preserve one exact successful run" >&2
     exit 1
-}
+fi
 snapshot_runner_processes
 test ! -s "$tracked_processes" || {
     cat "$tracked_processes" >&2
@@ -376,4 +373,48 @@ test ! -d "$home/runs" || test -z "$(find "$home/runs" -mindepth 1 -print -quit)
     exit 1
 }
 
-echo "Linux source smoke passed: private socket, daemon crash/restart recovery, one-shot shell task, and resource teardown"
+"$factoryctl" change list --project linux-smoke-project >"$scratch/changes.json"
+grep -Fq '"phase":"available"' "$scratch/changes.json" || {
+    cat "$scratch/changes.json" >&2
+    echo "completed task did not retain one available Change" >&2
+    exit 1
+}
+change_source=$(find "$home/changes" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print)
+if ! test "$(printf '%s\n' "$change_source" | sed '/^$/d' | wc -l | tr -d '[:space:]')" = 1 \
+    || test -e "$change_source/.git" \
+    || ! grep -Fq 'retained-mutation' "$change_source/README.md"; then
+    find "$home/changes" -mindepth 1 -maxdepth 2 -print >&2
+    echo "retained Change source is missing, ambiguous, Git-linked, or lost provider edits" >&2
+    exit 1
+fi
+
+change_id=$(sed -n 's/.*"changes":\[{"id":"\([^"]*\)".*/\1/p' "$scratch/changes.json")
+change_revision=$(sed -n 's/.*"revision":\([0-9][0-9]*\).*/\1/p' "$scratch/changes.json")
+test -n "$change_id" && test -n "$change_revision" || {
+    cat "$scratch/changes.json" >&2
+    echo "could not derive the typed Change identity and revision" >&2
+    exit 1
+}
+"$factoryctl" change remove \
+    --project linux-smoke-project \
+    --change "$change_id" \
+    --revision "$change_revision" >/dev/null
+attempt=0
+while ! "$factoryctl" change list --project linux-smoke-project \
+    | grep -q '"phase":"removed"'; do
+    attempt=$((attempt + 1))
+    test "$attempt" -lt 300 || {
+        "$factoryctl" change list --project linux-smoke-project >&2 || true
+        cat "$scratch/factoryd.log" >&2
+        echo "explicit Change removal did not converge" >&2
+        exit 1
+    }
+    sleep 0.1
+done
+test ! -e "$change_source" || {
+    find "$change_source" -mindepth 0 -maxdepth 2 -print >&2
+    echo "removed Change retained its source directory" >&2
+    exit 1
+}
+
+echo "Linux source smoke passed: exact .git-free Change, daemon crash/restart recovery, one-shot shell task, explicit removal, and resource teardown"

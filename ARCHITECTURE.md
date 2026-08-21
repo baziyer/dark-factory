@@ -1,16 +1,15 @@
 # Architecture
 
 Dark Factory separates model policy from durable work authority. This file
-describes the Stage 1 kernel now implemented on the refactor branch and the
-fail-closed boundaries that remain until Stages 2 and 3. It is a contract, not
-a component catalogue.
+describes the attempt kernel and daemon-owned Change model implemented on the
+refactor branch, plus the fail-closed build boundary that remains for Stage 3.
+It is a contract, not a component catalogue.
 
 ## Current status
 
-Stage 1 is an intermediate implementation pending pull-request review. It is
-not a boot candidate. Worker admission deliberately fails because no
-production Change allocator exists yet. Do not start the daemon against the
-operator installation or submit provider work.
+Stages 1 and 2 remain frozen implementation work pending pull-request and boot
+review. They are not a boot candidate. Do not start the daemon against the
+operator installation or submit real provider work.
 
 The complete design and causal proof matrix live in
 [`docs/development/SAFE_KERNEL_REFACTOR.md`](docs/development/SAFE_KERNEL_REFACTOR.md).
@@ -59,11 +58,11 @@ pretends the resource disappeared or rewrites the outcome.
 4. Request authorization is exhaustive and fail-closed. Workers can act only
    on their admitted work. Orchestrators can propose bounded scheduling policy
    within their project. Operator authority cannot be used as an attempt
-   identity for completion, blocking, hooks, or repository mutation.
+   identity for completion, blocking, or hooks.
 5. Admission is the only transition from queued work to an attempt. It binds
    the immutable task incarnation and work revision before external effects.
 6. No admitted attempt means no provider process, tool hook, outcome request,
-   repository mutation, or writable source lease.
+   or writable source lease.
 7. A retry creates a new run and new bearer. It never revives an old process
    or credential.
 
@@ -121,21 +120,33 @@ falls back to the operator token.
 Provider output is opaque. Hooks are authenticated observations and bounded
 requests, not lifecycle authority. The daemon never infers success from text.
 
-## Source ownership: Stage 1 refusal
+## Source ownership
 
-Stage 1 has no production source allocator. Worker admission therefore returns
-`SourceProvisioningUnavailable`. Module-private tests may insert an exact
-Change backed by a temporary directory solely to prove the authority model.
+For a worker, admission atomically reserves one Change ID and one daemon-derived
+path for the exact task incarnation. A registered, parent-bound wrapper then
+selects one full local Git commit, records the repository and staging inode,
+reads its bounded manifest and exact blob OIDs through `git cat-file`, and
+atomically publishes the resulting safe tree. It does not use `git archive`,
+so repository-local export attributes cannot transform committed bytes.
+Partial clones are refused before object reads, and lazy promisor fetch is
+disabled: the selected commit must already be wholly local. The real provider
+replaces that same registered process only after SQLite records the Change as
+`available`.
 
-Migration preserves each legacy agent worktree as an unlinked retained Change.
-It does not inspect, delete, relocate, or assign that path. Stage 2 will make
-`factoryd` the only product path that creates and leases Change worktrees,
-remove Git administrative locators from provider source views, and refuse
-non-Git source mutation.
+The provider sees a plain writable source tree with no `.git` locator. Git
+repository discovery and linked-worktree creation are refused by construction
+and by the sanitized environment. Retries reuse the same retained Change;
+deletion is an explicit identity- and revision-checked transition that is
+refused while an attempt leases it. Factoryd supplies no status, commit, push,
+pull-request, or publication operation.
+
+Pre-kernel source paths live only in `legacy_sources`. They are quarantine
+metadata, not Changes: factoryd never touches the recorded filesystem path and
+can only forget the metadata row by typed ID.
 
 ## Build and storage boundary
 
-Stage 1 does not solve build storage. Stage 3 must replace per-worktree Cargo
+Stages 1 and 2 do not solve build storage. Stage 3 must replace per-checkout Cargo
 targets with a bounded project cache keyed by toolchain/profile configuration,
 then prepare content-addressed immutable executable bundles with verified
 digests. Mutable `target/debug` sibling launch is not an acceptable boot path.
@@ -147,9 +158,9 @@ Until that stage and its storage proofs land, Dark Factory remains frozen.
 God/orchestrators schedule and prioritize through ordinary authenticated
 requests. Factoryd independently checks project scope, task state, capacity,
 budget, source availability, and admission. An orchestrator cannot create
-worktrees, launch processes directly, mutate capacity or agents, perform
-repository publication, choose an outcome for another attempt, or finalize a
-run. Its death cannot prevent the daemon finalizer from converging.
+Changes, launch processes directly, mutate capacity or agents, choose an
+outcome for another attempt, or finalize a run. Its death cannot prevent the
+daemon finalizer from converging.
 
 ## Clients and integrations
 

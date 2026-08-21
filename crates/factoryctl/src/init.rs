@@ -138,7 +138,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     //    time, whether or not launchd is touched.
     println!(
         "\nOutside {}, Dark Factory writes only {} (the launchd job that keeps factoryd running; rewritten by `factoryctl update --install`).\n  \
-         Stage 1 does not create source worktrees, mutate project repositories, or edit ~/.claude.json.\n  \
+         Managed Changes are plain source trees under the factory home; Dark Factory does not mutate project repositories or edit ~/.claude.json.\n  \
          Codex attempts seed private per-run configuration from {} inside {}.",
         home.display(),
         plist.display(),

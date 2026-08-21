@@ -14,8 +14,8 @@ security fixes.
 
 The safe-kernel refactor is not a live release. Do not install or start this
 revision, enable auto mode, submit provider work, expose webhook intake, or use
-the operator's `~/.dark-factory`. Stage 1 deliberately cannot admit workers;
-Stages 2 and 3 and an independent boot review remain required.
+the operator's `~/.dark-factory`. Stage 3 and an independent boot review remain
+required.
 
 ## Threat model
 
@@ -38,7 +38,7 @@ Every request carries a versioned envelope and is resolved once as one of:
 - **Anonymous**: health only.
 - **Operator**: authenticated by the private operator credential. Operator
   commands administer durable state but cannot impersonate an attempt for
-  completion, blocking, hooks, or repository writes.
+  completion, blocking, or hooks.
 - **Attempt**: authenticated by a random bearer stored in a private per-run
   file. The store derives exact project, agent, task, run, role, provider, and
   Change scope. The bearer works only while that run is `running`.
@@ -86,9 +86,11 @@ delivery replay, provider resume, or session outboxes.
 Provider hooks are authenticated observations and bounded requests.
 `PreToolUse` applies the durable tool-call budget and a conservative command
 tripwire. The tripwire denies recognized destructive or credential-sensitive
-commands and unsupported shell syntax. It is not a sandbox: interpreters,
-generated programs, MCP tools, provider defects, and direct syscalls can evade
-string inspection.
+commands, every recognized `git push` publication attempt, and unsupported
+shell syntax. Local source-editing commands such as `git apply`, `git mv`, and
+`git rm` remain permitted. It is not a sandbox: interpreters, generated
+programs, MCP tools, provider defects, and direct syscalls can evade string
+inspection.
 
 Auto mode can remove a provider's own approval prompts and therefore increases
 risk within the same-user boundary. It never bypasses daemon authentication,
@@ -99,15 +101,18 @@ authority and does not enter public events, webhook responses, or tracing.
 
 ## Source and repository boundary
 
-Stage 1 has no production Change allocator, so worker admission fails closed.
-Legacy worktrees are retained without inspection or automatic adoption.
+`factoryd` is the only product creator and administrator of Changes. Worker
+admission reserves one daemon-derived path for one task incarnation, and a
+registered wrapper materializes one exact committed tree before the provider
+can execute. The leased provider view is a plain writable directory with no
+Git administrative locator. Factoryd exposes no repository status, commit,
+push, pull-request, or publication operation.
 
-Stage 2 must make `factoryd` the only supported creator and administrator of
-Change worktrees. Providers will receive a leased source view with no Git
-administrative locator. Daemon repository operations will infer the exact
-Change and branch from the running attempt; callers will not provide paths,
-remotes, refspecs, force/delete flags, or PR heads. Review and merge remain
-independent operator actions.
+Pre-kernel paths are retained only as `legacy_sources` metadata. They are never
+statted, adopted, measured, leased, renamed, or deleted. Forgetting a legacy
+record deletes only that row. Managed Change removal requires the exact typed
+ID, current revision, durable inode identity, and absence of a live lease; a
+replacement or ambiguous path remains visibly pending and is never touched.
 
 This repository scoping reduces accidental delegation but is still not OS
 isolation from a hostile same-user process.
@@ -116,7 +121,7 @@ isolation from a hostile same-user process.
 
 The complete boot contract requires Stage 3 to build through a bounded
 project/configuration cache and execute immutable prepared bundles verified by
-digest. Mutable Cargo sibling discovery and one target per worktree are not
+digest. Mutable Cargo sibling discovery and one target per checkout are not
 secure or bounded execution paths. Resource reclamation may remove only exact,
 registered, unleased regenerable data; unique retained Changes are never
 automatic cleanup targets.

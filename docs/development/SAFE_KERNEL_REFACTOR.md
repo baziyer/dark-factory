@@ -1,16 +1,17 @@
 # Safe kernel refactor epic
 
-Status: architecture merged; Stage 1 implemented on a branch pending PR,
-independent review, and merge, 20 August 2026
+Status: architecture and Stage 1 merged; Stage 2 passes its branch gates and working-tree adversarial review, pending exact-PR-head review and merge, 21 August 2026
 
 Architecture merge: `f4f17d05315368139e408296ade6e95982cff137`
+
+Stage 1 merge: `301785e51a6bc4b280cf9c1aadc6e208f628121d`
 
 Audit baseline: `c19091ea2eb2b20c2de8717cb14799340268c8c7`
 
 Factory state: frozen; do not start provider work until the boot gate below is met
 
 This document is the durable plan for replacing Dark Factory's overlapping
-work, process, worktree, and build authorities with one small daemon-owned
+work, process, source, and build authorities with one small daemon-owned
 kernel. GitHub issues and pull requests are the execution record; this document
 owns the architecture, order, deletion targets, and definition of done.
 
@@ -24,12 +25,12 @@ The smallest safe model is stricter than the current resident-session design:
 
 - A queued task has no provider process.
 - Admission creates one exact attempt, one scoped capability, and one lease on
-  a factoryd-created change worktree.
+  a factoryd-created Change source tree.
 - One non-interactive provider process exists for that attempt only.
 - The process ends before the attempt becomes terminal.
 - A later attempt may receive bounded retained context, but it starts a fresh
   provider conversation and process under new authority.
-- A retained change, not a session or attempt, owns the review worktree across
+- A retained Change, not a session or attempt, owns the writable source across
   retries and review.
 - God proposes priority and assignment. Factoryd alone admits work, grants
   capabilities, owns resources, and terminalizes attempts.
@@ -56,7 +57,7 @@ Run:        admitted -> running -> finalizing -> terminal
 Resources: declared -> active -> releasing -> released
                                       \-> unresolved
 
-Change:     owns one retained review worktree across serial attempts
+Change:     owns one retained `.git`-free source tree across serial attempts
 ```
 
 `running` on the task is a projection written by the admission transaction and
@@ -148,7 +149,7 @@ stage; it must not claim the complete boot contract early.
 2. No admitted attempt means no provider process, writable source lease, tool
    authority, repository mutation, or outcome authority.
 3. Admission atomically captures the task incarnation and revision, provider
-   configuration, change/worktree lease, and capability before any provider
+   configuration, Change lease, and capability before any provider
    effect is possible.
 4. Only `running` grants provider effect authority or permits initial provider
    `exec`. The first `finalizing` transition atomically revokes tool, mutation,
@@ -164,9 +165,9 @@ stage; it must not claim the complete boot contract early.
    correctness authority.
 7. A retry creates a new attempt. It may lease the same retained change only
    after the preceding attempt is terminal.
-8. Factoryd creates, records, and removes change worktrees. Providers receive a
-   leased source directory but cannot choose or create source paths through the
-   product API.
+8. Factoryd creates, records, and removes Change source trees. Providers
+   receive a leased `.git`-free source directory but cannot choose or create
+   source paths through the product API.
 9. Rust builds use a bounded project cache with one writer lease per project
    configuration. Executions use daemon-owned prepared bundles, not mutable
    Cargo outputs.
@@ -190,7 +191,7 @@ or dependency boundary has changed:
 | --- | --- |
 | `factory-core` | attempt/resource/change domain and bounded wire types |
 | `factory-runner` | minimal provider-blind process host and blocked-exec handshake |
-| `factoryd` | durable admission, capabilities, resources, finalization, worktrees, cache |
+| `factoryd` | durable admission, capabilities, resources, finalization, Changes, cache |
 | `factoryctl` | operator and attempt-scoped client requests; no hidden lifecycle logic |
 | `factory-tui` | operator projection through the same API as `factoryctl` |
 
@@ -299,39 +300,62 @@ Stage checkpoint:
 
 Do not boot Dark Factory after this intermediate stage.
 
-### Stage 2: daemon-owned changes and provider source views
+### Stage 2: daemon-owned Changes and provider source views
 
-Purpose: make factoryd the sole supported product path for source-worktree
-administration and prevent accidental recursive worktree creation.
+Purpose: make factoryd the sole supported product path for writable source and
+eliminate linked-worktree administration from the product entirely.
 
-- [ ] Give each retained Change one factoryd-created worktree and lease it
-  serially to runs. A retry reuses the Change only after the previous run is
-  terminal.
-- [ ] Place managed Changes under a daemon-owned root, not underneath whichever
-  checkout invoked a helper.
-- [ ] Give the provider a writable source view with no `.git` file or other Git
-  administrative locator. Factoryd retains the worktree gitdir privately and
-  performs status/diff/commit/push/PR operations for the exact running Change.
-- [ ] Prove that ordinary `git worktree add` from the provider source view fails
-  while factoryd repository operations continue to work.
-- [ ] Require a Git repository for source mutation; remove fallback mutation in
-  the shared project root.
-- [ ] Remove per-agent worktrees, caller-selected paths, `--worktree` protocol
-  fields, and provider guidance that invokes the development worktree helper.
-  Keep any human helper explicitly outside product authority.
-- [ ] Give unique retained Changes an operator-visible soft byte bound and a
-  hard admission count/byte cap. At the cap, refuse new Change admission and
-  request an operator retention/removal decision; never automatically delete
-  unique or dirty work.
+The simpler architecture is a plain source tree materialized from one exact
+local Git commit. It is not a linked Git worktree: there is no `.git` file,
+directory, private gitdir, branch, index, or repository-discovery path in the
+provider view. Stage 2 deliberately supplies no status, commit, push, PR, or
+GitHub operation. Publication remains quarantined rather than recreating the
+deleted repository subsystem.
+
+- [x] Give each retained Change one factoryd-created plain source tree and
+  lease it serially to runs. A retry reuses the Change only after the previous
+  run is terminal.
+- [x] Place managed Changes under one daemon-owned root, never under the
+  checkout that invoked a helper and never at a caller-selected path.
+- [x] Materialize the source from an exact resolved local Git commit through a
+  process group registered to the admitted run before exec. Publish by exact
+  identity; a provider cannot exec until the Change is durably available.
+- [x] Give the provider a writable source view with no Git administrative
+  locator. Materialize the exact selected blob OIDs directly, rejecting unsafe
+  tree paths, links, gitlinks, and special entries without `git archive`
+  attribute transformations.
+- [x] Prove ordinary repository discovery and `git worktree add` fail from the
+  provider source view because it is not a repository.
+- [x] Refuse partial clones before object reads and disable lazy promisor
+  fetch. The exact selected commit must already be wholly local.
+- [x] Require a Git repository for a worker Change. Orchestrators remain in a
+  private policy directory; remove fallback worker mutation in the shared
+  project root.
+- [x] Move schema-30 legacy source paths into a metadata-only quarantine.
+  Factoryd never stats, adopts, launches from, or deletes those paths.
+- [x] Remove per-agent worktrees, caller-selected paths, branch fields, and
+  provider guidance that invokes the development worktree helper. Keep the
+  human worktree helper explicitly outside product authority.
+- [x] Report active and retained Changes with an exact count and quiescent
+  allocated-byte measurement. Enforce one hard factory-wide managed-Change
+  count cap. At the cap, refuse new Change admission and request an operator
+  retention/removal decision; never automatically delete unique work.
+- [x] Keep Change inventory, removal, and legacy-metadata forgetting on the
+  bounded CLI-first API; do not duplicate lifecycle authority in the TUI.
+- [x] Remove a retained Change only after an explicit operator request, no
+  nonterminal run lease, and exact parent/path/device/inode verification.
+  Restart resumes the same identity-safe removal; replacement remains
+  `removing` with durable failure evidence and is never touched.
 
 Stage checkpoint:
 
-- Factoryd is the only supported product path that creates or administers a
-  Change worktree.
+- Factoryd is the only supported product path that creates or removes a Change
+  source tree.
 - A confused provider starting in its source view cannot recursively create a
   Git worktree through ordinary repository discovery.
-- Active and retained Changes are reported exactly; reaching the hard cap stops
-  admission without deleting unique data.
+- Active and retained Changes are reported per project and factory-wide;
+  reaching the factory-wide hard cap stops admission without deleting unique
+  data.
 
 The same-UID hostile-process caveat still applies: cryptographic or OS-level
 filesystem isolation requires the separate hardened-runner project.
@@ -409,7 +433,7 @@ the externally visible effect, not only an internal callback or row.
 | Immutable source | Select source snapshot A, then mutate the live Change before and during compilation. The bundle is built entirely from A and records A's exact tree, or publication fails closed; it never records a mixed or later tree. |
 | Cache reuse | Build two exact source revisions with the same project/build configuration. They use one mutable cache namespace and publish different source-bound immutable manifests. |
 | Bounded storage | When safe regenerable entries suffice, reclamation reaches the hard bound and is idempotent. When protected leases alone exceed it, new build admission is refused and exact overage is reported until lease release permits convergence. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
-| Source-view boundary | The provider source view has no discoverable Git administrative locator; ordinary worktree creation fails. Exact factoryd status/diff/commit operations still target the retained Change. |
+| Source-view boundary | The provider source view has no discoverable Git administrative locator; repository discovery and ordinary worktree creation fail. The exact retained Change remains inspectable and removable only through daemon-owned operations. |
 | God policy only | God may propose priority and assignment. Worktree creation, process launch, repository publication, outcome submission, capacity/budget mutation, and operator control fail. Killing God does not change finalization. |
 
 The design PR runs no process or launchd fixtures. Implementation proof may and
@@ -504,7 +528,7 @@ kernel; the second should wait for measured post-kernel evidence.
   merely by adding another socket path.
 - Remove non-Git source mutation and fallback-to-project-root behavior. A
   non-Git project may remain observable/read-only or be rejected explicitly.
-- Remove per-agent source worktrees, caller-provided worktree paths, and
+- Remove per-agent source worktrees, caller-provided paths and branches, and
   provider-facing `--worktree` fields.
 - Remove provider-state changes as proof of work ownership. Provider state is
   observation only.
@@ -551,7 +575,7 @@ The baseline deletion map is reviewable rather than aspirational:
 | Resident dispatch, delivery, deadlines, session launch/recovery | `execution.rs` delivery/session ranges | 3,000-4,000 |
 | Session, episode, delivery journal, direct terminalization | `store.rs`, `session_work.rs` | 3,000-4,000 |
 | Session protocol/API, generic outbox, resume clients/projections | `local_api.rs`, `factory-core`, providers, CLI/TUI | 2,000-3,000 |
-| Per-agent worktrees and caller path selection | worktrees, paths, API/CLI | 500-1,000 |
+| Per-agent worktrees and caller path/branch selection | worktrees, paths, API/CLI | 500-1,000 |
 | Mutable sibling launch and obsolete build/headroom paths | runner/build scripts and fixtures | 300-800 |
 
 The daemon-independent local-CI lease is excluded unless its replacement is
@@ -580,8 +604,8 @@ record branch implementation, but must not imply review, gates, or acceptance.
 | Stage | PR(s) | Merged SHA | Net production lines | Local gate | Hosted gate | Adversarial review | Status |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
 | Architecture decision | #281 | `f4f17d05315368139e408296ade6e95982cff137` | docs only | docs checks | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/281#pullrequestreview-4987687825) | Merged |
-| 1. Attempt/resource cutover | pending | — | pending exact count | pending | pending | pending | Implemented on branch; not reviewed or merged |
-| 2. Change/source ownership | — | — | — | — | — | — | Not started |
+| 1. Attempt/resource cutover | #282 | `301785e51a6bc4b280cf9c1aadc6e208f628121d` | -39,399 total lines | passed | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/282#pullrequestreview-4988698847) | Merged |
+| 2. Change/source ownership | pending | — | pending exact count | branch gate passed | pending | working-tree ALLOW; exact PR head required | Ready for PR |
 | 3. Build/bundle/storage | — | — | — | — | — | — | Not started |
 | Boot review | — | — | — | — | — | — | Frozen |
 
@@ -607,9 +631,8 @@ independent review confirms:
 - the run phase/outcome contract is the only work and terminalization authority;
 - no provider can exist or mutate while taskless;
 - factoryd can finalize exact external resources after crashes and restarts;
-- factoryd is the only supported product path that creates or administers
-  Change worktrees, and provider source views expose no Git administrative
-  locator;
+- factoryd is the only supported product path that creates or removes Change
+  source trees, and provider source views expose no Git administrative locator;
 - builds and executable launches use the bounded cache and immutable bundles;
 - storage reporting and reclamation are identity-safe and bounded;
 - God is policy-only and GitHub intake is still quarantined;

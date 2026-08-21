@@ -69,9 +69,10 @@ target/debug/factoryd --socket "$DARK_FACTORY_HOME/f.sock" &
 target/debug/factoryctl --socket "$DARK_FACTORY_HOME/f.sock" health
 ```
 
-During Stage 1, stop after anonymous health and store-level causal fixtures.
-Do not add a worker task: production worker admission intentionally refuses
-until Stage 2. Do not point an orchestrator policy fixture at a real provider.
+Worker lifecycle checks must use the deterministic shell provider and a tiny
+temporary Git repository. They must prove the provider receives one
+daemon-owned `.git`-free Change and that the same run and source survive the
+injected boundary. Do not point any fixture at a real provider.
 
 A lifecycle fixture must register resources before use and verify after its
 test that exact descendants and disposable paths are gone. Crash/restart tests
@@ -105,11 +106,12 @@ new schema and manually deleting objects.
 
 The Stage 1 cutover migration refuses a schema-29 database containing live
 sessions, active/uncertain delivery, nonterminal runs, or other work whose
-external effect cannot be proven. It preserves legacy worktrees as unlinked
-retained Changes, including separate records when agents or projects shared an
-exact path; it never invents one owner for that path. Before any future
-schema-30 boot, take an explicit database
-backup and rollback decision; the refactor itself does not boot it.
+external effect cannot be proven. Stage 2 moves every preserved source path
+into metadata-only `legacy_sources` quarantine, including separate records
+when agents or projects shared a path. Factoryd never inspects or owns those
+paths; forgetting a record does not touch the filesystem. Before any future
+schema-30/31 boot, take an explicit database backup and rollback decision; the
+refactor itself does not boot it.
 
 ## CI and GitHub
 

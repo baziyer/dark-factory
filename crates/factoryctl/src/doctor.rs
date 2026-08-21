@@ -345,8 +345,9 @@ fn check_codex_seed(user_home: Option<&Path>) -> Check {
     }
 }
 
-/// Validate the operator-configured source roots. Stage 1 deliberately has no
-/// source-worktree diagnostics because workers cannot own source paths.
+/// Validate the configured project paths without claiming that a directory is
+/// already materializable. Worker admission separately resolves and persists
+/// an exact local Git commit before it publishes a Change.
 fn check_projects(client: &Client) -> Vec<Check> {
     let projects = match list_projects(client) {
         Ok(projects) => projects,
@@ -373,7 +374,7 @@ fn check_projects(client: &Client) -> Vec<Check> {
         checks.push(Check::ok(
             format!("project:{}", project.id),
             format!(
-                "root {} (worker source Changes are disabled until Stage 2)",
+                "root {} exists (exact Git commit is validated at worker admission)",
                 root.display()
             ),
         ));

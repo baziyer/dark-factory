@@ -1,19 +1,22 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentId, AgentRole, EventEnvelope, FactoryEvent, MessageId, ProjectId, Provider,
-    RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot, RunnerInstanceId, TaskId,
+    AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, FactoryEvent, MessageId, ProjectId,
+    Provider, RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot, RunnerInstanceId, TaskId,
     TaskStatus,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::changes::{
+    change_mutation, invalidate_change_measurement, load_change, parse_change_phase, reserve_change,
+};
 use super::{
-    AgentMessage, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES, MAX_TASK_RESULT_BYTES,
-    MAX_WAIT_REASON_BYTES, Result, Store, StoreError, append_agent_changed_event, append_event,
-    load_agent, load_agent_profile, load_task, parse_agent_role, parse_id, parse_observer_health,
-    parse_provider,
+    AgentMessage, ChangeReservation, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES,
+    MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, Result, Store, StoreError,
+    append_agent_changed_event, append_event, load_agent, load_agent_profile, load_task,
+    parse_agent_role, parse_id, parse_observer_health, parse_provider,
 };
 
 const CAPABILITY_HEX_LEN: usize = 64;
@@ -32,10 +35,7 @@ pub struct NewRunAdmission {
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub max_active_runs: usize,
-    /// Stage 1 has no production Change allocator. Stage 1 module tests insert
-    /// a disposable fixture Change and pass its private identity here; Stage 2
-    /// replaces this seam with daemon-owned provisioning.
-    pub change_id: Option<String>,
+    pub change_reservation: Option<ChangeReservation>,
     pub policy_cwd: Option<String>,
 }
 
@@ -54,7 +54,11 @@ pub struct AttemptTarget {
     pub task_title: String,
     pub task_body: String,
     pub messages: Vec<AgentMessage>,
-    pub worktree: String,
+    pub source_root: String,
+    pub change_id: Option<ChangeId>,
+    pub change_phase: Option<ChangePhase>,
+    pub change_revision: Option<i64>,
+    pub base_oid: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub permission_mode: Option<String>,
@@ -73,9 +77,9 @@ pub struct AttemptPrincipal {
     pub role: AgentRole,
     pub provider: Provider,
     pub phase: RunPhase,
-    pub worktree: String,
-    pub change_id: Option<String>,
-    pub branch: Option<String>,
+    pub source_root: String,
+    pub change_id: Option<ChangeId>,
+    pub change_phase: Option<ChangePhase>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +161,8 @@ pub struct PreparedProcessIdentity {
 
 pub struct RecoverableKernelRun {
     pub run: RunSnapshot,
+    pub change_id: Option<ChangeId>,
+    pub source_root: String,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub resources: Vec<KernelResource>,
@@ -222,31 +228,119 @@ impl Store {
             return Err(StoreError::AgentUnavailable);
         }
 
-        let worktree = match agent.snapshot.role {
-            AgentRole::Worker => {
-                let change_id = input
-                    .change_id
-                    .as_deref()
-                    .ok_or(StoreError::SourceProvisioningUnavailable)?;
-                transaction
-                    .query_row(
-                        "SELECT c.worktree FROM changes c
-                         JOIN tasks t ON t.id = c.task_id AND t.project_id = c.project_id
-                         WHERE c.id = ?1 AND c.project_id = ?2 AND c.task_id = ?3
-                           AND c.task_incarnation_id = t.incarnation_id
-                           AND c.ready_at_ms IS NOT NULL",
-                        params![change_id, input.project_id.as_str(), input.task_id.as_str()],
-                        |row| row.get::<_, String>(0),
+        let (source_root, change_id, change_phase, change_revision, base_oid, change_event) =
+            match agent.snapshot.role {
+                AgentRole::Worker => {
+                    let row: Option<(String, String, String, i64, Option<String>)> = transaction
+                        .query_row(
+                            "SELECT c.id, c.source_root, c.phase, c.revision, c.base_oid
+                         FROM changes c
+                         WHERE c.project_id = ?1 AND c.task_id = ?2
+                           AND c.task_incarnation_id = ?3",
+                            params![
+                                input.project_id.as_str(),
+                                input.task_id.as_str(),
+                                task_incarnation_id,
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    let (change_id, source_root, phase, mut revision, base_oid, mut change_event) =
+                        match row {
+                            Some((change_id, source_root, phase, revision, base_oid)) => {
+                                (change_id, source_root, phase, revision, base_oid, None)
+                            }
+                            None => {
+                                let reservation = input
+                                    .change_reservation
+                                    .as_ref()
+                                    .ok_or(StoreError::InvalidExecutionMetadata)?;
+                                let mutation = reserve_change(
+                                    &transaction,
+                                    &input.project_id,
+                                    &input.task_id,
+                                    &task_incarnation_id,
+                                    reservation,
+                                    now_ms,
+                                )?;
+                                let change_event = mutation.event;
+                                let change = mutation.change;
+                                (
+                                    change.id.to_string(),
+                                    change.source_root,
+                                    "provisioning".to_owned(),
+                                    change.revision,
+                                    change.base_oid,
+                                    change_event,
+                                )
+                            }
+                        };
+                    let change_id = ChangeId::try_from(change_id)
+                        .map_err(|_| StoreError::InvalidChangeMetadata)?;
+                    let phase = parse_change_phase(&phase).ok_or(StoreError::InvalidChangeState)?;
+                    if phase == ChangePhase::Removed {
+                        return Err(StoreError::TaskChangeUnavailable);
+                    }
+                    if phase == ChangePhase::Removing {
+                        return Err(StoreError::InvalidChangeState);
+                    }
+                    if phase == ChangePhase::Available {
+                        let changed = transaction.execute(
+                            "UPDATE changes
+                         SET size_bytes = NULL, measured_at_ms = NULL,
+                             revision = revision + 1, updated_at_ms = ?1
+                         WHERE id = ?2 AND project_id = ?3 AND revision = ?4
+                           AND phase = 'available'",
+                            params![
+                                now_ms,
+                                change_id.as_str(),
+                                input.project_id.as_str(),
+                                revision,
+                            ],
+                        )?;
+                        if changed != 1 {
+                            return Err(StoreError::ChangeRevisionConflict);
+                        }
+                        revision += 1;
+                        let change = load_change(&transaction, &input.project_id, &change_id)?
+                            .ok_or(StoreError::ChangeNotFound)?;
+                        change_event = change_mutation(&transaction, change, now_ms)?.event;
+                    }
+                    (
+                        source_root,
+                        Some(change_id),
+                        Some(phase),
+                        Some(revision),
+                        base_oid,
+                        change_event,
                     )
-                    .optional()?
-                    .ok_or(StoreError::ChangeNotFound)?
-            }
-            AgentRole::Orchestrator => input
-                .policy_cwd
-                .clone()
-                .ok_or(StoreError::SourceProvisioningUnavailable)?,
-        };
-        validate_absolute_path(&worktree)?;
+                }
+                AgentRole::Orchestrator => (
+                    {
+                        if input.change_reservation.is_some() {
+                            return Err(StoreError::InvalidChangeMetadata);
+                        }
+                        input
+                            .policy_cwd
+                            .clone()
+                            .ok_or(StoreError::InvalidExecutionMetadata)?
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            };
+        validate_absolute_path(&source_root)?;
 
         let profile =
             load_agent_profile(&transaction, &input.agent_id)?.ok_or(StoreError::AgentNotFound)?;
@@ -266,7 +360,7 @@ impl Store {
         transaction.execute(
             "INSERT INTO runs (
                 id, project_id, agent_id, task_id, task_incarnation_id,
-                admitted_task_work_revision, change_id, parent_run_id, worktree,
+                admitted_task_work_revision, change_id, parent_run_id, source_root,
                 phase, outcome, outcome_detail, outcome_result, capability_digest,
                 provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
                 runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
@@ -288,8 +382,8 @@ impl Store {
                 input.task_id.as_str(),
                 task_incarnation_id,
                 admitted_task_work_revision,
-                input.change_id,
-                worktree,
+                change_id.as_ref().map(ChangeId::as_str),
+                source_root,
                 input.capability_digest,
                 provider_str(input.expected_provider),
                 profile.model,
@@ -353,6 +447,22 @@ impl Store {
         let run_sequence = append_event(&transaction, now_ms, &run_event_value)?;
         transaction.commit()?;
 
+        let mut events = Vec::with_capacity(4);
+        events.extend(change_event);
+        events.push(EventEnvelope {
+            protocol_version: factory_core::PROTOCOL_VERSION,
+            sequence: task_sequence,
+            occurred_at_ms: now_ms,
+            event: task_event,
+        });
+        events.push(agent_event);
+        events.push(EventEnvelope {
+            protocol_version: factory_core::PROTOCOL_VERSION,
+            sequence: run_sequence,
+            occurred_at_ms: now_ms,
+            event: run_event_value,
+        });
+
         Ok(AdmittedRun {
             run,
             target: AttemptTarget {
@@ -364,7 +474,11 @@ impl Store {
                 task_title,
                 task_body,
                 messages,
-                worktree,
+                source_root,
+                change_id,
+                change_phase,
+                change_revision,
+                base_oid,
                 model: profile.model,
                 reasoning_effort: profile.reasoning_effort,
                 permission_mode: profile.permission_mode,
@@ -373,21 +487,7 @@ impl Store {
                 runner_runtime: input.runner_runtime,
                 runtime_claim: input.runtime_claim,
             },
-            events: vec![
-                EventEnvelope {
-                    protocol_version: factory_core::PROTOCOL_VERSION,
-                    sequence: task_sequence,
-                    occurred_at_ms: now_ms,
-                    event: task_event,
-                },
-                agent_event,
-                EventEnvelope {
-                    protocol_version: factory_core::PROTOCOL_VERSION,
-                    sequence: run_sequence,
-                    occurred_at_ms: now_ms,
-                    event: run_event_value,
-                },
-            ],
+            events,
         })
     }
 
@@ -540,29 +640,14 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT r.id, r.project_id, r.task_id, r.agent_id, a.role,
-                        r.provider, r.phase, r.worktree, r.change_id, c.branch
+                        r.provider, r.phase, r.source_root, r.change_id, c.phase
                  FROM runs r
                  JOIN agents a ON a.id = r.agent_id AND a.project_id = r.project_id
                  LEFT JOIN changes c ON c.id = r.change_id AND c.project_id = r.project_id
-                 WHERE r.capability_digest = ?1 AND r.phase <> 'terminal'",
+                WHERE r.capability_digest = ?1 AND r.phase <> 'terminal'
+                   AND (a.role = 'orchestrator' OR c.phase = 'available')",
                 params![digest],
-                |row| {
-                    let role: String = row.get(4)?;
-                    let provider: String = row.get(5)?;
-                    let phase: String = row.get(6)?;
-                    Ok(AttemptPrincipal {
-                        run_id: parse_id(row.get(0)?, 0)?,
-                        project_id: parse_id(row.get(1)?, 1)?,
-                        task_id: parse_id(row.get(2)?, 2)?,
-                        agent_id: parse_id(row.get(3)?, 3)?,
-                        role: parse_agent_role(&role, 4)?,
-                        provider: parse_provider(&provider, 5)?,
-                        phase: parse_phase(&phase, 6)?,
-                        worktree: row.get(7)?,
-                        change_id: row.get(8)?,
-                        branch: row.get(9)?,
-                    })
-                },
+                attempt_principal_from_row,
             )
             .optional()
             .map_err(StoreError::from)
@@ -974,6 +1059,19 @@ impl Store {
              WHERE id = ?2 AND phase = 'finalizing'",
             params![now_ms, run_id.as_str()],
         )?;
+        let change_event = transaction
+            .query_row(
+                "SELECT change_id FROM runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .map(|value| parse_id::<ChangeId>(value, 0))
+            .transpose()?
+            .map(|change_id| {
+                invalidate_change_measurement(&transaction, &run.project_id, &change_id, now_ms)
+            })
+            .transpose()?
+            .flatten();
         let task = load_task(&transaction, &run.task_id)?
             .ok_or(StoreError::TaskNotFound)?
             .snapshot;
@@ -986,24 +1084,26 @@ impl Store {
         };
         let run_sequence = append_event(&transaction, now_ms, &run_event)?;
         transaction.commit()?;
-        Ok((
-            run,
-            vec![
-                EventEnvelope {
-                    protocol_version: factory_core::PROTOCOL_VERSION,
-                    sequence: task_sequence,
-                    occurred_at_ms: now_ms,
-                    event: task_event,
-                },
-                agent_event,
-                EventEnvelope {
-                    protocol_version: factory_core::PROTOCOL_VERSION,
-                    sequence: run_sequence,
-                    occurred_at_ms: now_ms,
-                    event: run_event,
-                },
-            ],
-        ))
+        let mut events = Vec::with_capacity(4);
+        if let Some(event) = change_event {
+            events.push(event);
+        }
+        events.extend([
+            EventEnvelope {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                sequence: task_sequence,
+                occurred_at_ms: now_ms,
+                event: task_event,
+            },
+            agent_event,
+            EventEnvelope {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                sequence: run_sequence,
+                occurred_at_ms: now_ms,
+                event: run_event,
+            },
+        ]);
+        Ok((run, events))
     }
 
     pub fn recoverable_kernel_runs(&self) -> Result<Vec<RecoverableKernelRun>> {
@@ -1022,14 +1122,17 @@ impl Store {
                     .runner_instance_id
                     .clone()
                     .ok_or(StoreError::InvalidExecutionMetadata)?;
-                let runner_runtime: String = self.connection.query_row(
-                    "SELECT runner_runtime FROM runs WHERE id = ?1",
-                    params![run_id.as_str()],
-                    |row| row.get(0),
-                )?;
+                let (runner_runtime, change_id, source_root): (String, Option<String>, String) =
+                    self.connection.query_row(
+                        "SELECT runner_runtime, change_id, source_root FROM runs WHERE id = ?1",
+                        params![run_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
                 Ok(RecoverableKernelRun {
                     resources: load_resources(&self.connection, &run_id)?,
                     run,
+                    change_id: change_id.map(|value| parse_id(value, 1)).transpose()?,
+                    source_root,
                     runner_instance_id,
                     runner_runtime,
                 })
@@ -1050,6 +1153,38 @@ pub fn capability_digest(bearer: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bearer.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn attempt_principal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptPrincipal> {
+    let role: String = row.get(4)?;
+    let provider: String = row.get(5)?;
+    let phase: String = row.get(6)?;
+    Ok(AttemptPrincipal {
+        run_id: parse_id(row.get(0)?, 0)?,
+        project_id: parse_id(row.get(1)?, 1)?,
+        task_id: parse_id(row.get(2)?, 2)?,
+        agent_id: parse_id(row.get(3)?, 3)?,
+        role: parse_agent_role(&role, 4)?,
+        provider: parse_provider(&provider, 5)?,
+        phase: parse_phase(&phase, 6)?,
+        source_root: row.get(7)?,
+        change_id: row
+            .get::<_, Option<String>>(8)?
+            .map(|value| parse_id(value, 8))
+            .transpose()?,
+        change_phase: row
+            .get::<_, Option<String>>(9)?
+            .map(|value| {
+                parse_change_phase(&value).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        format!("invalid Change phase {value:?}").into(),
+                    )
+                })
+            })
+            .transpose()?,
+    })
 }
 
 fn validate_capability_digest(value: &str) -> Result<()> {
@@ -1479,11 +1614,14 @@ fn undelivered_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{NewAgent, NewAgentMessage, NewProject, NewTask};
+    use crate::store::{
+        ChangeBaseIdentity, ChangeMaterialization, ChangeRemovalKind, ChangeSourceIdentity,
+        NewAgent, NewAgentMessage, NewProject, NewTask,
+    };
 
     const BEARER: &str = "attempt-secret";
 
-    fn admit_worker(store: &mut Store) -> RunId {
+    fn admit_worker_provisioning(store: &mut Store) -> (RunId, ProjectId, ChangeId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("worker").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
@@ -1524,37 +1662,12 @@ mod tests {
                 3,
             )
             .unwrap();
-        let incarnation: String = store
-            .connection
-            .query_row(
-                "SELECT incarnation_id FROM tasks WHERE id = ?1",
-                [task_id.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO changes (
-                    id, project_id, task_id, task_incarnation_id, branch, worktree,
-                    ready_at_ms, retained_reason, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?7, ?7)",
-                params![
-                    "change-1",
-                    project_id.as_str(),
-                    task_id.as_str(),
-                    incarnation,
-                    "factory/change-1",
-                    "/tmp/factory-change-1",
-                    4,
-                ],
-            )
-            .unwrap();
+        let change_id = ChangeId::try_from("change-1").unwrap();
         let admitted = store
             .admit_run(
                 NewRunAdmission {
                     run_id: run_id.clone(),
-                    project_id,
+                    project_id: project_id.clone(),
                     task_id,
                     agent_id,
                     expected_provider: Provider::Shell,
@@ -1566,13 +1679,58 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner".into(),
                     max_active_runs: 1,
-                    change_id: Some("change-1".into()),
+                    change_reservation: Some(ChangeReservation {
+                        id: change_id.clone(),
+                        source_root: "/tmp/factory-change-1".into(),
+                        max_factory_changes: 1,
+                    }),
                     policy_cwd: None,
                 },
                 5,
             )
             .unwrap();
         assert_eq!(admitted.run.phase, RunPhase::Admitted);
+        assert!(matches!(
+            admitted.events.first(),
+            Some(EventEnvelope {
+                event: FactoryEvent::ChangeChanged { change },
+                ..
+            }) if change.id == change_id
+                && change.phase == ChangePhase::Provisioning
+                && change.revision == 0
+        ));
+        (run_id, project_id, change_id)
+    }
+
+    fn admit_worker(store: &mut Store) -> RunId {
+        let (run_id, project_id, change_id) = admit_worker_provisioning(store);
+        let base = ChangeBaseIdentity {
+            repository_root: "/tmp/factory".into(),
+            device: 1,
+            inode: 2,
+        };
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        store
+            .record_change_base(&project_id, &change_id, 0, oid, &base, 5)
+            .unwrap();
+        store
+            .mark_change_available(
+                &project_id,
+                &change_id,
+                1,
+                &ChangeMaterialization {
+                    base_oid: oid.into(),
+                    base,
+                    source: ChangeSourceIdentity {
+                        source_root: "/tmp/factory-change-1".into(),
+                        device: 3,
+                        inode: 4,
+                        size_bytes: 5,
+                    },
+                },
+                5,
+            )
+            .unwrap();
         run_id
     }
 
@@ -1613,9 +1771,21 @@ mod tests {
         assert!(store.authenticate_attempt("wrong").unwrap().is_none());
         let principal = store.authenticate_attempt(BEARER).unwrap().unwrap();
         assert_eq!(principal.run_id, run_id);
-        assert_eq!(principal.change_id.as_deref(), Some("change-1"));
-        assert_eq!(principal.branch.as_deref(), Some("factory/change-1"));
-        assert_eq!(principal.worktree, "/tmp/factory-change-1");
+        assert_eq!(
+            principal.change_id.as_ref().map(ChangeId::as_str),
+            Some("change-1")
+        );
+        assert_eq!(principal.change_phase, Some(ChangePhase::Available));
+        assert_eq!(principal.source_root, "/tmp/factory-change-1");
+        assert!(matches!(
+            store.begin_change_removal(
+                &ProjectId::try_from("factory").unwrap(),
+                &ChangeId::try_from("change-1").unwrap(),
+                2,
+                6,
+            ),
+            Err(StoreError::ChangeLeased)
+        ));
     }
 
     #[test]
@@ -1651,6 +1821,55 @@ mod tests {
     }
 
     #[test]
+    fn failed_provisioning_attempt_releases_its_lease_before_change_reclamation() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (run_id, project_id, change_id) = admit_worker_provisioning(&mut store);
+        let reserved = store.change(&project_id, &change_id).unwrap().unwrap();
+        assert_eq!(reserved.phase, ChangePhase::Provisioning);
+        assert_eq!(reserved.revision, 0);
+        assert!(
+            store.recoverable_changes().unwrap().is_empty(),
+            "a live materializer tree is never eligible for measurement"
+        );
+
+        let (finalizing, _) = store
+            .fail_admitted_run(&run_id, RunFailureReason::Spawn, 6)
+            .unwrap();
+        assert_eq!(finalizing.phase, RunPhase::Finalizing);
+        assert!(matches!(
+            store.begin_change_removal(&project_id, &change_id, 0, 7),
+            Err(StoreError::ChangeLeased)
+        ));
+        release_all(&mut store, &run_id, 8);
+        let (terminal, _) = store.finalize_run(&run_id, 9).unwrap();
+        assert_eq!(terminal.phase, RunPhase::Terminal);
+        assert_eq!(
+            store.recoverable_changes().unwrap(),
+            vec![store.change(&project_id, &change_id).unwrap().unwrap()],
+            "the same Provisioning Change becomes measurable only after terminalization"
+        );
+        assert!(
+            store
+                .kernel_resources(&run_id)
+                .unwrap()
+                .iter()
+                .all(|resource| resource.state == KernelResourceState::Released)
+        );
+
+        let removing = store
+            .begin_change_removal(&project_id, &change_id, 0, 10)
+            .unwrap()
+            .change;
+        assert_eq!(removing.phase, ChangePhase::Removing);
+        assert_eq!(removing.revision, 1);
+        assert_eq!(store.recoverable_changes().unwrap(), vec![removing.clone()]);
+        assert_eq!(
+            removing.removal_kind().unwrap(),
+            ChangeRemovalKind::Provisioning
+        );
+    }
+
+    #[test]
     fn finalization_waits_for_every_registered_resource_then_revokes_authority() {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker(&mut store);
@@ -1676,9 +1895,29 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (terminal, _) = store.finalize_run(&run_id, 10).unwrap();
+        let (terminal, events) = store.finalize_run(&run_id, 10).unwrap();
         assert_eq!(terminal.phase, RunPhase::Terminal);
         assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
+        let change = store
+            .change(
+                &terminal.project_id,
+                &ChangeId::try_from("change-1").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.revision, 3);
+        assert_eq!(change.size_bytes, None);
+        assert_eq!(change.measured_at_ms, None);
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                FactoryEvent::ChangeChanged { change }
+                    if change.id.as_str() == "change-1"
+                        && change.revision == 3
+                        && change.measured_bytes.is_none()
+            )
+        }));
+        assert_eq!(store.recoverable_changes().unwrap(), vec![change]);
         assert_eq!(
             store
                 .get_task(&terminal.project_id, &terminal.task_id)
@@ -1876,7 +2115,11 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner-retry".into(),
                     max_active_runs: 1,
-                    change_id: Some("change-1".into()),
+                    change_reservation: Some(ChangeReservation {
+                        id: ChangeId::try_from("unused-retry-change").unwrap(),
+                        source_root: "/tmp/unused-retry-change".into(),
+                        max_factory_changes: 1,
+                    }),
                     policy_cwd: None,
                 },
                 11,

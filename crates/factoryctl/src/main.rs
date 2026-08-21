@@ -1,8 +1,9 @@
 use std::{env, io::Write, path::PathBuf, process};
 
 use factory_core::local::{
-    GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
-    MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RequestCredential, ServerFrame,
+    GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS,
+    MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
+    RequestCredential, ServerFrame,
 };
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
@@ -17,7 +18,7 @@ mod usage;
 
 const ATTEMPT_TOKEN_FILE_ENV: &str = "DARK_FACTORY_ATTEMPT_TOKEN_FILE";
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|hook|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -38,6 +39,8 @@ Commands:
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
+  change list|remove|legacy-list|forget-legacy
+                                               Inspect retained source and forget legacy metadata
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
   events [--follow]                           Read durable events
 
@@ -79,7 +82,7 @@ Guided first install on this machine:
   3. install the binaries next to this factoryctl as $DARK_FACTORY_HOME/bin/<version>/
      and point bin/current at them (a bin/<version> holding a different build of the
      same version is refused, never overwritten)
-  4. state that Stage 1 writes outside its home only for the launchd job, and
+  4. state that Dark Factory writes outside its home only for the launchd job, and
      ask before touching launchd
   5. render ~/Library/LaunchAgents/com.dark-factory.factoryd.plist with a PATH that
      can find those CLIs, load it, and wait for the daemon to answer health with
@@ -146,8 +149,7 @@ const USAGE_HELP: &str = "usage: factoryctl usage
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
 result. No daemon or socket is involved and nothing is persisted; Claude's
 usage is read by running `/usage` inside Claude's own interactive terminal.";
-const PROJECT_HELP: &str =
-    "usage: factoryctl project <add|list|delete|get|guidance|repository> [options]
+const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete|get|guidance> [options]
 
 Manage projects.
 
@@ -157,7 +159,6 @@ Actions:
   delete    Delete a project that has no non-terminal run
   get       Fetch one project, including its guidance file path
   guidance  Manage a project's standing guidance file
-  repository  Set the daemon-owned remote and PR base used by agent requests
 
 Run `factoryctl project <action> --help` for action-specific options.";
 const PROJECT_ADD_HELP: &str = "usage: factoryctl project add --name TEXT --root PATH [options]
@@ -181,8 +182,9 @@ Options:
   -h, --help                  Show this help";
 const PROJECT_DELETE_HELP: &str = "usage: factoryctl project delete --project ID
 
-Delete a project that has no non-terminal run. Cascades to delete every
-task, agent, and run in the project.
+Delete a project that has no non-terminal run and no retained managed Change
+or legacy-source metadata. Cascades to delete every remaining task, agent, and
+run in the project.
 
 Required:
   --project ID           Project to delete
@@ -211,21 +213,6 @@ Required:
 
 Options:
   -h, --help                Show this help";
-const PROJECT_REPOSITORY_HELP: &str =
-    "usage: factoryctl project repository set --project ID --remote URL --base BRANCH
-
-Set the daemon-owned remote and PR base for a project. This authority is
-write-once and can be set only while the factory has no active attempts in any
-project; later retarget attempts are rejected.
-
-Required:
-  --project ID           Project to configure
-  --remote URL           Exact Git remote URL agents may push to
-  --base BRANCH          Pull-request base branch
-
-Options:
-  -h, --help              Show this help";
-
 const TASK_HELP: &str =
     "usage: factoryctl task <add|list|get|start|retry|assign|cancel|update|delete|done|blocked> [options]
 
@@ -347,9 +334,9 @@ Options:
   -h, --help                    Show this help";
 const TASK_DELETE_HELP: &str = "usage: factoryctl task delete --project ID --task ID
 
-Delete a task that has no non-terminal run, no subtasks, and no run that is
-a parent of another run. Also deletes its terminal runs and any rows that
-reference it (questions, dependencies, webhook capabilities).
+Delete a task that has no non-terminal run, no retained Change, no subtasks,
+and no run that is a parent of another run. Also deletes its terminal runs and
+any rows that reference it (questions, dependencies, webhook capabilities).
 
 Required:
   --project ID           Project the task belongs to
@@ -581,6 +568,64 @@ Options:
   --grace-ms N              Grace period before a harder stop (default 0, max 60000)
   -h, --help                  Show this help";
 
+const CHANGE_HELP: &str =
+    "usage: factoryctl change <list|remove|legacy-list|forget-legacy> [options]
+
+Inspect retained daemon-owned Change source trees, request exact removal, or
+forget metadata for a source path retained by the pre-kernel architecture.
+
+Run `factoryctl change <action> --help` for action-specific options.";
+const CHANGE_LIST_HELP: &str = "usage: factoryctl change list --project ID [options]
+
+List retained Changes, the project's last measured allocated bytes, and the
+factory-wide retained count/cap.
+
+Required:
+  --project ID           Project to inspect
+
+Options:
+  --after ID             Resume after this Change ID
+  --limit N              Page size (default and max: 16)
+  -h, --help             Show this help";
+const CHANGE_REMOVE_HELP: &str =
+    "usage: factoryctl change remove --project ID --change ID --revision N
+
+Request identity-safe removal of one retained Change. Removal is refused while
+an attempt leases it and when the inventory revision is stale. No path can be
+supplied by the caller.
+
+Required:
+  --project ID           Project owning the Change
+  --change ID            Change to remove
+  --revision N           Exact revision returned by `change list`
+
+Options:
+  -h, --help             Show this help";
+const CHANGE_LEGACY_LIST_HELP: &str = "usage: factoryctl change legacy-list --project ID [options]
+
+List metadata for pre-kernel source paths. These paths are quarantined
+evidence: factoryd never stats, measures, leases, renames, or deletes them.
+
+Required:
+  --project ID           Project whose legacy metadata to inspect
+
+Options:
+  --after ID             Resume after this legacy-source ID
+  --limit N              Page size (default and max: 16)
+  -h, --help             Show this help";
+const CHANGE_FORGET_LEGACY_HELP: &str =
+    "usage: factoryctl change forget-legacy --project ID --legacy-source ID
+
+Forget exactly one pre-kernel source metadata row. This never touches the
+recorded filesystem path; any preserved directory remains operator-owned.
+
+Required:
+  --project ID           Project owning the metadata row
+  --legacy-source ID     Typed legacy-source ID from `change legacy-list`
+
+Options:
+  -h, --help             Show this help";
+
 const HOOK_HELP: &str = "usage: factoryctl hook --token-file PATH PreToolUse
 
 Forwards one provider hook invocation (a Claude Code `--settings` hook or a
@@ -606,6 +651,8 @@ const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
 const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
+const CHANGE_LIST_LIMIT: u32 = MAX_CHANGE_PAGE_ITEMS;
+const LEGACY_SOURCE_LIST_LIMIT: u32 = MAX_LEGACY_SOURCE_PAGE_ITEMS;
 /// Hard bound on `factoryctl hook`'s stdin payload, matching
 /// `LocalRequest::ProviderHook`'s documented 64 KiB payload limit
 /// (`factory-core/src/local.rs`).
@@ -660,11 +707,6 @@ enum CliCommand {
     ProjectGuidanceSet {
         project_id: String,
         file: String,
-    },
-    ProjectRepositorySet {
-        project_id: String,
-        remote_url: String,
-        base_branch: String,
     },
     TaskAdd {
         id: Option<String>,
@@ -802,6 +844,25 @@ enum CliCommand {
         run_id: String,
         grace_ms: u64,
     },
+    ChangeList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    ChangeRemove {
+        project_id: String,
+        change_id: String,
+        expected_revision: i64,
+    },
+    ChangeLegacyList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    ChangeForgetLegacy {
+        project_id: String,
+        legacy_source_id: String,
+    },
     Hook {
         token_file: String,
         event: ProviderHookEvent,
@@ -826,6 +887,9 @@ fn run() -> Result<i32, String> {
     if let CliCommand::Help(text) = command {
         println!("{text}");
         return Ok(0);
+    }
+    if env::var_os(ATTEMPT_TOKEN_FILE_ENV).is_some() && host_level_command(&command) {
+        return Err("this host-level operation is unavailable inside an attempt".into());
     }
     if matches!(command, CliCommand::Usage) {
         return Ok(usage::run());
@@ -968,6 +1032,18 @@ fn run() -> Result<i32, String> {
         write_frame(&mut output, &frame)?;
     }
     Ok(if is_error(&frame) { 2 } else { 0 })
+}
+
+fn host_level_command(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Usage
+            | CliCommand::CapacityStatus
+            | CliCommand::CapacitySet { .. }
+            | CliCommand::Init { .. }
+            | CliCommand::Doctor { .. }
+            | CliCommand::Update { .. }
+    )
 }
 
 fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
@@ -1261,6 +1337,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         "task" => parse_task(args).map(|command| (socket, command)),
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
+        "change" => parse_change(args).map(|command| (socket, command)),
         "hook" => {
             if wants_help(&args) {
                 return Ok((socket, CliCommand::Help(HOOK_HELP)));
@@ -1305,7 +1382,6 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             "delete" => PROJECT_DELETE_HELP,
             "get" => PROJECT_GET_HELP,
             "guidance" => PROJECT_GUIDANCE_HELP,
-            "repository" => PROJECT_REPOSITORY_HELP,
             _ => PROJECT_HELP,
         }));
     }
@@ -1344,21 +1420,6 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
                 }
                 _ => Err(format!("unknown project guidance action {sub_action:?}")),
             }
-        }
-        "repository" => {
-            let sub_action = take_action(&mut args, "project repository")?;
-            if sub_action != "set" {
-                return Err(format!("unknown project repository action {sub_action:?}"));
-            }
-            let project_id = required_project(&mut args)?;
-            let remote_url = required_option(&mut args, "--remote")?;
-            let base_branch = required_option(&mut args, "--base")?;
-            require_empty(&args)?;
-            Ok(CliCommand::ProjectRepositorySet {
-                project_id,
-                remote_url,
-                base_branch,
-            })
         }
         _ => Err(format!("unknown project action {action:?}")),
     }
@@ -1801,6 +1862,75 @@ fn parse_run(mut args: Vec<String>) -> Result<CliCommand, String> {
     }
 }
 
+fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(CHANGE_HELP));
+    }
+    let action = take_action(&mut args, "change")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "list" => CHANGE_LIST_HELP,
+            "remove" => CHANGE_REMOVE_HELP,
+            "legacy-list" => CHANGE_LEGACY_LIST_HELP,
+            "forget-legacy" => CHANGE_FORGET_LEGACY_HELP,
+            _ => CHANGE_HELP,
+        }));
+    }
+    match action.as_str() {
+        "list" => {
+            let project_id = required_project(&mut args)?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(&mut args, CHANGE_LIST_LIMIT, MAX_CHANGE_PAGE_ITEMS)?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeList {
+                project_id,
+                after_id,
+                limit,
+            })
+        }
+        "remove" => {
+            let project_id = required_project(&mut args)?;
+            let change_id = required_option(&mut args, "--change")?;
+            let expected_revision =
+                parse_number::<i64>(&required_option(&mut args, "--revision")?, "--revision")?;
+            if expected_revision < 0 {
+                return Err("--revision must be a non-negative integer".into());
+            }
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeRemove {
+                project_id,
+                change_id,
+                expected_revision,
+            })
+        }
+        "legacy-list" => {
+            let project_id = required_project(&mut args)?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(
+                &mut args,
+                LEGACY_SOURCE_LIST_LIMIT,
+                MAX_LEGACY_SOURCE_PAGE_ITEMS,
+            )?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeLegacyList {
+                project_id,
+                after_id,
+                limit,
+            })
+        }
+        "forget-legacy" => {
+            let project_id = required_project(&mut args)?;
+            let legacy_source_id = required_option(&mut args, "--legacy-source")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeForgetLegacy {
+                project_id,
+                legacy_source_id,
+            })
+        }
+        _ => Err(format!("unknown change action {action:?}")),
+    }
+}
+
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
@@ -1841,15 +1971,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 text: read_guidance_file(&file)?,
             })
         }
-        CliCommand::ProjectRepositorySet {
-            project_id,
-            remote_url,
-            base_branch,
-        } => Ok(LocalRequest::SetProjectRepositoryAuthority {
-            project_id: parse_id(project_id, "project")?,
-            remote_url,
-            base_branch,
-        }),
         CliCommand::TaskAdd {
             id,
             project_id,
@@ -2099,6 +2220,44 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             run_id: parse_id(run_id, "run")?,
             grace_ms,
+        }),
+        CliCommand::ChangeList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListChanges {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "change cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::ChangeRemove {
+            project_id,
+            change_id,
+            expected_revision,
+        } => Ok(LocalRequest::RemoveChange {
+            project_id: parse_id(project_id, "project")?,
+            change_id: parse_id(change_id, "change")?,
+            expected_revision,
+        }),
+        CliCommand::ChangeLegacyList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListLegacySources {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "legacy source cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::ChangeForgetLegacy {
+            project_id,
+            legacy_source_id,
+        } => Ok(LocalRequest::ForgetLegacySource {
+            project_id: parse_id(project_id, "project")?,
+            legacy_source_id: parse_id(legacy_source_id, "legacy source")?,
         }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
         CliCommand::Events(command) => Ok(events::request(command)),
@@ -2501,19 +2660,6 @@ mod tests {
             CliCommand::Help(PROJECT_GUIDANCE_HELP)
         );
         assert_eq!(
-            parse_args(args(&["project", "repository", "--help"]))
-                .unwrap()
-                .1,
-            CliCommand::Help(PROJECT_REPOSITORY_HELP)
-        );
-        assert_eq!(
-            parse_args(args(&["project", "repository", "set", "--help"]))
-                .unwrap()
-                .1,
-            CliCommand::Help(PROJECT_REPOSITORY_HELP)
-        );
-
-        assert_eq!(
             parse_args(args(&["task"])).unwrap().1,
             CliCommand::Help(TASK_HELP)
         );
@@ -2537,14 +2683,6 @@ mod tests {
             );
         }
 
-        for required in ["--project ID", "--remote URL", "--base BRANCH"] {
-            assert!(
-                PROJECT_REPOSITORY_HELP.contains(required),
-                "repository help must name required flag {required}"
-            );
-        }
-        assert!(PROJECT_REPOSITORY_HELP.contains("write-once"));
-        assert!(PROJECT_REPOSITORY_HELP.contains("no active attempts in any\nproject"));
         assert!(TASK_ASSIGN_HELP.contains("wakes automatic admission"));
         assert!(TASK_ASSIGN_HELP.contains("may start an attempt"));
         assert!(!TASK_ASSIGN_HELP.contains("without starting"));
@@ -2589,6 +2727,22 @@ mod tests {
                 "run {action} --help"
             );
         }
+        assert_eq!(
+            parse_args(args(&["change"])).unwrap().1,
+            CliCommand::Help(CHANGE_HELP)
+        );
+        for (action, expected) in [
+            ("list", CHANGE_LIST_HELP),
+            ("remove", CHANGE_REMOVE_HELP),
+            ("legacy-list", CHANGE_LEGACY_LIST_HELP),
+            ("forget-legacy", CHANGE_FORGET_LEGACY_HELP),
+        ] {
+            assert_eq!(
+                parse_args(args(&["change", action, "--help"])).unwrap().1,
+                CliCommand::Help(expected),
+                "change {action} --help"
+            );
+        }
 
         assert_eq!(
             parse_args(args(&["hook", "--help"])).unwrap().1,
@@ -2603,6 +2757,10 @@ mod tests {
         assert_eq!(command, CliCommand::Help(TASK_ADD_HELP));
         let (_, command) = parse_args(args(&["run", "stop", "--help"])).unwrap();
         assert_eq!(command, CliCommand::Help(RUN_STOP_HELP));
+        let (_, command) = parse_args(args(&["change", "remove", "--help"])).unwrap();
+        assert_eq!(command, CliCommand::Help(CHANGE_REMOVE_HELP));
+        let (_, command) = parse_args(args(&["change", "forget-legacy", "--help"])).unwrap();
+        assert_eq!(command, CliCommand::Help(CHANGE_FORGET_LEGACY_HELP));
     }
 
     #[test]
@@ -3381,6 +3539,128 @@ mod tests {
                 project_id: "project-1".try_into().unwrap(),
                 run_id: "run-1".try_into().unwrap(),
                 grace_ms: 2500,
+            }
+        );
+    }
+
+    #[test]
+    fn attempt_context_cannot_select_host_level_operations() {
+        for command in [
+            CliCommand::Usage,
+            CliCommand::CapacityStatus,
+            CliCommand::CapacitySet { value: 8 },
+            CliCommand::Init {
+                yes: true,
+                no_launchd: true,
+            },
+            CliCommand::Doctor { json: false },
+            CliCommand::Update {
+                install: false,
+                json: false,
+            },
+        ] {
+            assert!(host_level_command(&command));
+        }
+        assert!(!host_level_command(&CliCommand::Health));
+    }
+
+    #[test]
+    fn change_commands_select_only_typed_identity_and_revision() {
+        let (_, list) = parse_args(args(&[
+            "change",
+            "list",
+            "--project",
+            "project-1",
+            "--after",
+            "change-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(list).unwrap(),
+            LocalRequest::ListChanges {
+                project_id: "project-1".try_into().unwrap(),
+                after_id: Some("change-1".try_into().unwrap()),
+                limit: MAX_CHANGE_PAGE_ITEMS,
+            }
+        );
+
+        let (_, remove) = parse_args(args(&[
+            "change",
+            "remove",
+            "--project",
+            "project-1",
+            "--change",
+            "change-1",
+            "--revision",
+            "7",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(remove).unwrap(),
+            LocalRequest::RemoveChange {
+                project_id: "project-1".try_into().unwrap(),
+                change_id: "change-1".try_into().unwrap(),
+                expected_revision: 7,
+            }
+        );
+        let (_, remove_newly_reserved) = parse_args(args(&[
+            "change",
+            "remove",
+            "--project",
+            "project-1",
+            "--change",
+            "change-1",
+            "--revision",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(remove_newly_reserved).unwrap(),
+            LocalRequest::RemoveChange {
+                project_id: "project-1".try_into().unwrap(),
+                change_id: "change-1".try_into().unwrap(),
+                expected_revision: 0,
+            }
+        );
+        assert!(
+            parse_args(args(&[
+                "change",
+                "remove",
+                "--project",
+                "project-1",
+                "--change",
+                "change-1",
+                "--revision",
+                "-1",
+            ]))
+            .is_err()
+        );
+
+        let (_, list_legacy) =
+            parse_args(args(&["change", "legacy-list", "--project", "project-1"])).unwrap();
+        assert_eq!(
+            request_for(list_legacy).unwrap(),
+            LocalRequest::ListLegacySources {
+                project_id: "project-1".try_into().unwrap(),
+                after_id: None,
+                limit: MAX_LEGACY_SOURCE_PAGE_ITEMS,
+            }
+        );
+
+        let (_, forget_legacy) = parse_args(args(&[
+            "change",
+            "forget-legacy",
+            "--project",
+            "project-1",
+            "--legacy-source",
+            "legacy-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(forget_legacy).unwrap(),
+            LocalRequest::ForgetLegacySource {
+                project_id: "project-1".try_into().unwrap(),
+                legacy_source_id: "legacy-1".try_into().unwrap(),
             }
         );
     }
