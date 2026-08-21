@@ -9,16 +9,15 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, ChangeStorageSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, RunId, RunPhase,
+    AgentId, AgentRole, ChangeStorageSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
         MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS,
-        MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
-        ProjectDetail as LocalProjectDetail, RequestCredential, RequestEnvelope,
-        RustStorageSnapshot, ServerFrame, normalize_task_title,
+        MAX_PROVIDER_HOOK_PAYLOAD_BYTES, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
+        MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES, ProjectDetail as LocalProjectDetail,
+        RequestCredential, RequestEnvelope, RustStorageSnapshot, ServerFrame, normalize_task_title,
     },
     status,
 };
@@ -37,8 +36,9 @@ use crate::{
     execution,
     guidance::{self, GuidanceError},
     store::{
-        AgentMessage, AttemptPrincipal, MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewAgent,
-        NewAgentMessage, NewProject, NewTask, Store, StoreError, UpdateAgentProfile,
+        AgentMessage, AttemptPrincipal, AttemptToolPolicy, AttemptToolVerdict,
+        MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewAgent, NewAgentMessage, NewProject, NewTask,
+        StoreError, UpdateAgentProfile,
     },
 };
 
@@ -52,7 +52,7 @@ enum Principal {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
-    use factory_core::TaskId;
+    use factory_core::{RunId, TaskId};
 
     fn orchestrator_attempt() -> AttemptPrincipal {
         AttemptPrincipal {
@@ -262,6 +262,10 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "agent message is invalid or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidToolPolicy) => (
+                ErrorCode::InvalidRequest,
+                "provider tool policy input is invalid or exceeds its bound".into(),
+            ),
             Self::Store(StoreError::InvalidTaskResult) => (
                 ErrorCode::InvalidRequest,
                 "task result exceeds its bound".into(),
@@ -464,6 +468,9 @@ async fn handle_connection(
         Ok(envelope) => envelope,
         Err(response) => return write_response(&mut write, *response).await,
     };
+    if let Err(response) = validate_provider_hook_payload(&envelope.request) {
+        return write_response(&mut write, *response).await;
+    }
     let principal = match resolve_principal(&state, envelope.credential, &operator_credential).await
     {
         Ok(principal) => principal,
@@ -532,6 +539,24 @@ fn parse_envelope(payload: &[u8]) -> Result<RequestEnvelope, Box<LocalResponse>>
         })
     })?;
     Ok(envelope)
+}
+
+fn validate_provider_hook_payload(request: &LocalRequest) -> Result<(), Box<LocalResponse>> {
+    let LocalRequest::ProviderHook { payload, .. } = request else {
+        return Ok(());
+    };
+    let oversized = serde_json::to_vec(payload).map_or(true, |encoded| {
+        encoded.len() > MAX_PROVIDER_HOOK_PAYLOAD_BYTES
+    });
+    if oversized {
+        return Err(Box::new(LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            message: format!(
+                "provider hook payload must be at most {MAX_PROVIDER_HOOK_PAYLOAD_BYTES} bytes"
+            ),
+        }));
+    }
+    Ok(())
 }
 
 async fn resolve_principal(
@@ -638,17 +663,6 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         Err(ApiFailure::Unauthorized(
             "request is outside the admitted attempt's authority".into(),
         ))
-    }
-}
-
-fn verify_mutation_attempt(store: &Store, run_id: &RunId) -> crate::store::Result<()> {
-    let running = store
-        .kernel_run(run_id)?
-        .is_some_and(|run| run.phase == RunPhase::Running);
-    if running {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidHookToken)
     }
 }
 
@@ -1514,58 +1528,36 @@ async fn handle_request(
                 ));
             };
             let decision = crate::policy::decide(&payload, Path::new(&attempt.source_root));
-            let project_id = attempt.project_id.clone();
-            let agent_id = attempt.agent_id.clone();
             let authority_run_id = attempt.run_id.clone();
-            let budget_denied = state
+            let recorded = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, &authority_run_id)?;
-                    let (_, denied, event) =
-                        store.observe_tool_call(&project_id, &agent_id, now_ms()?)?;
-                    Ok((denied, vec![event]))
+                    let recorded = store.decide_tool_call_as_attempt(
+                        &authority_run_id,
+                        AttemptToolPolicy {
+                            tool_name: decision.tool_name,
+                            denied_by: decision.denied_by.map(str::to_owned),
+                        },
+                        now_ms()?,
+                    )?;
+                    Ok((recorded.verdict, recorded.events))
                 })
                 .await?;
-            let reply = {
-                let denied_by = decision.denied_by.map(str::to_owned);
-                let policy_event = FactoryEvent::PolicyDecision {
-                    project_id: attempt.project_id.clone(),
-                    agent_id: attempt.agent_id.clone(),
-                    run_id: attempt.run_id.clone(),
-                    tool_name: decision.tool_name,
-                    decision: if budget_denied || denied_by.is_some() {
-                        "deny"
-                    } else {
-                        "allow"
+            let reply = match recorded {
+                AttemptToolVerdict::Allow => serde_json::json!({}),
+                AttemptToolVerdict::DenyBudget => serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Dark Factory budget exhausted"
                     }
-                    .to_owned(),
-                    rule: denied_by.clone(),
-                };
-                state
-                    .commit_and_publish(move |store| {
-                        let event = store.record_policy_decision(policy_event, now_ms()?)?;
-                        Ok(((), vec![event]))
-                    })
-                    .await?;
-                if budget_denied {
-                    serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": "Dark Factory budget exhausted"
-                        }
-                    })
-                } else {
-                    denied_by.map_or_else(
-                        || serde_json::json!({}),
-                        |rule| serde_json::json!({
-                            "hookSpecificOutput": {
-                                "hookEventName": "PreToolUse",
-                                "permissionDecision": "deny",
-                                "permissionDecisionReason": format!("Dark Factory policy: {rule}")
-                            }
-                        }),
-                    )
-                }
+                }),
+                AttemptToolVerdict::DenyPolicy { rule } => serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": format!("Dark Factory policy: {rule}")
+                    }
+                }),
             };
             Ok(LocalResponse::ProviderHookReply { reply })
         }
@@ -2313,7 +2305,7 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use factory_core::ExecutionMode;
+    use factory_core::{ExecutionMode, RunId};
 
     fn attempt() -> Principal {
         Principal::Attempt(AttemptPrincipal {

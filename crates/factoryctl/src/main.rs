@@ -2,8 +2,8 @@ use std::{env, io::Write, path::PathBuf, process};
 
 use factory_core::local::{
     GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS,
-    MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
-    RequestCredential, ServerFrame,
+    MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_PROVIDER_HOOK_PAYLOAD_BYTES,
+    MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RequestCredential, ServerFrame,
 };
 use factory_core::{AgentRole, CompletionVerification, ExecutionMode, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
@@ -668,10 +668,6 @@ const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
 const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
 const CHANGE_LIST_LIMIT: u32 = MAX_CHANGE_PAGE_ITEMS;
 const LEGACY_SOURCE_LIST_LIMIT: u32 = MAX_LEGACY_SOURCE_PAGE_ITEMS;
-/// Hard bound on `factoryctl hook`'s stdin payload, matching
-/// `LocalRequest::ProviderHook`'s documented 64 KiB payload limit
-/// (`factory-core/src/local.rs`).
-const HOOK_PAYLOAD_LIMIT_BYTES: usize = 64 * 1024;
 /// `factoryctl hook`'s fail-open budget: long enough for a healthy daemon
 /// under normal load, short enough that a wedged daemon never visibly
 /// stalls the operator's live Claude Code or Codex session.
@@ -1137,7 +1133,7 @@ fn hook_reply(
     event: ProviderHookEvent,
 ) -> Option<serde_json::Value> {
     let credential = credential_from_file(token_file).ok()?;
-    let payload = read_bounded_stdin_json(HOOK_PAYLOAD_LIMIT_BYTES)?;
+    let payload = read_bounded_stdin_json(MAX_PROVIDER_HOOK_PAYLOAD_BYTES)?;
     let frame = client
         .request_with_timeout_authenticated(
             LocalRequest::ProviderHook { event, payload },

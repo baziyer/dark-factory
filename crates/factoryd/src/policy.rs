@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use factory_core::local::MAX_PROVIDER_TOOL_NAME_BYTES;
 use serde_json::Value;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -13,22 +14,44 @@ pub struct Decision {
 }
 
 pub fn decide(payload: &Value, source_root: &Path) -> Decision {
-    let tool_name = payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .unwrap_or("tool");
+    let Some(requested_tool_name) = payload.get("tool_name").and_then(Value::as_str) else {
+        return Decision {
+            tool_name: "invalid_tool".into(),
+            denied_by: Some("invalid_tool_name"),
+        };
+    };
+    let valid_tool_name = !requested_tool_name.is_empty()
+        && requested_tool_name.len() <= MAX_PROVIDER_TOOL_NAME_BYTES
+        && !requested_tool_name.chars().any(char::is_control);
+    let tool_name = if valid_tool_name {
+        requested_tool_name
+    } else {
+        "invalid_tool"
+    };
     let input = payload.get("tool_input").unwrap_or(&Value::Null);
-    let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+    let shell_tool = matches!(tool_name, "Bash" | "Shell" | "shell");
+    let command = match (shell_tool, input.get("command").and_then(Value::as_str)) {
+        (true, Some(command)) if !command.is_empty() => command,
+        (true, _) => {
+            return Decision {
+                tool_name: tool_name.to_owned(),
+                denied_by: Some("invalid_shell_command"),
+            };
+        }
+        (false, _) => "",
+    };
     let mut paths = ["file_path", "path", "notebook_path"]
         .into_iter()
         .filter_map(|key| input.get(key).and_then(Value::as_str));
-    let commands = if matches!(tool_name, "Bash" | "Shell" | "shell") {
+    let commands = if shell_tool {
         shell_commands(command)
     } else {
         Ok(Vec::new())
     };
 
-    let denied_by = if commands.is_err() {
+    let denied_by = if !valid_tool_name {
+        Some("invalid_tool_name")
+    } else if commands.is_err() {
         Some("unsupported_shell_syntax")
     } else if direct_rust_toolchain(commands.as_deref().unwrap_or_default()) {
         Some("daemon_owned_rust_verification")
@@ -533,6 +556,40 @@ mod tests {
 
     fn bash(command: &str) -> Value {
         json!({"tool_name":"Bash","tool_input":{"command":command}})
+    }
+
+    #[test]
+    fn malformed_tool_names_are_bounded_and_denied() {
+        let root = Path::new("/tmp/change");
+        for payload in [json!({}), json!({"tool_name":42})] {
+            let decision = decide(&payload, root);
+            assert_eq!(decision.tool_name, "invalid_tool");
+            assert_eq!(decision.denied_by, Some("invalid_tool_name"));
+        }
+        for tool_name in [
+            String::new(),
+            "x".repeat(MAX_PROVIDER_TOOL_NAME_BYTES + 1),
+            "Read\nWrite".into(),
+        ] {
+            let decision = decide(&json!({"tool_name":tool_name,"tool_input":{}}), root);
+            assert_eq!(decision.tool_name, "invalid_tool");
+            assert_eq!(decision.denied_by, Some("invalid_tool_name"));
+        }
+    }
+
+    #[test]
+    fn malformed_shell_commands_are_bounded_and_denied() {
+        let root = Path::new("/tmp/change");
+        for payload in [
+            json!({"tool_name":"Bash"}),
+            json!({"tool_name":"Bash","tool_input":{}}),
+            json!({"tool_name":"Bash","tool_input":{"command":42}}),
+            json!({"tool_name":"Bash","tool_input":{"command":""}}),
+        ] {
+            let decision = decide(&payload, root);
+            assert_eq!(decision.tool_name, "Bash");
+            assert_eq!(decision.denied_by, Some("invalid_shell_command"));
+        }
     }
 
     #[test]
