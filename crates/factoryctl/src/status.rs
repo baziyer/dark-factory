@@ -33,8 +33,8 @@ pub fn write_with_daemon_version(
         .collect();
     writeln!(
         output,
-        "Dark Factory: {versions} | auto {} | attempts {}/{} | projects {} | attention {}",
-        if status.auto_mode { "on" } else { "off" },
+        "Dark Factory: {versions} | dispatch {} | attempts {}/{} | projects {} | attention {}",
+        if status.dispatch_enabled { "on" } else { "off" },
         status.active_runs,
         status.active_run_cap,
         status.projects.len(),

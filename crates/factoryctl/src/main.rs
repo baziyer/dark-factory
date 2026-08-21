@@ -5,7 +5,7 @@ use factory_core::local::{
     MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
     RequestCredential, ServerFrame,
 };
-use factory_core::{AgentRole, CompletionVerification, Provider, ProviderHookEvent};
+use factory_core::{AgentRole, CompletionVerification, ExecutionMode, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ mod usage;
 
 const ATTEMPT_TOKEN_FILE_ENV: &str = "DARK_FACTORY_ATTEMPT_TOKEN_FILE";
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|storage|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|storage|dispatch|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -27,7 +27,7 @@ Commands:
   health                                      Check the daemon
   status [--json]                             The whole fleet at one instant: attempts, queues, attention, active-attempt cap
   storage status [--json]                     Show bounded daemon-owned Rust caches
-  auto on|off|status                         Set or show the factory-wide provider bypass default
+  dispatch on|off|status                     Enable or disable admission of new attempts
   capacity status|set N                     Show or change the operator-owned active-attempt capacity (1..=64)
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Diagnose the install, one line each; exit 1 if any fail
@@ -37,7 +37,7 @@ Commands:
   project add|list|delete|get|guidance|verification
                                                Manage projects and completion verification
   task add|list|get|retry|assign|cancel|update|delete|done|blocked
-                                               Manage tasks; assignment and auto mode admit work
+                                               Manage tasks; assignment and dispatch admit work
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
@@ -392,7 +392,7 @@ Actions:
   delete    Delete an agent that has no open run
   get       Fetch one agent, including its guidance file paths
   status    One agent's live picture: attempt, queue, inbox, budget, and attention
-  profile   Manage an agent's model, permission mode, and guidance files
+  profile   Manage an agent's model, execution mode, and guidance files
   budget    Show, set, or reset the agent's durable provider budget
   message   Send a durable message from one agent to another
   inbox     List an agent's durable messages
@@ -416,7 +416,7 @@ Options:
   --model MODEL               Provider model identifier for this agent
                                (shell provider: a command to run under
                                `sh -lc`, e.g. an absolute path to a script;
-                               omitted means a plain interactive shell)
+                               omitted means `sh -s` reads the one startup input)
   --reasoning-effort TIER      Codex reasoning tier (none|low|medium|high|xhigh|max)
   --model-reason REASON        Auditable reason for an explicit model or escalation
   -h, --help                   Show this help";
@@ -482,7 +482,7 @@ not report trustworthy per-agent cost; Dark Factory never estimates it.";
 const AGENT_PROFILE_HELP: &str =
     "usage: factoryctl agent profile set --project ID --agent ID [options]
 
-Update an agent's model, permission mode, and/or guidance files. Any flag
+Update an agent's model, execution mode, and/or guidance files. Any flag
 left unset carries the currently stored value forward unchanged, so this
 cannot silently clear standing instructions or memory it was not asked to
 change.
@@ -495,7 +495,7 @@ Options:
   --model MODEL                     Provider model identifier
   --reasoning-effort TIER            Codex reasoning tier (none|low|medium|high|xhigh|max)
   --model-reason REASON              Auditable reason for an explicit model or escalation
-  --permission-mode MODE            Provider permission mode
+  --execution-mode MODE             plan-only|workspace-write|unrestricted
   --instructions-file PATH          Local file to read new instructions.md contents from
   --memory-file PATH                Local file to read new memory.md contents from
   -h, --help                          Show this help";
@@ -687,7 +687,7 @@ enum CliCommand {
     StorageStatus {
         json: bool,
     },
-    SetAutoMode {
+    SetDispatchEnabled {
         enabled: bool,
     },
     CapacityStatus,
@@ -823,7 +823,7 @@ enum CliCommand {
         model: Option<String>,
         reasoning_effort: Option<String>,
         model_selection_reason: Option<String>,
-        permission_mode: Option<String>,
+        execution_mode: Option<ExecutionMode>,
         instructions_file: Option<String>,
         memory_file: Option<String>,
     },
@@ -993,7 +993,7 @@ fn run() -> Result<i32, String> {
         model,
         reasoning_effort,
         model_selection_reason,
-        permission_mode,
+        execution_mode,
         instructions_file,
         memory_file,
     } = command
@@ -1006,7 +1006,7 @@ fn run() -> Result<i32, String> {
                 model,
                 reasoning_effort,
                 model_selection_reason,
-                permission_mode,
+                execution_mode,
                 instructions_file,
                 memory_file,
             },
@@ -1171,7 +1171,7 @@ fn read_bounded_stdin_json(limit: usize) -> Option<serde_json::Value> {
     serde_json::from_slice(&buffer).ok()
 }
 
-/// Applies `--model`/`--permission-mode`/`--instructions-file`/
+/// Applies `--model`/`--execution-mode`/`--instructions-file`/
 /// `--memory-file` as a patch over the agent's current profile: any flag
 /// left unset carries the currently stored value forward unchanged, so
 /// `agent profile set` cannot silently clear standing guidance or memory it
@@ -1180,7 +1180,7 @@ struct AgentProfileSetOptions {
     model: Option<String>,
     reasoning_effort: Option<String>,
     model_selection_reason: Option<String>,
-    permission_mode: Option<String>,
+    execution_mode: Option<ExecutionMode>,
     instructions_file: Option<String>,
     memory_file: Option<String>,
 }
@@ -1195,7 +1195,7 @@ fn agent_profile_set_frame(
         model,
         reasoning_effort,
         model_selection_reason,
-        permission_mode,
+        execution_mode,
         instructions_file,
         memory_file,
     } = options;
@@ -1246,7 +1246,7 @@ fn agent_profile_set_frame(
             model: selected_model,
             reasoning_effort: reasoning_effort.or(agent.profile.reasoning_effort),
             model_selection_reason: selection_reason,
-            permission_mode: permission_mode.or(agent.profile.permission_mode),
+            execution_mode: execution_mode.unwrap_or(agent.profile.execution_mode),
             instructions,
             memory,
         })
@@ -1337,24 +1337,22 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             require_empty(&args)?;
             Ok((socket, CliCommand::StorageStatus { json }))
         }
-        "auto" => {
+        "dispatch" => {
             if wants_help(&args) {
                 return Ok((
                     socket,
                     CliCommand::Help(
-                        "usage: factoryctl auto <on|off|status>\n\nSet the durable factory-wide provider bypass default, or show fleet status containing its current value.",
+                        "usage: factoryctl dispatch <on|off|status>\n\nEnable or disable admission of new attempts. Already-admitted attempts keep their frozen execution mode.",
                     ),
                 ));
             }
-            let action = take_action(&mut args, "auto")?;
+            let action = take_action(&mut args, "dispatch")?;
             require_empty(&args)?;
             match action.as_str() {
-                "on" => Ok((socket, CliCommand::SetAutoMode { enabled: true })),
-                "off" => Ok((socket, CliCommand::SetAutoMode { enabled: false })),
-                // Keep this compatibility alias machine-readable; the
-                // human-first command is `factoryctl status`.
+                "on" => Ok((socket, CliCommand::SetDispatchEnabled { enabled: true })),
+                "off" => Ok((socket, CliCommand::SetDispatchEnabled { enabled: false })),
                 "status" => Ok((socket, CliCommand::Status { json: true })),
-                _ => Err("auto action must be `on`, `off`, or `status`".into()),
+                _ => Err("dispatch action must be `on`, `off`, or `status`".into()),
             }
         }
         "capacity" => {
@@ -1814,7 +1812,10 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                     let model = take_option(&mut args, "--model")?;
                     let reasoning_effort = take_option(&mut args, "--reasoning-effort")?;
                     let model_selection_reason = take_option(&mut args, "--model-reason")?;
-                    let permission_mode = take_option(&mut args, "--permission-mode")?;
+                    let execution_mode = take_option(&mut args, "--execution-mode")?
+                        .map(|value| value.parse::<ExecutionMode>())
+                        .transpose()
+                        .map_err(str::to_owned)?;
                     let instructions_file = take_option(&mut args, "--instructions-file")?;
                     let memory_file = take_option(&mut args, "--memory-file")?;
                     require_empty(&args)?;
@@ -1824,7 +1825,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                         model,
                         reasoning_effort,
                         model_selection_reason,
-                        permission_mode,
+                        execution_mode,
                         instructions_file,
                         memory_file,
                     })
@@ -2006,7 +2007,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Status { .. } => Ok(LocalRequest::FleetStatus),
         CliCommand::StorageStatus { .. } => Ok(LocalRequest::RustStorageStatus),
-        CliCommand::SetAutoMode { enabled } => Ok(LocalRequest::SetAutoMode { enabled }),
+        CliCommand::SetDispatchEnabled { enabled } => {
+            Ok(LocalRequest::SetDispatchEnabled { enabled })
+        }
         CliCommand::CapacityStatus | CliCommand::CapacitySet { .. } => {
             Err("capacity is handled outside the daemon protocol".into())
         }
@@ -3036,11 +3039,11 @@ mod tests {
     #[test]
     fn status_and_agent_status_map_to_the_status_requests() {
         assert_eq!(
-            request_for(parse_args(args(&["auto", "off"])).unwrap().1).unwrap(),
-            LocalRequest::SetAutoMode { enabled: false }
+            request_for(parse_args(args(&["dispatch", "off"])).unwrap().1).unwrap(),
+            LocalRequest::SetDispatchEnabled { enabled: false }
         );
         assert_eq!(
-            request_for(parse_args(args(&["auto", "status"])).unwrap().1).unwrap(),
+            request_for(parse_args(args(&["dispatch", "status"])).unwrap().1).unwrap(),
             LocalRequest::FleetStatus
         );
         assert_eq!(
@@ -3166,8 +3169,8 @@ mod tests {
                 "god",
                 "--model",
                 "gpt-5-codex",
-                "--permission-mode",
-                "on-request",
+                "--execution-mode",
+                "plan-only",
                 "--instructions-file",
                 instructions.path().to_str().unwrap(),
                 "--memory-file",
@@ -3182,7 +3185,7 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     reasoning_effort: None,
                     model_selection_reason: None,
-                    permission_mode: Some("on-request".into()),
+                    execution_mode: Some(ExecutionMode::PlanOnly),
                     instructions_file: Some(instructions.path().to_str().unwrap().into()),
                     memory_file: Some(memory.path().to_str().unwrap().into()),
                 }
@@ -3207,11 +3210,25 @@ mod tests {
                     model: None,
                     reasoning_effort: None,
                     model_selection_reason: None,
-                    permission_mode: None,
+                    execution_mode: None,
                     instructions_file: None,
                     memory_file: None,
                 }
             )
+        );
+        assert!(
+            parse_args(args(&[
+                "agent",
+                "profile",
+                "set",
+                "--project",
+                "factory",
+                "--agent",
+                "god",
+                "--execution-mode",
+                "interactive",
+            ]))
+            .is_err()
         );
     }
 

@@ -6,9 +6,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentSnapshot, ChangeId, ChangeSnapshot, ChangeStorageSnapshot,
-    CompletionVerification, EventEnvelope, LegacySourceId, LegacySourceSnapshot, MessageId,
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot,
-    TaskDetail, TaskId,
+    CompletionVerification, EventEnvelope, ExecutionMode, LegacySourceId, LegacySourceSnapshot,
+    MessageId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId,
+    RunSnapshot, TaskDetail, TaskId,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -26,12 +26,9 @@ pub struct AgentProfile {
     /// Durable policy/operator explanation for the configured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_selection_reason: Option<String>,
-    /// Provider-scoped permission mode (Claude: `default`/`acceptEdits`/
-    /// `plan`; Codex: `on-request`/`never`); `None` is the provider default.
-    /// Applied to future provider launches; the resulting runtime value is
-    /// recorded separately on each run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
+    /// Typed provider authority applied to future attempts. The exact value
+    /// used for an admitted attempt is frozen separately on its run.
+    pub execution_mode: ExecutionMode,
     pub instructions: String,
     pub memory: String,
     pub updated_at_ms: i64,
@@ -246,8 +243,9 @@ impl RequestEnvelope {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalRequest {
     Health,
-    /// Changes the durable factory-wide provider bypass default.
-    SetAutoMode {
+    /// Enables or disables admission of new attempts. Already-admitted
+    /// attempts are unaffected.
+    SetDispatchEnabled {
         enabled: bool,
     },
     /// The whole daemon at one instant (`factoryctl status`): every
@@ -322,8 +320,7 @@ pub enum LocalRequest {
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_selection_reason: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_mode: Option<String>,
+        execution_mode: ExecutionMode,
         instructions: String,
         memory: String,
     },
@@ -526,7 +523,7 @@ pub enum LocalResponse {
         #[serde(default)]
         process_id: u32,
     },
-    AutoModeSet {
+    DispatchSet {
         enabled: bool,
     },
     FleetStatus {

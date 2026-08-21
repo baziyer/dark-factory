@@ -6,15 +6,21 @@
 
 use std::path::PathBuf;
 
-use crate::providers::{Capabilities, Provider, ProviderError, ProviderLaunch, SpawnContext};
+use factory_core::ExecutionMode;
 
-pub const PERMISSION_MODES: [&str; 0] = [];
+use crate::providers::{Provider, ProviderError, ProviderLaunch, SpawnContext};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShellProvider;
 
 impl Provider for ShellProvider {
     fn spawn_spec(&self, ctx: &SpawnContext) -> Result<ProviderLaunch, ProviderError> {
+        if ctx.execution_mode != ExecutionMode::Unrestricted {
+            return Err(ProviderError::UnsupportedExecutionMode {
+                provider: factory_core::Provider::Shell,
+                mode: ctx.execution_mode,
+            });
+        }
         let args = ctx.model.as_ref().map_or_else(
             || vec!["-s".to_owned()],
             |command| vec!["-lc".to_owned(), command.clone()],
@@ -28,10 +34,6 @@ impl Provider for ShellProvider {
             )],
             startup_input: ctx.startup_input.clone(),
         })
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::for_provider(factory_core::Provider::Shell, &PERMISSION_MODES)
     }
 }
 
@@ -48,10 +50,10 @@ mod tests {
             startup_input: b"printf ready".to_vec(),
             model: None,
             reasoning_effort: None,
-            permission_mode: None,
-            auto_mode: true,
+            execution_mode: ExecutionMode::Unrestricted,
             hook_token_path: directory.join("runtime/hook.token"),
             factoryctl_path: PathBuf::from("/abs/factoryctl"),
+            socket_path: PathBuf::from("/abs/factory.sock"),
             agent_dir: directory.join("agent-dir"),
         }
     }
@@ -75,5 +77,19 @@ mod tests {
         let launch = ShellProvider.spawn_spec(&ctx).unwrap();
         assert_eq!(launch.args, ["-lc", "/abs/fixtures/shell-agent.sh"]);
         assert_eq!(launch.startup_input, b"printf ready");
+    }
+
+    #[test]
+    fn shell_refuses_modes_it_cannot_enforce() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = context(directory.path());
+        ctx.execution_mode = ExecutionMode::WorkspaceWrite;
+        assert!(matches!(
+            ShellProvider.spawn_spec(&ctx),
+            Err(ProviderError::UnsupportedExecutionMode {
+                provider: factory_core::Provider::Shell,
+                mode: ExecutionMode::WorkspaceWrite,
+            })
+        ));
     }
 }

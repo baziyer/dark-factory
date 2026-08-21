@@ -104,9 +104,37 @@ provider build surface. This is not a sandbox: interpreters, generated
 programs, MCP tools, provider defects, and direct syscalls can evade string
 inspection.
 
-Auto mode can remove a provider's own approval prompts and therefore increases
-risk within the same-user boundary. It never bypasses daemon authentication,
-attempt scope, run phase, or finalization rules.
+Factory dispatch and provider authority are separate durable controls.
+`dispatch_enabled` decides only whether another attempt may be admitted; turning
+it off cannot weaken or rewrite an already-admitted attempt. Every agent instead
+has one typed execution mode, frozen onto the run at admission:
+
+- `PlanOnly` is non-interactive and source-read-only; the two exact attempt
+  outcome requests remain available;
+- `WorkspaceWrite` is non-interactive and bounds durable writes to the admitted
+  source with the provider's native sandbox. Codex also denies both system temp
+  aliases. Claude requires its own per-session temporary scratch directory;
+  that provider-owned ephemeral directory is the one explicit write exception;
+  and
+- `Unrestricted` uses the provider's explicit approval/sandbox bypass.
+
+Codex and Claude agents default to `WorkspaceWrite`. The shell test adapter has
+no native restriction mechanism and therefore supports only `Unrestricted`
+instead of claiming a boundary it cannot enforce. These provider controls never
+bypass daemon authentication, attempt scope, run phase, or finalization rules,
+and they remain cooperative same-user controls rather than OS isolation.
+
+Claude `WorkspaceWrite` is macOS-only because its exact AF_UNIX sandbox policy
+is ignored elsewhere. `PlanOnly` has no sandbox stanza and does not technically
+depend on that policy, but is conservatively restricted to the supported macOS
+product runtime rather than asserting a second platform claim. `Unrestricted`
+remains available elsewhere. Factoryd resolves and validates one exact
+reviewed Claude executable and every generated settings shape before opening
+the Store for admission. Missing or invalid Claude makes that provider
+unavailable without stopping Codex or Shell; a Claude launch, changed
+executable, or unreviewed version fails closed. Codex launch configuration is
+parsed under `--strict-config` in every mode so a future CLI cannot silently
+ignore the daemon-authored hooks or typed permission profile.
 
 Provider output remains opaque and bounded. It never becomes lifecycle
 authority and does not enter public events, local-API responses, or tracing.

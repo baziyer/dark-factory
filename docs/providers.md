@@ -16,7 +16,6 @@ The complete trait is in `crates/factoryd/src/providers/mod.rs`:
 pub trait Provider {
     fn spawn_spec(&self, ctx: &SpawnContext)
         -> Result<ProviderLaunch, ProviderError>;
-    fn capabilities(&self) -> Capabilities;
 }
 ```
 
@@ -25,9 +24,10 @@ pub trait Provider {
 - the exact `RunId` that owns this process;
 - the daemon-selected source directory;
 - one `startup_input` byte string;
-- resolved model, reasoning, permission, and auto-mode settings;
+- resolved model and reasoning settings plus one typed execution mode frozen by
+  admission;
 - private paths for the attempt bearer and generated configuration; and
-- the trusted absolute `factoryctl` path.
+- the trusted absolute `factoryctl` path and exact daemon socket.
 
 `ProviderLaunch` returns one executable, argv, provider-specific environment
 additions, the same startup input, generated configuration paths, and runtime
@@ -60,7 +60,50 @@ The launch is always fresh and non-interactive:
 - Shell: `sh -s`, or `sh -lc <configured-fixture-command>`, receiving the same
   startup input. This is the deterministic reference adapter.
 
-Model and permission flags are explicit when configured. Missing runtime
+Dispatch is not a provider input. It controls only whether the Store may admit
+another attempt. Each admitted run instead freezes one `ExecutionMode`:
+
+| Mode | Codex | Claude Code | Shell |
+|---|---|---|---|
+| `PlanOnly` | named profile extending `:read-only`, `approval_policy="never"`, and command network limited to the exact daemon socket | conservatively restricted to the supported macOS product runtime; `--permission-mode dontAsk`, read tools plus only the two `factoryctl task` outcome commands, with all write tools denied | unsupported |
+| `WorkspaceWrite` | named profile extending `:workspace`, both system-temp roots denied, `approval_policy="never"`, and command network limited to the exact daemon socket | macOS-only because exact AF_UNIX sandbox policy is required; `--permission-mode dontAsk`, exact `Edit(./**)` rule anchored by the Change working directory, and native sandboxing that fails if unavailable or asked to retry unsandboxed | unsupported |
+| `Unrestricted` | `--dangerously-bypass-approvals-and-sandbox` | `--permission-mode bypassPermissions` | the only honest shell mode |
+
+Codex and Claude profiles default to `WorkspaceWrite`; shell defaults to its
+only supported mode. Claude always uses `-p`, ignores user/project setting
+sources, and uses strict MCP configuration. Codex always uses `exec
+--strict-config`, disables interactive approvals for bounded modes, and reads
+the one task from stdin.
+No advertised mode can wait for an unanswered native approval prompt.
+
+Bounded Codex modes require Codex CLI 0.138.0 or later. They pass
+`--enable network_proxy`, so a client that does not recognize the required
+enforcement feature exits before `exec` rather than silently ignoring the
+socket-only policy. Adapter tests validate the complete generated profile with
+an installed Codex metadata command and never send a prompt.
+
+Claude `WorkspaceWrite` uses a native Bash sandbox that writes to the Change
+and one provider-created per-session temp directory; the latter is ephemeral
+runtime scratch, not durable product source. Its exact AF_UNIX allowlist is
+enforced by Claude only on macOS, so `WorkspaceWrite` fails before launch on
+other platforms. `PlanOnly` has no sandbox stanza and technically does not
+depend on that allowlist, but is conservatively restricted to the supported
+macOS product runtime to avoid a second platform claim. The explicit
+`Unrestricted` mode remains available elsewhere. Linux remains a source/test
+lane rather than an advertised daemon runtime.
+
+At daemon startup, Dark Factory resolves one canonical Claude executable,
+requires the reviewed exact `2.1.236 (Claude Code)` version, and passes every
+generated settings shape through the metadata-only `doctor` command with a
+fixed non-colour `C` locale. Claude reports invalid settings while still
+exiting zero, so the daemon also rejects its `Invalid settings` diagnostic. No
+prompt is submitted. Missing, unreviewed, or invalid Claude is marked
+unavailable: the daemon can still serve Codex and Shell, but a Claude attempt
+fails explicitly. Attempts reuse the validated executable identity and fail
+before launch if an auto-update or replacement changed it; the next Claude
+version must be reviewed and allow-listed deliberately.
+
+Model and reasoning flags are explicit when configured. Missing runtime
 metadata remains `None`; never invent a plausible provider default.
 
 ## Hooks and attempt authority
@@ -112,12 +155,19 @@ orchestrators are not workspace-test subjects.
 Keep generated files private and limited to what the provider needs for this
 launch.
 
-- Claude receives a per-run settings file containing daemon-authored hooks.
+- Claude receives a per-run settings file containing daemon-authored hooks and
+  the exact permissions/sandbox settings for the frozen execution mode.
   Dark Factory does not edit the operator's `~/.claude.json`.
-- Codex uses an isolated generated home. The first seed may retain bounded
-  operator authentication/model configuration while excluding operator MCP,
-  project-trust, and hook tables. Dark Factory then writes its own hook,
-  approval, sandbox, and source settings.
+- Codex uses an isolated generated home. The seed retains only the operator's
+  `auth.json` link, not ambient configuration. Model and reasoning selection
+  comes from the admitted agent profile; custom model-provider tables and
+  their command-backed authentication cannot enter the attempt.
+  It excludes every table, including custom model-provider tables whose
+  authentication may execute a helper command, plus every ambient rule,
+  profile, MCP, project-trust, hook, permission, network-feature, and legacy
+  sandbox setting. Dark Factory then writes its own hook and source-trust
+  settings and supplies the exact frozen permission profile at launch. Ambient
+  authority is removed, not merged or overridden by precedence.
 - Provider environment additions must not duplicate the runner's generic
   sanitized environment or expose repository credentials.
 
@@ -131,9 +181,11 @@ finalizer must release and acknowledge it durably.
    `providers/mod.rs` and the shared provider enum.
 2. Implement `spawn_spec` as a pure launch description plus the smallest
    necessary private configuration writes.
-3. Return a `Capabilities` declaration for accepted model, reasoning, and
-   permission values. Validation happens before a future launch.
-4. Add focused tests proving the exact executable/argv, one unchanged startup
+3. Add the provider's model/reasoning policy to the shared model-policy module
+   and define which typed execution modes it can truthfully enforce. Validation
+   happens before a future launch.
+4. Add focused tests proving the exact executable/argv for every supported
+   execution mode, one unchanged startup
    input, private generated files, sanitized environment additions, and no
    resume or caller-selected source path.
 5. Exercise lifecycle behavior through the generic prepare/activate runner

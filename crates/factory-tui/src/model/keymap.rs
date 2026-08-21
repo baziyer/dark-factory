@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use factory_core::local::LocalRequest;
 use factory_core::status::AttentionItem;
-use factory_core::{AgentId, AgentRole, ProjectId, RunId, TaskId, TaskStatus};
+use factory_core::{AgentId, AgentRole, ExecutionMode, ProjectId, RunId, TaskId, TaskStatus};
 
 use super::{Board, StatusLevel};
 use crate::mouse::Target as MouseTarget;
@@ -76,7 +76,7 @@ pub enum Action {
     EditMemory,
     ManageTask,
     EditModel,
-    EditPermission,
+    EditExecutionMode,
     EditCapacity,
     /// `u`: run the visible verified update once.
     Update,
@@ -110,7 +110,7 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('M') => Some(Action::EditMemory),
         KeyCode::Char('t') => Some(Action::ManageTask),
         KeyCode::Char('v') => Some(Action::EditModel),
-        KeyCode::Char('a') => Some(Action::EditPermission),
+        KeyCode::Char('a') => Some(Action::EditExecutionMode),
         KeyCode::Char('C') => Some(Action::EditCapacity),
         KeyCode::Char('u') => Some(Action::Update),
         _ => None,
@@ -129,7 +129,7 @@ pub enum PromptKind {
     EditTaskTitle(TaskId),
     ReorderTask(TaskId),
     EditModel(AgentId),
-    EditPermission(AgentId),
+    EditExecutionMode(AgentId),
     Capacity,
 }
 
@@ -194,15 +194,15 @@ impl PromptState {
         }
     }
 
-    fn edit_profile(agent_id: AgentId, permission: bool, current: String) -> Self {
+    fn edit_profile(agent_id: AgentId, execution_mode: bool, current: String) -> Self {
         Self {
-            kind: if permission {
-                PromptKind::EditPermission(agent_id)
+            kind: if execution_mode {
+                PromptKind::EditExecutionMode(agent_id)
             } else {
                 PromptKind::EditModel(agent_id)
             },
-            labels: vec![if permission {
-                "permission mode"
+            labels: vec![if execution_mode {
+                "execution mode"
             } else {
                 "model"
             }],
@@ -463,7 +463,7 @@ impl Board {
             Action::EditMemory => self.edit_guidance(false),
             Action::ManageTask => self.manage_task(),
             Action::EditModel => self.begin_profile_edit(false),
-            Action::EditPermission => self.begin_profile_edit(true),
+            Action::EditExecutionMode => self.begin_profile_edit(true),
             Action::EditCapacity => self.begin_capacity_edit(),
             Action::Update => {
                 if self.update_available.is_some() && self.update_progress.is_none() {
@@ -589,7 +589,7 @@ impl Board {
         Intent::Redraw
     }
 
-    fn begin_profile_edit(&mut self, permission: bool) -> Intent {
+    fn begin_profile_edit(&mut self, execution_mode: bool) -> Intent {
         let Some(agent_id) = self.selected_agent.clone() else {
             return Intent::None;
         };
@@ -597,13 +597,12 @@ impl Board {
             self.set_status("agent settings are still loading", StatusLevel::Error);
             return Intent::Redraw;
         };
-        let current = if permission {
-            detail.profile.permission_mode.clone()
+        let current = if execution_mode {
+            detail.profile.execution_mode.to_string()
         } else {
-            detail.profile.model.clone()
-        }
-        .unwrap_or_default();
-        self.mode = Mode::Prompt(PromptState::edit_profile(agent_id, permission, current));
+            detail.profile.model.clone().unwrap_or_default()
+        };
+        self.mode = Mode::Prompt(PromptState::edit_profile(agent_id, execution_mode, current));
         Intent::Redraw
     }
 
@@ -1061,27 +1060,33 @@ impl Board {
                     model: value,
                     reasoning_effort: detail.profile.reasoning_effort.clone(),
                     model_selection_reason,
-                    permission_mode: detail.profile.permission_mode.clone(),
+                    execution_mode: detail.profile.execution_mode,
                     instructions: detail.profile.instructions.clone(),
                     memory: detail.profile.memory.clone(),
                 })
             }
-            PromptKind::EditPermission(agent_id) => {
+            PromptKind::EditExecutionMode(agent_id) => {
                 let Some(detail) = self.agent_details.get(&agent_id) else {
                     return Intent::Redraw;
                 };
-                let permission_mode = prompt
+                let execution_mode = prompt
                     .values
                     .first()
-                    .cloned()
-                    .filter(|value| !value.trim().is_empty());
+                    .and_then(|value| value.trim().parse::<ExecutionMode>().ok());
+                let Some(execution_mode) = execution_mode else {
+                    self.set_status(
+                        "execution mode must be plan-only, workspace-write, or unrestricted",
+                        StatusLevel::Error,
+                    );
+                    return Intent::Redraw;
+                };
                 Intent::Send(LocalRequest::UpdateAgentProfile {
                     project_id: detail.snapshot.project_id.clone(),
                     agent_id,
                     model: detail.profile.model.clone(),
                     reasoning_effort: detail.profile.reasoning_effort.clone(),
                     model_selection_reason: detail.profile.model_selection_reason.clone(),
-                    permission_mode,
+                    execution_mode,
                     instructions: detail.profile.instructions.clone(),
                     memory: detail.profile.memory.clone(),
                 })

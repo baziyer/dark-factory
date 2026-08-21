@@ -30,6 +30,7 @@ struct Config {
     runner: PathBuf,
     factoryctl: PathBuf,
     git: PathBuf,
+    claude: Option<PathBuf>,
     cargo: Option<PathBuf>,
     runtime_root: PathBuf,
     changes_root: PathBuf,
@@ -56,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .compact()
         .init();
     let config = parse_config()?;
-    preflight_sibling_binaries(&config)?;
+    let claude = preflight_runtime_binaries(&config)?;
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
@@ -75,6 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             runner_program: config.runner,
             factoryctl_path: config.factoryctl,
             git_program: config.git,
+            claude_installation: claude,
             cargo_program: config.cargo,
             runtime_root: config.runtime_root,
             changes_root: config.changes_root,
@@ -252,6 +254,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         runner,
         factoryctl,
         git: resolve_executable_on_path("git")?,
+        claude: resolve_optional_executable_on_path("claude"),
         cargo: resolve_cargo_on_path().ok(),
         runtime_root: home.join("runs"),
         changes_root: home.join("changes"),
@@ -265,6 +268,11 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
 fn resolve_executable_on_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     let path = env::var_os("PATH").ok_or("PATH is not set")?;
     resolve_executable_in_path(name, &path).map_err(Into::into)
+}
+
+fn resolve_optional_executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    resolve_executable_in_path(name, &path).ok()
 }
 
 fn resolve_cargo_on_path() -> Result<PathBuf, Box<dyn Error>> {
@@ -459,7 +467,9 @@ fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
 /// version of the same check `runner_process::spawn_runner` runs on every
 /// individual spawn attempt (`checked_executable`, shared here rather than
 /// duplicated).
-fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
+fn preflight_runtime_binaries(
+    config: &Config,
+) -> Result<Option<factoryd::providers::claude::ClaudeInstallation>, String> {
     for (role, path) in [
         ("daemon materializer", &config.factoryd),
         ("runner", &config.runner),
@@ -472,7 +482,16 @@ fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    let Some(program) = config.claude.as_deref() else {
+        return Ok(None);
+    };
+    match factoryd::providers::claude::preflight_installation(program, std::env::consts::OS) {
+        Ok(installation) => Ok(Some(installation)),
+        Err(error) => {
+            tracing::warn!(%error, "Claude Code is unavailable; Claude attempts will fail closed");
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -485,8 +504,8 @@ mod tests {
     };
 
     use super::{
-        Config, parse_arguments, resolve_cargo_in_path, resolve_executable_in_path,
-        rust_worker_must_terminate,
+        Config, parse_arguments, preflight_runtime_binaries, resolve_cargo_in_path,
+        resolve_executable_in_path, rust_worker_must_terminate,
     };
 
     fn config() -> Config {
@@ -497,6 +516,7 @@ mod tests {
             runner: PathBuf::from("/bin/factory-runner"),
             factoryctl: PathBuf::from("/bin/factoryctl"),
             git: PathBuf::from("/usr/bin/git"),
+            claude: None,
             cargo: Some(PathBuf::from("/usr/bin/cargo")),
             runtime_root: PathBuf::from("/state/runs"),
             changes_root: PathBuf::from("/state/changes"),
@@ -512,6 +532,25 @@ mod tests {
             .map(|value| OsString::from(*value))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn rejected_claude_install_does_not_stop_other_runtime_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        fs::write(&claude, "#!/bin/sh\nprintf 'unreviewed (Claude Code)\\n'\n").unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        let sibling = root.path().join("sibling");
+        fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = config();
+        config.factoryd = sibling.clone();
+        config.runner = sibling.clone();
+        config.factoryctl = sibling.clone();
+        config.git = sibling;
+        config.claude = Some(claude);
+
+        assert!(preflight_runtime_binaries(&config).unwrap().is_none());
     }
 
     #[test]

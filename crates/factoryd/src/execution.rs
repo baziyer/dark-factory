@@ -69,6 +69,7 @@ pub struct Config {
     pub runner_program: PathBuf,
     pub factoryctl_path: PathBuf,
     pub git_program: PathBuf,
+    pub claude_installation: Option<providers::claude::ClaudeInstallation>,
     pub cargo_program: Option<PathBuf>,
     pub runtime_root: PathBuf,
     pub changes_root: PathBuf,
@@ -710,6 +711,13 @@ async fn launch_admitted(
     bearer: String,
 ) -> Result<StartedProcess, (Error, Option<Child>, RecoverableKernelRun)> {
     let recovery = recovery_from_admission(&admitted);
+    let provider = match select_provider(
+        admitted.target.provider,
+        config.claude_installation.as_ref(),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
     let runtime_dir = PathBuf::from(&admitted.target.runner_runtime);
     if let Err(error) = ensure_private_directory(&runtime_dir) {
         return Err((error, None, recovery));
@@ -750,6 +758,26 @@ async fn launch_admitted(
         }
     }
     let hook_token_path = runtime_dir.join("attempt.token");
+    let startup_input = match compose_startup(config, &admitted) {
+        Ok(input) => input,
+        Err(error) => return Err((error, None, recovery)),
+    };
+    let context = SpawnContext {
+        run_id: admitted.run.id.clone(),
+        source_root: PathBuf::from(&admitted.target.source_root),
+        startup_input,
+        model: admitted.target.model.clone(),
+        reasoning_effort: admitted.target.reasoning_effort.clone(),
+        execution_mode: admitted.target.execution_mode,
+        hook_token_path: hook_token_path.clone(),
+        factoryctl_path: config.factoryctl_path.clone(),
+        socket_path: config.socket_path.clone(),
+        agent_dir: runtime_dir.join("provider"),
+    };
+    let mut launch = match provider.spawn_spec(&context) {
+        Ok(launch) => launch,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
     if let Err(source) = hooks::write_private_file(&hook_token_path, bearer.as_bytes()) {
         return Err((
             Error::Runtime {
@@ -760,27 +788,6 @@ async fn launch_admitted(
             recovery,
         ));
     }
-    let startup_input = match compose_startup(config, &admitted) {
-        Ok(input) => input,
-        Err(error) => return Err((error, None, recovery)),
-    };
-    let provider = select_provider(admitted.target.provider);
-    let context = SpawnContext {
-        run_id: admitted.run.id.clone(),
-        source_root: PathBuf::from(&admitted.target.source_root),
-        startup_input,
-        model: admitted.target.model.clone(),
-        reasoning_effort: admitted.target.reasoning_effort.clone(),
-        permission_mode: admitted.target.permission_mode.clone(),
-        auto_mode: admitted.target.auto_mode,
-        hook_token_path,
-        factoryctl_path: config.factoryctl_path.clone(),
-        agent_dir: runtime_dir.join("provider"),
-    };
-    let mut launch = match provider.spawn_spec(&context) {
-        Ok(launch) => launch,
-        Err(error) => return Err((error.into(), None, recovery)),
-    };
     if provisioning {
         let change_id = match admitted.target.change_id.as_ref() {
             Some(change_id) => change_id,
@@ -1045,11 +1052,22 @@ fn provider_environment(
     )
 }
 
-fn select_provider(kind: Provider) -> Box<dyn providers::Provider + Send> {
+fn select_provider(
+    kind: Provider,
+    claude_installation: Option<&providers::claude::ClaudeInstallation>,
+) -> Result<Box<dyn providers::Provider + Send>, providers::ProviderError> {
     match kind {
-        Provider::ClaudeCode => Box::new(providers::claude::ClaudeProvider),
-        Provider::Codex => Box::new(providers::codex::CodexProvider::new()),
-        Provider::Shell => Box::new(providers::shell::ShellProvider),
+        Provider::ClaudeCode => claude_installation
+            .map(|installation| {
+                Box::new(providers::claude::ClaudeProvider::new(installation.clone()))
+                    as Box<dyn providers::Provider + Send>
+            })
+            .ok_or(providers::ProviderError::Unavailable {
+                provider: Provider::ClaudeCode,
+                reason: "no validated executable was found on daemon startup PATH",
+            }),
+        Provider::Codex => Ok(Box::new(providers::codex::CodexProvider::new())),
+        Provider::Shell => Ok(Box::new(providers::shell::ShellProvider)),
     }
 }
 
@@ -1129,14 +1147,14 @@ async fn dispatch_agent(
     )
     .await;
     if let Err(error) = &result
-        && is_admission_capacity(error)
+        && is_admission_paused(error)
     {
         return Ok(());
     }
     result.map(|_| ())
 }
 
-fn is_admission_capacity(error: &Error) -> bool {
+fn is_admission_paused(error: &Error) -> bool {
     matches!(
         error,
         Error::State(DaemonStateError::Store(
@@ -4010,6 +4028,7 @@ mod tests {
             runner_program: PathBuf::from("/bin/factory-runner"),
             factoryctl_path: PathBuf::from("/bin/factoryctl"),
             git_program: PathBuf::from("/usr/bin/git"),
+            claude_installation: None,
             cargo_program: Some(PathBuf::from("/usr/bin/cargo")),
             runtime_root: root.join("runs"),
             changes_root: root.join("changes"),
@@ -4029,16 +4048,27 @@ mod tests {
     }
 
     #[test]
-    fn both_attempt_and_change_capacity_pause_only_the_current_dispatch() {
+    fn unavailable_claude_is_rejected_without_a_bare_path_fallback() {
+        assert!(matches!(
+            select_provider(Provider::ClaudeCode, None),
+            Err(providers::ProviderError::Unavailable {
+                provider: Provider::ClaudeCode,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capacity_errors_pause_only_the_current_dispatch() {
         for error in [
             StoreError::CapacityReached { limit: 8 },
             StoreError::ChangeCapacityReached { limit: 64 },
         ] {
-            assert!(is_admission_capacity(&Error::State(
-                DaemonStateError::Store(error)
-            )));
+            assert!(is_admission_paused(&Error::State(DaemonStateError::Store(
+                error
+            ))));
         }
-        assert!(!is_admission_capacity(&Error::InvalidId));
+        assert!(!is_admission_paused(&Error::InvalidId));
     }
 
     #[test]

@@ -74,7 +74,7 @@ mod tests {
             runner_instance_id: None,
             runtime_model: None,
             runtime_reasoning_effort: None,
-            runtime_permission_mode: None,
+            runtime_execution_mode: None,
             runtime_control_mode: None,
             activity: None,
             wait_reason: None,

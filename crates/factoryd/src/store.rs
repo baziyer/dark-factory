@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
-    ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, RunId, RunSnapshot,
-    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, ExecutionMode, FactoryEvent,
+    MessageId, ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, RunId,
+    RunSnapshot, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::{Attention, run_attention},
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     model_policy,
@@ -42,7 +42,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -56,7 +56,6 @@ const MAX_STATE_PAGE: usize = 1_001;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AGENT_MODEL_BYTES: usize = 256;
-const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
 const MAX_WAIT_REASON_BYTES: usize = 512;
 /// Mirrors the `tasks.blocked_reason` CHECK bound (migration 0014).
 const MAX_BLOCKED_REASON_BYTES: usize = 4096;
@@ -89,18 +88,18 @@ pub struct NewAgent {
     pub provider: Provider,
 }
 
-/// Durable, provider-scoped model selection and permission mode. Standing
+/// Durable model selection and typed provider execution authority. Standing
 /// instructions and memory used to live here as TEXT columns; they are now
 /// operator- and agent-editable files under the state directory (see
 /// `factoryd::guidance` and `factory_core::paths`), composed at launch by
-/// the execution track. `permission_mode` is consumed by provider launch and
+/// the execution track. `execution_mode` is consumed by provider launch and
 /// retained separately from each admitted attempt's resolved runtime metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub model_selection_reason: Option<String>,
-    pub permission_mode: Option<String>,
+    pub execution_mode: ExecutionMode,
     pub updated_at_ms: i64,
 }
 
@@ -113,7 +112,7 @@ pub struct UpdateAgentProfile {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub model_selection_reason: Option<String>,
-    pub permission_mode: Option<String>,
+    pub execution_mode: ExecutionMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,8 +195,11 @@ pub enum StoreError {
     InvalidAgentProfile,
     #[error("agent model policy rejected the profile: {0}")]
     InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
-    #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
-    UnsupportedAgentPermissionMode { provider: Provider, mode: String },
+    #[error("execution mode {mode:?} is not supported by provider {provider:?}")]
+    UnsupportedAgentExecutionMode {
+        provider: Provider,
+        mode: ExecutionMode,
+    },
     #[error("agent budget is invalid or exceeds its bound")]
     InvalidAgentBudget,
     #[error("agent budget is exhausted; reset it before resuming")]
@@ -324,25 +326,27 @@ impl Store {
         Ok(Self { connection })
     }
 
-    pub fn auto_mode(&self) -> Result<bool> {
+    pub fn dispatch_enabled(&self) -> Result<bool> {
         self.connection
             .query_row(
-                "SELECT auto_mode FROM factory_settings WHERE singleton = 1",
+                "SELECT dispatch_enabled FROM factory_settings WHERE singleton = 1",
                 [],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(Into::into)
     }
 
-    pub fn set_auto_mode(&mut self, enabled: bool, now_ms: i64) -> Result<EventEnvelope> {
+    pub fn set_dispatch_enabled(&mut self, enabled: bool, now_ms: i64) -> Result<EventEnvelope> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "UPDATE factory_settings SET auto_mode = ?1, updated_at_ms = ?2 WHERE singleton = 1",
+            "UPDATE factory_settings
+             SET dispatch_enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
             params![enabled, now_ms],
         )?;
-        let event = FactoryEvent::AutoModeChanged { enabled };
+        let event = FactoryEvent::DispatchPolicyChanged { enabled };
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
         Ok(EventEnvelope {
@@ -548,13 +552,15 @@ impl Store {
         )?;
         transaction.execute(
             "INSERT INTO agent_profiles (
-                agent_id, model, reasoning_effort, model_selection_reason, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                agent_id, model, reasoning_effort, model_selection_reason,
+                execution_mode, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 agent.id.as_str(),
                 model,
                 reasoning_effort,
                 model_selection_reason,
+                ExecutionMode::default_for_provider(agent.provider).as_str(),
                 agent.updated_at_ms
             ],
         )?;
@@ -1754,13 +1760,14 @@ impl Store {
         let agent = load_agent(&self.connection, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
+        let default_execution_mode = ExecutionMode::default_for_provider(agent.snapshot.provider);
         Ok(AgentDetail {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
                 reasoning_effort: None,
                 model_selection_reason: None,
-                permission_mode: None,
+                execution_mode: default_execution_mode,
                 updated_at_ms: 0,
             }),
         })
@@ -1780,14 +1787,11 @@ impl Store {
         let agent = load_agent(&transaction, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
-        if let Some(mode) = input.permission_mode.as_deref() {
-            let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
-            if !capabilities.permission_modes.contains(&mode) {
-                return Err(StoreError::UnsupportedAgentPermissionMode {
-                    provider: agent.snapshot.provider,
-                    mode: mode.to_owned(),
-                });
-            }
+        if !input.execution_mode.supported_by(agent.snapshot.provider) {
+            return Err(StoreError::UnsupportedAgentExecutionMode {
+                provider: agent.snapshot.provider,
+                mode: input.execution_mode,
+            });
         }
         let selection = model_policy::normalize_profile(
             agent.snapshot.provider,
@@ -1802,20 +1806,20 @@ impl Store {
         transaction.execute(
             "INSERT INTO agent_profiles (
                 agent_id, model, reasoning_effort, model_selection_reason,
-                permission_mode, updated_at_ms
+                execution_mode, updated_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
                 reasoning_effort = excluded.reasoning_effort,
                 model_selection_reason = excluded.model_selection_reason,
-                permission_mode = excluded.permission_mode,
+                execution_mode = excluded.execution_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
                 selection.model,
                 selection.reasoning_effort,
                 selection.reason,
-                input.permission_mode,
+                input.execution_mode.as_str(),
                 now_ms
             ],
         )?;
@@ -2036,8 +2040,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 fn validate_agent_profile(input: &UpdateAgentProfile) -> Result<()> {
-    validate_agent_model(input.model.as_deref())?;
-    validate_agent_permission_mode(input.permission_mode.as_deref())
+    validate_agent_model(input.model.as_deref())
 }
 
 fn validate_agent_message(body: &str, created_at_ms: i64) -> Result<()> {
@@ -2058,20 +2061,6 @@ fn validate_agent_model(model: Option<&str>) -> Result<()> {
     if model.is_some_and(|value| {
         value.is_empty()
             || value.len() > MAX_AGENT_MODEL_BYTES
-            || value.chars().any(char::is_control)
-    }) {
-        return Err(StoreError::InvalidAgentProfile);
-    }
-    Ok(())
-}
-
-/// Provider-scoped, free-form permission mode (e.g. Claude's `acceptEdits`
-/// or `plan`; Codex's `on-request` or `never`); `None` means the provider
-/// default. Validated the same way as `model`; provider launch consumes it.
-fn validate_agent_permission_mode(permission_mode: Option<&str>) -> Result<()> {
-    if permission_mode.is_some_and(|value| {
-        value.is_empty()
-            || value.len() > MAX_AGENT_PERMISSION_MODE_BYTES
             || value.chars().any(char::is_control)
     }) {
         return Err(StoreError::InvalidAgentProfile);
@@ -2217,7 +2206,7 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
     connection
         .query_row(
             "SELECT model, reasoning_effort, model_selection_reason,
-                    permission_mode, updated_at_ms
+                    execution_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
@@ -2225,7 +2214,7 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
                     model: row.get(0)?,
                     reasoning_effort: row.get(1)?,
                     model_selection_reason: row.get(2)?,
-                    permission_mode: row.get(3)?,
+                    execution_mode: parse_execution_mode(&row.get::<_, String>(3)?, 3)?,
                     updated_at_ms: row.get(4)?,
                 })
             },
@@ -2486,7 +2475,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 }
 
 fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
-    debug_assert!(matches!(target, 29 | 30 | 31 | SCHEMA_VERSION));
+    debug_assert!(matches!(target, 29 | 30 | 31 | 32 | 33 | SCHEMA_VERSION));
     let mut current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current < 0 {
         return Err(StoreError::InvalidSchemaVersion(current));
@@ -2786,12 +2775,22 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
         current = 32;
     }
-    if current == 32 && target == SCHEMA_VERSION {
+    if current == 32 && target >= 33 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
             "../migrations/0033_retire_webhook_document_delete_guard.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 33)?;
+        transaction.commit()?;
+        verify_no_foreign_key_violations(connection)?;
+        current = 33;
+    }
+    if current == 33 && target == SCHEMA_VERSION {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0034_dispatch_execution_modes.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 34)?;
         transaction.commit()?;
         verify_no_foreign_key_violations(connection)?;
     }
@@ -2969,12 +2968,14 @@ struct EventMetadata<'a> {
 
 fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
     match event {
-        FactoryEvent::AutoModeChanged { .. } => EventMetadata {
-            project_id: None,
-            task_id: None,
-            agent_id: None,
-            run_id: None,
-        },
+        FactoryEvent::DispatchPolicyChanged { .. } | FactoryEvent::LegacyAutoModeChanged { .. } => {
+            EventMetadata {
+                project_id: None,
+                task_id: None,
+                agent_id: None,
+                run_id: None,
+            }
+        }
         FactoryEvent::PolicyDecision {
             project_id,
             agent_id,
@@ -3162,6 +3163,12 @@ fn parse_provider(value: &str, column: usize) -> rusqlite::Result<Provider> {
     })
 }
 
+fn parse_execution_mode(value: &str, column: usize) -> rusqlite::Result<ExecutionMode> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
 fn parse_observer_health(value: &str, column: usize) -> rusqlite::Result<ObserverHealth> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
@@ -3188,16 +3195,223 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_mode_defaults_on_and_changes_with_an_audit_event() {
+    fn dispatch_defaults_on_and_changes_with_an_audit_event() {
         let mut store = Store::open_in_memory().unwrap();
-        assert!(store.auto_mode().unwrap());
-        let event = store.set_auto_mode(false, 42).unwrap();
-        assert!(!store.auto_mode().unwrap());
+        assert!(store.dispatch_enabled().unwrap());
+        let event = store.set_dispatch_enabled(false, 42).unwrap();
+        assert!(!store.dispatch_enabled().unwrap());
         assert_eq!(
             event.event,
-            FactoryEvent::AutoModeChanged { enabled: false }
+            FactoryEvent::DispatchPolicyChanged { enabled: false }
         );
         assert_eq!(store.events_after(0, 10).unwrap(), vec![event]);
+    }
+
+    #[test]
+    fn schema_34_separates_dispatch_from_explicit_profile_authority() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;",
+            )
+            .unwrap();
+        migrate_to(&mut connection, 33).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES ('project', 'Project', '/tmp/project', 1, 1);
+                 INSERT INTO agents (
+                     id, project_id, parent_agent_id, role, provider, paused,
+                     created_at_ms, updated_at_ms
+                 ) VALUES
+                     ('claude-plan', 'project', NULL, 'worker', 'claude_code', 0, 2, 2),
+                     ('codex-default', 'project', NULL, 'worker', 'codex', 0, 2, 2),
+                     ('codex-never', 'project', NULL, 'worker', 'codex', 0, 2, 2),
+                     ('claude-edits', 'project', NULL, 'worker', 'claude_code', 0, 2, 2),
+                     ('shell', 'project', NULL, 'worker', 'shell', 0, 2, 2);
+                 INSERT INTO agent_profiles (
+                     agent_id, model, updated_at_ms, permission_mode,
+                     reasoning_effort, model_selection_reason
+                 ) VALUES
+                     ('claude-plan', NULL, 2, 'plan', NULL, NULL),
+                     ('codex-default', NULL, 2, NULL, NULL, NULL),
+                     ('codex-never', NULL, 2, 'never', NULL, NULL),
+                     ('claude-edits', NULL, 2, 'acceptEdits', NULL, NULL),
+                     ('shell', NULL, 2, NULL, NULL, NULL);
+                 INSERT INTO tasks (
+                     id, project_id, assigned_agent_id, title, body, status,
+                     priority, created_at_ms, updated_at_ms, completed_at_ms,
+                     incarnation_id, work_revision
+                 ) VALUES
+                     ('task-plan', 'project', 'claude-plan', 'Plan', 'Body',
+                      'succeeded', 0, 2, 4, 4, 'task-plan-incarnation', 0),
+                     ('task-unknown', 'project', 'codex-default', 'Unknown', 'Body',
+                      'succeeded', 0, 2, 4, 4, 'task-unknown-incarnation', 0),
+                     ('task-cross-provider', 'project', 'codex-never', 'Cross', 'Body',
+                      'succeeded', 0, 2, 4, 4, 'task-cross-incarnation', 0);
+                 INSERT INTO runs (
+                     id, project_id, agent_id, task_id, task_incarnation_id,
+                     admitted_task_work_revision, source_root, phase, outcome,
+                     provider, runtime_permission_mode, observer_health,
+                     admitted_at_ms, running_at_ms, finalizing_at_ms,
+                     phase_since_ms, updated_at_ms, ended_at_ms
+                 ) VALUES
+                     ('run-plan', 'project', 'claude-plan', 'task-plan',
+                      'task-plan-incarnation', 0, '/tmp/source-plan', 'terminal',
+                      'succeeded', 'claude_code', 'plan', 'healthy', 2, 2, 3, 3, 4, 4),
+                     ('run-unknown', 'project', 'codex-default', 'task-unknown',
+                      'task-unknown-incarnation', 0, '/tmp/source-unknown', 'terminal',
+                      'succeeded', 'codex', NULL, 'healthy', 2, 2, 3, 3, 4, 4),
+                     ('run-cross-provider', 'project', 'codex-never',
+                      'task-cross-provider', 'task-cross-incarnation', 0,
+                      '/tmp/source-cross', 'terminal', 'succeeded', 'codex',
+                      'acceptEdits', 'healthy', 2, 2, 3, 3, 4, 4);
+                 UPDATE factory_settings
+                 SET auto_mode = 1, updated_at_ms = 3
+                 WHERE singleton = 1;",
+            )
+            .unwrap();
+
+        migrate_to(&mut connection, SCHEMA_VERSION).unwrap();
+        let store = Store { connection };
+        let project_id = ProjectId::try_from("project").unwrap();
+        let mode = |id: &str| {
+            store
+                .get_agent_detail(&project_id, &AgentId::try_from(id).unwrap())
+                .unwrap()
+                .profile
+                .execution_mode
+        };
+
+        assert!(store.dispatch_enabled().unwrap());
+        assert_eq!(mode("claude-plan"), ExecutionMode::PlanOnly);
+        assert_eq!(mode("codex-default"), ExecutionMode::Unrestricted);
+        assert_eq!(mode("codex-never"), ExecutionMode::WorkspaceWrite);
+        assert_eq!(mode("claude-edits"), ExecutionMode::WorkspaceWrite);
+        assert_eq!(mode("shell"), ExecutionMode::Unrestricted);
+        let runs = store.list_runs(&project_id, None, 10).unwrap();
+        let runtime_mode = |id: &str| {
+            runs.iter()
+                .find(|run| run.id.as_str() == id)
+                .unwrap()
+                .runtime_execution_mode
+        };
+        assert_eq!(runtime_mode("run-plan"), Some(ExecutionMode::PlanOnly));
+        assert_eq!(runtime_mode("run-unknown"), None);
+        assert_eq!(runtime_mode("run-cross-provider"), None);
+        for (table, removed, added) in [
+            ("factory_settings", "auto_mode", "dispatch_enabled"),
+            ("agent_profiles", "permission_mode", "execution_mode"),
+            ("runs", "runtime_permission_mode", "runtime_execution_mode"),
+        ] {
+            let columns = store
+                .connection
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(!columns.iter().any(|column| column == removed));
+            assert!(columns.iter().any(|column| column == added));
+        }
+    }
+
+    #[test]
+    fn schema_34_rejects_unknown_or_cross_provider_legacy_profile_authority() {
+        for (provider, permission_mode) in [
+            ("codex", "corrupt-legacy-mode"),
+            ("codex", "unrestricted"),
+            ("claude_code", "never"),
+            ("codex", "acceptEdits"),
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     PRAGMA journal_mode = WAL;
+                     PRAGMA synchronous = FULL;",
+                )
+                .unwrap();
+            migrate_to(&mut connection, 33).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                     VALUES ('project', 'Project', '/tmp/project', 1, 1);
+                     UPDATE factory_settings
+                     SET auto_mode = 1, updated_at_ms = 3
+                     WHERE singleton = 1;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO agents (
+                         id, project_id, parent_agent_id, role, provider, paused,
+                         created_at_ms, updated_at_ms
+                     ) VALUES ('agent', 'project', NULL, 'worker', ?1, 0, 2, 2)",
+                    [provider],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO agent_profiles (
+                         agent_id, model, updated_at_ms, permission_mode,
+                         reasoning_effort, model_selection_reason
+                     ) VALUES ('agent', NULL, 2, ?1, NULL, NULL)",
+                    [permission_mode],
+                )
+                .unwrap();
+
+            let error = migrate_to(&mut connection, SCHEMA_VERSION).unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "legacy authority {provider}={permission_mode:?} must abort migration, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_persisted_execution_mode_fails_closed() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("project").unwrap();
+        let agent_id = AgentId::try_from("agent").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Project".into(),
+                    root: "/tmp/project".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agent_profiles SET execution_mode = 'interactive' WHERE agent_id = ?1",
+                [agent_id.as_str()],
+            )
+            .unwrap();
+
+        assert!(store.get_agent_detail(&project_id, &agent_id).is_err());
     }
 
     #[test]
@@ -4047,7 +4261,7 @@ mod tests {
                 .unwrap()
         };
 
-        migrate_to(&mut connection, SCHEMA_VERSION).unwrap();
+        migrate_to(&mut connection, 32).unwrap();
 
         let runs_after: String = connection
             .query_row(

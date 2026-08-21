@@ -679,7 +679,8 @@ impl Board {
             FactoryEvent::ProjectDeleted { project_id } => {
                 self.invalidate_attention(|item| &item.project_id == project_id);
             }
-            FactoryEvent::AutoModeChanged { .. }
+            FactoryEvent::DispatchPolicyChanged { .. }
+            | FactoryEvent::LegacyAutoModeChanged { .. }
             | FactoryEvent::PolicyDecision { .. }
             | FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
@@ -689,7 +690,9 @@ impl Board {
         }
 
         match event.event {
-            FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
+            FactoryEvent::DispatchPolicyChanged { .. }
+            | FactoryEvent::LegacyAutoModeChanged { .. }
+            | FactoryEvent::PolicyDecision { .. } => {}
             FactoryEvent::AgentBudgetChanged {
                 agent_id, paused, ..
             } => {
@@ -1011,7 +1014,8 @@ impl Board {
             | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
             | FactoryEvent::ChangeChanged { .. }
             | FactoryEvent::LegacySourceForgotten { .. }
-            | FactoryEvent::AutoModeChanged { .. }
+            | FactoryEvent::DispatchPolicyChanged { .. }
+            | FactoryEvent::LegacyAutoModeChanged { .. }
             | FactoryEvent::TaskDeleted { .. }
             | FactoryEvent::ProjectChanged { .. }
             | FactoryEvent::ProjectDeleted { .. } => None,

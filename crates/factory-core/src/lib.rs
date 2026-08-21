@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +123,73 @@ pub enum Provider {
     /// permission prompts to speak of, useful for deterministic lifecycle
     /// tests and as a template for a new provider.
     Shell,
+}
+
+/// Provider-native authority frozen for one admitted attempt.
+///
+/// This is deliberately independent from the factory-wide dispatch switch:
+/// dispatch decides whether a new attempt may be admitted, while this value
+/// decides what the provider process may do after admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Inspect the source without changing it.
+    PlanOnly,
+    /// Write inside the admitted attempt's source boundary, failing closed
+    /// when the provider cannot enforce that boundary.
+    WorkspaceWrite,
+    /// Use the provider's explicit native bypass. This is not an OS security
+    /// boundary and is intended only for separately isolated execution.
+    Unrestricted,
+}
+
+impl ExecutionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanOnly => "plan_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+
+    /// The least-authority useful default for a newly created agent. The
+    /// shell fixture has no native restriction mechanism and therefore
+    /// truthfully defaults to `Unrestricted` instead of pretending otherwise.
+    #[must_use]
+    pub const fn default_for_provider(provider: Provider) -> Self {
+        match provider {
+            Provider::ClaudeCode | Provider::Codex => Self::WorkspaceWrite,
+            Provider::Shell => Self::Unrestricted,
+        }
+    }
+
+    #[must_use]
+    pub const fn supported_by(self, provider: Provider) -> bool {
+        match provider {
+            Provider::ClaudeCode | Provider::Codex => true,
+            Provider::Shell => matches!(self, Self::Unrestricted),
+        }
+    }
+}
+
+impl fmt::Display for ExecutionMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExecutionMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "plan-only" | "plan_only" => Ok(Self::PlanOnly),
+            "workspace-write" | "workspace_write" => Ok(Self::WorkspaceWrite),
+            "unrestricted" => Ok(Self::Unrestricted),
+            _ => Err("execution mode must be plan-only, workspace-write, or unrestricted"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,7 +503,7 @@ pub struct RunSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_permission_mode: Option<String>,
+    pub runtime_execution_mode: Option<ExecutionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_control_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,9 +544,16 @@ impl RunSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum FactoryEvent {
-    /// Factory-wide autonomy posture changed. Policy decisions are recorded
-    /// separately so the event ledger explains both configuration and use.
-    AutoModeChanged {
+    /// Factory-wide admission policy changed. Provider authority is a
+    /// separate per-agent execution mode frozen on each admitted run.
+    DispatchPolicyChanged {
+        enabled: bool,
+    },
+    /// Decode-only compatibility for the pre-split setting, which controlled
+    /// both admission and provider bypass. Its meaning cannot be represented
+    /// honestly as a current dispatch-policy event.
+    #[serde(rename = "auto_mode_changed")]
+    LegacyAutoModeChanged {
         enabled: bool,
     },
     /// The daemon's answer to one provider `PreToolUse` hook.

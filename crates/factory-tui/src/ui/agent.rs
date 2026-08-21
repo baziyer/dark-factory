@@ -178,13 +178,9 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                 )),
                 Line::from(format!(
                     "access: {} → {}",
-                    detail
-                        .profile
-                        .permission_mode
-                        .as_deref()
-                        .unwrap_or("provider default"),
-                    run.and_then(|run| run.runtime_permission_mode.as_deref())
-                        .unwrap_or("unreported")
+                    detail.profile.execution_mode,
+                    run.and_then(|run| run.runtime_execution_mode)
+                        .map_or_else(|| "unreported".to_owned(), |mode| mode.to_string())
                 )),
                 Line::from(format!(
                     "memory: {} {}/{}",
