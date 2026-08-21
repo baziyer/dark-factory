@@ -85,6 +85,56 @@ async fn exact_signed_ping_is_durable_and_idempotent_across_restart() {
 }
 
 #[tokio::test]
+async fn concurrent_exact_deliveries_collapse_to_one_row() {
+    let temporary = TempDir::new().unwrap();
+    let database = temporary.path().join("broker.sqlite3");
+    let router = app(state(&database, "maintainer-v1"));
+    let body = br#"{"zen":"concurrent replay"}"#;
+    let delivery = "9c8a5c44-7f1f-11f0-952e-acde48001122";
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let router = router.clone();
+        let request = signed_request("ping", delivery, body);
+        tasks.push(tokio::spawn(async move {
+            router.oneshot(request).await.unwrap().status()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), StatusCode::OK);
+    }
+    assert_eq!(delivery_count(&database), 1);
+}
+
+#[tokio::test]
+async fn concurrent_conflicting_delivery_has_one_winner() {
+    let temporary = TempDir::new().unwrap();
+    let database = temporary.path().join("broker.sqlite3");
+    let router = app(state(&database, "maintainer-v1"));
+    let delivery = "ac8a5c44-7f1f-11f0-952e-acde48001122";
+    let first = tokio::spawn({
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(signed_request("ping", delivery, br#"{"zen":"first"}"#))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let second = tokio::spawn(async move {
+        router
+            .oneshot(signed_request("ping", delivery, br#"{"zen":"second"}"#))
+            .await
+            .unwrap()
+            .status()
+    });
+    let mut statuses = [first.await.unwrap(), second.await.unwrap()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(delivery_count(&database), 1);
+}
+
+#[tokio::test]
 async fn replay_binds_hook_target_and_secret_revision() {
     let temporary = TempDir::new().unwrap();
     let database = temporary.path().join("broker.sqlite3");

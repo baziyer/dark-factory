@@ -55,15 +55,33 @@ The broker implementation belongs in the sibling
 `dark-factory-control-plane` service, not in the pure-Rust local-runtime
 workspace or `factoryd`. The temporary `control-plane/` staging export proves
 only a versioned, signed, inert maintainer `ping` boundary. Every non-ping event
-is policy-rejected. Its SQLite journal exists only behind a non-default
-development feature; the default build installs no webhook route, and readiness
-reports the webhook inactive.
-Moving the export does not activate it: the hosted service still requires a
-durable shared journal, secret-manager configuration with an explicit secret
-revision, independent review, and the activation gates below. Product webhook
-intake and operator/PWA projections keep separate routes, configuration,
-storage namespaces, and authentication even if they later share hardened HTTP
-or signature primitives.
+is policy-rejected. Its default build uses a durable Postgres journal behind
+Vercel's official Rust and Axum runtime adapter; SQLite exists only behind the
+non-default `development-sqlite` feature and can never satisfy readiness. The
+production adapter accepts exactly `DATABASE_URL`,
+`DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET`,
+`DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET_REVISION`, and
+`DARK_FACTORY_MAINTAINER_APP_ID`. Missing or partial configuration leaves the
+fixed inactive router with no webhook route. A configured but unavailable or
+unmigrated Postgres journal makes readiness and delivery acknowledgement fail
+closed. The URL must bind its host, user, password, database, and TLS mode;
+ambient `PG*` connection settings are rejected rather than becoming a hidden
+credential or routing fallback.
+
+The intended stable route is
+`https://broker.darkfactory.build/v1/github/maintainer/webhook`, but committing
+the adapter does not register that domain, deploy the service, configure an
+App, or activate a webhook. Production credentials are never shared with
+preview deployments; preview integration requires a distinct disposable App,
+secret, and database. The migration is applied explicitly before deployment,
+never by a function cold start. The fixed-output migration runner can execute
+under `vercel env run -e production -- cargo run --locked --bin migrate`
+without printing `DATABASE_URL`; this is an operator deployment step, not
+provider or task authority to pull production configuration. Readiness verifies
+the expected migration revision and digest as well as the required table shape
+and runtime privileges. Product webhook intake and operator/PWA projections
+keep separate routes, configuration, storage namespaces, and authentication
+even if they later share hardened HTTP or signature primitives.
 
 The local coordinator client has no direct GitHub mutation path. Every
 maintainer effect executes inside the broker authenticated as the exact

@@ -16,12 +16,29 @@ hmac = "0.12.1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"], optional = true }
 serde_json = "1"
 sha2 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tower = "0.5.3"
+url = "2.5.8"
+vercel_runtime = { version = "2.4", features = ["axum"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[[bin]]
+name = "broker"
+path = "api/broker.rs"
+
+[[bin]]
+name = "migrate"
+path = "tools/migrate.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
 
 [lints.rust]
 unsafe_code = "forbid"

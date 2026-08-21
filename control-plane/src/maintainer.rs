@@ -1,7 +1,5 @@
-#[cfg(feature = "development-sqlite")]
 use std::sync::Arc;
 
-#[cfg(feature = "development-sqlite")]
 use axum::{
     body::Bytes,
     extract::State,
@@ -9,32 +7,22 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 use hmac::{Hmac, Mac as _};
-#[cfg(feature = "development-sqlite")]
 use serde_json::Value;
-#[cfg(feature = "development-sqlite")]
-use sha2::Digest as _;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
-#[cfg(feature = "development-sqlite")]
 use crate::{BrokerState, journal};
 
 pub const WEBHOOK_PATH: &str = "/v1/github/maintainer/webhook";
-#[cfg(feature = "development-sqlite")]
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
-#[cfg(feature = "development-sqlite")]
 const MAX_SECRET_BYTES: usize = 1024;
-#[cfg(feature = "development-sqlite")]
 const MAX_IDENTIFIER_BYTES: usize = 64;
 
-#[cfg(feature = "development-sqlite")]
 #[derive(Clone)]
 pub struct WebhookSecret(Arc<[u8]>);
 
-#[cfg(feature = "development-sqlite")]
 #[derive(Clone)]
 pub struct SecretRevision(Arc<str>);
 
-#[cfg(feature = "development-sqlite")]
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SecretError {
     #[error("webhook secret must contain between 32 and 1024 bytes")]
@@ -43,7 +31,6 @@ pub enum SecretError {
     InvalidRevision,
 }
 
-#[cfg(feature = "development-sqlite")]
 impl WebhookSecret {
     pub fn new(secret: Vec<u8>) -> Result<Self, SecretError> {
         if !(32..=MAX_SECRET_BYTES).contains(&secret.len()) {
@@ -53,7 +40,6 @@ impl WebhookSecret {
     }
 }
 
-#[cfg(feature = "development-sqlite")]
 impl SecretRevision {
     pub fn new(revision: String) -> Result<Self, SecretError> {
         let valid = !revision.is_empty()
@@ -68,7 +54,6 @@ impl SecretRevision {
     }
 }
 
-#[cfg(feature = "development-sqlite")]
 #[derive(Clone)]
 pub(crate) struct MaintainerState {
     secret: WebhookSecret,
@@ -77,9 +62,8 @@ pub(crate) struct MaintainerState {
     journal: journal::DeliveryJournal,
 }
 
-#[cfg(feature = "development-sqlite")]
 impl MaintainerState {
-    pub(crate) fn development(
+    pub(crate) fn new(
         secret: WebhookSecret,
         secret_revision: SecretRevision,
         expected_target_id: i64,
@@ -92,9 +76,12 @@ impl MaintainerState {
             journal,
         }
     }
+
+    pub(crate) async fn ready(&self) -> Result<(), journal::Error> {
+        self.journal.ready().await
+    }
 }
 
-#[cfg(feature = "development-sqlite")]
 #[derive(Clone, Copy)]
 pub(crate) enum Disposition {
     Ping,
@@ -102,7 +89,6 @@ pub(crate) enum Disposition {
     PayloadRejected,
 }
 
-#[cfg(feature = "development-sqlite")]
 impl Disposition {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -112,16 +98,12 @@ impl Disposition {
         }
     }
 
-    pub(crate) fn from_database(value: &str) -> Result<Self, rusqlite::Error> {
+    pub(crate) fn from_database(value: &str) -> Option<Self> {
         match value {
-            "ping" => Ok(Self::Ping),
-            "policy_rejected" => Ok(Self::PolicyRejected),
-            "payload_rejected" => Ok(Self::PayloadRejected),
-            other => Err(rusqlite::Error::FromSqlConversionFailure(
-                7,
-                rusqlite::types::Type::Text,
-                format!("invalid maintainer disposition: {other}").into(),
-            )),
+            "ping" => Some(Self::Ping),
+            "policy_rejected" => Some(Self::PolicyRejected),
+            "payload_rejected" => Some(Self::PayloadRejected),
+            _ => None,
         }
     }
 
@@ -140,7 +122,7 @@ impl Disposition {
     }
 }
 
-#[cfg(feature = "development-sqlite")]
+#[derive(Clone)]
 pub(crate) struct Delivery {
     pub(crate) delivery_id: String,
     pub(crate) hook_id: i64,
@@ -153,7 +135,6 @@ pub(crate) struct Delivery {
     pub(crate) secret_revision: String,
 }
 
-#[cfg(feature = "development-sqlite")]
 pub(crate) async fn receive(
     State(state): State<BrokerState>,
     headers: HeaderMap,
@@ -211,17 +192,14 @@ pub(crate) async fn receive(
         disposition,
         secret_revision: maintainer.secret_revision.0.to_string(),
     };
-    let journal = maintainer.journal.clone();
-    let stored = tokio::task::spawn_blocking(move || journal.record(&delivery)).await;
-    match stored {
-        Ok(Ok(journal::Record::New)) => disposition_response(disposition),
-        Ok(Ok(journal::Record::Replay(stored))) => disposition_response(stored),
-        Ok(Ok(journal::Record::Conflict)) => response(StatusCode::CONFLICT, "delivery_conflict"),
-        Ok(Err(_)) | Err(_) => response(StatusCode::SERVICE_UNAVAILABLE, "journal_unavailable"),
+    match maintainer.journal.record(&delivery).await {
+        Ok(journal::Record::New) => disposition_response(disposition),
+        Ok(journal::Record::Replay(stored)) => disposition_response(stored),
+        Ok(journal::Record::Conflict) => response(StatusCode::CONFLICT, "delivery_conflict"),
+        Err(_) => response(StatusCode::SERVICE_UNAVAILABLE, "journal_unavailable"),
     }
 }
 
-#[cfg(feature = "development-sqlite")]
 fn disposition(event: &str, body: &[u8]) -> (Option<String>, Disposition) {
     let payload = serde_json::from_slice(body)
         .ok()
@@ -248,23 +226,31 @@ fn disposition(event: &str, body: &[u8]) -> (Option<String>, Disposition) {
     }
 }
 
-#[cfg(feature = "development-sqlite")]
 fn disposition_response(disposition: Disposition) -> Response {
     let (status, body) = disposition.response();
-    (status, [("content-type", "application/json")], body).into_response()
+    (
+        status,
+        [
+            ("content-type", "application/json"),
+            ("cache-control", "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
-#[cfg(feature = "development-sqlite")]
 fn response(status: StatusCode, error: &'static str) -> Response {
     (
         status,
-        [("content-type", "application/json")],
+        [
+            ("content-type", "application/json"),
+            ("cache-control", "no-store"),
+        ],
         format!(r#"{{"error":"{error}"}}"#),
     )
         .into_response()
 }
 
-#[cfg(feature = "development-sqlite")]
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, StatusCode> {
     let mut values = headers.get_all(name).iter();
     let value = values.next().ok_or(StatusCode::BAD_REQUEST)?;
@@ -274,7 +260,6 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, StatusCode>
     value.to_str().map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-#[cfg(feature = "development-sqlite")]
 fn validate_identifier(value: &str) -> Result<&str, StatusCode> {
     let valid = !value.is_empty()
         && value.len() <= MAX_IDENTIFIER_BYTES
@@ -284,7 +269,6 @@ fn validate_identifier(value: &str) -> Result<&str, StatusCode> {
     valid.then_some(value).ok_or(StatusCode::BAD_REQUEST)
 }
 
-#[cfg(feature = "development-sqlite")]
 fn validate_delivery(delivery: &str) -> Result<&str, StatusCode> {
     let valid = delivery.len() == 36
         && delivery.bytes().enumerate().all(|(index, byte)| {
@@ -297,7 +281,6 @@ fn validate_delivery(delivery: &str) -> Result<&str, StatusCode> {
     valid.then_some(delivery).ok_or(StatusCode::BAD_REQUEST)
 }
 
-#[cfg(feature = "development-sqlite")]
 fn numeric_header(headers: &HeaderMap, name: &str) -> Result<i64, StatusCode> {
     header(headers, name)?
         .parse::<i64>()
