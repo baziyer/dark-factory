@@ -5,6 +5,9 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 gate="$repository_root/scripts/local-ci.sh"
 contributing="$repository_root/CONTRIBUTING.md"
 ci="$repository_root/.github/workflows/ci.yml"
+runner_manifest="$repository_root/crates/factory-runner/Cargo.toml"
+runner_library="$repository_root/crates/factory-runner/src/lib.rs"
+stale_control_plane_workflow="$repository_root/control-plane/.github/workflows/ci.yml"
 
 fail() {
     echo "local-ci mode test failed: $*" >&2
@@ -19,20 +22,39 @@ grep -Fq 'cargo +1.88.0 test --locked --workspace -- --test-threads=1' "$gate" \
     || fail "Linux source mode lost workspace tests"
 grep -Fq 'git diff --check' "$gate" || fail "Linux source mode lost diff check"
 
+runner_lib_section=$(awk '
+    $0 == "[lib]" { in_lib = 1; next }
+    /^\[/ { if (in_lib) exit }
+    in_lib { print }
+' "$runner_manifest")
+if printf '%s\n' "$runner_lib_section" \
+    | grep -Eq '^[[:space:]]*test[[:space:]]*=[[:space:]]*false'; then
+    fail "factory-runner library unit tests are disabled"
+fi
+grep -Fq '#[cfg(test)]' "$runner_library" \
+    || fail "factory-runner lost its substantive library unit tests"
+
 linux_mode=$(sed -n '/^[[:space:]]*--linux-source)/,/^[[:space:]]*;;/p' "$gate")
 printf '%s\n' "$linux_mode" | grep -Fq './scripts/check-toolchain-pins.sh' \
     || fail "Linux source mode lost toolchain pin validation"
-for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-package-release.sh; do
+for mac_fixture in test-prepare-release-source.sh test-publish-release.sh \
+    test-package-release.sh test-macos-launchd-release-proof.sh; do
     if printf '%s\n' "$linux_mode" | grep -Fq "$mac_fixture"; then
         fail "Linux source mode invokes macOS fixture $mac_fixture"
     fi
 done
 
 macos_mode=$(sed -n '/^[[:space:]]*macos)/,/^[[:space:]]*;;/p' "$gate")
-for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-package-release.sh; do
+for mac_fixture in test-prepare-release-source.sh test-publish-release.sh \
+    test-package-release.sh test-macos-launchd-release-proof.sh; do
     printf '%s\n' "$macos_mode" | grep -Fq "$mac_fixture" \
         || fail "macOS mode lost fixture $mac_fixture"
 done
+shared_gate=$(sed -n '/^# Measure after/,$p' "$gate")
+if printf '%s\n' "$shared_gate" \
+    | grep -Fq './scripts/test-macos-launchd-release-proof.sh'; then
+    fail "shared source gate invokes the macOS launchd fixture"
+fi
 
 linux_job=$(sed -n '/^  linux:/,$p' "$ci")
 line_of() {
@@ -53,6 +75,22 @@ printf '%s\n' "$linux_job" \
 if printf '%s\n' "$linux_job" | grep -Fq 'name: Check build headroom'; then
     fail "Linux CI duplicates the authoritative gate's build-headroom check"
 fi
+
+control_plane_job=$(sed -n '/^  control-plane:/,/^  linux:/p' "$ci")
+control_line_of() {
+    printf '%s\n' "$control_plane_job" | grep -n -F "$1" | head -1 | cut -d: -f1
+}
+apt_update_line=$(control_line_of 'sudo apt-get update')
+zsh_install_line=$(control_line_of 'sudo apt-get install --yes --no-install-recommends zsh')
+control_gate_line=$(control_line_of 'run: ./control-plane/scripts/local-ci.sh')
+[ -n "$apt_update_line" ] && [ -n "$zsh_install_line" ] && [ -n "$control_gate_line" ] \
+    || fail "hosted control-plane CI lost apt update, zsh install, or its gate"
+[ "$apt_update_line" -lt "$zsh_install_line" ] \
+    || fail "hosted control-plane CI installs zsh without first updating apt metadata"
+[ "$zsh_install_line" -lt "$control_gate_line" ] \
+    || fail "hosted control-plane CI runs its gate before installing zsh"
+[ ! -e "$stale_control_plane_workflow" ] \
+    || fail "control-plane gate remains hidden in an undiscovered nested workflow"
 
 grep -Fxq './scripts/local-ci.sh' "$contributing" \
     || fail "CONTRIBUTING lost the macOS gate command"

@@ -3,7 +3,8 @@
 # This file is intentionally not an API mutator. An authorized maintainer may
 # reconcile it with GitHub after reviewing the exact prepared commit. The
 # `required` context is the CI workflow's aggregate job: it is green only
-# when both `checks` (hosted macOS) and `linux` (hosted Ubuntu) are green.
+# when `checks` (hosted macOS), `linux` (hosted Ubuntu), and the separately
+# deployed `control-plane` gate are green.
 repository: baziyer/dark-factory
 default_branch: main
 rulesets:

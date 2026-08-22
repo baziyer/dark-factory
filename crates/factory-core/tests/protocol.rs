@@ -13,7 +13,7 @@ where
 
 #[test]
 fn run_phases_have_stable_wire_names_and_only_running_grants_authority() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     let cases = [
         (RunPhase::Admitted, "admitted"),
         (RunPhase::Running, "running"),

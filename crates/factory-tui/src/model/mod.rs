@@ -685,6 +685,8 @@ impl Board {
             | FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
             | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::InputReceived { .. }
+            | FactoryEvent::WorkCandidateStatusChanged { .. }
             | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::ProjectChanged { .. } => {}
         }
@@ -703,6 +705,8 @@ impl Board {
             FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
             | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::InputReceived { .. }
+            | FactoryEvent::WorkCandidateStatusChanged { .. }
             | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::LegacyRunChanged { .. }
             | FactoryEvent::LegacySessionChanged { .. } => {}
@@ -1013,6 +1017,8 @@ impl Board {
             | FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
             | FactoryEvent::ChangeChanged { .. }
+            | FactoryEvent::InputReceived { .. }
+            | FactoryEvent::WorkCandidateStatusChanged { .. }
             | FactoryEvent::LegacySourceForgotten { .. }
             | FactoryEvent::DispatchPolicyChanged { .. }
             | FactoryEvent::LegacyAutoModeChanged { .. }

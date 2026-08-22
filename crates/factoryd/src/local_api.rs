@@ -14,10 +14,11 @@ use factory_core::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
-        MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS,
-        MAX_PROVIDER_HOOK_PAYLOAD_BYTES, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES, ProjectDetail as LocalProjectDetail,
-        RequestCredential, RequestEnvelope, RustStorageSnapshot, ServerFrame, normalize_task_title,
+        MAX_INPUT_ENVELOPE_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_PROJECT_PAGE_ITEMS, MAX_PROVIDER_HOOK_PAYLOAD_BYTES, MAX_RUN_PAGE_ITEMS,
+        MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
+        MAX_WORK_CANDIDATE_PAGE_ITEMS, ProjectDetail as LocalProjectDetail, RequestCredential,
+        RequestEnvelope, RustStorageSnapshot, ServerFrame, normalize_task_title,
     },
     status,
 };
@@ -37,8 +38,8 @@ use crate::{
     guidance::{self, GuidanceError},
     store::{
         AgentMessage, AttemptPrincipal, AttemptToolPolicy, AttemptToolVerdict,
-        MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewAgent, NewAgentMessage, NewProject, NewTask,
-        StoreError, UpdateAgentProfile,
+        MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewAgent, NewAgentMessage, NewInputEnvelope,
+        NewProject, NewTask, StoreError, UpdateAgentProfile,
     },
 };
 
@@ -132,6 +133,21 @@ mod protocol_tests {
             .is_ok()
         );
         assert!(authorize_attempt(&attempt, &LocalRequest::RustStorageStatus).is_err());
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::ReceiveInput {
+                    project_id: attempt.project_id.clone(),
+                    source_kind: "fixture".into(),
+                    source_id: "source".into(),
+                    delivery_id: "delivery".into(),
+                    source_revision: "revision".into(),
+                    content: "untrusted".into(),
+                    expected_current_candidate_id: None,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -278,6 +294,12 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "task blocked reason is empty or exceeds its bound".into(),
             ),
+            Self::Store(
+                StoreError::InvalidInputEnvelope | StoreError::InvalidWorkCandidateReason,
+            ) => (
+                ErrorCode::InvalidRequest,
+                "input quarantine request is invalid or exceeds its bound".into(),
+            ),
             Self::Store(StoreError::InvalidChangeMetadata | StoreError::InvalidChangeCapacity) => (
                 ErrorCode::InvalidRequest,
                 "change metadata or retention capacity is invalid".into(),
@@ -294,6 +316,8 @@ impl ApiFailure {
                 error @ (StoreError::AgentNotFound
                 | StoreError::ProjectNotFound
                 | StoreError::TaskNotFound
+                | StoreError::InputEnvelopeNotFound
+                | StoreError::WorkCandidateNotFound
                 | StoreError::RunNotFound
                 | StoreError::ChangeNotFound
                 | StoreError::LegacySourceNotFound
@@ -336,6 +360,13 @@ impl ApiFailure {
                 | StoreError::AgentRunHasDependents
                 | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun),
+            ) => (ErrorCode::Conflict, error.to_string()),
+            Self::Store(
+                error @ (StoreError::InputDeliveryConflict
+                | StoreError::SourceRevisionConflict
+                | StoreError::StaleInputSource
+                | StoreError::WorkCandidateRevisionConflict
+                | StoreError::InvalidWorkCandidateState),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -651,6 +682,12 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         | LocalRequest::CancelRun { .. }
         | LocalRequest::ListChanges { .. }
         | LocalRequest::RemoveChange { .. }
+        | LocalRequest::ReceiveInput { .. }
+        | LocalRequest::ListInputEnvelopes { .. }
+        | LocalRequest::GetInputEnvelope { .. }
+        | LocalRequest::ListWorkCandidates { .. }
+        | LocalRequest::GetWorkCandidate { .. }
+        | LocalRequest::RejectWorkCandidate { .. }
         | LocalRequest::ListLegacySources { .. }
         | LocalRequest::ForgetLegacySource { .. }
         | LocalRequest::EventsAfter { .. }
@@ -689,6 +726,107 @@ async fn handle_request(
                 })
                 .await?;
             Ok(LocalResponse::DispatchSet { enabled })
+        }
+        LocalRequest::ReceiveInput {
+            project_id,
+            source_kind,
+            source_id,
+            delivery_id,
+            source_revision,
+            content,
+            expected_current_candidate_id,
+        } => {
+            let receipt = state
+                .commit_and_publish(move |store| {
+                    let (receipt, events) = store.receive_input(
+                        NewInputEnvelope {
+                            project_id,
+                            source_kind,
+                            source_id,
+                            delivery_id,
+                            source_revision,
+                            content,
+                            expected_current_candidate_id,
+                        },
+                        now_ms()?,
+                    )?;
+                    Ok((receipt, events))
+                })
+                .await?;
+            Ok(LocalResponse::InputReceived { receipt })
+        }
+        LocalRequest::ListInputEnvelopes {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("input envelope", limit, MAX_INPUT_ENVELOPE_PAGE_ITEMS)?;
+            let mut envelopes = state
+                .with_store(move |store| {
+                    store.list_input_envelopes(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id = next_cursor(&mut envelopes, limit, |envelope| envelope.id.clone());
+            Ok(LocalResponse::InputEnvelopes {
+                envelopes,
+                next_after_id,
+            })
+        }
+        LocalRequest::GetInputEnvelope {
+            project_id,
+            envelope_id,
+        } => {
+            let envelope = state
+                .with_store(move |store| store.get_input_envelope(&project_id, &envelope_id))
+                .await?;
+            Ok(LocalResponse::InputEnvelope { envelope })
+        }
+        LocalRequest::ListWorkCandidates {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("work candidate", limit, MAX_WORK_CANDIDATE_PAGE_ITEMS)?;
+            let mut candidates = state
+                .with_store(move |store| {
+                    store.list_work_candidates(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id =
+                next_cursor(&mut candidates, limit, |candidate| candidate.id.clone());
+            Ok(LocalResponse::WorkCandidates {
+                candidates,
+                next_after_id,
+            })
+        }
+        LocalRequest::GetWorkCandidate {
+            project_id,
+            candidate_id,
+        } => {
+            let candidate = state
+                .with_store(move |store| store.get_work_candidate(&project_id, &candidate_id))
+                .await?;
+            Ok(LocalResponse::WorkCandidate { candidate })
+        }
+        LocalRequest::RejectWorkCandidate {
+            project_id,
+            candidate_id,
+            expected_revision,
+            reason,
+        } => {
+            let candidate = state
+                .commit_and_publish(move |store| {
+                    let (candidate, events) = store.reject_work_candidate(
+                        &project_id,
+                        &candidate_id,
+                        expected_revision,
+                        reason,
+                        now_ms()?,
+                    )?;
+                    Ok((candidate, events))
+                })
+                .await?;
+            Ok(LocalResponse::WorkCandidateRejected { candidate })
         }
         LocalRequest::SetAgentBudget {
             project_id,

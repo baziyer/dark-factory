@@ -1,9 +1,15 @@
-use std::{env, io::Write, path::PathBuf, process};
+use std::{
+    env,
+    io::{Read as _, Write},
+    path::PathBuf,
+    process,
+};
 
 use factory_core::local::{
     GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS,
-    MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_PROVIDER_HOOK_PAYLOAD_BYTES,
-    MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RequestCredential, ServerFrame,
+    MAX_INPUT_CONTENT_BYTES, MAX_INPUT_ENVELOPE_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS,
+    MAX_PROJECT_PAGE_ITEMS, MAX_PROVIDER_HOOK_PAYLOAD_BYTES, MAX_RUN_PAGE_ITEMS,
+    MAX_TASK_PAGE_ITEMS, MAX_WORK_CANDIDATE_PAGE_ITEMS, RequestCredential, ServerFrame,
 };
 use factory_core::{AgentRole, CompletionVerification, ExecutionMode, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
@@ -18,7 +24,7 @@ mod usage;
 
 const ATTEMPT_TOKEN_FILE_ENV: &str = "DARK_FACTORY_ATTEMPT_TOKEN_FILE";
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|storage|dispatch|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|storage|dispatch|capacity|init|doctor|update|version|usage|project|task|agent|run|change|input|candidate|hook|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -43,6 +49,8 @@ Commands:
   run list|stop                               List and stop process attempts
   change list|remove|legacy-list|forget-legacy
                                                Inspect retained source and forget legacy metadata
+  input receive|list|get                       Store and inspect inert quarantined observations
+  candidate list|get|reject                    Inspect or reject quarantined source revisions
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
   events [--follow]                           Read durable events
 
@@ -662,12 +670,44 @@ Required:
 Options:
   -h, --help                    Show this help";
 
+const INPUT_HELP: &str = "usage: factoryctl input <receive|list|get> [options]
+
+Store and inspect provider-neutral untrusted observations. Receipt creates only
+quarantine state; it cannot create executable work.";
+const INPUT_RECEIVE_HELP: &str = "usage: factoryctl input receive --project ID --source-kind KIND --source-id ID --delivery-id ID --source-revision REV --content-file PATH [--expected-current ID]
+
+Store one bounded untrusted observation. A new source revision must name the
+exact current candidate with --expected-current; the first revision omits it.";
+const INPUT_LIST_HELP: &str = "usage: factoryctl input list --project ID [--after ID] [--limit N]
+
+List immutable input envelopes, including their private untrusted content.";
+const INPUT_GET_HELP: &str = "usage: factoryctl input get --project ID --input ID
+
+Fetch one immutable input envelope.";
+const CANDIDATE_HELP: &str = "usage: factoryctl candidate <list|get|reject> [options]
+
+Inspect or reject quarantined source revisions. There is no accept or
+materialize command.";
+const CANDIDATE_LIST_HELP: &str =
+    "usage: factoryctl candidate list --project ID [--after ID] [--limit N]
+
+List work candidates.";
+const CANDIDATE_GET_HELP: &str = "usage: factoryctl candidate get --project ID --candidate ID
+
+Fetch one work candidate.";
+const CANDIDATE_REJECT_HELP: &str =
+    "usage: factoryctl candidate reject --project ID --candidate ID --revision N --reason TEXT
+
+Reject the exact current quarantined candidate revision.";
+
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
 const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
 const CHANGE_LIST_LIMIT: u32 = MAX_CHANGE_PAGE_ITEMS;
 const LEGACY_SOURCE_LIST_LIMIT: u32 = MAX_LEGACY_SOURCE_PAGE_ITEMS;
+const INPUT_ENVELOPE_LIST_LIMIT: u32 = MAX_INPUT_ENVELOPE_PAGE_ITEMS;
+const WORK_CANDIDATE_LIST_LIMIT: u32 = MAX_WORK_CANDIDATE_PAGE_ITEMS;
 /// `factoryctl hook`'s fail-open budget: long enough for a healthy daemon
 /// under normal load, short enough that a wedged daemon never visibly
 /// stalls the operator's live Claude Code or Codex session.
@@ -875,6 +915,39 @@ enum CliCommand {
     ChangeForgetLegacy {
         project_id: String,
         legacy_source_id: String,
+    },
+    InputReceive {
+        project_id: String,
+        source_kind: String,
+        source_id: String,
+        delivery_id: String,
+        source_revision: String,
+        content_file: String,
+        expected_current_candidate_id: Option<String>,
+    },
+    InputList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    InputGet {
+        project_id: String,
+        envelope_id: String,
+    },
+    CandidateList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    CandidateGet {
+        project_id: String,
+        candidate_id: String,
+    },
+    CandidateReject {
+        project_id: String,
+        candidate_id: String,
+        expected_revision: i64,
+        reason: String,
     },
     Hook {
         token_file: String,
@@ -1271,6 +1344,21 @@ fn read_guidance_file(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))
 }
 
+fn read_bounded_text_file(path: &str, label: &str, max_bytes: usize) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1).min(8192));
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {path}: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!("{label} must be at most {max_bytes} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{label} must be valid UTF-8"))
+}
+
 fn write_frame(output: &mut impl Write, frame: &ServerFrame) -> Result<(), String> {
     serde_json::to_writer(&mut *output, frame).map_err(|error| error.to_string())?;
     output.write_all(b"\n").map_err(|error| error.to_string())?;
@@ -1399,6 +1487,8 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
         "change" => parse_change(args).map(|command| (socket, command)),
+        "input" => parse_input(args).map(|command| (socket, command)),
+        "candidate" => parse_candidate(args).map(|command| (socket, command)),
         "hook" => {
             if wants_help(&args) {
                 return Ok((socket, CliCommand::Help(HOOK_HELP)));
@@ -1997,6 +2087,120 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
     }
 }
 
+fn parse_input(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(INPUT_HELP));
+    }
+    let action = take_action(&mut args, "input")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "receive" => INPUT_RECEIVE_HELP,
+            "list" => INPUT_LIST_HELP,
+            "get" => INPUT_GET_HELP,
+            _ => INPUT_HELP,
+        }));
+    }
+    match action.as_str() {
+        "receive" => {
+            let command = CliCommand::InputReceive {
+                project_id: required_project(&mut args)?,
+                source_kind: required_option(&mut args, "--source-kind")?,
+                source_id: required_option(&mut args, "--source-id")?,
+                delivery_id: required_option(&mut args, "--delivery-id")?,
+                source_revision: required_option(&mut args, "--source-revision")?,
+                content_file: required_option(&mut args, "--content-file")?,
+                expected_current_candidate_id: take_option(&mut args, "--expected-current")?,
+            };
+            require_empty(&args)?;
+            Ok(command)
+        }
+        "list" => {
+            let project_id = required_project(&mut args)?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(
+                &mut args,
+                INPUT_ENVELOPE_LIST_LIMIT,
+                MAX_INPUT_ENVELOPE_PAGE_ITEMS,
+            )?;
+            require_empty(&args)?;
+            Ok(CliCommand::InputList {
+                project_id,
+                after_id,
+                limit,
+            })
+        }
+        "get" => {
+            let project_id = required_project(&mut args)?;
+            let envelope_id = required_option(&mut args, "--input")?;
+            require_empty(&args)?;
+            Ok(CliCommand::InputGet {
+                project_id,
+                envelope_id,
+            })
+        }
+        _ => Err(format!("unknown input action {action:?}")),
+    }
+}
+
+fn parse_candidate(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(CANDIDATE_HELP));
+    }
+    let action = take_action(&mut args, "candidate")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "list" => CANDIDATE_LIST_HELP,
+            "get" => CANDIDATE_GET_HELP,
+            "reject" => CANDIDATE_REJECT_HELP,
+            _ => CANDIDATE_HELP,
+        }));
+    }
+    match action.as_str() {
+        "list" => {
+            let project_id = required_project(&mut args)?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(
+                &mut args,
+                WORK_CANDIDATE_LIST_LIMIT,
+                MAX_WORK_CANDIDATE_PAGE_ITEMS,
+            )?;
+            require_empty(&args)?;
+            Ok(CliCommand::CandidateList {
+                project_id,
+                after_id,
+                limit,
+            })
+        }
+        "get" => {
+            let project_id = required_project(&mut args)?;
+            let candidate_id = required_option(&mut args, "--candidate")?;
+            require_empty(&args)?;
+            Ok(CliCommand::CandidateGet {
+                project_id,
+                candidate_id,
+            })
+        }
+        "reject" => {
+            let project_id = required_project(&mut args)?;
+            let candidate_id = required_option(&mut args, "--candidate")?;
+            let expected_revision =
+                parse_number(&required_option(&mut args, "--revision")?, "--revision")?;
+            if expected_revision < 1 {
+                return Err("--revision must be a positive integer".into());
+            }
+            let reason = required_option(&mut args, "--reason")?;
+            require_empty(&args)?;
+            Ok(CliCommand::CandidateReject {
+                project_id,
+                candidate_id,
+                expected_revision,
+                reason,
+            })
+        }
+        _ => Err(format!("unknown candidate action {action:?}")),
+    }
+}
+
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
@@ -2326,6 +2530,76 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             legacy_source_id: parse_id(legacy_source_id, "legacy source")?,
         }),
+        CliCommand::InputReceive {
+            project_id,
+            source_kind,
+            source_id,
+            delivery_id,
+            source_revision,
+            content_file,
+            expected_current_candidate_id,
+        } => Ok(LocalRequest::ReceiveInput {
+            project_id: parse_id(project_id, "project")?,
+            source_kind,
+            source_id,
+            delivery_id,
+            source_revision,
+            content: read_bounded_text_file(
+                &content_file,
+                "input content",
+                MAX_INPUT_CONTENT_BYTES,
+            )?,
+            expected_current_candidate_id: expected_current_candidate_id
+                .map(|id| parse_id(id, "current candidate"))
+                .transpose()?,
+        }),
+        CliCommand::InputList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListInputEnvelopes {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "input envelope cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::InputGet {
+            project_id,
+            envelope_id,
+        } => Ok(LocalRequest::GetInputEnvelope {
+            project_id: parse_id(project_id, "project")?,
+            envelope_id: parse_id(envelope_id, "input envelope")?,
+        }),
+        CliCommand::CandidateList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListWorkCandidates {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "work candidate cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::CandidateGet {
+            project_id,
+            candidate_id,
+        } => Ok(LocalRequest::GetWorkCandidate {
+            project_id: parse_id(project_id, "project")?,
+            candidate_id: parse_id(candidate_id, "work candidate")?,
+        }),
+        CliCommand::CandidateReject {
+            project_id,
+            candidate_id,
+            expected_revision,
+            reason,
+        } => Ok(LocalRequest::RejectWorkCandidate {
+            project_id: parse_id(project_id, "project")?,
+            candidate_id: parse_id(candidate_id, "work candidate")?,
+            expected_revision,
+            reason,
+        }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
         CliCommand::Events(command) => Ok(events::request(command)),
     }
@@ -2589,6 +2863,71 @@ mod tests {
         );
         assert!(parse_args(args(&["storage", "prune"])).is_err());
         assert!(parse_args(args(&["storage", "status", "--unexpected"])).is_err());
+    }
+
+    #[test]
+    fn input_and_candidate_commands_have_no_accept_or_materialize_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "untrusted body").unwrap();
+        let content_path = file.path().to_str().unwrap();
+        let (_, receive) = parse_args(args(&[
+            "input",
+            "receive",
+            "--project",
+            "project-1",
+            "--source-kind",
+            "fixture",
+            "--source-id",
+            "source-1",
+            "--delivery-id",
+            "delivery-1",
+            "--source-revision",
+            "revision-1",
+            "--content-file",
+            content_path,
+        ]))
+        .unwrap();
+        assert!(matches!(
+            request_for(receive).unwrap(),
+            LocalRequest::ReceiveInput { content, .. } if content == "untrusted body"
+        ));
+
+        let (_, reject) = parse_args(args(&[
+            "candidate",
+            "reject",
+            "--project",
+            "project-1",
+            "--candidate",
+            "candidate-1",
+            "--revision",
+            "1",
+            "--reason",
+            "not-approved",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            request_for(reject).unwrap(),
+            LocalRequest::RejectWorkCandidate {
+                expected_revision: 1,
+                ..
+            }
+        ));
+        assert!(parse_args(args(&["candidate", "accept"])).is_err());
+        assert!(parse_args(args(&["input", "materialize"])).is_err());
+
+        let mut oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized
+            .write_all(&vec![b'x'; MAX_INPUT_CONTENT_BYTES + 1])
+            .unwrap();
+        assert_eq!(
+            read_bounded_text_file(
+                oversized.path().to_str().unwrap(),
+                "input content",
+                MAX_INPUT_CONTENT_BYTES,
+            )
+            .unwrap_err(),
+            format!("input content must be at most {MAX_INPUT_CONTENT_BYTES} bytes")
+        );
     }
 
     #[test]

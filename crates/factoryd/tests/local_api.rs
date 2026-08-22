@@ -2,10 +2,10 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
     AgentId, AgentRole, ChangeId, FactoryEvent, ProjectId, Provider, ProviderHookEvent, RunId,
-    RunnerInstanceId, TaskId,
+    RunnerInstanceId, TaskId, WorkCandidateStatus,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_PROVIDER_HOOK_PAYLOAD_BYTES, RequestCredential,
-        RequestEnvelope, ServerFrame,
+        ErrorCode, LocalRequest, LocalResponse, MAX_PROVIDER_HOOK_PAYLOAD_BYTES,
+        MAX_WORK_CANDIDATE_PAGE_ITEMS, RequestCredential, RequestEnvelope, ServerFrame,
     },
 };
 use factoryd::{
@@ -145,6 +145,9 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("factory.sock");
     let runtime_root = directory.path().join("runs");
+    let guidance_root = fs::canonicalize(directory.path()).unwrap().join("guidance");
+    fs::create_dir(&guidance_root).unwrap();
+    fs::set_permissions(&guidance_root, fs::Permissions::from_mode(0o700)).unwrap();
     let state = DaemonState::new(Store::open_in_memory().unwrap());
     let (execution, manager) = execution::spawn(
         execution::Config {
@@ -158,7 +161,7 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
             runtime_root,
             changes_root: directory.path().join("changes"),
             artifacts_root: directory.path().join("artifacts"),
-            guidance_root: directory.path().join("guidance"),
+            guidance_root: guidance_root.clone(),
             socket_path: socket.clone(),
             max_active_runs: 1,
         },
@@ -172,7 +175,7 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
         listener,
         state,
         execution.clone(),
-        directory.path().join("guidance"),
+        guidance_root.clone(),
         operator.clone(),
         async move {
             let _ = shutdown.await;
@@ -278,7 +281,7 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
                     after_id: None,
                     limit: 1,
                 },
-                operator,
+                operator.clone(),
             ),
         )
         .await,
@@ -286,6 +289,91 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
             response: LocalResponse::Projects { projects, .. },
             ..
         } if projects.is_empty()
+    ));
+
+    let project_id = ProjectId::try_from("quarantine-project").unwrap();
+    let created = request(
+        &socket,
+        RequestEnvelope::authenticated(
+            LocalRequest::CreateProject {
+                id: project_id.clone(),
+                name: "Quarantine".into(),
+                root: directory.path().to_string_lossy().into_owned(),
+            },
+            operator.clone(),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(
+            created,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ),
+        "unexpected project response: {created:?}"
+    );
+    let candidate = match request(
+        &socket,
+        RequestEnvelope::authenticated(
+            LocalRequest::ReceiveInput {
+                project_id: project_id.clone(),
+                source_kind: "fixture".into(),
+                source_id: "source-1".into(),
+                delivery_id: "delivery-1".into(),
+                source_revision: "revision-1".into(),
+                content: "untrusted".into(),
+                expected_current_candidate_id: None,
+            },
+            operator.clone(),
+        ),
+    )
+    .await
+    {
+        ServerFrame::Response {
+            response: LocalResponse::InputReceived { receipt },
+            ..
+        } => receipt.candidate,
+        frame => panic!("unexpected input response: {frame:?}"),
+    };
+    assert_eq!(candidate.status, WorkCandidateStatus::Quarantined);
+    assert!(matches!(
+        request(
+            &socket,
+            RequestEnvelope::authenticated(
+                LocalRequest::ListWorkCandidates {
+                    project_id: project_id.clone(),
+                    after_id: None,
+                    limit: MAX_WORK_CANDIDATE_PAGE_ITEMS,
+                },
+                operator.clone(),
+            ),
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::WorkCandidates { candidates, .. },
+            ..
+        } if candidates.len() == 1 && candidates[0].id == candidate.id
+    ));
+    assert!(matches!(
+        request(
+            &socket,
+            RequestEnvelope::authenticated(
+                LocalRequest::RejectWorkCandidate {
+                    project_id,
+                    candidate_id: candidate.id,
+                    expected_revision: candidate.revision,
+                    reason: "not approved".into(),
+                },
+                operator,
+            ),
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::WorkCandidateRejected { candidate },
+            ..
+        } if candidate.status == WorkCandidateStatus::Rejected
     ));
 
     let _ = stop.send(());

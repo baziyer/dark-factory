@@ -28,6 +28,11 @@ directory/socket modes. There is no HTTP webhook or generic connector listener.
 Exposing the local API beyond the machine is external deployment work and is
 unsupported.
 
+The operator-only quarantine API is not a network ingress or trust decision.
+It stores bounded external observations as untrusted `InputEnvelope` and
+`WorkCandidate` state. Attempt credentials cannot receive, list, inspect, or
+reject that state, and no accept/materialize operation exists.
+
 ## Principals and capabilities
 
 Every request carries a versioned envelope and is resolved once as one of:
@@ -69,18 +74,23 @@ SQLite transaction that writes the message, task, revision, and event.
 ## Process and cleanup safety
 
 Before provider execution, `factoryd` durably records the admitted run and its
-resources. `factory-runner` prepares a child blocked before `exec`, reports its
-PID and process group, and waits. Only after the daemon records those exact
+resources. Before the outer runner gate is spawned, the daemon records the
+exact identity of a locked private startup file inherited as the gate's stdin.
+After a crash, that lock proves whether a gate not yet bound to a PID can still
+exist; a missing or replaced bound file is unresolved, never absent.
+`factory-runner` then prepares a child blocked before `exec`, reports its PID
+and process group, and waits. Only after the daemon records those exact
 identities and transitions the run to `running` may the child execute.
 
 Success, block, failure, cancellation, and exit converge through
 `finalizing`. A restartable daemon finalizer is the only writer of `terminal`.
-It matches exact resource identities before signalling, deleting, or
-acknowledging them. Reused PIDs, paths, runner identities, and job labels are
-reported as unresolved rather than touched.
-
-Rust `Drop`, shell traps, provider exit handlers, and test harnesses may perform
-fast cleanup but are not trusted for correctness. A run remains visibly
+It uses the authenticated runner while that runner is live; only the runner may
+signal a provider group, and only before it reaps the leader child it directly
+owns. Its live-child guard retains that bounded cleanup authority across
+cancellation or unwind and disarms immediately after a successful wait; it is
+not terminal authority. Stored numeric process identities are observation
+evidence, never signal authority. Reused PIDs, paths, runner identities, and job
+labels are reported as unresolved rather than touched. A run remains visibly
 `finalizing` while any ephemeral resource is active or unresolved.
 
 ## Provider and tool boundary
@@ -183,9 +193,10 @@ container.
 
 Resource reclamation may remove only exact, registered, unleased regenerable
 cache data; unique retained Changes are never automatic cleanup targets. A
-writer makes byte status incomplete. Its exact process group is reaped before
-remeasurement, after which the byte policy converges; an already measured
-over-limit cache is refused for a new verification. The daemon reports total
+writer makes byte status incomplete. The daemon publishes a private finish
+marker and a healthy verifier leader terminates its own group. Only after exact
+group absence may remeasurement and byte-policy convergence proceed; an already
+measured over-limit cache is refused for a new verification. The daemon reports total
 measured bytes plus protected entry count and recoverable failure count, and
 does not claim an instantaneous filesystem byte ceiling while Cargo is writing.
 If a verifier group leader disappears while descendants remain, finalization
@@ -202,6 +213,12 @@ an authority ledger.
 Provider credentials, repository credentials, prompts, raw output, message
 bodies, and source content do not belong in public events or diagnostic
 projections.
+
+Quarantined input content is private operator data. Receipt events contain only
+bounded project/envelope/candidate IDs; candidate-status events add only the
+bounded status. Same-observation replay is effect-idempotent, changed bytes
+conflict, source changes require the exact current candidate, and rejection is
+revision-bound. None of these paths creates executable work.
 
 ## Contributor and CI boundary
 

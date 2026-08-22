@@ -4,12 +4,17 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
+    io::{Seek as _, Write as _},
     os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
 };
 
-use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+use factory_core::{
+    RunId, RunnerInstanceId,
+    runner::{MAX_STARTUP_STDIN_BYTES, RUNNER_STARTUP_LEASE_FILE},
+};
+use rustix::fs::FlockOperation;
 use tokio::process::{Child, Command};
 
 const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
@@ -112,6 +117,47 @@ pub enum Error {
     InvalidAttemptEnvironment { name: String },
 }
 
+/// A validated runner command whose locked startup input is durably
+/// registerable before any process can exist.
+pub struct PreparedRunnerSetup {
+    command: Command,
+    activation_path: PathBuf,
+    setup_path: PathBuf,
+    setup_device: u64,
+    setup_inode: u64,
+}
+
+impl PreparedRunnerSetup {
+    #[must_use]
+    pub fn setup_path(&self) -> &Path {
+        &self.setup_path
+    }
+
+    #[must_use]
+    pub const fn setup_device(&self) -> u64 {
+        self.setup_device
+    }
+
+    #[must_use]
+    pub const fn setup_inode(&self) -> u64 {
+        self.setup_inode
+    }
+
+    /// Spawns the inert outer gate only after the caller has durably bound
+    /// this setup identity. The locked file is mapped to stdin, so the child
+    /// inherits the lease without a separate non-CLOEXEC descriptor race.
+    pub fn spawn(mut self) -> Result<PreparedRunnerProcess, Error> {
+        let child = self.command.spawn().map_err(Error::Spawn)?;
+        if child.id().is_none() {
+            return Err(Error::MissingProcessId);
+        }
+        Ok(PreparedRunnerProcess(PreparedProcess::new(
+            child,
+            self.activation_path,
+        )))
+    }
+}
+
 /// A stable factory-runner PID that has not executed runner code yet.
 ///
 /// The caller must durably register [`Self::child_pid`] before calling
@@ -183,6 +229,21 @@ impl PreparedRunnerProcess {
     pub async fn activate(self) -> Result<Child, Error> {
         self.0.activate().await
     }
+
+    /// Stops and reaps the inert gate when durable state revoked launch after
+    /// setup. Correctness does not depend on this fast path: restart recovery
+    /// still waits for the inherited setup lease to become available.
+    pub async fn terminate(mut self) {
+        self.0.kill_and_reap().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_unactivated_child(mut self) -> Child {
+        self.0
+            .child
+            .take()
+            .expect("prepared runner process is present")
+    }
 }
 
 /// One daemon effect process held behind the same register-before-exec gate.
@@ -241,19 +302,20 @@ impl CapturedEnvironment {
 /// explicit `CODEX_HOME` is the only provider-specific addition. The child
 /// also gets fixed non-interactive values for `NO_COLOR`, `TERM`, and
 /// `GIT_TERMINAL_PROMPT`. Task bytes are bounded by [`MAX_STARTUP_STDIN_BYTES`],
-/// spooled to an anonymous file before spawn, avoiding both argv/environment
-/// disclosure and a pipe-capacity deadlock while the runner is gated.
+/// spooled to a locked owner-only file inside the private runtime before
+/// spawn, avoiding both argv/environment disclosure and a pipe-capacity
+/// deadlock while the runner is gated.
 ///
-/// The returned gate must be durably registered and then activated. Until
-/// activation it exits when its exact parent disappears; dropping the prepared
-/// value kills it. Its PID is retained across `exec` into the real runner.
+/// The returned setup identity must be durably registered before [`PreparedRunnerSetup::spawn`].
+/// Its lock is inherited as the gate's stdin, so restart recovery can prove
+/// the absence of a gate that spawned before its PID was registered.
 ///
 /// # Errors
 ///
-/// Returns an error before spawning when task bytes are oversized, either
-/// executable is missing or unusable, or the explicit provider environment is
-/// invalid. Startup-input preparation and spawn failures are also returned.
-pub async fn prepare_runner(spec: LaunchSpec) -> Result<PreparedRunnerProcess, Error> {
+/// Returns an error when task bytes are oversized, either executable is
+/// missing or unusable, the explicit provider environment is invalid, or the
+/// locked startup input cannot be prepared. This function does not spawn.
+pub async fn prepare_runner(spec: LaunchSpec) -> Result<PreparedRunnerSetup, Error> {
     prepare_runner_with_environment(spec, CapturedEnvironment::capture()).await
 }
 
@@ -267,7 +329,7 @@ pub fn resolve_provider_executable(program: &Path) -> Result<PathBuf, Error> {
 async fn prepare_runner_with_environment(
     spec: LaunchSpec,
     environment: CapturedEnvironment,
-) -> Result<PreparedRunnerProcess, Error> {
+) -> Result<PreparedRunnerSetup, Error> {
     if spec.startup_input.len() > MAX_STARTUP_STDIN_BYTES {
         return Err(Error::StartupInputTooLarge {
             actual_bytes: spec.startup_input.len(),
@@ -290,7 +352,9 @@ async fn prepare_runner_with_environment(
     let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
     let activation_path = spec.runtime_dir.join("runner-exec.activate");
     ensure_exec_gate_absent(&activation_path)?;
-    let startup_input = prepare_startup_input(&spec.startup_input)?;
+    let setup_path = spec.runtime_dir.join(RUNNER_STARTUP_LEASE_FILE);
+    let startup_input = prepare_startup_input(&setup_path, &spec.startup_input)?;
+    let setup_metadata = startup_input.metadata().map_err(Error::StartupInput)?;
     let cwd = spec.cwd;
     let source_root = spec.source_root;
     let expected_parent = rustix::process::getpid();
@@ -338,14 +402,13 @@ async fn prepare_runner_with_environment(
         command.env(name, value);
     }
 
-    let child = command.spawn().map_err(Error::Spawn)?;
-    if child.id().is_none() {
-        return Err(Error::MissingProcessId);
-    }
-    Ok(PreparedRunnerProcess(PreparedProcess::new(
-        child,
+    Ok(PreparedRunnerSetup {
+        command,
         activation_path,
-    )))
+        setup_path,
+        setup_device: setup_metadata.dev(),
+        setup_inode: setup_metadata.ino(),
+    })
 }
 
 /// Prepares a daemon-owned effect without allowing its program to execute.
@@ -397,6 +460,7 @@ async fn spawn_runner_with_environment(
 ) -> Result<Child, Error> {
     prepare_runner_with_environment(spec, environment)
         .await?
+        .spawn()?
         .activate()
         .await
 }
@@ -421,16 +485,23 @@ fn release_exec_gate(path: &Path) -> Result<(), Error> {
     file.sync_all().map_err(Error::Activate)
 }
 
-fn prepare_startup_input(input: &[u8]) -> Result<Stdio, Error> {
-    use std::io::{Seek as _, Write as _};
-
-    let mut file = tempfile::tempfile().map_err(Error::StartupInput)?;
+fn prepare_startup_input(path: &Path, input: &[u8]) -> Result<fs::File, Error> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(Error::StartupInput)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(Error::StartupInput)?;
+    rustix::fs::flock(&file, FlockOperation::LockExclusive)
+        .map_err(|error| Error::StartupInput(error.into()))?;
     file.write_all(input).map_err(Error::StartupInput)?;
+    file.sync_all().map_err(Error::StartupInput)?;
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(Error::StartupInput)?;
-    Ok(Stdio::from(file))
+    Ok(file)
 }
 
 fn apply_runner_environment(
@@ -630,6 +701,7 @@ mod tests {
     };
 
     use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+    use rustix::fs::FlockOperation;
     use rustix::process::{Pid, test_kill_process};
     use tokio::process::Command;
 
@@ -1270,7 +1342,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(!directory.path().join("runner-argv").exists());
         assert!(!directory.path().join("provider-stdin").exists());
 
-        let mut child = prepared.activate().await.unwrap();
+        let mut child = prepared.spawn().unwrap().activate().await.unwrap();
         assert!(child.wait().await.unwrap().success());
         assert_eq!(
             fs::metadata(directory.path().join("provider-stdin"))
@@ -1290,6 +1362,8 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             captured,
         )
         .await
+        .unwrap()
+        .spawn()
         .unwrap();
         let child_pid = prepared.child_pid();
         let pid = Pid::from_raw(i32::try_from(child_pid).unwrap()).unwrap();
@@ -1318,6 +1392,40 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
     }
 
     #[tokio::test]
+    async fn startup_lease_is_inherited_by_the_spawned_exec_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let setup = prepare_runner_with_environment(
+            spec(directory.path(), b"private task".to_vec()),
+            captured,
+        )
+        .await
+        .unwrap();
+        let lease_path = setup.setup_path().to_owned();
+        let contender = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        assert_eq!(
+            rustix::fs::flock(&contender, FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::AGAIN),
+            "a separately opened descriptor must not share the setup lock"
+        );
+
+        let prepared = setup.spawn().unwrap();
+        assert_eq!(
+            rustix::fs::flock(&contender, FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::AGAIN),
+            "the child must inherit the lock after the parent command is consumed"
+        );
+        prepared.terminate().await;
+        rustix::fs::flock(&contender, FlockOperation::NonBlockingLockExclusive)
+            .expect("the setup lock must become available only after the gate is reaped");
+    }
+
+    #[tokio::test]
     async fn activation_retains_the_exact_prepared_pid() {
         let directory = tempfile::tempdir().unwrap();
         scripts(directory.path());
@@ -1325,6 +1433,8 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         let prepared =
             prepare_runner_with_environment(spec(directory.path(), Vec::new()), captured)
                 .await
+                .unwrap()
+                .spawn()
                 .unwrap();
         let prepared_pid = prepared.child_pid();
 

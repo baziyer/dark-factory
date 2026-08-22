@@ -16,11 +16,13 @@ use std::{
 
 use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, ChangeSnapshot, ProjectId, Provider,
-    RunFailureReason, RunId, RunPhase, RunnerInstanceId, runner::RunnerEvent,
+    RunFailureReason, RunId, RunPhase, RunnerInstanceId,
+    runner::{RUNNER_STARTUP_LEASE_FILE, RunnerEvent},
 };
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, test_kill_process_group};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -860,7 +862,38 @@ async fn launch_admitted(
         source_root: PathBuf::from(&admitted.target.source_root),
         startup_input: launch.startup_input,
     };
-    let prepared_runner = match runner_process::prepare_runner(spec).await {
+    let prepared_setup = match runner_process::prepare_runner(spec).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
+    let setup_locator = runner_setup_locator(
+        prepared_setup.setup_path(),
+        &admitted.target.runner_instance_id,
+    );
+    let setup_birth =
+        runner_setup_birth_fingerprint(prepared_setup.setup_device(), prepared_setup.setup_inode());
+    let setup_run_id = admitted.run.id.clone();
+    let registered_setup_locator = setup_locator.clone();
+    let registered_setup_birth = setup_birth.clone();
+    let setup_registered_at_ms = match now_ms() {
+        Ok(value) => value,
+        Err(error) => return Err((error, None, recovery)),
+    };
+    if let Err(error) = state
+        .commit_and_publish(move |store| {
+            store.register_admitted_runner_setup(
+                &setup_run_id,
+                &registered_setup_locator,
+                &registered_setup_birth,
+                setup_registered_at_ms,
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await
+    {
+        return Err((error.into(), None, recovery));
+    }
+    let prepared_runner = match prepared_setup.spawn() {
         Ok(prepared) => prepared,
         Err(error) => return Err((error.into(), None, recovery)),
     };
@@ -869,32 +902,55 @@ async fn launch_admitted(
     let runner_birth = match process_birth_fingerprint(runner_pid) {
         Ok(Some(fingerprint)) => fingerprint,
         Ok(None) => {
+            prepared_runner.terminate().await;
             return Err((
                 Error::ProcessIdentityUnavailable(runner_pid),
                 None,
                 recovery,
             ));
         }
-        Err(error) => return Err((error, None, recovery)),
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error, None, recovery));
+        }
     };
     let register_run_id = admitted.run.id.clone();
     let registered_at_ms = match now_ms() {
         Ok(value) => value,
-        Err(error) => return Err((error, None, recovery)),
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error, None, recovery));
+        }
     };
-    if let Err(error) = state
+    let register_setup_locator = setup_locator.clone();
+    let register_setup_birth = setup_birth.clone();
+    let registered_phase = match state
         .commit_and_publish(move |store| {
-            store.register_admitted_runner(
+            let phase = store.register_admitted_runner(
                 &register_run_id,
+                &register_setup_locator,
+                &register_setup_birth,
                 &runner_locator,
                 &runner_birth,
                 registered_at_ms,
             )?;
-            Ok(((), Vec::new()))
+            Ok((phase, Vec::new()))
         })
         .await
     {
-        return Err((error.into(), None, recovery));
+        Ok(phase) => phase,
+        Err(error) => {
+            prepared_runner.terminate().await;
+            return Err((error.into(), None, recovery));
+        }
+    };
+    if registered_phase == RunPhase::Finalizing {
+        prepared_runner.terminate().await;
+        return Err((
+            Error::State(DaemonStateError::Store(StoreError::InvalidRunState)),
+            None,
+            recovery,
+        ));
     }
     let child = match prepared_runner.activate().await {
         Ok(child) => child,
@@ -1500,7 +1556,7 @@ async fn run_rust_worker_effect(
         Ok(child) => child,
         Err(error) => {
             let result = failed_worker_result(&error.to_string());
-            return match terminate_effect_group(state, &check.run_id, None, &finish_path).await {
+            return match request_effect_finish(state, &check.run_id, None, &finish_path).await {
                 Ok(()) => Ok(RustWorkerEffectOutcome::Released(result)),
                 Err(cleanup_error) => {
                     tracing::warn!(
@@ -1516,7 +1572,7 @@ async fn run_rust_worker_effect(
     let worker_result =
         wait_for_worker_result(&mut child, &result_path, RUST_VERIFICATION_TIMEOUT).await;
     if let Err(error) =
-        terminate_effect_group(state, &check.run_id, Some(&mut child), &finish_path).await
+        request_effect_finish(state, &check.run_id, Some(&mut child), &finish_path).await
     {
         tracing::warn!(
             run_id = %check.run_id,
@@ -1881,72 +1937,19 @@ async fn remeasure_rust_cache(
     Ok(())
 }
 
-async fn terminate_effect_group(
+async fn request_effect_finish(
     state: &DaemonState,
     run_id: &RunId,
     mut child: Option<&mut Child>,
-    _finish_path: &Path,
+    finish_path: &Path,
 ) -> Result<(), Error> {
-    let _resources = state
-        .with_store({
-            let run_id = run_id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await?;
-    #[cfg(target_os = "linux")]
-    if let Some(group) = _resources.iter().find(|resource| {
-        resource.kind == KernelResourceKind::EffectGroup
-            && resource.state != KernelResourceState::Released
-    }) {
-        kill_registered_effect_group(group)?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    write_finish_signal(_finish_path)?;
+    write_finish_signal(finish_path)?;
     if let Some(child) = child.as_mut() {
         let _ = timeout(RUNNER_EXIT_GRACE, child.wait()).await;
     }
     release_effect_resources(state, run_id).await
 }
 
-#[cfg(target_os = "linux")]
-fn kill_registered_effect_group(resource: &KernelResource) -> Result<(), Error> {
-    let pgid = locator_number(&resource.locator, "pgid").ok_or(DaemonStateError::Store(
-        StoreError::InvalidExecutionMetadata,
-    ))?;
-    let expected = resource
-        .birth_fingerprint
-        .as_deref()
-        .ok_or(DaemonStateError::Store(
-            StoreError::InvalidExecutionMetadata,
-        ))?;
-    if !exact_effect_group_leader(Some(expected), process_birth_fingerprint(pgid)?.as_deref()) {
-        if process_group_absent(resource)? {
-            return Ok(());
-        }
-        // A process group may outlive its leader. Without that leader's exact
-        // birth identity, signalling the numeric PGID could hit a reused
-        // group. Keep the check and its cache nonterminal until group absence
-        // is independently proven.
-        return Err(Error::ProcessIdentityUnavailable(pgid));
-    }
-    let Some(pid) = Pid::from_raw(pgid as i32) else {
-        return Ok(());
-    };
-    match kill_process_group(pid, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(error) => Err(Error::Runtime {
-            path: PathBuf::from(format!("effect-group:{pgid}")),
-            source: io::Error::from_raw_os_error(error.raw_os_error()),
-        }),
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn exact_effect_group_leader(expected: Option<&str>, current: Option<&str>) -> bool {
-    expected.is_some() && expected == current
-}
-
-#[cfg(not(target_os = "linux"))]
 fn write_finish_signal(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -2245,7 +2248,7 @@ async fn recover_prior_rust_effect(
         let finish_path = locator_named_path(&effect.locator, "finish").ok_or(
             DaemonStateError::Store(StoreError::InvalidExecutionMetadata),
         )?;
-        terminate_effect_group(state, &check.run_id, None, &finish_path).await?;
+        request_effect_finish(state, &check.run_id, None, &finish_path).await?;
     }
 
     let temporary = match prepare_completion_temporary_root(config, state, &check).await {
@@ -2700,8 +2703,7 @@ async fn reconcile_one(
             run.runner_instance_id.clone(),
         );
         if let Err(error) = client.stop(grace_ms).await {
-            tracing::debug!(run_id = %run.run.id, %error, "exact runner stop deferred to finalizer");
-            kill_registered_processes(&run.resources)?;
+            tracing::debug!(run_id = %run.run.id, %error, "exact runner stop deferred until resource absence is observed");
         }
     }
     if release_absent_resources(state, &run).await? {
@@ -2807,7 +2809,6 @@ async fn fail_unrecoverable_admission(
             Ok(((), events))
         })
         .await?;
-    kill_registered_processes(&run.resources)?;
     let refreshed = state
         .with_store({
             let run_id = run.run.id.clone();
@@ -2821,16 +2822,6 @@ async fn fail_unrecoverable_admission(
             }
         })
         .await?;
-    // A declared runner has no process identity and never passed Prepare.
-    // The bounded authenticated connection failure above is the authority to
-    // abandon that declaration; active identities still require absence.
-    for resource in refreshed.resources.iter().filter(|resource| {
-        resource.kind == KernelResourceKind::RunnerProcess
-            && resource.state == KernelResourceState::Releasing
-            && resource.birth_fingerprint.is_none()
-    }) {
-        release_resource(state, resource).await?;
-    }
     let _ = release_absent_resources(state, &refreshed).await?;
     Ok(())
 }
@@ -2863,8 +2854,7 @@ async fn observe_run(
     if run.run.phase == RunPhase::Finalizing
         && let Err(error) = client.stop(DEFAULT_FINALIZE_GRACE_MS).await
     {
-        tracing::debug!(run_id = %run.run.id, %error, "runner stop failed; using registered identities");
-        kill_registered_processes(&run.resources)?;
+        tracing::debug!(run_id = %run.run.id, %error, "runner stop failed; awaiting exact resource absence");
     }
     let mut subscription = match subscribe_with_grace(&client).await {
         Ok(subscription) => subscription,
@@ -2906,12 +2896,6 @@ async fn observe_run(
                     })
                     .await?;
             }
-            if matches!(
-                refreshed.run.phase,
-                RunPhase::Running | RunPhase::Finalizing
-            ) {
-                kill_registered_processes(&refreshed.resources)?;
-            }
             return Err(error.into());
         }
     };
@@ -2936,10 +2920,8 @@ async fn observe_run(
         .await?;
     client.acknowledge_exit(observed.terminal_sequence).await?;
     if let Some(child) = child.as_mut() {
-        if timeout(RUNNER_EXIT_GRACE, child.wait()).await.is_err()
-            && let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32))
-        {
-            let _ = kill_process_group(pid, Signal::KILL);
+        if timeout(RUNNER_EXIT_GRACE, child.wait()).await.is_err() {
+            let _ = child.kill().await;
             let _ = child.wait().await;
         }
     } else {
@@ -3240,9 +3222,7 @@ async fn cleanup_unactivated(
     mut child: Option<Child>,
 ) {
     if let Some(child) = child.as_mut() {
-        if let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32)) {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
+        let _ = child.kill().await;
         let _ = child.wait().await;
     }
     let run_id = run.run.id.clone();
@@ -3254,21 +3234,6 @@ async fn cleanup_unactivated(
                 Ok(((), events))
             })
             .await;
-    }
-    if let Ok(resources) = state
-        .with_store({
-            let run_id = run.run.id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await
-    {
-        for resource in resources.iter().filter(|resource| {
-            resource.kind == KernelResourceKind::RunnerProcess
-                && resource.birth_fingerprint.is_none()
-                && resource.state != KernelResourceState::Released
-        }) {
-            let _ = release_resource(state, resource).await;
-        }
     }
     let _ = release_completed_resources(state, run).await;
 }
@@ -3303,9 +3268,17 @@ async fn release_absent_resources(
             continue;
         }
         let absent = match resource.kind {
-            KernelResourceKind::RunnerProcess
-            | KernelResourceKind::ProviderProcess
-            | KernelResourceKind::EffectProcess => process_resource_absent(resource)?,
+            KernelResourceKind::RunnerProcess => match runner_resource_status(run, resource)? {
+                RunnerResourceStatus::Present => false,
+                RunnerResourceStatus::Absent => true,
+                RunnerResourceStatus::Unresolved(failure) => {
+                    mark_resource_unresolved(state, resource, failure).await?;
+                    false
+                }
+            },
+            KernelResourceKind::ProviderProcess | KernelResourceKind::EffectProcess => {
+                process_resource_absent(resource)?
+            }
             KernelResourceKind::ProcessGroup | KernelResourceKind::EffectGroup => {
                 process_group_absent(resource)?
             }
@@ -3346,9 +3319,6 @@ async fn release_absent_resources(
                 Ok(((), events))
             })
             .await?;
-        kill_registered_group(&resources)?;
-    } else if runner_released && run.run.phase == RunPhase::Finalizing {
-        kill_registered_group(&resources)?;
     }
     if processes_released && run.run.phase == RunPhase::Finalizing {
         for resource in resources.iter().filter(|resource| {
@@ -3378,7 +3348,7 @@ async fn release_absent_resources(
             }) {
                 let finish_path = locator_named_path(&effect.locator, "finish")
                     .ok_or(Error::InvalidRuntimeRoot)?;
-                terminate_effect_group(state, &run.run.id, None, &finish_path).await?;
+                request_effect_finish(state, &run.run.id, None, &finish_path).await?;
             }
             release_completion_temporary_root(state, &run.run.id).await?;
         }
@@ -3484,87 +3454,6 @@ fn remove_runtime_if_claimed(
     remove_runtime_if_exact(path, quarantine, Some(&current))
 }
 
-#[cfg(target_os = "linux")]
-fn kill_registered_group(resources: &[KernelResource]) -> Result<(), Error> {
-    for group in registered_process_groups(resources) {
-        let Some(pgid) = locator_number(&group.locator, "pgid") else {
-            continue;
-        };
-        // A reused process-group number must never authorize a signal. The
-        // group leader's birth fingerprint is the durable proof that this is
-        // still the group factoryd registered before execution began.
-        if process_birth_fingerprint(pgid)?.as_deref() != group.birth_fingerprint.as_deref() {
-            continue;
-        }
-        let Some(pid) = Pid::from_raw(pgid as i32) else {
-            continue;
-        };
-        match kill_process_group(pid, Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-            Err(error) => {
-                return Err(Error::Runtime {
-                    path: PathBuf::from(format!("process-group:{pgid}")),
-                    source: io::Error::from_raw_os_error(error.raw_os_error()),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn registered_process_groups(
-    resources: &[KernelResource],
-) -> impl Iterator<Item = &KernelResource> {
-    resources.iter().filter(|resource| {
-        resource.kind == KernelResourceKind::ProcessGroup
-            && resource.state != KernelResourceState::Released
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn kill_registered_group(_resources: &[KernelResource]) -> Result<(), Error> {
-    // macOS exposes only second-resolution process start time through the
-    // safe APIs available here. That is sufficient to remain unresolved,
-    // never to authorize a destructive signal across a check/kill race.
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn kill_registered_processes(resources: &[KernelResource]) -> Result<(), Error> {
-    kill_registered_group(resources)?;
-    let Some(runner) = resources.iter().find(|resource| {
-        resource.kind == KernelResourceKind::RunnerProcess
-            && resource.state != KernelResourceState::Released
-    }) else {
-        return Ok(());
-    };
-    let Some(pid_number) = locator_number(&runner.locator, "pid") else {
-        return Ok(());
-    };
-    if process_birth_fingerprint(pid_number)?.as_deref() != runner.birth_fingerprint.as_deref() {
-        return Ok(());
-    }
-    let Some(pid) = Pid::from_raw(pid_number as i32) else {
-        return Ok(());
-    };
-    match kill_process_group(pid, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(error) => Err(Error::Runtime {
-            path: PathBuf::from(format!("runner-process-group:{pid_number}")),
-            source: io::Error::from_raw_os_error(error.raw_os_error()),
-        }),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn kill_registered_processes(_resources: &[KernelResource]) -> Result<(), Error> {
-    // Finalization first uses the authenticated runner socket. If that fails,
-    // weak PID metadata cannot authorize a fallback signal; the durable
-    // resources remain unresolved until absence can be established.
-    Ok(())
-}
-
 async fn release_resource(state: &DaemonState, resource: &KernelResource) -> Result<(), Error> {
     let id = resource.id.clone();
     let locator = resource.locator.clone();
@@ -3642,35 +3531,215 @@ fn process_resource_absent(resource: &KernelResource) -> Result<bool, Error> {
     let Some(pid) = locator_number(&resource.locator, "pid") else {
         return Ok(false);
     };
+    process_identity_absent(pid, resource.birth_fingerprint.as_deref())
+}
+
+fn process_identity_absent(pid: u32, expected_birth: Option<&str>) -> Result<bool, Error> {
     let current = process_birth_fingerprint(pid)?;
     if current.is_none() {
         return Ok(true);
     }
     #[cfg(target_os = "linux")]
-    return Ok(resource
+    return Ok(expected_birth.is_some_and(|expected| current.as_deref() != Some(expected)));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected_birth;
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum RunnerResourceLocator {
+    Setup(RunnerSetupLocator),
+    Pid(RunnerPidLocator),
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RunnerSetupLocator {
+    setup_path: PathBuf,
+    runner_instance_id: RunnerInstanceId,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RunnerPidLocator {
+    pid: u32,
+    runner_instance_id: RunnerInstanceId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerResourceStatus {
+    Present,
+    Absent,
+    Unresolved(&'static str),
+}
+
+fn runner_resource_status(
+    run: &RecoverableKernelRun,
+    resource: &KernelResource,
+) -> Result<RunnerResourceStatus, Error> {
+    let locator = match serde_json::from_str::<RunnerResourceLocator>(&resource.locator) {
+        Ok(locator) => locator,
+        Err(_) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "runner resource locator is malformed",
+            ));
+        }
+    };
+    let RunnerSetupLocator {
+        setup_path,
+        runner_instance_id,
+    } = match locator {
+        RunnerResourceLocator::Setup(setup) => setup,
+        RunnerResourceLocator::Pid(RunnerPidLocator {
+            pid,
+            runner_instance_id,
+        }) => {
+            if runner_instance_id != run.runner_instance_id {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process locator does not match its run",
+                ));
+            }
+            if i32::try_from(pid).ok().and_then(Pid::from_raw).is_none() {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process locator has an invalid PID",
+                ));
+            }
+            if !runner_pid_birth_is_compatible(resource.birth_fingerprint.as_deref()) {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process fingerprint is incompatible with its locator",
+                ));
+            }
+            return Ok(
+                if process_identity_absent(pid, resource.birth_fingerprint.as_deref())? {
+                    RunnerResourceStatus::Absent
+                } else {
+                    RunnerResourceStatus::Present
+                },
+            );
+        }
+    };
+    if runner_instance_id != run.runner_instance_id {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup locator does not match its run",
+        ));
+    }
+    let expected_setup_path = Path::new(&run.runner_runtime).join(RUNNER_STARTUP_LEASE_FILE);
+    if setup_path != expected_setup_path {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup locator does not match its run",
+        ));
+    }
+    if !runner_setup_birth_is_compatible(resource.birth_fingerprint.as_deref()) {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup fingerprint is incompatible with its locator",
+        ));
+    }
+
+    let descriptor = match rustix::fs::open(
+        &setup_path,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) if resource.birth_fingerprint.is_none() => {
+            // This locator shape is the durable pre-spawn checkpoint. The
+            // revised launcher cannot spawn until it replaces `None` with the
+            // exact file identity, so absence here proves no gate ever began.
+            return Ok(RunnerResourceStatus::Absent);
+        }
+        Err(rustix::io::Errno::NOENT) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "registered runner setup lease is missing",
+            ));
+        }
+        Err(_) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "runner setup lease could not be opened safely",
+            ));
+        }
+    };
+    let file = fs::File::from(descriptor);
+    let metadata = file.metadata().map_err(|source| Error::Runtime {
+        path: setup_path.clone(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup lease is not an owner-only regular file",
+        ));
+    }
+    let current = runner_setup_birth_fingerprint(metadata.dev(), metadata.ino());
+    if resource
         .birth_fingerprint
         .as_deref()
-        .is_some_and(|expected| current.as_deref() != Some(expected)));
-    #[cfg(not(target_os = "linux"))]
-    Ok(false)
+        .is_some_and(|expected| expected != current)
+    {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup lease identity changed",
+        ));
+    }
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(RunnerResourceStatus::Absent),
+        Err(rustix::io::Errno::AGAIN) => Ok(RunnerResourceStatus::Present),
+        Err(source) => Err(Error::Runtime {
+            path: setup_path,
+            source: source.into(),
+        }),
+    }
+}
+
+fn runner_setup_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    let Some(fingerprint) = fingerprint else {
+        return true;
+    };
+    let Some(value) = fingerprint.strip_prefix("unix-device:") else {
+        return false;
+    };
+    let Some((device, inode)) = value.split_once(":inode:") else {
+        return false;
+    };
+    let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+        return false;
+    };
+    fingerprint == runner_setup_birth_fingerprint(device, inode)
+}
+
+#[cfg(target_os = "linux")]
+fn runner_pid_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    let Some(fingerprint) = fingerprint else {
+        return false;
+    };
+    let Some(ticks) = fingerprint.strip_prefix("linux-start-ticks:") else {
+        return false;
+    };
+    ticks
+        .parse::<u64>()
+        .is_ok_and(|ticks| fingerprint == format!("linux-start-ticks:{ticks}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runner_pid_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    fingerprint == Some("weak-presence-only")
 }
 
 fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
     let Some(pgid) = locator_number(&resource.locator, "pgid") else {
         return Ok(false);
     };
-    let Some(pid) = Pid::from_raw(pgid as i32) else {
-        return Ok(true);
-    };
+    let pid = i32::try_from(pgid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(DaemonStateError::Store(
+            StoreError::InvalidExecutionMetadata,
+        ))?;
     match test_kill_process_group(pid) {
-        Ok(()) | Err(rustix::io::Errno::PERM) => {
-            #[cfg(not(target_os = "linux"))]
-            return Ok(false);
-            #[cfg(target_os = "linux")]
-            let current = process_birth_fingerprint(pgid)?;
-            #[cfg(target_os = "linux")]
-            Ok(current.is_some() && current.as_deref() != resource.birth_fingerprint.as_deref())
-        }
+        Ok(()) | Err(rustix::io::Errno::PERM) => Ok(false),
         Err(rustix::io::Errno::SRCH) => Ok(true),
         Err(error) => Err(Error::Runtime {
             path: PathBuf::from(format!("process-group:{pgid}")),
@@ -3714,6 +3783,18 @@ fn runner_locator(pid: u32, runner_instance_id: &RunnerInstanceId) -> String {
         "runner_instance_id": runner_instance_id.as_str(),
     })
     .to_string()
+}
+
+fn runner_setup_locator(path: &Path, runner_instance_id: &RunnerInstanceId) -> String {
+    serde_json::json!({
+        "runner_instance_id": runner_instance_id.as_str(),
+        "setup_path": path,
+    })
+    .to_string()
+}
+
+fn runner_setup_birth_fingerprint(device: u64, inode: u64) -> String {
+    format!("unix-device:{device}:inode:{inode}")
 }
 
 fn runtime_birth_fingerprint(path: &Path) -> Result<Option<String>, Error> {
@@ -3995,7 +4076,17 @@ impl<Id: Eq + std::hash::Hash + Clone> DeleteGate<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use rustix::process::test_kill_process;
+    use std::{
+        os::unix::{
+            fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+            process::CommandExt as _,
+        },
+        process::Stdio,
+        thread,
+    };
+
+    use crate::store::{NewAgent, NewProject, NewTask, Store};
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -4005,6 +4096,14 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    struct ReleaseOnDrop(PathBuf);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
     }
 
     fn rust_check(phase: RustCompletionPhase) -> RustCompletionCheck {
@@ -4041,6 +4140,187 @@ mod tests {
             socket_path: root.join("factory.sock"),
             max_active_runs: 1,
         }
+    }
+
+    fn executable(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn outer_gate_probe(root: &Path) -> PathBuf {
+        let runner = root.join("runner-probe");
+        executable(
+            &runner,
+            r#"#!/bin/sh
+set -eu
+[ "${1:-}" = "--exec-gate" ] || exit 64
+gate_path=$2
+shift 2
+[ "${1:-}" = "--expected-parent-pid" ] || exit 64
+expected_parent=$2
+shift 2
+[ "${1:-}" = "--" ] || exit 64
+[ "$PPID" = "$expected_parent" ] || exit 0
+# Keep the probe single-process: a polling child would inherit the lease.
+while [ ! -e "$gate_path" ]; do
+    [ "$PPID" = "$expected_parent" ] || exit 0
+done
+exit 125
+"#,
+        );
+        runner
+    }
+
+    fn admit_shell_attempt(store: &mut Store, root: &Path) -> AdmittedRun {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("worker").unwrap();
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let project_root = root.join("project");
+        ensure_private_directory(&project_root).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id,
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "task".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+                agent_id.clone(),
+                3,
+            )
+            .unwrap();
+        let runtime = root.join("runs/11111111111141118111111111111111");
+        store
+            .admit_next_run(
+                NewRunAdmission {
+                    run_id: RunId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+                    project_id,
+                    agent_id,
+                    capability_digest: capability_digest("test-bearer"),
+                    runtime_claim: "runtime-claim:11111111111141118111111111111111".into(),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: runtime.to_string_lossy().into_owned(),
+                    max_active_runs: 1,
+                    change_reservation: ChangeReservation {
+                        id: ChangeId::try_from("change-1").unwrap(),
+                        source_root: root.join("change-1").to_string_lossy().into_owned(),
+                        max_factory_changes: 1,
+                    },
+                    policy_cwd: runtime.join("policy").to_string_lossy().into_owned(),
+                },
+                4,
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn runner_launch_spec(admitted: &AdmittedRun, root: &Path) -> LaunchSpec {
+        LaunchSpec {
+            runner_program: outer_gate_probe(root),
+            factoryctl_path: PathBuf::from("/usr/bin/true"),
+            provider_program: PathBuf::from("/usr/bin/true"),
+            provider_arguments: Vec::new(),
+            provider_environment: ProviderEnvironment::Inherited,
+            attempt_environment: Vec::new(),
+            run_id: admitted.run.id.clone(),
+            runner_instance_id: admitted.target.runner_instance_id.clone(),
+            runtime_dir: PathBuf::from(&admitted.target.runner_runtime),
+            cwd: root.to_owned(),
+            source_root: root.to_owned(),
+            startup_input: b"private task".to_vec(),
+        }
+    }
+
+    async fn register_runtime(state: &DaemonState, admitted: &AdmittedRun) {
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        ensure_private_directory(&runtime).unwrap();
+        let locator = runtime_locator(&runtime);
+        let birth = runtime_birth_fingerprint(&runtime).unwrap().unwrap();
+        let run_id = admitted.run.id.clone();
+        let claim = admitted.target.runtime_claim.clone();
+        state
+            .commit_and_publish(move |store| {
+                store.register_admitted_runtime(&run_id, &locator, &claim, &birth, 5)?;
+                Ok(((), Vec::new()))
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn register_setup(
+        state: &DaemonState,
+        admitted: &AdmittedRun,
+        setup: &runner_process::PreparedRunnerSetup,
+    ) -> (String, String) {
+        let locator = runner_setup_locator(setup.setup_path(), &admitted.target.runner_instance_id);
+        let birth = runner_setup_birth_fingerprint(setup.setup_device(), setup.setup_inode());
+        let run_id = admitted.run.id.clone();
+        let stored_locator = locator.clone();
+        let stored_birth = birth.clone();
+        state
+            .commit_and_publish(move |store| {
+                store.register_admitted_runner_setup(&run_id, &stored_locator, &stored_birth, 6)?;
+                Ok(((), Vec::new()))
+            })
+            .await
+            .unwrap();
+        (locator, birth)
+    }
+
+    async fn cancel_attempt(state: &DaemonState, run_id: &RunId) {
+        let run_id = run_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let (_, events) = store.cancel_admitted_or_running_run(
+                    &run_id,
+                    "operator cancelled".into(),
+                    7,
+                )?;
+                Ok(((), events))
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn recover_run(state: &DaemonState, run_id: &RunId) -> RecoverableKernelRun {
+        let run_id = run_id.clone();
+        state
+            .with_store(move |store| {
+                store
+                    .recoverable_kernel_runs()?
+                    .into_iter()
+                    .find(|candidate| candidate.run.id == run_id)
+                    .ok_or(StoreError::RunNotFound)
+            })
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -4105,58 +4385,587 @@ mod tests {
         assert!(gate.wait_for_drain(&id, Duration::ZERO).await);
     }
 
-    #[test]
-    fn pid_locator_is_typed_json_not_display_text() {
-        let locator = serde_json::json!({ "pid": 42 }).to_string();
-        assert_eq!(locator_number(&locator, "pid"), Some(42));
-        assert_eq!(locator_number("pid 42", "pid"), None);
+    #[tokio::test]
+    async fn restart_waits_for_a_spawned_unregistered_gate_before_terminal() {
+        let root = private_tempdir();
+        let database = root.path().join("state.db");
+        let mut store = Store::open(&database).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let child_pid = prepared.child_pid();
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap()).unwrap();
+        let mut detached_gate = prepared.into_unactivated_child();
+        cancel_attempt(&state, &run_id).await;
+        drop(state);
+
+        let restarted = DaemonState::new(Store::open(&database).unwrap());
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert_eq!(recovered.run.phase, RunPhase::Finalizing);
+        assert!(
+            !release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        let still_finalizing = recover_run(&restarted, &run_id).await;
+        assert_eq!(still_finalizing.run.phase, RunPhase::Finalizing);
+        assert!(still_finalizing.resources.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Releasing
+        }));
+        assert!(rustix::process::test_kill_process(pid).is_ok());
+
+        detached_gate.kill().await.unwrap();
+        detached_gate.wait().await.unwrap();
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert!(
+            release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        let terminal = restarted
+            .with_store({
+                let run_id = run_id.clone();
+                move |store| store.kernel_run(&run_id)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.phase, RunPhase::Terminal);
+        assert_eq!(
+            terminal.outcome,
+            Some(factory_core::RunOutcome::Cancelled {
+                reason: "operator cancelled".into()
+            })
+        );
+        assert!(rustix::process::test_kill_process(pid).is_err());
+        assert!(!runtime.exists());
+    }
+
+    #[tokio::test]
+    async fn mixed_runner_locator_with_a_live_setup_lease_stays_unresolved() {
+        let root = private_tempdir();
+        let mut store = Store::open(root.path().join("state.db")).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        let setup_path = setup.setup_path().to_owned();
+        register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let runner_pid = prepared.child_pid();
+        cancel_attempt(&state, &run_id).await;
+
+        let mut recovered = recover_run(&state, &run_id).await;
+        let runner_index = recovered
+            .resources
+            .iter()
+            .position(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+            .unwrap();
+        recovered.resources[runner_index].locator = serde_json::json!({
+            "pid": runner_pid,
+            "runner_instance_id": admitted.target.runner_instance_id.as_str(),
+            "setup_path": &setup_path,
+        })
+        .to_string();
+        assert!(matches!(
+            runner_resource_status(&recovered, &recovered.resources[runner_index]).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(!release_absent_resources(&state, &recovered).await.unwrap());
+        let stored = state
+            .with_store({
+                let run_id = run_id.clone();
+                move |store| store.kernel_resources(&run_id)
+            })
+            .await
+            .unwrap();
+        assert!(stored.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Unresolved
+        }));
+        assert!(runtime.exists());
+        assert!(setup_path.exists());
+        let runner_pid = Pid::from_raw(i32::try_from(runner_pid).unwrap()).unwrap();
+        assert!(rustix::process::test_kill_process(runner_pid).is_ok());
+
+        prepared.terminate().await;
+        assert_eq!(
+            rustix::process::test_kill_process(runner_pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_spawn_and_pid_registration_binds_then_reaps_exact_gate() {
+        let root = private_tempdir();
+        let database = root.path().join("state.db");
+        let mut store = Store::open(&database).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        let (setup_locator, setup_birth) = register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let runner_pid = prepared.child_pid();
+        let runner_birth = process_birth_fingerprint(runner_pid).unwrap().unwrap();
+        let runner_locator = runner_locator(runner_pid, &admitted.target.runner_instance_id);
+        cancel_attempt(&state, &run_id).await;
+
+        let register_run_id = run_id.clone();
+        let phase = state
+            .commit_and_publish(move |store| {
+                let phase = store.register_admitted_runner(
+                    &register_run_id,
+                    &setup_locator,
+                    &setup_birth,
+                    &runner_locator,
+                    &runner_birth,
+                    8,
+                )?;
+                Ok((phase, Vec::new()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(phase, RunPhase::Finalizing);
+        prepared.terminate().await;
+        drop(state);
+
+        let restarted = DaemonState::new(Store::open(&database).unwrap());
+        let recovered = recover_run(&restarted, &run_id).await;
+        assert!(recovered.resources.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Releasing
+                && locator_number(&resource.locator, "pid") == Some(runner_pid)
+                && resource.birth_fingerprint.is_some()
+        }));
+        assert!(
+            release_absent_resources(&restarted, &recovered)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            restarted
+                .with_store({
+                    let run_id = run_id.clone();
+                    move |store| store.kernel_run(&run_id)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            RunPhase::Terminal
+        );
     }
 
     #[test]
-    fn finalizer_selects_every_unreleased_process_group() {
+    fn setup_recovery_rejects_malformed_missing_and_replaced_bound_identity() {
+        let root = private_tempdir();
+        let runtime = root.path().join("runtime");
+        ensure_private_directory(&runtime).unwrap();
         let run_id = RunId::try_from("run-1").unwrap();
-        let resource = |id: &str, kind, state| KernelResource {
-            id: id.to_owned(),
+        let runner_instance_id = RunnerInstanceId::try_from("runner-1").unwrap();
+        let run = RecoverableKernelRun {
+            run: factory_core::RunSnapshot {
+                id: run_id.clone(),
+                project_id: ProjectId::try_from("project").unwrap(),
+                agent_id: AgentId::try_from("agent").unwrap(),
+                task_id: factory_core::TaskId::try_from("task").unwrap(),
+                provider: Provider::Shell,
+                phase: RunPhase::Finalizing,
+                outcome: Some(factory_core::RunOutcome::Cancelled {
+                    reason: "cancelled".into(),
+                }),
+                runner_instance_id: Some(runner_instance_id.clone()),
+                runtime_model: None,
+                runtime_reasoning_effort: None,
+                runtime_execution_mode: None,
+                runtime_control_mode: None,
+                activity: None,
+                wait_reason: None,
+                observer_health: factory_core::ObserverHealth::Unknown,
+                observer_reason: None,
+                admitted_at_ms: 1,
+                started_at_ms: None,
+                phase_since_ms: 2,
+                updated_at_ms: 2,
+                ended_at_ms: None,
+                exit_code: None,
+                exit_signal: None,
+            },
+            change_id: None,
+            source_root: root.path().to_string_lossy().into_owned(),
+            runner_instance_id: runner_instance_id.clone(),
+            runner_runtime: runtime.to_string_lossy().into_owned(),
+            resources: Vec::new(),
+        };
+        let resource = |locator: String, birth_fingerprint: Option<String>| KernelResource {
+            id: "run-1:runner".into(),
             run_id: run_id.clone(),
-            kind,
-            state,
-            locator: serde_json::json!({ "pgid": 42 }).to_string(),
-            birth_fingerprint: Some("fingerprint".to_owned()),
+            kind: KernelResourceKind::RunnerProcess,
+            state: KernelResourceState::Releasing,
+            locator,
+            birth_fingerprint,
             retry_count: 0,
             last_failure: None,
             declared_at_ms: 1,
-            updated_at_ms: 1,
+            updated_at_ms: 2,
             released_at_ms: None,
         };
-        let resources = vec![
-            resource(
-                "provider-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Releasing,
-            ),
-            resource(
-                "secondary-provider-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Active,
-            ),
-            resource(
-                "released-group",
-                KernelResourceKind::ProcessGroup,
-                KernelResourceState::Released,
-            ),
-            resource(
-                "runtime",
-                KernelResourceKind::RuntimeRoot,
-                KernelResourceState::Releasing,
-            ),
-        ];
+        assert!(matches!(
+            runner_resource_status(&run, &resource("{}".into(), None)).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
 
+        let setup_path = runtime.join(RUNNER_STARTUP_LEASE_FILE);
+        let setup_locator = runner_setup_locator(&setup_path, &runner_instance_id);
+        let wrong_instance = RunnerInstanceId::try_from("runner-2").unwrap();
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(runner_setup_locator(&setup_path, &wrong_instance), None)
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some("weak-presence-only".into()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
         assert_eq!(
-            registered_process_groups(&resources)
-                .map(|resource| resource.id.as_str())
-                .collect::<Vec<_>>(),
-            ["provider-group", "secondary-provider-group"]
+            runner_resource_status(&run, &resource(setup_locator.clone(), None)).unwrap(),
+            RunnerResourceStatus::Absent
         );
+        let setup_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&setup_path)
+            .unwrap();
+        rustix::fs::flock(&setup_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let metadata = setup_file.metadata().unwrap();
+        let exact_birth = runner_setup_birth_fingerprint(metadata.dev(), metadata.ino());
+        assert_eq!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some(exact_birth.clone()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Present
+        );
+        let mixed_locator = serde_json::json!({
+            "pid": std::process::id(),
+            "runner_instance_id": runner_instance_id.as_str(),
+            "setup_path": &setup_path,
+        })
+        .to_string();
+        assert!(matches!(
+            runner_resource_status(&run, &resource(mixed_locator, Some(exact_birth.clone())))
+                .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some("replacement".into()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+
+        let pid_locator = runner_locator(std::process::id(), &runner_instance_id);
+        assert!(matches!(
+            runner_resource_status(&run, &resource(pid_locator.clone(), None)).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            runner_resource_status(&run, &resource(pid_locator, Some(exact_birth.clone())))
+                .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        let current_pid_birth = process_birth_fingerprint(std::process::id())
+            .unwrap()
+            .unwrap();
+        for invalid_pid in [0, u32::MAX] {
+            assert!(matches!(
+                runner_resource_status(
+                    &run,
+                    &resource(
+                        runner_locator(invalid_pid, &runner_instance_id),
+                        Some(current_pid_birth.clone())
+                    )
+                )
+                .unwrap(),
+                RunnerResourceStatus::Unresolved(_)
+            ));
+        }
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(
+                    runner_locator(std::process::id(), &wrong_instance),
+                    Some(current_pid_birth)
+                )
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+
+        drop(setup_file);
+        fs::remove_file(&setup_path).unwrap();
+        assert!(matches!(
+            runner_resource_status(&run, &resource(setup_locator, Some(exact_birth))).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn runner_locator_is_a_closed_pair_of_typed_variants() {
+        let runner_instance_id = RunnerInstanceId::try_from("runner-1").unwrap();
+        let setup_path = PathBuf::from("/tmp/runner-startup.lease");
+        assert!(matches!(
+            serde_json::from_str::<RunnerResourceLocator>(&runner_setup_locator(
+                &setup_path,
+                &runner_instance_id
+            )),
+            Ok(RunnerResourceLocator::Setup(_))
+        ));
+        assert!(matches!(
+            serde_json::from_str::<RunnerResourceLocator>(&runner_locator(42, &runner_instance_id)),
+            Ok(RunnerResourceLocator::Pid(_))
+        ));
+
+        for malformed in [
+            serde_json::json!({}).to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+                "setup_path": &setup_path,
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+                "unknown": true,
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": "42",
+                "runner_instance_id": runner_instance_id.as_str(),
+            })
+            .to_string(),
+            serde_json::json!({
+                "setup_path": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": "not valid",
+            })
+            .to_string(),
+            "pid 42".into(),
+        ] {
+            assert!(
+                serde_json::from_str::<RunnerResourceLocator>(&malformed).is_err(),
+                "accepted malformed runner locator: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_execution_has_no_numeric_process_group_signal() {
+        let forbidden = ["kill", "process", "group"].join("_");
+        assert!(
+            !include_str!("execution.rs")
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| token == forbidden)
+        );
+    }
+
+    #[test]
+    fn invalid_process_group_ids_fail_closed_before_the_presence_probe() {
+        for pgid in [0, i32::MAX as u32 + 1] {
+            let resource = KernelResource {
+                id: "provider-group".to_owned(),
+                run_id: RunId::try_from("run-1").unwrap(),
+                kind: KernelResourceKind::ProcessGroup,
+                state: KernelResourceState::Releasing,
+                locator: serde_json::json!({ "pgid": pgid }).to_string(),
+                birth_fingerprint: None,
+                retry_count: 0,
+                last_failure: None,
+                declared_at_ms: 1,
+                updated_at_ms: 2,
+                released_at_ms: None,
+            };
+            assert!(matches!(
+                process_group_absent(&resource),
+                Err(Error::State(DaemonStateError::Store(
+                    StoreError::InvalidExecutionMetadata
+                )))
+            ));
+        }
+    }
+
+    #[test]
+    fn leader_exit_with_live_descendant_keeps_group_resource_nonterminal() {
+        let directory = private_tempdir();
+        let marker = directory.path().join("descendant.pid");
+        let release = directory.path().join("release-descendant");
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("(while [ ! -e \"$2\" ]; do sleep 0.02; done) & echo $! > \"$1\"; sleep 0.2")
+            .arg("sh")
+            .arg(&marker)
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id();
+        let birth = process_birth_fingerprint(pgid).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let descendant = loop {
+            if let Ok(pid) = fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                break Pid::from_raw(pid).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant PID was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(leader.wait().unwrap().success());
+        assert!(test_kill_process(descendant).is_ok());
+
+        let resource = KernelResource {
+            id: "provider-group".to_owned(),
+            run_id: RunId::try_from("run-1").unwrap(),
+            kind: KernelResourceKind::ProcessGroup,
+            state: KernelResourceState::Releasing,
+            locator: serde_json::json!({ "pgid": pgid }).to_string(),
+            birth_fingerprint: Some(birth),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 2,
+            released_at_ms: None,
+        };
+        assert!(
+            !process_group_absent(&resource).unwrap(),
+            "leader loss must not release a group while its descendant lives"
+        );
+
+        fs::write(&release, b"release").unwrap();
+        drop(release_on_drop);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while test_kill_process(descendant) != Err(rustix::io::Errno::SRCH) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant did not exit cooperatively"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn live_group_with_mismatched_leader_birth_is_not_observed_absent() {
+        let directory = private_tempdir();
+        let release = directory.path().join("release-leader");
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.02; done")
+            .arg("sh")
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id();
+        let resource = KernelResource {
+            id: "provider-group".to_owned(),
+            run_id: RunId::try_from("run-1").unwrap(),
+            kind: KernelResourceKind::ProcessGroup,
+            state: KernelResourceState::Releasing,
+            locator: serde_json::json!({ "pgid": pgid }).to_string(),
+            birth_fingerprint: Some("stale-leader-birth".to_owned()),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 2,
+            released_at_ms: None,
+        };
+        assert!(
+            !process_group_absent(&resource).unwrap(),
+            "an observed group must stay nonterminal despite leader PID reuse"
+        );
+
+        fs::write(&release, b"release").unwrap();
+        drop(release_on_drop);
+        assert!(leader.wait().unwrap().success());
+    }
+
+    #[test]
+    fn healthy_verifier_finish_marker_triggers_cooperative_group_exit() {
+        let directory = private_tempdir();
+        let finish = directory.path().join("finish");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.05; done; kill -KILL 0")
+            .arg("sh")
+            .arg(&finish)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut worker = command.spawn().unwrap();
+
+        write_finish_signal(&finish).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = worker.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "healthy verifier ignored its cooperative finish marker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        write_finish_signal(&finish).unwrap();
     }
 
     #[test]
@@ -4375,14 +5184,6 @@ mod tests {
             "durable evidence of any prior verifier must prevent setup replay"
         );
         assert!(!rust_effect_was_attempted(&[]));
-    }
-
-    #[test]
-    fn verifier_group_kill_requires_the_exact_live_leader() {
-        assert!(exact_effect_group_leader(Some("birth-a"), Some("birth-a")));
-        assert!(!exact_effect_group_leader(Some("birth-a"), None));
-        assert!(!exact_effect_group_leader(Some("birth-a"), Some("birth-b")));
-        assert!(!exact_effect_group_leader(None, None));
     }
 
     #[test]

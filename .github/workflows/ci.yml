@@ -71,6 +71,15 @@ jobs:
       - name: Run the macOS source gate
         run: ./scripts/local-ci.sh
 
+      - name: Run the macOS causal source smoke
+        run: |
+          cargo +1.88.0 build --locked --workspace
+          ./scripts/macos-contributor-smoke.sh
+          ./scripts/test-macos-contributor-smoke.sh
+
+      - name: Run the disposable launchd release proof
+        run: ./scripts/macos-launchd-release-proof.sh
+
       - name: Publish bounded workflow summary
         if: always()
         env:
@@ -98,21 +107,47 @@ jobs:
           fi
 
   # The repository's single required context is deliberately an aggregate:
-  # GitHub must require both hosted source gates, not just whichever job name
-  # happened to be selected when the ruleset was first configured.
+  # GitHub must require both hosted runtime source gates and the separately
+  # deployed control-plane gate, not just whichever job name happened to be
+  # selected when the ruleset was first configured.
   required:
     if: always()
-    needs: [checks, linux]
+    needs: [checks, linux, control-plane]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require both hosted source gates
-        if: needs.checks.result != 'success' || needs.linux.result != 'success'
+        if: needs.checks.result != 'success' || needs.linux.result != 'success' || needs.control-plane.result != 'success'
         run: |
-          echo "required source gates failed: macOS=${{ needs.checks.result }}, Linux=${{ needs.linux.result }}" >&2
+          echo "required source gates failed: macOS=${{ needs.checks.result }}, Linux=${{ needs.linux.result }}, control-plane=${{ needs.control-plane.result }}" >&2
           exit 1
-      - name: Confirm both hosted source gates passed
-        run: echo "macOS and Linux source gates passed"
+      - name: Confirm all hosted source gates passed
+        run: echo "macOS, Linux, and control-plane source gates passed"
+
+  control-plane:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out $GITHUB_SHA
+        run: |
+          set -euxo pipefail
+          rm -rf .git
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          git clean -ffdx
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Install the production bootstrap shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh
+
+      - name: Run the control-plane authoritative gate
+        run: ./control-plane/scripts/local-ci.sh
 
   # Ubuntu is the source-contributor preview gate. It keeps the macOS
   # compatibility gate above intact while making the Linux claim explicit:

@@ -344,6 +344,7 @@ name = "factory-runner"
 version = "0.2.6"
 dependencies = [
  "factory-core",
+ "factoryd",
  "rustix",
  "serde_json",
  "tempfile",

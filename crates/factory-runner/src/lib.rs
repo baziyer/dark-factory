@@ -10,7 +10,7 @@ use std::{
     },
     path::{Path, PathBuf},
     pin::Pin,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,7 +23,7 @@ use factory_core::{
         RunnerEventEnvelope, RunnerFrame, RunnerRequest,
     },
 };
-use rustix::process::{Pid, Signal, getpgid, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, Signal, getpgid, kill_process_group};
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -31,41 +31,13 @@ use tokio::{
     process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
-    time::{Instant, Sleep, sleep, timeout},
+    time::{Instant, Sleep, timeout},
 };
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
 /// Grace before escalating a process-group `TERM` to `KILL`.
 const DEFAULT_GROUP_GRACE: Duration = Duration::from_secs(2);
-const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Grace the group cleanup (the pass that reaps anything still holding the
-/// process group after the leader itself has already exited) gives a
-/// straggler *only when a `Stop` or runner shutdown was actually requested*
-/// during the leader's lifetime: that request's own grace/kill cycle
-/// (`DEFAULT_GROUP_GRACE`, or the caller's `grace_ms`) has already run its
-/// course by the time cleanup runs, so a straggler here is a race artifact
-/// being mopped up, not a workload owed a second multi-second courtesy.
-///
-/// When the leader instead exited entirely on its own — no `Stop` was ever
-/// requested — this grace does *not* apply; the cleanup uses
-/// `DEFAULT_GROUP_GRACE` instead, because that TERM is the straggler's
-/// first and only grace period, not a mop-up of one already spent.
-///
-/// Either way, the cleanup now polls (`GROUP_POLL_INTERVAL`) instead of
-/// blind-waiting the full grace regardless of whether the group already
-/// emptied out. See #55: an unconditional `DEFAULT_GROUP_GRACE` blind wait
-/// here, stacked with `POST_KILL_DRAIN_TIMEOUT`, pushed a run's worst-case
-/// stop-to-`Exited` latency to ~7.2-7.7s against `tests/runner.rs`'s and
-/// `tests/terminal.rs`'s fixed 8s deadline; a deterministic repro
-/// (`natural_leader_exit_terminates_a_descendant_that_retains_output_pipes`)
-/// measured ~2.05s pre-fix vs. ~0.2-0.3s post-fix for a well-behaved
-/// straggler reaped via the (still 2s-capped, but now polled) natural-exit path.
-const GROUP_CLEANUP_GRACE: Duration = Duration::from_millis(200);
-/// How often the group cleanup re-checks whether the group has already
-/// emptied out, so it can move on immediately instead of always waiting out
-/// the full grace it was given.
-const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
 
@@ -152,25 +124,75 @@ enum SupervisionOutcome {
     RunnerSignalled,
 }
 
-struct ProcessGroupGuard {
+/// Destructive group authority exists only while this guard owns the exact,
+/// unreaped direct child whose PID created the group. Cancellation and unwind
+/// drop the guard before the child handle, so cleanup cannot be skipped; a
+/// successful wait clears the handle immediately and permanently disarms it.
+struct OwnedProcessGroup {
+    child: Option<tokio::process::Child>,
     pid: Pid,
-    armed: bool,
 }
 
-impl ProcessGroupGuard {
-    fn new(pid: Pid) -> Self {
-        Self { pid, armed: true }
+impl OwnedProcessGroup {
+    fn new(child: tokio::process::Child, pid: Pid) -> Result<Self, Error> {
+        let child_pid = child
+            .id()
+            .and_then(|value| i32::try_from(value).ok())
+            .and_then(Pid::from_raw);
+        if child_pid != Some(pid) {
+            return Err(Error::Task(
+                "process-group ownership requires its exact direct child".into(),
+            ));
+        }
+        Ok(Self {
+            child: Some(child),
+            pid,
+        })
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    fn child(&self) -> &tokio::process::Child {
+        self.child
+            .as_ref()
+            .expect("owned process group is armed only with its unreaped child")
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("owned process group is armed only with its unreaped child")
+    }
+
+    fn is_armed(&self) -> bool {
+        self.child.is_some()
+    }
+
+    fn signal(&self, signal: Signal) -> Result<(), Error> {
+        signal_owned_process_group(self.child(), self.pid, signal)
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus, Error> {
+        let status = self.child_mut().wait().await?;
+        self.child.take();
+        Ok(status)
+    }
+
+    async fn kill_and_reap(&mut self) -> Result<(ExitStatus, Option<Error>), Error> {
+        let signal_error = self.signal(Signal::KILL).err();
+        if signal_error.is_some() {
+            // The exact direct child handle remains valid authority even if
+            // its process-group signal fails. Descendants then remain for
+            // durable absence observation; no later numeric-PGID retry occurs.
+            let _ = self.child_mut().kill().await;
+        }
+        let status = self.wait().await?;
+        Ok((status, signal_error))
     }
 }
 
-impl Drop for ProcessGroupGuard {
+impl Drop for OwnedProcessGroup {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = kill_process_group(self.pid, Signal::KILL);
+        if let Some(child) = self.child.as_ref() {
+            let _ = signal_owned_process_group(child, self.pid, Signal::KILL);
         }
     }
 }
@@ -193,15 +215,7 @@ impl PipeDrainTask {
         result: Result<Result<(), Error>, tokio::task::JoinError>,
     ) -> Result<(), Error> {
         self.finished = true;
-        join_drain(result)
-    }
-
-    async fn join(&mut self) -> Result<(), Error> {
-        if self.finished {
-            return Ok(());
-        }
-        let result = (&mut self.handle).await;
-        self.finish(result)
+        result.map_err(|error| Error::Task(format!("pipe drain task failed: {error}")))?
     }
 
     async fn abort(&mut self) {
@@ -1133,7 +1147,7 @@ async fn supervise_piped(
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
     command.kill_on_drop(true);
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             log.append_lifecycle(
@@ -1154,29 +1168,39 @@ async fn supervise_piped(
         i32::try_from(child_pid).map_err(|_| Error::Task("child PID overflow".into()))?,
     )
     .ok_or_else(|| Error::Task("child PID was zero".into()))?;
-    let mut process_group = ProcessGroupGuard::new(pid);
-    let identity = process_identity(child_pid, pid)?;
+    let mut process_group = OwnedProcessGroup::new(child, pid)?;
+    let identity = match process_identity(child_pid, pid) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = stop_owned_group(&mut process_group).await;
+            return Err(error);
+        }
+    };
     if prepare.prepared.send(Ok(identity)).is_err() {
-        signal_process_group(pid, Signal::KILL)?;
-        let _ = child.wait().await;
-        process_group.disarm();
+        stop_owned_group(&mut process_group).await?;
         return Ok(SupervisionOutcome::RunnerSignalled);
     }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Task("child stdout was not captured".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Task("child stderr was not captured".into()))?;
+    let stdout = match process_group.child_mut().stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            stop_owned_group(&mut process_group).await?;
+            return Err(Error::Task("child stdout was not captured".into()));
+        }
+    };
+    let stderr = match process_group.child_mut().stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            stop_owned_group(&mut process_group).await?;
+            return Err(Error::Task("child stderr was not captured".into()));
+        }
+    };
     let mut stdout_task = PipeDrainTask::new(tokio::spawn(drain_output(stdout)));
     let mut stderr_task = PipeDrainTask::new(tokio::spawn(drain_output(stderr)));
     let mut activation = prepare.activation;
     let activated = loop {
         tokio::select! {
             result = &mut activation => break result.is_ok(),
-            status = child.wait() => {
+            status = process_group.wait() => {
                 status?;
                 break false;
             }
@@ -1184,7 +1208,7 @@ async fn supervise_piped(
                 let Some(command) = command else {
                     continue;
                 };
-                let result = signal_process_group(pid, Signal::KILL).map_err(|error| {
+                let result = stop_owned_group(&mut process_group).await.map_err(|error| {
                     ControlError::new(RunnerErrorCode::Internal, format!("failed to stop exec gate: {error}"))
                 });
                 let _ = command.response.send(result);
@@ -1192,21 +1216,21 @@ async fn supervise_piped(
             }
             changed = runner_shutdown.changed() => {
                 changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
+                stop_owned_group(&mut process_group).await?;
                 break false;
             }
         }
     };
     if !activated {
-        let _ = signal_process_group(pid, Signal::KILL);
-        let _ = child.wait().await;
+        if process_group.is_armed() {
+            stop_owned_group(&mut process_group).await?;
+        }
         stdout_task.abort().await;
         stderr_task.abort().await;
-        process_group.disarm();
         return Ok(SupervisionOutcome::RunnerSignalled);
     }
     if let Err(error) = release_exec_gate(&gate_path) {
-        signal_process_group(pid, Signal::KILL)?;
-        let _ = child.wait().await;
+        stop_owned_group(&mut process_group).await?;
         stdout_task.abort().await;
         stderr_task.abort().await;
         log.append_lifecycle(
@@ -1216,23 +1240,21 @@ async fn supervise_piped(
             true,
         )
         .await?;
-        process_group.disarm();
         return Ok(SupervisionOutcome::AwaitAcknowledgement);
     }
     log.append_lifecycle(RunnerEvent::Started { child_pid }, false)
         .await?;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut runner_signalled = false;
-    let mut stop_requested = false;
+    let mut output_failure = None;
     let status = loop {
         tokio::select! {
-            status = child.wait() => break status?,
+            status = process_group.wait() => break status?,
             command = stops.recv() => {
                 let Some(command) = command else {
                     continue;
                 };
-                stop_requested = true;
-                if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
+                if let Err(error) = begin_group_termination(&process_group, command.grace, &mut kill_deadline) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
                         format!("failed to stop process group: {error}"),
@@ -1244,70 +1266,55 @@ async fn supervise_piped(
             changed = runner_shutdown.changed(), if !runner_signalled => {
                 changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
                 runner_signalled = true;
-                begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+                begin_group_termination(&process_group, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
-                signal_process_group(pid, Signal::KILL)?;
+                process_group.signal(Signal::KILL)?;
                 kill_deadline = None;
             }
             result = &mut stdout_task.handle, if !stdout_task.finished => {
                 if let Err(error) = stdout_task.finish(result) {
-                    signal_process_group(pid, Signal::KILL)?;
-                    stderr_task.abort().await;
-                    let _ = child.wait().await;
-                    return Err(error);
+                    let (status, error) =
+                        reap_after_output_failure(&mut process_group, error).await?;
+                    output_failure = Some(error);
+                    break status;
                 }
             }
             result = &mut stderr_task.handle, if !stderr_task.finished => {
                 if let Err(error) = stderr_task.finish(result) {
-                    signal_process_group(pid, Signal::KILL)?;
-                    stdout_task.abort().await;
-                    let _ = child.wait().await;
-                    return Err(error);
+                    let (status, error) =
+                        reap_after_output_failure(&mut process_group, error).await?;
+                    output_failure = Some(error);
+                    break status;
                 }
             }
         }
     };
 
-    let cleanup_grace = if stop_requested || runner_signalled {
-        GROUP_CLEANUP_GRACE
-    } else {
-        DEFAULT_GROUP_GRACE
-    };
-    reap_group_stragglers(
-        pid,
-        cleanup_grace,
-        &mut kill_deadline,
-        &mut stops,
-        &mut runner_shutdown,
-        &mut runner_signalled,
-    )
-    .await?;
-
-    let output_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
-        stdout_task.join().await?;
-        stderr_task.join().await
-    })
-    .await;
-    match output_result {
-        Ok(result) => result?,
-        Err(_) => {
-            stdout_task.abort().await;
-            stderr_task.abort().await;
-            return Err(Error::Task(
-                "attempt output pipes remained open after process-group termination".into(),
-            ));
-        }
+    // `wait` consumes the only safe authority to signal the group: descendants
+    // may retain these pipes after the leader exits, but a numeric PGID is no
+    // longer ours to use. Persist the leader outcome first, then stop draining
+    // without touching whatever inherited the descriptors.
+    if let Err(error) = log
+        .append_lifecycle(
+            RunnerEvent::Exited {
+                exit_code: status.code(),
+                signal: status.signal(),
+            },
+            true,
+        )
+        .await
+    {
+        return match output_failure {
+            Some(drain) => Err(drain_cleanup_error(&drain, &error)),
+            None => Err(error),
+        };
     }
-    log.append_lifecycle(
-        RunnerEvent::Exited {
-            exit_code: status.code(),
-            signal: status.signal(),
-        },
-        true,
-    )
-    .await?;
-    process_group.disarm();
+    stdout_task.abort().await;
+    stderr_task.abort().await;
+    if let Some(error) = output_failure {
+        return Err(error);
+    }
     if runner_signalled {
         Ok(SupervisionOutcome::RunnerSignalled)
     } else {
@@ -1364,12 +1371,12 @@ fn prepare_startup_stdin(input: Option<Vec<u8>>) -> Result<Stdio, Error> {
 }
 
 fn begin_group_termination(
-    pid: Pid,
+    process_group: &OwnedProcessGroup,
     grace: Duration,
     deadline: &mut Option<Pin<Box<Sleep>>>,
 ) -> Result<(), Error> {
     if deadline.is_none() {
-        signal_process_group(pid, Signal::TERM)?;
+        process_group.signal(Signal::TERM)?;
         *deadline = Some(Box::pin(tokio::time::sleep(grace)));
     } else {
         shorten_deadline(grace, deadline);
@@ -1386,38 +1393,54 @@ fn shorten_deadline(grace: Duration, deadline: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
-/// A process-group ID stops being ours the moment its leader is reaped: the
-/// kernel is then free to hand that same numeric PID to an unrelated future
-/// process on the same host. If that new process belongs to a different
-/// user or session, `kill(-pgid, ...)` reaching it can return `EPERM`
-/// instead of the `ESRCH` a truly-gone group would give — same underlying
-/// situation (nothing of ours is there anymore), different errno. On a busy
-/// host (this repo's own self-hosted runner spawns dozens of these
-/// processes concurrently) that reuse window is real, not theoretical:
-/// reproduced directly by spawning this exact natural-leader-exit scenario
-/// in a tight loop — 3 `EPERM` crashes in 20 runs on `main`, pre-`GROUP_POLL_INTERVAL`.
-/// Polling `process_group_exists` far more often than the old single check
-/// did only widens the exposure. Treat both errnos as "gone", not a hard
-/// I/O failure that aborts the run without ever recording its `Exited`
-/// event.
-fn is_group_gone(error: rustix::io::Errno) -> bool {
-    matches!(error, rustix::io::Errno::SRCH | rustix::io::Errno::PERM)
-}
-
-fn signal_process_group(pid: Pid, signal: Signal) -> Result<(), Error> {
+fn signal_owned_process_group(
+    child: &tokio::process::Child,
+    pid: Pid,
+    signal: Signal,
+) -> Result<(), Error> {
+    let child_pid = child
+        .id()
+        .and_then(|value| i32::try_from(value).ok())
+        .and_then(Pid::from_raw);
+    if child_pid != Some(pid) {
+        return Err(Error::Task(
+            "process-group signal requires its exact unreaped child".into(),
+        ));
+    }
     match kill_process_group(pid, signal) {
         Ok(()) => Ok(()),
-        Err(error) if is_group_gone(error) => Ok(()),
+        Err(rustix::io::Errno::SRCH) => Ok(()),
         Err(error) => Err(Error::Io(error.into())),
     }
 }
 
-fn process_group_exists(pid: Pid) -> Result<bool, Error> {
-    match test_kill_process_group(pid) {
-        Ok(()) => Ok(true),
-        Err(error) if is_group_gone(error) => Ok(false),
-        Err(error) => Err(Error::Io(error.into())),
+async fn stop_owned_group(process_group: &mut OwnedProcessGroup) -> Result<(), Error> {
+    let (_, signal_error) = process_group.kill_and_reap().await?;
+    if let Some(error) = signal_error {
+        return Err(error);
     }
+    Ok(())
+}
+
+async fn reap_after_output_failure(
+    process_group: &mut OwnedProcessGroup,
+    drain: Error,
+) -> Result<(ExitStatus, Error), Error> {
+    let (status, signal_error) = process_group
+        .kill_and_reap()
+        .await
+        .map_err(|cleanup| drain_cleanup_error(&drain, &cleanup))?;
+    let drain = match signal_error {
+        Some(cleanup) => drain_cleanup_error(&drain, &cleanup),
+        None => drain,
+    };
+    Ok((status, drain))
+}
+
+fn drain_cleanup_error(drain: &Error, cleanup: &Error) -> Error {
+    Error::Task(format!(
+        "{drain}; owned process-group cleanup also failed: {cleanup}"
+    ))
 }
 
 async fn wait_for_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
@@ -1426,56 +1449,6 @@ async fn wait_for_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
     } else {
         pending::<()>().await;
     }
-}
-
-/// Reaps anything still holding the process group after the leader itself
-/// has already exited: a no-op if the group is already empty, otherwise a
-/// single TERM followed by polling (`GROUP_POLL_INTERVAL`) for the group to
-/// empty out on its own, escalating to KILL only once `grace` elapses
-/// without that happening. `grace` is the caller's choice — see
-/// `GROUP_CLEANUP_GRACE`'s doc comment for why it differs depending on
-/// whether a `Stop`/shutdown was ever requested. Shared by both
-/// the piped supervisor.
-async fn reap_group_stragglers(
-    pid: Pid,
-    grace: Duration,
-    kill_deadline: &mut Option<Pin<Box<Sleep>>>,
-    stops: &mut mpsc::Receiver<StopCommand>,
-    runner_shutdown: &mut watch::Receiver<bool>,
-    runner_signalled: &mut bool,
-) -> Result<(), Error> {
-    if !process_group_exists(pid)? {
-        return Ok(());
-    }
-    begin_group_termination(pid, grace, kill_deadline)?;
-    loop {
-        tokio::select! {
-            () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
-                signal_process_group(pid, Signal::KILL)?;
-                return Ok(());
-            }
-            () = sleep(GROUP_POLL_INTERVAL) => {
-                if !process_group_exists(pid)? {
-                    return Ok(());
-                }
-            }
-            command = stops.recv() => {
-                let Some(command) = command else {
-                    continue;
-                };
-                shorten_deadline(command.grace, kill_deadline);
-                let _ = command.response.send(Ok(()));
-            }
-            changed = runner_shutdown.changed(), if !*runner_signalled => {
-                changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
-                *runner_signalled = true;
-            }
-        }
-    }
-}
-
-fn join_drain(result: Result<Result<(), Error>, tokio::task::JoinError>) -> Result<(), Error> {
-    result.map_err(|error| Error::Task(format!("pipe drain task failed: {error}")))?
 }
 
 async fn drain_output(mut input: impl AsyncRead + Unpin) -> Result<(), Error> {
@@ -1510,4 +1483,194 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    struct PreparedSupervision {
+        _directory: tempfile::TempDir,
+        descendant: Pid,
+        log: Arc<EventLog>,
+        activate: oneshot::Sender<()>,
+        supervisor: JoinHandle<Result<SupervisionOutcome, Error>>,
+        _stop_sender: mpsc::Sender<StopCommand>,
+        _shutdown_sender: watch::Sender<bool>,
+    }
+
+    async fn prepare_supervision(writable_log: bool) -> PreparedSupervision {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        let marker = directory.path().join("descendant.pid");
+        let gate = directory.path().join("test-exec-gate.sh");
+        std::fs::write(
+            &gate,
+            "#!/bin/sh\n\
+             gate=$2\n\
+             sleep 30 &\n\
+             echo $! > descendant.pid\n\
+             while test ! -e \"$gate\"; do sleep 0.01; done\n\
+             shift 5\n\
+             exec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let spool = runtime.join("events.ndjson");
+        let file = if writable_log {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&spool)
+                .unwrap()
+        } else {
+            std::fs::write(&spool, []).unwrap();
+            OpenOptions::new().read(true).open(&spool).unwrap()
+        };
+        let log = EventLog::new(spool, File::from_std(file));
+        let (prepared_sender, mut prepared) = oneshot::channel();
+        let (activate, activation) = oneshot::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let config = Config {
+            run_id: RunId::try_from("run-guard-test").unwrap(),
+            runner_instance_id: RunnerInstanceId::try_from("runner-guard-test").unwrap(),
+            runtime_dir: runtime,
+            cwd: directory.path().to_path_buf(),
+            startup_input: None,
+            program: PathBuf::from("/bin/sleep"),
+            arguments: vec!["30".into()],
+            exec_gate_program: gate,
+        };
+        let supervisor = tokio::spawn(supervise_piped(
+            config,
+            Arc::clone(&log),
+            PrepareCommand {
+                prepared: prepared_sender,
+                activation,
+            },
+            stop_receiver,
+            shutdown_receiver,
+        ));
+        timeout(Duration::from_secs(5), &mut prepared)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let descendant = wait_for_pid_marker(&marker).await;
+        PreparedSupervision {
+            _directory: directory,
+            descendant,
+            log,
+            activate,
+            supervisor,
+            _stop_sender: stop_sender,
+            _shutdown_sender: shutdown_sender,
+        }
+    }
+
+    async fn wait_for_process_absence(pid: Pid) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) => return,
+                Ok(()) => {}
+                Err(error) => panic!("process observation failed: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned process-group descendant survived cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_server_abort_drops_supervisor_and_cleans_live_descendant() {
+        let fixture = prepare_supervision(true).await;
+        assert!(rustix::process::test_kill_process(fixture.descendant).is_ok());
+        fixture.activate.send(()).unwrap();
+        wait_for_started(&fixture.log).await;
+
+        // This is the exact action run_with_shutdown takes if its control
+        // server exits before terminal acknowledgement.
+        fixture.supervisor.abort();
+        assert!(fixture.supervisor.await.unwrap_err().is_cancelled());
+        wait_for_process_absence(fixture.descendant).await;
+    }
+
+    #[tokio::test]
+    async fn started_event_log_failure_cleans_a_live_descendant() {
+        let fixture = prepare_supervision(false).await;
+        fixture.activate.send(()).unwrap();
+        let error = fixture.supervisor.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::Io(_)));
+        assert_eq!(fixture.log.snapshot().await.head, 0);
+        wait_for_process_absence(fixture.descendant).await;
+    }
+
+    #[tokio::test]
+    async fn output_drain_failure_reaps_owned_group_and_preserves_the_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo $! > descendant.pid; wait")
+            .current_dir(directory.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        command.kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let child_pid = child.id().unwrap();
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap()).unwrap();
+        let mut process_group = OwnedProcessGroup::new(child, pid).unwrap();
+        let descendant = wait_for_pid_marker(&marker).await;
+
+        let (status, error) = reap_after_output_failure(
+            &mut process_group,
+            Error::Task("synthetic output drain failure".into()),
+        )
+        .await
+        .unwrap();
+        assert!(!status.success());
+        assert!(error.to_string().contains("synthetic output drain failure"));
+        assert!(!process_group.is_armed());
+        wait_for_process_absence(descendant).await;
+    }
+
+    async fn wait_for_pid_marker(path: &Path) -> Pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                return Pid::from_raw(raw).unwrap();
+            }
+            assert!(Instant::now() < deadline, "descendant was not started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_started(log: &EventLog) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if log.snapshot().await.head >= 1 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Started event was not durable");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }

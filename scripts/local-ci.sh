@@ -36,6 +36,7 @@ case "$mode" in
         ./scripts/test-prepare-release-source.sh
         ./scripts/test-publish-release.sh
         ./scripts/test-package-release.sh
+        ./scripts/test-macos-launchd-release-proof.sh
         ;;
     --linux-source)
         ./scripts/check-toolchain-pins.sh
@@ -45,6 +46,7 @@ esac
 # Measure after the macOS repository lease is held, so another linked worktree
 # cannot begin a broad gate between this read-only preflight and our compile.
 ./scripts/test-local-ci-environment.sh
+./scripts/test-new-worktree.sh
 ./scripts/check-build-headroom.sh
 ./scripts/test-build-headroom.sh
 

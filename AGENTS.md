@@ -32,8 +32,9 @@ Read-only context unless a task explicitly asks you to edit them:
 
 1. **Work on a branch in its own worktree, never on `main`.**
    `./scripts/new-worktree.sh <slug>` creates `.worktrees/<slug>` on a new
-   branch from `main`. Push the branch and open a PR; don't commit to
-   `main` directly.
+   branch from the locally available `origin/main` (or `main`). The helper
+   never contacts a remote; agents obtain a current base and publish through
+   the authorized remote-access path below. Don't commit to `main` directly.
 2. **Every PR gets an adversarial review before merge.** A second agent (or
    person) — not the author — reviews the diff trying to break it:
    correctness bugs, missed simplification, security. Steps: (a) author
@@ -92,6 +93,22 @@ Read-only context unless a task explicitly asks you to edit them:
    high-risk escalation with a durable reason. God remains Sol/xhigh. See
    the project guidance for the one operator-facing policy and CLI examples;
    existing profiles are not silently rewritten.
+14. **Keep agent automation out of operator credentials.** Agents never use
+   ambient `git fetch`, `git pull`, `git clone`, or `git push`; `gh` or
+   `gh auth`; SSH-agent state; credential helpers; or the user's keychain for
+   authenticated remote reads or writes. Use an explicitly authorized
+   credential broker or App-backed tool surface supplied by the host (the
+   current coordinator's connected GitHub App is one example; another harness
+   may provide an equivalent). Anonymous public reads are allowed only with
+   credential lookup and interactive prompts disabled; a host may instead
+   supply a short-lived, repository-scoped read credential for checkout.
+   Remote writes fail closed unless the broker/App is available. Operator
+   approval never authorizes injecting a personal token into an agent process;
+   human operators may instead perform a separately reviewed GitHub action
+   through their normal workflow. Never put credentials in a worktree, prompt,
+   command output, or log. This contributor-agent boundary is not a future Dark
+   Factory product GitHub integration and does not change a human operator's
+   normal workflow.
 
 ## Adding to the system
 

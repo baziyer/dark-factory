@@ -88,3 +88,9 @@ the result must expose a real ownership boundary without adding a framework.
 - Unique retained work is never an automatic storage-reclamation target.
 
 Prefer deleting an obsolete lifecycle over moving it into a smaller file.
+
+The proposed, inactive official-broker and BYO-broker boundary for future
+GitHub integration is recorded in
+[`docs/development/GITHUB_APP.md`](docs/development/GITHUB_APP.md). It cannot
+activate or merge ahead of the exact-main boot decision and #126's reviewed
+provider-neutral quarantine.

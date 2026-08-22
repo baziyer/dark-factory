@@ -3,6 +3,7 @@ set -eu
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 smoke="$repository_root/scripts/linux-contributor-smoke.sh"
+execution="$repository_root/crates/factoryd/src/execution.rs"
 root=$(mktemp -d /tmp/df-linux-smoke-test.XXXXXX)
 rmdir "$root"
 
@@ -26,15 +27,27 @@ fi
 grep -Eq '(^|[[:space:]])(pkill|killall)([[:space:]]|$)' "$smoke" \
     && fail "smoke signals by process name"
 for proof in stop_owned_runs wait_for_tracked_processes kill_exact_record \
-    wait_for_verifier_record wait_for_verifier_descendant record_is_alive; do
+    wait_for_verifier_record wait_for_verifier_descendant record_is_alive \
+    process_start_ticks runner_loss_orphan \
+    DARK_FACTORY_SMOKE_FORCE_RUNNER_LOSS_FAILURE; do
     grep -Fq "$proof" "$smoke" || fail "smoke lacks $proof"
 done
+grep -Fq '/proc/$ticks_pid/stat' "$smoke" \
+    || fail "Linux exact records do not capture /proc start ticks"
 grep -Fq '"complete":false' "$smoke" \
     || fail "smoke does not prove live verifier cache measurement stays incomplete"
 grep -Fq 'temporary_root=' "$smoke" \
     || fail "smoke does not retain verifier staging until exact group release"
 grep -Fq 'exec sleep 120' "$smoke" \
     || fail "runner-kill descendant can expire inside the smoke timeout"
+grep -Fq 'factoryd signalled a provider after losing its runner authority' "$smoke" \
+    || fail "smoke does not prove runner loss retains the provider"
+grep -Fq 'runner loss released its runtime while the provider survived' "$smoke" \
+    || fail "smoke does not prove runner loss retains the runtime"
+for forbidden in kill_process_group kill_registered_processes kill_registered_group; do
+    ! grep -Eq "(^|[^[:alnum:]_])${forbidden}([^[:alnum:]_]|$)" "$execution" \
+        || fail "factoryd execution retains numeric process-group signal authority: $forbidden"
+done
 grep -Fq 'verifier-release' "$smoke" \
     || fail "verifier descendant has no causal release handshake"
 grep -Fq ': >"$scratch/verifier-release"' "$smoke" \
@@ -46,10 +59,24 @@ grep -Fq '; sleep 5;' "$smoke" \
 grep -Fxq 'sleep 0.2' "$smoke" \
     && fail "process discovery uses an arbitrary delay before bounded polling"
 
-if DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 \
-    "$smoke"; then
-    fail "intentional interrupted smoke unexpectedly succeeded"
-fi
+set +e
+DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 "$smoke"
+smoke_status=$?
+set -e
+test "$smoke_status" -eq 23 \
+    || fail "intentional interrupted smoke exited $smoke_status, expected 23"
 test ! -e "$root" || fail "interrupted smoke left its scratch home"
+
+root=$(mktemp -d /tmp/df-linux-smoke-test.XXXXXX)
+rmdir "$root"
+set +e
+DARK_FACTORY_SMOKE_ROOT="$root" \
+    DARK_FACTORY_SMOKE_FORCE_RUNNER_LOSS_FAILURE=1 "$smoke"
+smoke_status=$?
+set -e
+test "$smoke_status" -eq 24 \
+    || fail "runner-loss interrupted smoke exited $smoke_status, expected 24"
+test ! -e "$root" \
+    || fail "runner-loss interruption left its exact orphan or scratch home"
 
 echo "Linux smoke teardown tests passed"

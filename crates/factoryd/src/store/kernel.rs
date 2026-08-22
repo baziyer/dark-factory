@@ -4,6 +4,7 @@ use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, ExecutionMode, FactoryEvent,
     MessageId, PROTOCOL_VERSION, ProjectId, Provider, RunFailureReason, RunId, RunOutcome,
     RunPhase, RunSnapshot, RunnerInstanceId, TaskId, local::MAX_PROVIDER_TOOL_NAME_BYTES,
+    runner::RUNNER_STARTUP_LEASE_FILE,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -152,6 +153,16 @@ pub enum KernelResourceState {
 }
 
 impl KernelResourceState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Active => "active",
+            Self::Releasing => "releasing",
+            Self::Released => "released",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "declared" => Self::Declared,
@@ -418,9 +429,7 @@ impl Store {
             ],
         )?;
         let runtime_locator = serde_json::json!({ "path": input.runner_runtime }).to_string();
-        let runner_locator =
-            serde_json::json!({ "runner_instance_id": input.runner_instance_id.as_str() })
-                .to_string();
+        let runner_locator = runner_setup_locator(&input.runner_runtime, &input.runner_instance_id);
         insert_resource(
             &transaction,
             &format!("{}:runtime", input.run_id.as_str()),
@@ -627,16 +636,17 @@ impl Store {
         Ok(())
     }
 
-    /// Durably binds the exact stable runner before Prepare can create the
-    /// provider exec gate.
-    pub fn register_admitted_runner(
+    /// Binds the exact locked startup file before the outer runner gate may
+    /// be spawned. A finalizer can therefore prove whether a gate created
+    /// before PID registration still holds the inherited lease.
+    pub fn register_admitted_runner_setup(
         &mut self,
         run_id: &RunId,
-        runner_locator: &str,
-        runner_birth_fingerprint: &str,
+        setup_locator: &str,
+        setup_birth_fingerprint: &str,
         now_ms: i64,
     ) -> Result<()> {
-        validate_resource_identity(runner_locator, runner_birth_fingerprint)?;
+        validate_resource_identity(setup_locator, setup_birth_fingerprint)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -644,16 +654,63 @@ impl Store {
         if run.phase != RunPhase::Admitted {
             return Err(StoreError::InvalidRunState);
         }
-        activate_or_confirm_resource(
+        let runner_instance_id = run
+            .runner_instance_id
+            .as_ref()
+            .ok_or(StoreError::InvalidExecutionMetadata)?;
+        let runner_runtime: String = transaction.query_row(
+            "SELECT runner_runtime FROM runs WHERE id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let expected_locator = runner_setup_locator(&runner_runtime, runner_instance_id);
+        if setup_locator != expected_locator {
+            return Err(StoreError::ResourceIdentityMismatch);
+        }
+        bind_runner_setup(
             &transaction,
             run_id,
-            KernelResourceKind::RunnerProcess,
-            runner_locator,
-            runner_birth_fingerprint,
+            setup_locator,
+            setup_birth_fingerprint,
             now_ms,
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Replaces the locked setup identity with the exact stable runner PID.
+    /// Cancellation is allowed to win between spawn and this transaction: in
+    /// that case the PID is still recorded in `releasing`, never discarded.
+    pub fn register_admitted_runner(
+        &mut self,
+        run_id: &RunId,
+        expected_setup_locator: &str,
+        expected_setup_birth_fingerprint: &str,
+        runner_locator: &str,
+        runner_birth_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<RunPhase> {
+        validate_resource_identity(expected_setup_locator, expected_setup_birth_fingerprint)?;
+        validate_resource_identity(runner_locator, runner_birth_fingerprint)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_kernel_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+        let resource_state = match run.phase {
+            RunPhase::Admitted => KernelResourceState::Active,
+            RunPhase::Finalizing => KernelResourceState::Releasing,
+            RunPhase::Running | RunPhase::Terminal => return Err(StoreError::InvalidRunState),
+        };
+        bind_registered_runner(
+            &transaction,
+            run_id,
+            resource_state,
+            (expected_setup_locator, expected_setup_birth_fingerprint),
+            (runner_locator, runner_birth_fingerprint),
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(run.phase)
     }
 
     pub fn authenticate_attempt(&self, bearer: &str) -> Result<Option<AttemptPrincipal>> {
@@ -1834,6 +1891,102 @@ fn insert_resource(
         ],
     )?;
     Ok(())
+}
+
+fn runner_setup_locator(runtime: &str, runner_instance_id: &RunnerInstanceId) -> String {
+    serde_json::json!({
+        "runner_instance_id": runner_instance_id.as_str(),
+        "setup_path": Path::new(runtime).join(RUNNER_STARTUP_LEASE_FILE),
+    })
+    .to_string()
+}
+
+fn bind_runner_setup(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    locator: &str,
+    fingerprint: &str,
+    now_ms: i64,
+) -> Result<()> {
+    let changed = transaction.execute(
+        "UPDATE resources
+         SET state = 'active', birth_fingerprint = ?1, updated_at_ms = ?2
+         WHERE run_id = ?3 AND kind = 'runner_process' AND state = 'declared'
+           AND locator = ?4 AND birth_fingerprint IS NULL",
+        params![fingerprint, now_ms, run_id.as_str(), locator],
+    )?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let current: Option<(String, Option<String>, String)> = transaction
+        .query_row(
+            "SELECT locator, birth_fingerprint, state FROM resources
+             WHERE run_id = ?1 AND kind = 'runner_process'",
+            [run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if matches!(
+        current,
+        Some((current_locator, Some(current_fingerprint), state))
+            if current_locator == locator
+                && current_fingerprint == fingerprint
+                && state == "active"
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::ResourceIdentityMismatch)
+    }
+}
+
+fn bind_registered_runner(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    state: KernelResourceState,
+    expected_setup: (&str, &str),
+    runner: (&str, &str),
+    now_ms: i64,
+) -> Result<()> {
+    let (expected_setup_locator, expected_setup_fingerprint) = expected_setup;
+    let (runner_locator, runner_fingerprint) = runner;
+    let state = state.as_str();
+    let changed = transaction.execute(
+        "UPDATE resources
+         SET locator = ?1, birth_fingerprint = ?2, updated_at_ms = ?3
+         WHERE run_id = ?4 AND kind = 'runner_process' AND state = ?5
+           AND locator = ?6 AND birth_fingerprint = ?7",
+        params![
+            runner_locator,
+            runner_fingerprint,
+            now_ms,
+            run_id.as_str(),
+            state,
+            expected_setup_locator,
+            expected_setup_fingerprint,
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let current: Option<(String, Option<String>, String)> = transaction
+        .query_row(
+            "SELECT locator, birth_fingerprint, state FROM resources
+             WHERE run_id = ?1 AND kind = 'runner_process'",
+            [run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if matches!(
+        current,
+        Some((current_locator, Some(current_fingerprint), current_state))
+            if current_locator == runner_locator
+                && current_fingerprint == runner_fingerprint
+                && current_state == state
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::ResourceIdentityMismatch)
+    }
 }
 
 fn bind_claimed_runtime(
@@ -4310,6 +4463,100 @@ mod tests {
                     == Some("runtime-claim:55555555555545558555555555555555")
         }));
         assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
+        let runner = recovered[0]
+            .resources
+            .iter()
+            .find(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+            .unwrap();
+        assert_eq!(
+            runner.locator,
+            runner_setup_locator(
+                "/tmp/factory-runner",
+                &RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap()
+            )
+        );
+        assert_eq!(runner.birth_fingerprint, None);
+    }
+
+    #[test]
+    fn cancellation_winning_runner_registration_keeps_the_exact_pid_releasing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let setup_locator = runner_setup_locator("/tmp/factory-runner", &runner_instance_id);
+        store
+            .register_admitted_runner_setup(&run_id, &setup_locator, "setup-birth", 6)
+            .unwrap();
+        store
+            .cancel_admitted_or_running_run(&run_id, "operator cancelled".into(), 7)
+            .unwrap();
+
+        let identity = prepared_identity();
+        assert_eq!(
+            store
+                .register_admitted_runner(
+                    &run_id,
+                    &setup_locator,
+                    "setup-birth",
+                    &identity.runner_locator,
+                    &identity.runner_birth_fingerprint,
+                    8,
+                )
+                .unwrap(),
+            RunPhase::Finalizing
+        );
+        let runner = store
+            .kernel_resources(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+            .unwrap();
+        assert_eq!(runner.state, KernelResourceState::Releasing);
+        assert_eq!(runner.locator, identity.runner_locator);
+        assert_eq!(
+            runner.birth_fingerprint.as_deref(),
+            Some(identity.runner_birth_fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn runner_setup_and_pid_binding_refuse_malformed_or_replaced_identity() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let setup_locator = runner_setup_locator("/tmp/factory-runner", &runner_instance_id);
+        let wrong_locator = runner_setup_locator("/tmp/other-runner", &runner_instance_id);
+        assert!(matches!(
+            store.register_admitted_runner_setup(&run_id, &wrong_locator, "setup-birth", 6),
+            Err(StoreError::ResourceIdentityMismatch)
+        ));
+        store
+            .register_admitted_runner_setup(&run_id, &setup_locator, "setup-birth", 7)
+            .unwrap();
+
+        let identity = prepared_identity();
+        assert!(matches!(
+            store.register_admitted_runner(
+                &run_id,
+                &setup_locator,
+                "replacement-birth",
+                &identity.runner_locator,
+                &identity.runner_birth_fingerprint,
+                8,
+            ),
+            Err(StoreError::ResourceIdentityMismatch)
+        ));
+        let runner = store
+            .kernel_resources(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+            .unwrap();
+        assert_eq!(runner.state, KernelResourceState::Active);
+        assert_eq!(runner.locator, setup_locator);
+        assert_eq!(runner.birth_fingerprint.as_deref(), Some("setup-birth"));
     }
 
     #[test]
@@ -4353,17 +4600,26 @@ mod tests {
                 && resource.birth_fingerprint.as_deref() == Some("runtime-birth")
         }));
         let identity = prepared_identity();
+        let setup_locator = runner_setup_locator(
+            "/tmp/factory-runner",
+            &RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap(),
+        );
+        store
+            .register_admitted_runner_setup(&run_id, &setup_locator, "setup-birth", 7)
+            .unwrap();
         store
             .register_admitted_runner(
                 &run_id,
+                &setup_locator,
+                "setup-birth",
                 &identity.runner_locator,
                 &identity.runner_birth_fingerprint,
-                7,
+                8,
             )
             .unwrap();
         assert_eq!(
             store
-                .activate_prepared_run(&run_id, prepared_identity(), 8)
+                .activate_prepared_run(&run_id, prepared_identity(), 9)
                 .unwrap()
                 .0
                 .phase,

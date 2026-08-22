@@ -20,6 +20,7 @@ On macOS, run the complete release-compatible gate:
 
 ```sh
 ./scripts/local-ci.sh
+./scripts/macos-contributor-smoke.sh
 ```
 
 On Ubuntu x86-64, run the source-only gate and contributor smoke instead:

@@ -1,12 +1,14 @@
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, ChangeId, ChangePhase, ChangeSnapshot,
-    ChangeStorageSnapshot, EventEnvelope, ExecutionMode, FactoryEvent, LegacySourceId,
-    LegacySourceSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider,
-    ProviderHookEvent, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ChangeStorageSnapshot, EventEnvelope, ExecutionMode, FactoryEvent, InputEnvelopeId,
+    InputEnvelopeSnapshot, LegacySourceId, LegacySourceSnapshot, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskDetail, TaskId, TaskSnapshot,
+    TaskStatus, WorkCandidateId, WorkCandidateSnapshot, WorkCandidateStatus,
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
-        MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS,
-        MAX_LOCAL_FRAME_BYTES, MAX_REQUEST_CREDENTIAL_BYTES, MAX_TASK_BODY_BYTES,
+        MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_INPUT_CONTENT_BYTES,
+        MAX_INPUT_ENVELOPE_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_REQUEST_CREDENTIAL_BYTES, MAX_TASK_BODY_BYTES, MAX_WORK_CANDIDATE_PAGE_ITEMS,
         RequestCredential, RequestEnvelope, ServerFrame,
     },
 };
@@ -29,7 +31,7 @@ fn run_id(value: &str) -> RunId {
 
 #[test]
 fn request_envelope_has_a_stable_tagged_shape() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         credential: None,
@@ -308,7 +310,7 @@ fn unknown_execution_modes_fail_closed_on_the_wire() {
 
 #[test]
 fn server_frames_version_responses_and_events_at_the_outer_boundary() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     let frame = ServerFrame::Response {
         protocol_version: PROTOCOL_VERSION,
         response: LocalResponse::Projects {
@@ -612,6 +614,68 @@ fn the_largest_valid_legacy_source_page_fits_one_local_frame() {
         response: LocalResponse::LegacySources {
             sources,
             next_after_id: Some(LegacySourceId::try_from("legacy-next").unwrap()),
+        },
+    };
+
+    assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+}
+
+#[test]
+fn the_largest_valid_input_envelope_page_fits_one_local_frame() {
+    let escaped = "\u{0001}".repeat(MAX_INPUT_CONTENT_BYTES);
+    let envelopes = (0..MAX_INPUT_ENVELOPE_PAGE_ITEMS)
+        .map(|index| InputEnvelopeSnapshot {
+            id: InputEnvelopeId::try_from(format!("input-{index}")).unwrap(),
+            project_id: project_id("project-1"),
+            candidate_id: WorkCandidateId::try_from(format!("candidate-{index}")).unwrap(),
+            source_kind: "fixture".into(),
+            source_id: "x".repeat(512),
+            delivery_id: "x".repeat(256),
+            source_revision: "x".repeat(256),
+            content: escaped.clone(),
+            content_digest: "f".repeat(64),
+            request_digest: "f".repeat(64),
+            received_at_ms: i64::MAX,
+        })
+        .collect();
+    let frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::InputEnvelopes {
+            envelopes,
+            next_after_id: Some(InputEnvelopeId::try_from("input-next").unwrap()),
+        },
+    };
+
+    assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+}
+
+#[test]
+fn the_largest_valid_work_candidate_page_fits_one_local_frame() {
+    let escaped_reason = "\u{0001}".repeat(1024);
+    let escaped_source_id = "\u{0001}".repeat(512);
+    let escaped_revision = "\u{0001}".repeat(256);
+    let candidates = (0..MAX_WORK_CANDIDATE_PAGE_ITEMS)
+        .map(|index| WorkCandidateSnapshot {
+            id: WorkCandidateId::try_from(format!("candidate-{index:0116}")).unwrap(),
+            project_id: project_id(&format!("project-{index:0118}")),
+            origin_envelope_id: InputEnvelopeId::try_from(format!("input-{index:0120}")).unwrap(),
+            source_kind: "x".repeat(64),
+            source_id: escaped_source_id.clone(),
+            source_revision: escaped_revision.clone(),
+            content_digest: "f".repeat(64),
+            is_current: true,
+            status: WorkCandidateStatus::Rejected,
+            status_reason: Some(escaped_reason.clone()),
+            revision: i64::MAX,
+            created_at_ms: i64::MAX,
+            updated_at_ms: i64::MAX,
+        })
+        .collect();
+    let frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::WorkCandidates {
+            candidates,
+            next_after_id: Some(WorkCandidateId::try_from("candidate-next").unwrap()),
         },
     };
 

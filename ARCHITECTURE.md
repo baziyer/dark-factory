@@ -78,6 +78,16 @@ pretends the resource disappeared or rewrites the outcome.
    or writable source lease.
 7. A retry creates a new run and new bearer. It never revives an old process
    or credential.
+8. External-input receipt is separate from work authority. An operator-only
+   transaction may create an immutable `InputEnvelope`, one quarantined
+   `WorkCandidate`, and bounded events. It cannot create a Task, Message, Run,
+   Change, provider prompt, ProposedAction, or scheduling event. A changed
+   source revision advances an exact expected-current pointer and stales an old
+   quarantined candidate atomically. A rejected predecessor keeps its durable
+   decision while losing current-source authority. Exact observation or
+   rejection replay has no second effect, even after that pointer advances.
+   Candidate snapshots derive `is_current` from that pointer so reconciliation
+   can recover exact causal authority after restart.
 
 ## Process and resource ownership
 
@@ -91,9 +101,13 @@ Launch is one nested register-before-exec handshake:
 1. `factoryd` records the admitted run with a random runtime claim. The
    claim-derived path is durable before `mkdir`; its inode replaces the claim
    before any credential, configuration, or process is created inside it.
-2. `factoryd` spawns an inert runner exec gate tied to the exact daemon parent,
-   persists its stable PID, then activates the same PID into `factory-runner`.
-3. The runner creates a second parent-bound child gate before provider `exec`
+2. `factoryd` creates and locks a private startup file, persists its exact
+   filesystem identity, then maps that lock to the inert runner gate's stdin.
+   A restart can prove that a gate spawned before PID registration is gone only
+   by acquiring the same lock; missing or replaced identities stay unresolved.
+3. `factoryd` persists the inert gate's stable PID, then activates that same
+   PID into `factory-runner`. The runner creates a second parent-bound child
+   gate before provider `exec`
    and reports the stable provider PID and process group.
 4. `factoryd` persists those identities and moves the run to `running`.
 5. The runner releases the child to provider `exec`.
@@ -104,10 +118,14 @@ provider-blind effect host, not a second lifecycle owner.
 
 The resource ledger records process, process group, runner, runtime root, and
 other external effects before use. Each record contains enough identity to
-refuse PID, path, or job-label reuse. Rust `Drop` and shell traps may accelerate
-cleanup, but correctness comes from the durable daemon finalizer, including
-after restart. On platforms without a stable process birth identity, a live or
-reused PID remains unresolved: weak presence can never authorize signalling or
+refuse PID, path, or job-label reuse, but stored numeric identities never grant
+signal authority. The daemon requests shutdown through the authenticated live
+runner; the runner may signal its provider group only while it still owns the
+unreaped leader child. A live-child guard preserves that authority across
+runner cancellation or unwind, then disarms immediately after a successful
+wait; it never authorizes terminalization. After leader or runner loss, the
+durable finalizer only observes exact absence. A live, reused, or weak identity
+remains unresolved and cannot authorize signalling, runtime removal, or
 terminalization.
 
 ## Provider boundary
@@ -181,8 +199,10 @@ Each project has one operator-selected verification policy: `None` or one fixed
 `RustWorkspaceTest`. There is no provider-visible generic build operation or
 Cargo shim. For a Rust-policy worker, `factoryctl task done` is the single
 completion boundary: the daemon moves the run to `finalizing`, revokes its
-authority, reaps every provider process group, and only then snapshots source
-and starts verification. Orchestrator runs are not verified this way.
+authority, asks the live runner to reap the provider process group, and only
+after exact resource absence snapshots source and starts verification. A lost
+runner leaves finalization pending; stored PIDs are not a fallback. Orchestrator
+runs are not verified this way.
 
 The source snapshot is a canonical scan/copy/scan of the plain Change;
 it is published only when the manifests agree. This deliberately replaces the
@@ -210,8 +230,10 @@ is neither signal authority nor proof that the effect is gone.
 
 Regenerable cache storage has a hard entry count and a measured byte policy.
 Starting a writer makes byte status incomplete; after its exact process group
-is reaped, factoryd remeasures allocated bytes and reclaims unprotected caches
-until the policy converges. A measured over-limit cache cannot be claimed for
+is absent, factoryd remeasures allocated bytes and reclaims unprotected caches
+until the policy converges. Healthy verifier shutdown is cooperative: factoryd
+publishes a private finish marker and the live leader terminates its own group.
+A measured over-limit cache cannot be claimed for
 another verification. Status reports aggregate measured bytes, protected entry
 count, and recoverable failure count, not an invented protected-byte subtotal.
 An ordinary directory
@@ -236,9 +258,12 @@ for their exact run through `DARK_FACTORY_ATTEMPT_TOKEN_FILE` (or an explicit
 hook `--token-file`). A provider-invoked `factoryctl` process cannot cross into
 operator authority by choosing an operator command.
 
-There is no HTTP webhook or generic connector intake. GitHub and other external
-intake remain outside the product; work enters only through the authenticated
-private local API and cannot bypass admission.
+There is no HTTP webhook, GitHub adapter, or generic connector intake. The
+operator may place bounded provider-neutral observations into inert quarantine
+through the authenticated private local API, then list, inspect, or reject
+them. Raw content is private local detail and public events carry only project,
+envelope, candidate, and status identities. There is no accept/materialize
+operation, so receipt cannot become executable work or bypass admission.
 
 ## State outside SQLite
 

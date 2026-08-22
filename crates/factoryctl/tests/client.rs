@@ -193,8 +193,11 @@ fn rejects_an_oversized_server_frame_before_parsing_json() {
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
-        stream.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]).unwrap();
-        stream.write_all(b"\n").unwrap();
+        let mut frame = vec![b'x'; MAX_FRAME_BYTES + 1];
+        frame.push(b'\n');
+        // The client may close as soon as it observes the size limit. A partial
+        // write is therefore an expected consequence of the assertion below.
+        let _ = stream.write_all(&frame);
     });
 
     let error = Client::new(&socket)

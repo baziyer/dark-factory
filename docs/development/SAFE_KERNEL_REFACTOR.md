@@ -94,15 +94,19 @@ PTY attach/input, prompt replay, delivery journal, or provider-process resume.
 Launch uses register-before-exec gates:
 
 1. factoryd records the run, runtime claim, and declared resources;
-2. an inert runner child reports a stable identity before activation;
-3. the runner prepares a provider child blocked before `exec`;
-4. factoryd records the provider PID, process group, and birth identity and
+2. factoryd records an exact locked startup-file identity before an inert
+   runner gate can inherit that lock and spawn;
+3. factoryd records the gate's stable PID before activation;
+4. the runner prepares a provider child blocked before `exec`;
+5. factoryd records the provider PID, process group, and birth identity and
    moves the run to `running`; and
-5. only then may the same child execute the provider.
+6. only then may the same child execute the provider.
 
 The resource ledger owns processes, process groups, runners, runtime roots,
-temporary roots, and verification effects. Recovery signals or removes only
-an exact recorded identity. Reused or weak identities stay unresolved.
+temporary roots, and verification effects. Stored process numbers support
+absence checks, not signalling. The authenticated live runner may signal its
+provider group only while it owns the unreaped leader child; recovery otherwise
+waits for exact absence. Reused or weak identities stay unresolved.
 
 A process group may outlive its leader. If the recorded leader disappears
 while descendants remain, its numeric group ID is not signal authority and is
@@ -110,8 +114,10 @@ not proof of absence. Finalization, temporary-root cleanup, and cache
 remeasurement remain pending until exact group absence is independently
 established.
 
-`Drop`, shell traps, and provider exit handlers may accelerate cleanup. They
-are never correctness authority.
+The runner's live-child guard preserves its bounded group authority across
+cancellation or unwind and disarms immediately after a successful wait. Its
+`Drop`, shell traps, and provider exit handlers may accelerate cleanup; none is
+terminal authority.
 
 ## Change and repository ownership
 
@@ -149,9 +155,10 @@ configuration, toolchain, identities, and digests. The daemon re-verifies each
 copy before launch and rechecks the stable source snapshot before and after
 each test. Mutable Cargo output is never a top-level launch target.
 
-The verifier is one registered effect with bounded output and time. Restart
-reaps that exact effect and consumes only its atomically published result; it
-does not rebuild against later Change contents. The same leader-loss rule
+The verifier is one registered effect with bounded output and time. Shutdown
+publishes a private finish marker; a healthy live verifier kills its own group.
+Recovery consumes only an atomically published result after exact group absence
+and never rebuilds against later Change contents. The same leader-loss rule
 above prevents premature completion or cache handoff.
 
 Cache count is checked before effects. A writer makes measured bytes
@@ -202,7 +209,7 @@ callback or row:
 | Crash and restart | Inject failure after admission, resource declaration, each blocked-exec release, provider exit, external cleanup, and before acknowledgement. Restart yields at most one provider execution, no input replay, exact identity, and idempotent convergence. |
 | Taskless refusal | With no admitted run, no provider exists. Old, forged, taskless, finalizing, and terminal credentials cannot mutate task, budget, source, or outcome state. |
 | Queue race | Reorder or insert higher-priority assigned work between observation and admission. The Store admits only the canonical queue head selected inside its transaction. |
-| Hierarchy scope | Reparent agents and attempt cross-agent messaging, creation, and assignment. The same mutation transaction uses the current durable hierarchy and refuses siblings, ancestors outside the worker allowance, and non-descendants. |
+| Hierarchy scope | Construct alternate durable agent hierarchies and attempt cross-agent messaging, creation, and assignment. The same mutation transaction uses the stored hierarchy and refuses siblings, ancestors outside the worker allowance, and non-descendants. |
 | Outcome and exit race | Exercise request-before-exit and exit-before-request. The first `finalizing` request wins; only failed configured verification may refine proposed success. |
 | Completion ordering | After a success proposal, further attempt mutation and successor admission are refused until provider reap, exact snapshot and configured verification, release of every resource, and terminalization. |
 | Failure, cancel, and retry | Spawn failure, provider crash, and cancellation converge through finalization. Retry is refused before terminal and creates a fresh run and bearer afterward. |
