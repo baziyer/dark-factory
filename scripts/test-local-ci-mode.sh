@@ -7,6 +7,7 @@ contributing="$repository_root/CONTRIBUTING.md"
 ci="$repository_root/.github/workflows/ci.yml"
 runner_manifest="$repository_root/crates/factory-runner/Cargo.toml"
 runner_library="$repository_root/crates/factory-runner/src/lib.rs"
+stale_control_plane_workflow="$repository_root/control-plane/.github/workflows/ci.yml"
 
 fail() {
     echo "local-ci mode test failed: $*" >&2
@@ -74,6 +75,13 @@ printf '%s\n' "$linux_job" \
 if printf '%s\n' "$linux_job" | grep -Fq 'name: Check build headroom'; then
     fail "Linux CI duplicates the authoritative gate's build-headroom check"
 fi
+
+control_plane_job=$(sed -n '/^  control-plane:/,/^  linux:/p' "$ci")
+printf '%s\n' "$control_plane_job" \
+    | grep -Fq 'run: ./control-plane/scripts/local-ci.sh' \
+    || fail "hosted CI does not run the control-plane authoritative gate"
+[ ! -e "$stale_control_plane_workflow" ] \
+    || fail "control-plane gate remains hidden in an undiscovered nested workflow"
 
 grep -Fxq './scripts/local-ci.sh' "$contributing" \
     || fail "CONTRIBUTING lost the macOS gate command"

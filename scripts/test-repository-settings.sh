@@ -12,8 +12,8 @@ grep -Fq 'context: required' "$manifest"
 grep -Fq 'integration_id: 15368' "$manifest"
 grep -Fq '  required:' "$workflow"
 grep -Fq '    if: always()' "$workflow"
-grep -Fq '    needs: [checks, linux]' "$workflow"
-grep -Fq "if: needs.checks.result != 'success' || needs.linux.result != 'success'" "$workflow"
+grep -Fq '    needs: [checks, linux, control-plane]' "$workflow"
+grep -Fq "if: needs.checks.result != 'success' || needs.linux.result != 'success' || needs.control-plane.result != 'success'" "$workflow"
 grep -Fq '"context": "required"' "$publisher"
 if grep -Fq '"context": "checks"' "$publisher"; then
     echo "repository settings still require the macOS-only checks context" >&2
