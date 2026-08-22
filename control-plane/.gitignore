@@ -4,5 +4,9 @@
 /*.sqlite3-wal
 .env
 .env.*
-!.env.example
-.vercel/
+.dev.vars
+.dev.vars.*
+.wrangler/
+node_modules/
+build/
+.tools/

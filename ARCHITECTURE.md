@@ -258,12 +258,22 @@ for their exact run through `DARK_FACTORY_ATTEMPT_TOKEN_FILE` (or an explicit
 hook `--token-file`). A provider-invoked `factoryctl` process cannot cross into
 operator authority by choosing an operator command.
 
-There is no HTTP webhook, GitHub adapter, or generic connector intake. The
-operator may place bounded provider-neutral observations into inert quarantine
-through the authenticated private local API, then list, inspect, or reject
-them. Raw content is private local detail and public events carry only project,
-envelope, candidate, and status identities. There is no accept/materialize
-operation, so receipt cannot become executable work or bypass admission.
+`factoryd` has no HTTP webhook, GitHub adapter, or generic connector intake.
+The separately deployed control plane may authenticate external deliveries,
+but it has no daemon or attempt authority. The operator may place bounded
+provider-neutral observations into inert quarantine through the authenticated
+private local API, then list, inspect, or reject them. Raw content is private
+local detail and public events carry only project, envelope, candidate, and
+status identities. There is no accept/materialize operation, so receipt cannot
+become executable work or bypass admission.
+
+The official control-plane adapter is a Rust Cloudflare Worker with sharded
+SQLite Durable Objects. That is a hosted deployment choice, not part of the
+daemon protocol: self-hosted brokers preserve the same typed contract without
+loading credentials into `factoryd`. The current bootstrap acknowledges only
+an exact signed maintainer-App `ping`; every other authenticated event is
+durably policy-rejected. Product intake and the operator/PWA API remain
+separate inactive planes.
 
 ## State outside SQLite
 

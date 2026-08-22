@@ -85,6 +85,31 @@ async fn exact_signed_ping_is_durable_and_idempotent_across_restart() {
 }
 
 #[tokio::test]
+async fn schema_drift_fails_closed_before_acknowledgement() {
+    let temporary = TempDir::new().unwrap();
+    let database = temporary.path().join("broker.sqlite3");
+    let router = app(state(&database, "maintainer-v1"));
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "ALTER TABLE maintainer_deliveries ADD COLUMN unreviewed TEXT",
+            [],
+        )
+        .unwrap();
+
+    let response = router
+        .oneshot(signed_request(
+            "ping",
+            "0d8a5c44-7f1f-11f0-952e-acde48001122",
+            br#"{"zen":"schema first"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(delivery_count(&database), 0);
+}
+
+#[tokio::test]
 async fn concurrent_exact_deliveries_collapse_to_one_row() {
     let temporary = TempDir::new().unwrap();
     let database = temporary.path().join("broker.sqlite3");
@@ -279,6 +304,20 @@ async fn arbitrary_target_type_and_wrong_configured_target_fail_closed() {
     );
     let response = router.oneshot(wrong_target).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(delivery_count(&database), 0);
+
+    let too_large_for_worker_sqlite = signed_request_with_bindings(
+        "ping",
+        "7d8a5c44-7f1f-11f0-952e-acde48001122",
+        "9007199254740992",
+        "5678",
+        body,
+    );
+    let response = app(state(&database, "maintainer-v1"))
+        .oneshot(too_large_for_worker_sqlite)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(delivery_count(&database), 0);
 }
 

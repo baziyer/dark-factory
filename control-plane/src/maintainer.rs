@@ -16,6 +16,7 @@ pub const WEBHOOK_PATH: &str = "/v1/github/maintainer/webhook";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_SECRET_BYTES: usize = 1024;
 const MAX_IDENTIFIER_BYTES: usize = 64;
+pub(crate) const MAX_EXACT_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Clone)]
 pub struct WebhookSecret(Arc<[u8]>);
@@ -63,6 +64,7 @@ pub(crate) struct MaintainerState {
 }
 
 impl MaintainerState {
+    #[cfg(any(target_arch = "wasm32", feature = "development-sqlite"))]
     pub(crate) fn new(
         secret: WebhookSecret,
         secret_revision: SecretRevision,
@@ -77,12 +79,14 @@ impl MaintainerState {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub(crate) async fn ready(&self) -> Result<(), journal::Error> {
         self.journal.ready().await
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Disposition {
     Ping,
     PolicyRejected,
@@ -90,6 +94,7 @@ pub(crate) enum Disposition {
 }
 
 impl Disposition {
+    #[cfg(any(target_arch = "wasm32", feature = "development-sqlite"))]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -98,6 +103,7 @@ impl Disposition {
         }
     }
 
+    #[cfg(any(target_arch = "wasm32", feature = "development-sqlite"))]
     pub(crate) fn from_database(value: &str) -> Option<Self> {
         match value {
             "ping" => Some(Self::Ping),
@@ -122,7 +128,7 @@ impl Disposition {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Delivery {
     pub(crate) delivery_id: String,
     pub(crate) hook_id: i64,
@@ -135,6 +141,7 @@ pub(crate) struct Delivery {
     pub(crate) secret_revision: String,
 }
 
+#[cfg_attr(target_arch = "wasm32", worker::send)]
 pub(crate) async fn receive(
     State(state): State<BrokerState>,
     headers: HeaderMap,
@@ -257,7 +264,11 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, StatusCode>
     if values.next().is_some() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    value.to_str().map_err(|_| StatusCode::BAD_REQUEST)
+    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if value.contains(',') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(value)
 }
 
 fn validate_identifier(value: &str) -> Result<&str, StatusCode> {
@@ -285,7 +296,7 @@ fn numeric_header(headers: &HeaderMap, name: &str) -> Result<i64, StatusCode> {
     header(headers, name)?
         .parse::<i64>()
         .ok()
-        .filter(|value| *value > 0)
+        .filter(|value| (1..=MAX_EXACT_INTEGER).contains(value))
         .ok_or(StatusCode::BAD_REQUEST)
 }
 

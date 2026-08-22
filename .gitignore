@@ -8,3 +8,12 @@
 
 # Internal notes (dogfood logs, handoffs, design scratch): local only, never published.
 docs/internal/
+
+# Cloudflare local state and secret-bearing development bindings.
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+.wrangler/
+node_modules/
+.tools/

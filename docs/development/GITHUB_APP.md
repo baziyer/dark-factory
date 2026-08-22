@@ -23,10 +23,10 @@ contract:
    that key and broker, but the daemon and provider contract is unchanged. A
    BYO deployment is not a mode that loads a private key into `factoryd`.
 
-The broker's hosting vendor, region, and operational topology are deployment
-choices for the future control plane. They do not change this authority
-boundary. The public site and release-manifest host are not implicitly the
-credential broker.
+The official broker is hosted as a Cloudflare Worker with SQLite Durable
+Objects. A self-hosted broker may choose another implementation while preserving
+the same typed authority contract. The public site and release-manifest host
+are not implicitly the credential broker.
 
 ## Registration identity
 
@@ -55,57 +55,45 @@ The broker implementation belongs in the sibling
 `dark-factory-control-plane` service, not in the pure-Rust local-runtime
 workspace or `factoryd`. The temporary `control-plane/` staging export proves
 only a versioned, signed, inert maintainer `ping` boundary. Every non-ping event
-is policy-rejected. Its default build uses a durable Postgres journal behind
-Vercel's official Rust and Axum runtime adapter; SQLite exists only behind the
-non-default `development-sqlite` feature and can never satisfy readiness. The
-production adapter accepts exactly `DARK_FACTORY_BROKER_DATABASE_URL`,
+is policy-rejected. The official hosted adapter is a Rust Cloudflare Worker.
+Its production journal uses strongly consistent SQLite Durable Objects;
+native SQLite exists only behind the non-default `development-sqlite` feature
+and can never satisfy readiness. The production adapter accepts exactly
 `DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET`,
 `DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET_REVISION`, and
 `DARK_FACTORY_MAINTAINER_APP_ID`. Missing or partial configuration leaves the
 fixed inactive router with no webhook route. A configured but unavailable or
-unmigrated Postgres journal makes readiness and delivery acknowledgement fail
-closed. The URL must bind its host, user, password, database, and TLS mode and
-authenticate as the provisioned `dark_factory_broker_runtime` role. The
-Marketplace owner `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `NEON_PROJECT_ID`,
-operator-only `DARK_FACTORY_NEON_API_KEY`, and all `PG*`/`POSTGRES_*` aliases
-must be absent from a deployment; their presence proves the owner integration
-remains connected and selects the fixed inactive router. The Vercel function
-also activates only when
-platform metadata sets `VERCEL_ENV=production`; preview, development, missing,
-and unknown values use the fixed inactive router even if credentials were
-accidentally scoped there.
+drifted Durable Object journal makes readiness and delivery acknowledgement
+fail closed.
+
+The namespace is sharded deterministically by App ID and the first byte of the
+SHA-256 delivery-ID digest. This keeps every replay identity on one serialized
+object without creating a global singleton. Each shard owns one private SQLite
+database, creates the reviewed schema on first use, records the exact migration
+digest, and audits both stored table definitions and its migration row before
+use. The delivery primary key and complete replay-identity comparison preserve
+exact replay and conflict behavior across concurrency, eviction, and Worker
+restart.
 
 The intended stable route is
 `https://broker.darkfactory.build/v1/github/maintainer/webhook`, but committing
 the adapter does not register that domain, deploy the service, configure an
 App, or activate a webhook. Production credentials are never shared with
-preview deployments; preview integration requires a distinct disposable App,
-secret, database, and activation contract. Migration and runtime-role creation
-happen in a separate reviewed operation, never at function cold start. For an
-existing exact `NOLOGIN` runtime role, the resumable bootstrap in
-`control-plane/README.md` first audits the bound Neon project, role, schema,
-migration, and ACL contract, then retrieves the existing password through
-Neon's typed reveal endpoint. Only the documented unavailable response permits
-one explicit reset. The restricted URL is stored as a sensitive Vercel
-production variable before a separate activation-only command uses fresh
-verified owner connections, repeats the full audit, enables `LOGIN`, and
-verifies the restricted connection. Failures keep the URL stored and the owner
-integration attached, so the broker remains inactive and activation can be
-resumed without another reset. The operator revokes the temporary
-project-scoped Neon key, then disconnects the integration, verifies every owner
-URL and alias is absent while the custom runtime setting remains, and only then
-deploys after independent adversarial `ALLOW`. Production is never deployed
-while owner credentials are attached. This is an operator deployment step,
-not provider or task authority to pull production configuration. Readiness
-verifies the exact migration,
-schema and physical table identity, both primary-key conflict arbiters, fixed
-role/session settings, and catalog-exact least-privilege ACLs;
-it is a read-only structural and authority proof. The disposable and live
-Postgres gates prove rollback-only conflict behavior. Bootstrap SQL never
-contains the runtime password. Product webhook intake and operator/PWA
-projections
-keep separate routes, configuration, storage namespaces, and authentication
-even if they later share hardened HTTP or signature primitives.
+preview or disposable deployments; those use a distinct App, secret, Durable
+Object namespace, and activation contract. `workers.dev` and preview URLs are
+disabled and the checked-in configuration has no route, so an upload cannot
+silently claim a public ingress. All three authority settings are required
+Cloudflare secrets. There is no database URL, owner integration, runtime role,
+provider API key, or ambient authentication fallback.
+
+`wrangler secret put` deploys immediately and is not an acceptable staging
+step. The separate live runbook must stage an exact version and its secrets
+without traffic, verify names and bindings without reading values, and add the
+route only after independent adversarial `ALLOW`. This is operator deployment
+authority, not provider or task authority. Product webhook intake and
+operator/PWA projections keep separate routes, configuration, storage
+namespaces, and authentication even if they later share hardened HTTP or
+signature primitives.
 
 The local coordinator client has no direct GitHub mutation path. Every
 maintainer effect executes inside the broker authenticated as the exact
