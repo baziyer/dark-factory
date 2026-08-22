@@ -141,10 +141,8 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
 
-      - name: Install the production bootstrap shell
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends zsh
+      - name: Verify the supported Node runtime
+        run: node -e "if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
 
       - name: Run the control-plane authoritative gate
         run: ./control-plane/scripts/local-ci.sh

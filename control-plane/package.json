@@ -1,0 +1,14 @@
+{
+  "name": "dark-factory-control-plane-worker-tests",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test:worker": "node --test tests/worker.integration.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.125.0"
+  }
+}

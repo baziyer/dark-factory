@@ -80,15 +80,12 @@ control_plane_job=$(sed -n '/^  control-plane:/,/^  linux:/p' "$ci")
 control_line_of() {
     printf '%s\n' "$control_plane_job" | grep -n -F "$1" | head -1 | cut -d: -f1
 }
-apt_update_line=$(control_line_of 'sudo apt-get update')
-zsh_install_line=$(control_line_of 'sudo apt-get install --yes --no-install-recommends zsh')
+node_runtime_line=$(control_line_of 'name: Verify the supported Node runtime')
 control_gate_line=$(control_line_of 'run: ./control-plane/scripts/local-ci.sh')
-[ -n "$apt_update_line" ] && [ -n "$zsh_install_line" ] && [ -n "$control_gate_line" ] \
-    || fail "hosted control-plane CI lost apt update, zsh install, or its gate"
-[ "$apt_update_line" -lt "$zsh_install_line" ] \
-    || fail "hosted control-plane CI installs zsh without first updating apt metadata"
-[ "$zsh_install_line" -lt "$control_gate_line" ] \
-    || fail "hosted control-plane CI runs its gate before installing zsh"
+[ -n "$node_runtime_line" ] && [ -n "$control_gate_line" ] \
+    || fail "hosted control-plane CI lost its Node runtime check or gate"
+[ "$node_runtime_line" -lt "$control_gate_line" ] \
+    || fail "hosted control-plane CI runs its gate before checking Node"
 [ ! -e "$stale_control_plane_workflow" ] \
     || fail "control-plane gate remains hidden in an undiscovered nested workflow"
 
