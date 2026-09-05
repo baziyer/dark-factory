@@ -31,11 +31,8 @@ const (
 	CallFail
 	CallRequestHuman
 	CallWebStatus
-	CallWebOpen
-	CallWebAbandonOpen
 	CallWebListClients
 	CallWebRevokeClient
-	CallRemotePair
 	CallRemoteStatus
 )
 
@@ -61,7 +58,6 @@ type Call struct {
 	task             EnqueueTaskInput
 	humanQuestion    HumanQuestionInput
 	webClient        WebClientRevocationInput
-	webAbandon       WebAbandonOpenInput
 	webAfter         string
 	expectedRevision uint64
 	enabled          bool
@@ -115,10 +111,6 @@ func (call Call) WebClientRevocationInput() (WebClientRevocationInput, bool) {
 	return call.webClient, call.kind == CallWebRevokeClient
 }
 
-func (call Call) WebAbandonOpenInput() (WebAbandonOpenInput, bool) {
-	return call.webAbandon, call.kind == CallWebAbandonOpen
-}
-
 func (call Call) WebListAfter() (string, bool) {
 	return call.webAfter, call.kind == CallWebListClients
 }
@@ -131,11 +123,8 @@ const (
 	replyMutation
 	replyAttemptTask
 	replyWebStatus
-	replyWebLaunch
-	replyWebAbandon
 	replyWebClients
 	replyWebRevoke
-	replyRemoteInvitation
 	replyRemoteStatus
 	replyError
 )
@@ -148,11 +137,8 @@ type Reply struct {
 	mutation    MutationResult
 	attemptTask AttemptTask
 	webStatus   WebStatus
-	webLaunch   WebLaunch
-	webAbandon  WebAbandonOpenResult
 	webClients  WebClientPage
 	webRevoke   WebRevokeResult
-	invitation  RemoteInvitation
 	remote      RemoteStatus
 	code        RemoteErrorCode
 }
@@ -202,17 +188,6 @@ func NewWebStatusReply(status WebStatus) (Reply, error) {
 	return Reply{kind: replyWebStatus, webStatus: status}, nil
 }
 
-func NewWebLaunchReply(launch WebLaunch) (Reply, error) {
-	if !validWebLaunch(launch) {
-		return Reply{}, ErrInvalidInput
-	}
-	return Reply{kind: replyWebLaunch, webLaunch: launch}, nil
-}
-
-func NewWebAbandonReply(result WebAbandonOpenResult) Reply {
-	return Reply{kind: replyWebAbandon, webAbandon: result}
-}
-
 func NewWebClientsReply(page WebClientPage) (Reply, error) {
 	if !validWebClientPage(page) {
 		return Reply{}, ErrInvalidInput
@@ -230,13 +205,6 @@ func NewWebRevokeReply(result WebRevokeResult) (Reply, error) {
 		return Reply{}, ErrInvalidInput
 	}
 	return Reply{kind: replyWebRevoke, webRevoke: result}, nil
-}
-
-func NewRemoteInvitationReply(invitation RemoteInvitation) (Reply, error) {
-	if !validRemoteInvitation(invitation) {
-		return Reply{}, ErrInvalidInput
-	}
-	return Reply{kind: replyRemoteInvitation, invitation: invitation}, nil
 }
 
 func NewRemoteStatusReply(status RemoteStatus) (Reply, error) {
@@ -466,7 +434,7 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		call.digest = digestAttemptCredential(bearer)
 	}
 	switch kind {
-	case CallHealth, CallSnapshot, CallAttemptTask, CallWebStatus, CallWebOpen, CallRemotePair, CallRemoteStatus:
+	case CallHealth, CallSnapshot, CallAttemptTask, CallWebStatus, CallRemoteStatus:
 		if err := decodeExact(request.Params, &struct{}{}); err != nil {
 			return Call{}, RemoteInvalidRequest
 		}
@@ -478,10 +446,6 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 			return Call{}, RemoteInvalidRequest
 		}
 		call.webAfter = input.After
-	case CallWebAbandonOpen:
-		if err := decodeExact(request.Params, &call.webAbandon); err != nil || !validDigest(call.webAbandon.ChallengeDigest) {
-			return Call{}, RemoteInvalidRequest
-		}
 	case CallCreateProject:
 		if err := decodeExact(request.Params, &call.project); err != nil || !validID(call.project.ID) || !validText(call.project.Name, 1, 128) || !validText(call.project.Root, 1, 4096) {
 			return Call{}, RemoteInvalidRequest
@@ -576,16 +540,10 @@ func methodKind(method string) (CallKind, byte) {
 		return CallRequestHuman, attemptDomain
 	case "web_status":
 		return CallWebStatus, operatorDomain
-	case "web_open":
-		return CallWebOpen, operatorDomain
-	case "web_abandon_open":
-		return CallWebAbandonOpen, operatorDomain
 	case "web_list_clients":
 		return CallWebListClients, operatorDomain
 	case "web_revoke_client":
 		return CallWebRevokeClient, operatorDomain
-	case "remote_pair":
-		return CallRemotePair, operatorDomain
 	case "remote_status":
 		return CallRemoteStatus, operatorDomain
 	default:
@@ -658,16 +616,10 @@ func replyMatches(kind CallKind, reply replyKind) bool {
 		return reply == replyMutation
 	case CallWebStatus:
 		return reply == replyWebStatus
-	case CallWebOpen:
-		return reply == replyWebLaunch
-	case CallWebAbandonOpen:
-		return reply == replyWebAbandon
 	case CallWebListClients:
 		return reply == replyWebClients
 	case CallWebRevokeClient:
 		return reply == replyWebRevoke
-	case CallRemotePair:
-		return reply == replyRemoteInvitation
 	case CallRemoteStatus:
 		return reply == replyRemoteStatus
 	default:
@@ -702,16 +654,10 @@ func (connection *Connection) writeReply(reply Reply) error {
 		data, err = json.Marshal(reply.attemptTask)
 	case replyWebStatus:
 		data, err = json.Marshal(reply.webStatus)
-	case replyWebLaunch:
-		data, err = json.Marshal(reply.webLaunch)
-	case replyWebAbandon:
-		data, err = json.Marshal(reply.webAbandon)
 	case replyWebClients:
 		data, err = json.Marshal(reply.webClients)
 	case replyWebRevoke:
 		data, err = json.Marshal(reply.webRevoke)
-	case replyRemoteInvitation:
-		data, err = json.Marshal(reply.invitation)
 	case replyRemoteStatus:
 		data, err = json.Marshal(reply.remote)
 	case replyError:

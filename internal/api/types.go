@@ -88,25 +88,6 @@ type WebStatus struct {
 	ActiveChallenges uint64   `json:"active_challenges"`
 }
 
-// WebLaunchOutcome describes whether the daemon knows that the challenge mint
-// committed. A commit-uncertain launch carries an exact cleanup identity but
-// must never be opened by factoryctl.
-type WebLaunchOutcome string
-
-const (
-	WebLaunchReady     WebLaunchOutcome = "ready"
-	WebLaunchUncertain WebLaunchOutcome = "uncertain"
-)
-
-// WebLaunch contains the one-shot browser URL only inside the owner-only
-// local API response. factoryctl consumes it without printing or logging it.
-type WebLaunch struct {
-	LaunchURL       string           `json:"launch_url"`
-	ExpiresAtMs     uint64           `json:"expires_at_ms"`
-	ChallengeDigest string           `json:"challenge_digest"`
-	Outcome         WebLaunchOutcome `json:"outcome"`
-}
-
 type WebClient struct {
 	ID             string  `json:"id"`
 	CapabilityMask uint8   `json:"capability_mask"`
@@ -124,17 +105,6 @@ type WebClientPage struct {
 type WebRevokeResult struct {
 	ID       string `json:"id"`
 	Revision uint64 `json:"revision"`
-}
-
-// RemoteInvitation is the one-shot remote pairing invitation. Link carries the
-// pairing challenge and the relay ticket in its fragment, so it is a secret:
-// the daemon returns it only in this reply and never logs it. ChallengeDigest
-// lets factoryctl prove the link's own challenge before printing it.
-type RemoteInvitation struct {
-	Link            string `json:"link"`
-	NodeID          string `json:"node_id"`
-	Expires         int64  `json:"expires"`
-	ChallengeDigest string `json:"challenge_digest"`
 }
 
 // RemoteStatus is the bounded, non-secret operator view of the outbound relay
@@ -287,13 +257,3 @@ type WebClientRevocationInput struct {
 	ID               string `json:"id"`
 	ExpectedRevision uint64 `json:"expected_revision"`
 }
-
-type WebAbandonOpenInput struct {
-	ChallengeDigest string `json:"challenge_digest"`
-}
-
-// WebAbandonOpenResult is an exact empty acknowledgement. Success means the
-// daemon's durable transaction proved that no active challenge remains for
-// the requested digest, boot and origin; absence and prior redemption are
-// intentionally idempotent success states.
-type WebAbandonOpenResult struct{}

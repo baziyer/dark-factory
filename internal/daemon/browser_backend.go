@@ -11,7 +11,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/dark-factory-build/dark-factory/internal/api"
 	"github.com/dark-factory-build/dark-factory/internal/browser"
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
@@ -252,21 +251,12 @@ func (backend *browserBackend) TerminalTarget(ctx context.Context, rawClient [br
 }
 
 // PairLink is the pair page's mint: the one-shot launch link OpenBrowser
-// returns. A commit-uncertain mint is a plain failure here, as in RemotePair:
-// the page has no cleanup identity to hand anyone and an unopened challenge
-// simply expires.
+// returns.
 func (backend *browserBackend) PairLink(ctx context.Context) (string, error) {
 	if backend == nil || backend.owner == nil {
 		return "", browser.ErrUnauthorized
 	}
-	launch, err := backend.owner.OpenBrowser(ctx)
-	if err != nil {
-		return "", mapBrowserError(err)
-	}
-	if launch.Outcome != api.WebLaunchReady {
-		return "", browser.ErrUnauthorized
-	}
-	return launch.LaunchURL, nil
+	return backend.owner.OpenBrowser(ctx)
 }
 
 func (backend *browserBackend) EnqueueTask(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskEnqueue) (browserprotocol.TaskEnqueueResult, error) {
@@ -334,7 +324,7 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 	}
 	agent, err := backend.store.UpdateAgent(ctx, agentID, expected, patch, at)
 	if err != nil {
-		return browserprotocol.AgentUpdateResult{}, mapBrowserError(err)
+		return browserprotocol.AgentUpdateResult{}, consoleUpdateError(err)
 	}
 	if backend.owner != nil {
 		backend.owner.notifyScheduler()
@@ -370,7 +360,7 @@ func (backend *browserBackend) UpdateTask(ctx context.Context, rawClient [browse
 	}
 	task, err := backend.store.UpdateTask(ctx, taskID, expected, patch, at)
 	if err != nil {
-		return browserprotocol.TaskUpdateResult{}, mapBrowserError(err)
+		return browserprotocol.TaskUpdateResult{}, consoleUpdateError(err)
 	}
 	if backend.owner != nil {
 		backend.owner.notifyScheduler()
@@ -411,25 +401,50 @@ func projectTopology(projectID string, snapshot topology.Snapshot) browserprotoc
 		ProjectID: projectID, Digest: snapshot.Digest, SourceRevision: snapshot.SourceRevision,
 		Nodes: make([]browserprotocol.TopologyNode, 0, len(snapshot.Nodes)),
 	}
-	// Nodes arrive parent-before-child (they are sorted by path, and a parent's
-	// path is a prefix of its children's), so one pass suffices to drop a whole
-	// subtree. A node whose parent is absent for any other reason is dropped
-	// too, rather than served pointing at nothing.
-	kept := make(map[string]struct{}, len(snapshot.Nodes))
+	// Nodes are ordered by path and kind, which is not ancestry order: a root
+	// module sorts before the repository that contains it. So each node is
+	// decided by walking its own ancestor chain, never by slice position.
+	byID := make(map[string]topology.Node, len(snapshot.Nodes))
 	for _, node := range snapshot.Nodes {
-		if !servableTopologyText(node) {
+		byID[node.ID] = node
+	}
+	decided := make(map[string]bool, len(snapshot.Nodes))
+	var servable func(string) bool
+	servable = func(id string) bool {
+		if result, ok := decided[id]; ok {
+			return result
+		}
+		node, ok := byID[id]
+		if !ok {
+			return false
+		}
+		// Provisionally false, so a chain that loops back on corrupt input
+		// terminates and fails closed rather than recursing forever.
+		decided[id] = false
+		result := servableTopologyText(node) && (node.ParentID == "" || servable(node.ParentID))
+		decided[id] = result
+		return result
+	}
+	for _, node := range snapshot.Nodes {
+		if !servable(node.ID) {
 			continue
 		}
-		if _, ok := kept[node.ParentID]; !ok && node.ParentID != "" {
-			continue
-		}
-		kept[node.ID] = struct{}{}
 		result.Nodes = append(result.Nodes, browserprotocol.TopologyNode{
 			ID: node.ID, ParentID: node.ParentID, Kind: string(node.Kind), Path: node.RelativePath,
 			Label: node.Label, Language: node.Language, SizeBucket: node.SizeBucket,
 		})
 	}
 	return result
+}
+
+// consoleUpdateError separates a member the domain refuses from a lost race.
+// Both are the operator's to resolve, but only one is resolved by refetching:
+// a reasoning effort no provider accepts is still refused after a refresh.
+func consoleUpdateError(err error) error {
+	if errors.Is(err, kernel.ErrInvalidValue) {
+		return browser.ErrInvalidRequest
+	}
+	return mapBrowserError(err)
 }
 
 func servableTopologyText(node topology.Node) bool {
@@ -442,9 +457,9 @@ func validTopologyText(value string, minimum, maximum int) bool {
 	return len(value) >= minimum && len(value) <= maximum && utf8.ValidString(value)
 }
 
-// RemoteInvite mints one remote pairing invitation for a paired operator: the
-// exact invitation `factoryctl remote pair` mints, plus its scannable code.
-// The mint is never retried; a failure is reported and the operator asks again.
+// RemoteInvite mints one remote pairing invitation for a paired operator, plus
+// its scannable code. The mint is never retried; a failure is reported and the
+// operator asks again.
 func (backend *browserBackend) RemoteInvite(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte) (browserprotocol.RemoteInviteResult, error) {
 	_, release, client, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
 	if err != nil {

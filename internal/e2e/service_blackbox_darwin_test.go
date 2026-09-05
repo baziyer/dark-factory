@@ -51,6 +51,14 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 	if state.State != "running" || state.PID <= 1 {
 		t.Fatalf("install state = %+v (%s)", state, output)
 	}
+	// A fresh install names the pair page and reports whether it opened it,
+	// inside the JSON: the whole result is one parseable document. runFactoryctl
+	// gives the child no PATH, so `open` is not findable and no browser can be
+	// launched — which is also what keeps this test from throwing a window onto
+	// the operator's screen.
+	if state.PairPage != "http://127.0.0.1:43123/pair" || state.BrowserOpened {
+		t.Fatalf("install pairing report = %+v (%s)", state, output)
+	}
 	client := fixture.waitClient(t)
 
 	// The managed daemon serves a real task end to end.
@@ -119,8 +127,10 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 }
 
 type serviceStateOutput struct {
-	State string `json:"state"`
-	PID   int    `json:"pid"`
+	State         string `json:"state"`
+	PID           int    `json:"pid"`
+	PairPage      string `json:"pair_page"`
+	BrowserOpened bool   `json:"browser_opened"`
 }
 
 func serviceState(t *testing.T, output string) serviceStateOutput {

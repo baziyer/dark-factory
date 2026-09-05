@@ -18,13 +18,16 @@ verify its entry in that release's `SHA256SUMS`, and put `factoryd`,
 release's Homebrew formula installs the same commands if it has been added to a
 tap.
 
-Create and install one managed home. Installation loads the launchd job;
-`service start` is the explicit command to use after a later stop:
+Create and install one managed home. Those two commands are the whole terminal
+side of setup: an install that starts a fresh service loads the launchd job,
+waits for the daemon to listen, and opens <http://127.0.0.1:43123/pair> in this
+machine's default browser, where confirming pairs that browser. A repeated
+install returns the service it found and opens nothing. `service start` is the
+explicit command to use after a later stop:
 
 ```sh
 factoryctl init --home "$HOME/.dark-factory"
 factoryctl service install --home "$HOME/.dark-factory"
-factoryctl service status --home "$HOME/.dark-factory"
 ```
 
 To upgrade a running installation to a new build, run `factoryctl service
@@ -45,25 +48,28 @@ receipt and keep proving ownership. Changing or removing the relay origin is
 `factoryctl service uninstall` followed by a fresh install carrying the origin
 you want: repeating an install with a different origin refuses, printing the
 origin already installed, rather than silently keeping or dropping it. Pair a
-phone from the console's PAIR A PHONE button (or `factoryctl remote pair`).
+phone from the console's PAIR A PHONE button.
 
-Point the operator client at that home and open the paired hosted console:
+Pairing never needs the terminal. Another browser on this machine pairs from the
+console's PAIR THIS BROWSER link, which goes to
+<http://127.0.0.1:43123/pair>; the daemon serves that one first-party page and
+nothing else. Pairing again there is also how a browser replaces a saved
+credential this daemon no longer accepts.
+
+Inspection and revocation still run through the operator client, so those
+commands need the socket and token exported:
 
 ```sh
 export DARK_FACTORY_SOCKET="$HOME/.dark-factory/runtimes/factory.sock"
 export DARK_FACTORY_OPERATOR_TOKEN_FILE="$HOME/.dark-factory/operator.token"
 factoryctl web status
-factoryctl web open
+factoryctl web list-clients
+factoryctl web revoke CLIENT_ID --revision REVISION
+factoryctl remote status
 ```
 
-Alternatively, open <http://127.0.0.1:43123/pair> in a browser on this machine
-and confirm; the daemon serves that one first-party page and nothing else.
-`web open` or the pair page also replaces a saved browser credential that this
-daemon no longer accepts. To inspect or revoke daemon-side browser clients
-explicitly, use `factoryctl web list-clients` and `factoryctl web revoke
-CLIENT_ID --revision REVISION`. The CLI cannot delete origin-scoped browser
-storage; a normal fresh `web open` makes that manual browser action
-unnecessary.
+The CLI cannot delete origin-scoped browser storage; pairing afresh from the
+pair page makes that manual browser action unnecessary.
 
 Create each agent with an explicit provider. `shell` needs no external tool;
 `claude_code` and `codex` require the corresponding `claude` or `codex` CLI to

@@ -3,14 +3,12 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -31,6 +29,14 @@ const (
 	exitFailure           = 1
 	maxHomeArgumentBytes  = 4096
 
+	// pairListenAddress is factoryd's fixed loopback listener and pairPageURL
+	// the first-party pair page it serves there. A successful install opens
+	// that page, so pairing a browser never needs a terminal. launchd returns
+	// from bootstrap before factoryd listens, hence the bounded wait.
+	pairListenAddress  = "127.0.0.1:43123"
+	pairPageURL        = "http://" + pairListenAddress + "/pair"
+	pairListenPatience = 10 * time.Second
+
 	usage = `usage:
   factoryctl attempt task
   factoryctl attempt succeed [--result TEXT]
@@ -42,10 +48,8 @@ const (
   factoryctl task add --project ID --agent ID --title TEXT [--body TEXT] [--priority N]
   factoryctl dispatch on|off
   factoryctl web status
-  factoryctl web open
   factoryctl web list-clients [--after CLIENT_ID]
   factoryctl web revoke CLIENT_ID --revision REVISION
-  factoryctl remote pair
   factoryctl remote status
   factoryctl init --home ABSOLUTE
   factoryctl doctor --home ABSOLUTE
@@ -68,10 +72,8 @@ const (
 	commandRequestHuman
 	commandAttemptTask
 	commandWebStatus
-	commandWebOpen
 	commandWebListClients
 	commandWebRevoke
-	commandRemotePair
 	commandRemoteStatus
 	commandInit
 	commandDoctor
@@ -153,13 +155,13 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		return runHome(ctx, command, stdout, stderr)
 	}
 	if command.kind == commandServiceStatus || command.kind == commandServiceInstall || command.kind == commandServiceStart || command.kind == commandServiceStop || command.kind == commandServiceUninstall {
-		return runService(ctx, command, stdout, stderr, inspect)
+		return runService(ctx, command, stdout, stderr, inspect, opener)
 	}
-	if command.kind == commandWebStatus || command.kind == commandWebOpen || command.kind == commandWebListClients || command.kind == commandWebRevoke {
-		return runWeb(ctx, command, getenv, stdout, stderr, opener)
+	if command.kind == commandWebStatus || command.kind == commandWebListClients || command.kind == commandWebRevoke {
+		return runWeb(ctx, command, getenv, stdout, stderr)
 	}
-	if command.kind == commandRemotePair || command.kind == commandRemoteStatus {
-		return runRemote(ctx, command, getenv, stdout, stderr)
+	if command.kind == commandRemoteStatus {
+		return runRemote(ctx, getenv, stdout, stderr)
 	}
 	if command.kind == commandProjectCreate || command.kind == commandAgentCreate || command.kind == commandTaskAdd || command.kind == commandDispatch {
 		return runOperator(ctx, command, getenv, stdout, stderr)
@@ -246,7 +248,7 @@ func parse(args []string) (attemptCommand, bool, bool) {
 		switch args[1] {
 		case "task", "succeed", "block", "fail", "request-human":
 			return attemptCommand{}, true, true
-		case "status", "open", "list-clients", "revoke":
+		case "status", "list-clients", "revoke":
 			if args[0] == "web" {
 				return attemptCommand{}, true, true
 			}
@@ -370,27 +372,30 @@ func serviceConfigFor(command attemptCommand) install.ServiceConfig {
 	return config
 }
 
-func runService(ctx context.Context, command attemptCommand, stdout, stderr io.Writer, inspect serviceInspector) int {
+func runService(ctx context.Context, command attemptCommand, stdout, stderr io.Writer, inspect serviceInspector, opener browserOpener) int {
 	callContext, cancel := context.WithTimeout(ctx, serviceRequestTimeout)
 	defer cancel()
 	config := serviceConfigFor(command)
 	var status install.ServiceStatus
+	var existing install.ServiceState
 	var err error
 	switch command.kind {
 	case commandServiceStatus:
-		if command.label == "" && command.plistDir == "" {
-			if inspect == nil {
-				_, _ = io.WriteString(stderr, "factoryctl: service status configuration is invalid\n")
-				return exitFailure
-			}
-			status, err = inspect(callContext, command.home)
-		} else {
-			status, err = install.InspectServiceWithConfig(callContext, command.home, config)
+		if inspect == nil && command.label == "" && command.plistDir == "" {
+			_, _ = io.WriteString(stderr, "factoryctl: service status configuration is invalid\n")
+			return exitFailure
 		}
+		status, err = inspectService(callContext, command, config, inspect)
 	case commandServiceInstall:
 		var self string
 		self, err = serviceSourceDirectory()
 		if err == nil {
+			// The service found before the install decides whether this
+			// command started anything: repeating an install returns the
+			// service it found, unchanged, and must open no browser.
+			if found, inspectErr := inspectService(callContext, command, config, inspect); inspectErr == nil {
+				existing = found.State
+			}
 			status, err = install.ServiceInstall(callContext, command.home, config, self)
 		}
 	case commandServiceStart:
@@ -441,7 +446,55 @@ func runService(ctx context.Context, command attemptCommand, stdout, stderr io.W
 		_, _ = io.WriteString(stderr, "factoryctl: the service projection is ambiguous\n")
 		return exitFailure
 	}
+	if command.kind == commandServiceInstall && pairPageOpens(existing, status.State) {
+		// The one command whose result is more than the projection. Every word
+		// of it goes in the JSON on stdout: this output is parsed, and a stray
+		// stderr line would be merged into it by any caller reading both.
+		return writeJSON(stdout, struct {
+			install.ServiceStatus
+			PairPage      string `json:"pair_page,omitempty"`
+			BrowserOpened bool   `json:"browser_opened"`
+		}{ServiceStatus: status, PairPage: pairPageURL, BrowserOpened: openPairPage(ctx, pairListenAddress, pairPageURL, opener)})
+	}
 	return writeJSON(stdout, status)
+}
+
+// inspectService is the read-only projection status and install share: the
+// injected exact inspector for the default label and plist directory, and the
+// explicit-config inspector otherwise.
+func inspectService(ctx context.Context, command attemptCommand, config install.ServiceConfig, inspect serviceInspector) (install.ServiceStatus, error) {
+	if inspect != nil && command.label == "" && command.plistDir == "" {
+		return inspect(ctx, command.home)
+	}
+	return install.InspectServiceWithConfig(ctx, command.home, config)
+}
+
+// pairPageOpens is true only for an install that actually started the service.
+func pairPageOpens(existing, resulting install.ServiceState) bool {
+	return resulting == install.ServiceRunning && existing != install.ServiceInstalled && existing != install.ServiceRunning
+}
+
+// openPairPage waits, bounded, for factoryd to accept on its loopback listener
+// and then opens the pair page exactly once, reporting whether it did. A
+// listener that never appears or an opener that fails is not an install
+// failure: the caller names the page in its own output and exits 0.
+func openPairPage(ctx context.Context, address, page string, opener browserOpener) bool {
+	return opener != nil && listenerAccepts(ctx, address) && opener(ctx, page) == nil
+}
+
+func listenerAccepts(ctx context.Context, address string) bool {
+	deadline := time.Now().Add(pairListenPatience)
+	for {
+		connection, err := net.DialTimeout("tcp", address, time.Second)
+		if err == nil {
+			_ = connection.Close()
+			return true
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // serviceSourceDirectory is the invoking factoryctl's own resolved directory:
@@ -501,10 +554,6 @@ func parseWeb(args []string) (attemptCommand, bool, bool) {
 	case "status":
 		if len(args) == 2 {
 			return attemptCommand{kind: commandWebStatus}, false, true
-		}
-	case "open":
-		if len(args) == 2 {
-			return attemptCommand{kind: commandWebOpen}, false, true
 		}
 	case "list-clients":
 		if len(args) == 2 {
@@ -784,7 +833,7 @@ func runOperator(ctx context.Context, command attemptCommand, getenv func(string
 	}
 }
 
-func runWeb(ctx context.Context, command attemptCommand, getenv func(string) string, stdout, stderr io.Writer, opener browserOpener) int {
+func runWeb(ctx context.Context, command attemptCommand, getenv func(string) string, stdout, stderr io.Writer) int {
 	socket := getenv("DARK_FACTORY_SOCKET")
 	if socket == "" {
 		_, _ = io.WriteString(stderr, "factoryctl: web client configuration is invalid\n")
@@ -820,28 +869,6 @@ func runWeb(ctx context.Context, command attemptCommand, getenv func(string) str
 			return writeWebFailure(stderr, "web status", callErr)
 		}
 		return writeJSON(stdout, result)
-	case commandWebOpen:
-		result, callErr := client.WebOpen(callContext)
-		if callErr != nil {
-			return handleWebOpenFailure(client, result, callErr, stderr)
-		}
-		if !validLaunch(result) {
-			return handleWebOpenFailure(client, result, api.ErrProtocol, stderr)
-		}
-		challengeDigest, _ := exactLaunchDigest(result)
-		if opener == nil || opener(callContext, result.LaunchURL) != nil {
-			cleanupErr := abandonWebOpen(client, challengeDigest)
-			if cleanupErr != nil {
-				_, _ = io.WriteString(stderr, "factoryctl: web browser could not be opened; challenge cleanup remains unresolved\n")
-			} else {
-				_, _ = io.WriteString(stderr, "factoryctl: web browser could not be opened\n")
-			}
-			return exitFailure
-		}
-		return writeJSON(stdout, struct {
-			State       string `json:"state"`
-			ExpiresAtMs uint64 `json:"expires_at_ms"`
-		}{State: "opened", ExpiresAtMs: result.ExpiresAtMs})
 	case commandWebListClients:
 		result, callErr := client.WebListClients(callContext, command.after)
 		if callErr != nil {
@@ -857,33 +884,6 @@ func runWeb(ctx context.Context, command attemptCommand, getenv func(string) str
 	default:
 		return exitUsage
 	}
-}
-
-func handleWebOpenFailure(client *api.OperatorClient, launch api.WebLaunch, openErr error, stderr io.Writer) int {
-	if challengeDigest, exact := exactLaunchDigest(launch); exact {
-		if cleanupErr := abandonWebOpen(client, challengeDigest); cleanupErr == nil {
-			return writeWebFailure(stderr, "web open", openErr)
-		}
-		_, _ = io.WriteString(stderr, "factoryctl: web open failed; challenge cleanup remains unresolved\n")
-		return exitFailure
-	}
-
-	// A completely empty result paired with a daemon rejection is authoritative
-	// and occurs before a launch is minted. Any partial or malformed launch
-	// must remain an uncertainty: no cleanup target is safe to choose.
-	var remote *api.RemoteError
-	if launch == (api.WebLaunch{}) && errors.As(openErr, &remote) {
-		return writeWebFailure(stderr, "web open", openErr)
-	}
-	_, _ = io.WriteString(stderr, "factoryctl: web open failed; challenge cleanup remains unresolved\n")
-	return exitFailure
-}
-
-func abandonWebOpen(client *api.OperatorClient, challengeDigest string) error {
-	cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), attemptRequestTimeout)
-	defer cleanupCancel()
-	_, err := client.WebAbandonOpen(cleanupContext, challengeDigest)
-	return err
 }
 
 // socketDaemonPresent distinguishes a missing or stale pathname from a
@@ -908,52 +908,6 @@ func writeJSON(stdout io.Writer, value any) int {
 		return exitFailure
 	}
 	return 0
-}
-
-func validLaunch(launch api.WebLaunch) bool {
-	_, exact := exactLaunchDigest(launch)
-	return exact && launch.ExpiresAtMs > 0 && launch.Outcome == api.WebLaunchReady
-}
-
-// exactLaunchDigest proves the only cleanup identity accepted by factoryctl:
-// the launch URL is the fixed syntactic form, its fragment carries raw
-// challenge A, and the daemon's returned digest is SHA-256(A). No digest is
-// returned for an invalid or internally inconsistent launch.
-func exactLaunchDigest(launch api.WebLaunch) (string, bool) {
-	if len(launch.LaunchURL) < 1 || len(launch.LaunchURL) > 4096 || !utf8.ValidString(launch.LaunchURL) || strings.ContainsRune(launch.LaunchURL, 0) || !strings.HasPrefix(launch.LaunchURL, "https://") || !validHex(launch.ChallengeDigest, 64) {
-		return "", false
-	}
-	parsed, err := url.Parse(launch.LaunchURL)
-	if err != nil || parsed.Host != "app.darkfactory.build" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment == "" || parsed.RawFragment != "" || parsed.Path != "/" || !strings.HasPrefix(parsed.Fragment, "df_pair=") {
-		return "", false
-	}
-	raw := strings.TrimPrefix(parsed.Fragment, "df_pair=")
-	if !validHex(raw, 64) {
-		return "", false
-	}
-	challenge, err := hex.DecodeString(raw)
-	if err != nil || len(challenge) != 32 {
-		return "", false
-	}
-	digest := sha256.Sum256(challenge)
-	encoded := hex.EncodeToString(digest[:])
-	if encoded != launch.ChallengeDigest {
-		return "", false
-	}
-	return encoded, true
-}
-
-func validHex(value string, length int) bool {
-	if len(value) != length {
-		return false
-	}
-	for _, character := range value {
-		if character >= '0' && character <= '9' || character >= 'a' && character <= 'f' {
-			continue
-		}
-		return false
-	}
-	return value != strings.Repeat("0", length)
 }
 
 func writeWebFailure(stderr io.Writer, subject string, err error) int {

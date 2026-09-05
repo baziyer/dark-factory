@@ -34,16 +34,18 @@ same-machine trust boundary, not a per-user one: a separate OS user isolates
 files, credentials and the operator socket, but not pairing. This was accepted
 on 5 September 2026 in exchange for pairing without a terminal. The control is
 revocation, through `factoryctl web list-clients` and `web revoke` or the
-console; challenges are capped at 32 per boot and expire after five minutes,
-so a hostile local process can delay pairing but cannot hold a grant it did not
-pair. A remote invitation is minted only by a client holding the full loopback
-grant, whose terminal_input bit a remote grant never carries, so a paired phone
-can never invite another phone. Such a console does consume the same cap, so
-the daemon bounds it to four invitations per five minutes: even a console
-looping the request holds at most four of the 32 slots, and the local `/pair`
-page can always still mint one. Revoking any client invalidates every live
-pairing challenge, so a link minted before the revocation cannot pair after
-it.
+console; a boot holds at most 32 live challenges, each expiring after five
+minutes, so a hostile local process can delay pairing but cannot hold a grant
+it did not pair. A bare 503 from the page means the mint failed — the
+live-challenge cap, the transport, or the store — and `factoryctl web status`
+reports the transport state and the live challenge count. A remote
+invitation is minted only by a client holding the full loopback grant, whose
+terminal_input bit a remote grant never carries, so a paired phone can never
+invite another phone. Such a console does consume the same cap, so the daemon
+bounds it to four invitations per five minutes: even a console looping the
+request holds at most four of the 32 slots, and the local `/pair` page can
+always still mint one. Revoking any client invalidates every live pairing
+challenge, so a link minted before the revocation cannot pair after it.
 
 ### Hosted-origin compromise response
 

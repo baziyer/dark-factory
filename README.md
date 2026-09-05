@@ -4,7 +4,7 @@ Dark Factory is a macOS-local runtime for supervised coding-agent work on
 your own machine. `factoryd` owns the durable queue, attempts, provider
 processes, and cleanup. `factoryctl` is the operator CLI. A hosted web console
 pairs with the daemon through the daemon's own pair page at
-<http://127.0.0.1:43123/pair> (or `factoryctl web open`) and connects to the
+<http://127.0.0.1:43123/pair>, which installation opens, and connects to the
 paired daemon's authenticated loopback API.
 
 The runtime is not a hosted coding service, a coding model, or a general agent

@@ -108,32 +108,6 @@ func (client *OperatorClient) WebStatus(ctx context.Context) (WebStatus, error) 
 	return result, nil
 }
 
-func (client *OperatorClient) WebOpen(ctx context.Context) (WebLaunch, error) {
-	var result WebLaunch
-	if err := client.client.call(ctx, "web_open", struct{}{}, &result); err != nil {
-		// Keep any bounded launch fields decoded before a strict protocol
-		// failure. factoryctl may be able to derive the exact one-shot
-		// challenge digest and abandon it; dropping them would strand it.
-		return result, err
-	}
-	if !validWebLaunch(result) {
-		return result, ErrProtocol
-	}
-	return result, nil
-}
-
-func (client *OperatorClient) WebAbandonOpen(ctx context.Context, challengeDigest string) (WebAbandonOpenResult, error) {
-	if !validDigest(challengeDigest) {
-		return WebAbandonOpenResult{}, ErrInvalidInput
-	}
-	params := WebAbandonOpenInput{ChallengeDigest: challengeDigest}
-	var result WebAbandonOpenResult
-	if err := client.client.call(ctx, "web_abandon_open", params, &result); err != nil {
-		return WebAbandonOpenResult{}, err
-	}
-	return result, nil
-}
-
 func (client *OperatorClient) WebListClients(ctx context.Context, after string) (WebClientPage, error) {
 	if after != "" && !validID(after) {
 		return WebClientPage{}, ErrInvalidInput
@@ -165,20 +139,6 @@ func (client *OperatorClient) WebRevokeClient(ctx context.Context, id string, ex
 	}
 	if !validWebRevokeResult(result) {
 		return WebRevokeResult{}, ErrProtocol
-	}
-	return result, nil
-}
-
-// RemotePair mints one remote pairing invitation. The returned link carries a
-// pairing challenge and a relay ticket, so the caller must treat it exactly
-// like the web launch URL: prove it, hand it to the operator, never log it.
-func (client *OperatorClient) RemotePair(ctx context.Context) (RemoteInvitation, error) {
-	var result RemoteInvitation
-	if err := client.client.call(ctx, "remote_pair", struct{}{}, &result); err != nil {
-		return RemoteInvitation{}, err
-	}
-	if !validRemoteInvitation(result) {
-		return RemoteInvitation{}, ErrProtocol
 	}
 	return result, nil
 }
@@ -744,19 +704,6 @@ func validWebStatus(status WebStatus) bool {
 		}
 	}
 	return true
-}
-
-func validWebLaunch(launch WebLaunch) bool {
-	if launch.Outcome != WebLaunchReady && launch.Outcome != WebLaunchUncertain {
-		return false
-	}
-	return validText(launch.LaunchURL, 1, 4096) && strings.HasPrefix(launch.LaunchURL, "https://") && launch.ExpiresAtMs > 0 && validDigest(launch.ChallengeDigest)
-}
-
-func validRemoteInvitation(invitation RemoteInvitation) bool {
-	return validText(invitation.Link, 1, 8192) && strings.HasPrefix(invitation.Link, "https://") &&
-		!strings.ContainsAny(invitation.Link, " \t\r\n") && validNodeID(invitation.NodeID) &&
-		invitation.Expires > 0 && validDigest(invitation.ChallengeDigest)
 }
 
 func validRemoteStatus(status RemoteStatus) bool {

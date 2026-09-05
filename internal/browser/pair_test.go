@@ -15,6 +15,7 @@ const pairLink = testOrigin + "/#df_pair=" + "404142434445464748494a4b4c4d4e4f50
 type pairLinkBackend struct {
 	*fakeBackend
 	mu    sync.Mutex
+	link  string
 	err   error
 	calls int
 }
@@ -23,6 +24,9 @@ func (backend *pairLinkBackend) PairLink(context.Context) (string, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.calls++
+	if backend.link != "" {
+		return backend.link, backend.err
+	}
 	return pairLink, backend.err
 }
 
@@ -153,8 +157,6 @@ func TestPairPageAdmitsOnlyUserNavigationsAndItsOwnForm(t *testing.T) {
 }
 
 func TestPairPageIsAbsentWithoutABackendAndFailsClosedOnMintErrors(t *testing.T) {
-	backend := &pairLinkBackend{fakeBackend: newFakeBackend(), err: errors.New("mint failed")}
-	server := startTaskServer(t, backend)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	post := func(t *testing.T, address string) *http.Response {
 		t.Helper()
@@ -172,8 +174,21 @@ func TestPairPageIsAbsentWithoutABackendAndFailsClosedOnMintErrors(t *testing.T)
 		_ = response.Body.Close()
 		return response
 	}
-	if response := post(t, server.Addr()); response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Location") != "" {
-		t.Fatalf("mint failure status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
+	// A mint that fails, and one that answers with anything but a challenge
+	// for an allowed origin, both fail the request rather than redirecting.
+	for _, test := range []struct {
+		name    string
+		backend *pairLinkBackend
+	}{
+		{name: "mint error", backend: &pairLinkBackend{fakeBackend: newFakeBackend(), err: errors.New("mint failed")}},
+		{name: "link outside the allowed origins", backend: &pairLinkBackend{fakeBackend: newFakeBackend(), link: "https://evil.example/#df_pair=" + strings.Repeat("a", 64)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := startTaskServer(t, test.backend)
+			if response := post(t, server.Addr()); response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Location") != "" {
+				t.Fatalf("status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
+			}
+		})
 	}
 	plain := startServer(t, newFakeBackend())
 	if response := post(t, plain.Addr()); response.StatusCode != http.StatusNotFound {

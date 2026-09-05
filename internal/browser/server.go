@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -384,7 +385,7 @@ func (server *Server) handlePair(writer http.ResponseWriter, request *http.Reque
 		_, _ = io.WriteString(writer, pairPage)
 	case request.Method == http.MethodPost && header.Get("Sec-Fetch-Site") == "same-origin":
 		link, err := server.pairBackend.PairLink(request.Context())
-		if err != nil {
+		if err != nil || !server.validPairLink(link) {
 			http.Error(writer, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 			return
 		}
@@ -392,6 +393,22 @@ func (server *Server) handlePair(writer http.ResponseWriter, request *http.Reque
 	default:
 		http.NotFound(writer, request)
 	}
+}
+
+// validPairLink proves the redirect target before it is sent: one allowed
+// origin, the root path, and a fragment carrying exactly one challenge in
+// lowercase hex. A mint that returns anything else fails the request rather
+// than sending the browser somewhere this server did not choose.
+func (server *Server) validPairLink(link string) bool {
+	origin, challenge, found := strings.Cut(link, "/#df_pair=")
+	if !found || len(challenge) != 2*browserprotocol.ChallengeSize || challenge != strings.ToLower(challenge) {
+		return false
+	}
+	if _, err := hex.DecodeString(challenge); err != nil {
+		return false
+	}
+	_, allowed := server.origins[origin]
+	return allowed
 }
 
 func (server *Server) refererAllowed(referer string) bool {
@@ -621,6 +638,8 @@ func errorFrame(err error) browserprotocol.Error {
 		return browserprotocol.Error{Code: browserprotocol.ErrorNotFound}
 	case errors.Is(err, ErrStale):
 		return browserprotocol.Error{Code: browserprotocol.ErrorStale}
+	case errors.Is(err, ErrInvalidRequest):
+		return browserprotocol.Error{Code: browserprotocol.ErrorInvalidRequest}
 	case errors.Is(err, ErrTooLarge):
 		return browserprotocol.Error{Code: browserprotocol.ErrorTooLarge}
 	case errors.Is(err, ErrRateLimited):

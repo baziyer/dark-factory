@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/dark-factory-build/dark-factory/internal/api"
 	"github.com/dark-factory-build/dark-factory/internal/browser"
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
@@ -653,15 +652,15 @@ func TestBrowserCloseLinearizesOpenAndClearsChallenges(t *testing.T) {
 		t.Fatal(err)
 	}
 	openDone := make(chan struct {
-		launch api.WebLaunch
-		err    error
+		link string
+		err  error
 	}, 1)
 	go func() {
-		launch, openErr := daemon.OpenBrowser(context.Background())
+		link, openErr := daemon.OpenBrowser(context.Background())
 		openDone <- struct {
-			launch api.WebLaunch
-			err    error
-		}{launch: launch, err: openErr}
+			link string
+			err  error
+		}{link: link, err: openErr}
 	}()
 	select {
 	case <-enteredClock:
@@ -691,8 +690,8 @@ func TestBrowserCloseLinearizesOpenAndClearsChallenges(t *testing.T) {
 	}
 	close(releaseClock)
 	opened := <-openDone
-	if opened.err != nil || opened.launch.Outcome != api.WebLaunchReady {
-		t.Fatalf("gated open = %+v, want ready launch", opened)
+	if opened.err != nil || !strings.HasPrefix(opened.link, adapterOrigin+"/#df_pair=") {
+		t.Fatalf("gated open = %+v, want a launch link", opened)
 	}
 	if err := <-closeDone; err != nil {
 		t.Fatalf("daemon close = %v", err)

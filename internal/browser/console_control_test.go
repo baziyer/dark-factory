@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 )
@@ -131,7 +132,7 @@ func TestConsoleControlFailsClosedWithoutBackendAndOnBackendRefusal(t *testing.T
 		for _, outcome := range []struct {
 			err  error
 			code browserprotocol.ErrorCode
-		}{{ErrUnauthorized, browserprotocol.ErrorUnauthorized}, {ErrStale, browserprotocol.ErrorStale}, {ErrRateLimited, browserprotocol.ErrorRateLimited}} {
+		}{{ErrUnauthorized, browserprotocol.ErrorUnauthorized}, {ErrStale, browserprotocol.ErrorStale}, {ErrRateLimited, browserprotocol.ErrorRateLimited}, {ErrInvalidRequest, browserprotocol.ErrorInvalidRequest}} {
 			for _, expected := range consoleRequests {
 				backend := newConsoleDispatchBackend()
 				backend.err = outcome.err
@@ -176,4 +177,41 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 	}
 	t.Fatalf("no console frame for %s", kind)
 	return ""
+}
+
+// invalid_request reaches a client by two routes that differ in what happens
+// next. A member the backend refuses is one bad answer on a connection that
+// keeps working; a frame the transport itself refuses ends the connection.
+// Observing only one of them would let the backend route become the harsh one
+// without anything noticing.
+func TestConsoleInvalidRequestKeepsTheConnectionTheTransportWouldClose(t *testing.T) {
+	backend := newConsoleDispatchBackend()
+	backend.err = ErrInvalidRequest
+	server := startTaskServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeAgentUpdate)))
+	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
+	// The same connection still answers, so the refusal was about the member.
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeTaskUpdate)))
+	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
+
+	// The transport's own invalid_request, from a repeated request id, ends it.
+	closing, _ := dialServer(t, startTaskServer(t, newConsoleDispatchBackend()), testOrigin)
+	authenticate(t, closing)
+	frame := []byte(consoleFrame(t, browserprotocol.TypeAgentUpdate))
+	writeClientFrame(t, closing, frame)
+	if reply := readServerFrame(t, closing); reply.Type != browserprotocol.TypeAgentUpdateResult {
+		t.Fatalf("first request = %+v", reply)
+	}
+	writeClientFrame(t, closing, frame)
+	assertError(t, readServerFrame(t, closing), browserprotocol.ErrorInvalidRequest)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// The transport closes abruptly, so a client sees EOF and no close status.
+	// What has to be observed is that the read ended for some reason other than
+	// this deadline: a connection merely left idle would expire here instead.
+	if _, _, err := closing.Read(ctx); err == nil || ctx.Err() != nil {
+		t.Fatalf("a repeated request id left the connection open: err=%v ctx=%v", err, ctx.Err())
+	}
 }

@@ -996,69 +996,6 @@ func testListener(t testing.TB, directory string) (*net.UnixListener, string) {
 	return listener, socket
 }
 
-func TestWebOpenPreservesDecodedLaunchOnProtocolError(t *testing.T) {
-	bearer := testCredential('L')
-	challenge := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	digest := "4884fdaafea47c29fea7159d0daddd9c085d6200e1359e85bb81736af6b7c837"
-	fixture := newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {
-		// A complete but invalid launch: the URL is not https, so the client
-		// refuses it after decoding every bounded field.
-		body := `{"launch_url":"http://app.darkfactory.build/#df_pair=` + challenge + `","expires_at_ms":1234,"challenge_digest":"` + digest + `","outcome":"ready"}`
-		return writeTestResponse(connection, wireOperatorDomain, successResponse(body))
-	})
-	client, err := NewOperatorClient(fixture.socket, fixture.token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := client.WebOpen(context.Background())
-	if !errors.Is(err, ErrProtocol) {
-		t.Fatalf("web open error = %v", err)
-	}
-	if result.LaunchURL == "" || result.ExpiresAtMs != 1234 || result.ChallengeDigest != digest || result.Outcome != WebLaunchReady {
-		t.Fatalf("web open discarded decoded launch = %+v", result)
-	}
-	<-fixture.request
-	fixture.wait(t)
-}
-
-func TestWebAbandonOpenUsesUnambiguousEmptyAcknowledgement(t *testing.T) {
-	bearer := testCredential('A')
-	digest := "4884fdaafea47c29fea7159d0daddd9c085d6200e1359e85bb81736af6b7c837"
-	fixture := newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {
-		return writeTestResponse(connection, wireOperatorDomain, successResponse(`{}`))
-	})
-	client, err := NewOperatorClient(fixture.socket, fixture.token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.WebAbandonOpen(context.Background(), digest); err != nil {
-		t.Fatal(err)
-	}
-	if got := requestJSON(t, <-fixture.request, wireOperatorDomain, bearer); got != `{"method":"web_abandon_open","params":{"challenge_digest":"`+digest+`"}}` {
-		t.Fatalf("abandon request = %s", got)
-	}
-	fixture.wait(t)
-
-	// The deleted `abandoned` result member cannot come back as authority: it
-	// reaches no field, so the acknowledgement stays the empty one above.
-	fixture = newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {
-		return writeTestResponse(connection, wireOperatorDomain, successResponse(`{"abandoned":false}`))
-	})
-	client, err = NewOperatorClient(fixture.socket, fixture.token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := client.WebAbandonOpen(context.Background(), digest)
-	if err != nil {
-		t.Fatalf("legacy abandonment result = %v", err)
-	}
-	if result != (WebAbandonOpenResult{}) {
-		t.Fatalf("legacy abandonment member reached the result: %+v", result)
-	}
-	<-fixture.request
-	fixture.wait(t)
-}
-
 func TestSocketParentSwapAfterDialIsRejected(t *testing.T) {
 	bearer := testCredential('W')
 	tokenDirectory := privateTestDirectory(t)

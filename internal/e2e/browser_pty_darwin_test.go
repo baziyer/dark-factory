@@ -319,15 +319,15 @@ func (fixture *fixture) startRun() <-chan runResult {
 
 func (fixture *fixture) runNode(node, script string, test scenario) nodeResult {
 	fixture.t.Helper()
-	launch, err := fixture.daemon.OpenBrowser(context.Background())
+	link, err := fixture.daemon.OpenBrowser(context.Background())
 	if err != nil {
 		fixture.t.Fatalf("OpenBrowser: %v", err)
 	}
 	const fragmentPrefix = e2eOrigin + "/#df_pair="
-	if !strings.HasPrefix(launch.LaunchURL, fragmentPrefix) {
+	if !strings.HasPrefix(link, fragmentPrefix) {
 		fixture.t.Fatalf("unexpected pairing launch shape")
 	}
-	challenge := strings.TrimPrefix(launch.LaunchURL, fragmentPrefix)
+	challenge := strings.TrimPrefix(link, fragmentPrefix)
 	if decoded, decodeErr := hex.DecodeString(challenge); decodeErr != nil || len(decoded) != 32 {
 		fixture.t.Fatalf("invalid one-time challenge shape")
 	}

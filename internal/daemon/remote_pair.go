@@ -32,40 +32,48 @@ const (
 	qrQuietModules = 4
 )
 
+// RemoteInvitation is one minted remote pairing invitation. Link carries the
+// pairing challenge and the relay ticket in its fragment, so it is a secret:
+// the daemon returns it only to the caller that minted it and never logs it.
+type RemoteInvitation struct {
+	Link    string
+	Expires int64
+}
+
 // RemotePair mints one remote pairing invitation: a browser pairing challenge
 // bound to the production origin, plus a single-use relay ticket signed by the
 // node key. The challenge and the ticket are secrets that exist only in this
 // reply; the daemon never logs them and keeps no copy it could reveal later.
-func (daemon *Daemon) RemotePair(ctx context.Context) (api.RemoteInvitation, error) {
+func (daemon *Daemon) RemotePair(ctx context.Context) (RemoteInvitation, error) {
 	// The same gate OpenBrowser uses. A challenge must not be minted against a
 	// transport that browser shutdown has already begun to invalidate.
 	daemon.browserLifecycleMu.Lock()
 	defer daemon.browserLifecycleMu.Unlock()
 	runtime, valid := daemon.webRuntime()
 	if !valid || !browserRuntimeReady(runtime) {
-		return api.RemoteInvitation{}, fmt.Errorf("%w: browser transport unavailable", kernel.ErrBusy)
+		return RemoteInvitation{}, fmt.Errorf("%w: browser transport unavailable", kernel.ErrBusy)
 	}
 	relay, err := daemon.relayRuntime()
 	if err != nil {
-		return api.RemoteInvitation{}, err
+		return RemoteInvitation{}, err
 	}
 	if !runtimeAllowsProductionOrigin(runtime) {
-		return api.RemoteInvitation{}, fmt.Errorf("%w: production browser origin is not configured", kernel.ErrInvalidValue)
+		return RemoteInvitation{}, fmt.Errorf("%w: production browser origin is not configured", kernel.ErrInvalidValue)
 	}
 	state, err := daemon.store.Factory(ctx)
 	if err != nil {
-		return api.RemoteInvitation{}, err
+		return RemoteInvitation{}, err
 	}
 	at, err := daemon.timestamp()
 	if err != nil {
-		return api.RemoteInvitation{}, err
+		return RemoteInvitation{}, err
 	}
 	if at.Int64() > math.MaxInt64-int64(webChallengeTTL/time.Millisecond) {
-		return api.RemoteInvitation{}, fmt.Errorf("%w: browser challenge clock exhausted", kernel.ErrInvalidValue)
+		return RemoteInvitation{}, fmt.Errorf("%w: browser challenge clock exhausted", kernel.ErrInvalidValue)
 	}
 	expires, err := kernel.NewUnixMillis(at.Int64() + int64(webChallengeTTL/time.Millisecond))
 	if err != nil {
-		return api.RemoteInvitation{}, err
+		return RemoteInvitation{}, err
 	}
 	var challenge [browserprotocol.ChallengeSize]byte
 	var controller [relayhost.ControllerIDSize]byte
@@ -74,18 +82,18 @@ func (daemon *Daemon) RemotePair(ctx context.Context) (api.RemoteInvitation, err
 	_, controllerErr := io.ReadFull(runtime.backend.random, controller[:])
 	runtime.backend.randomMu.Unlock()
 	if challengeErr != nil || controllerErr != nil || allZero(challenge[:]) || allZero(controller[:]) {
-		return api.RemoteInvitation{}, fmt.Errorf("%w: remote pairing secret generation failed", kernel.ErrBusy)
+		return RemoteInvitation{}, fmt.Errorf("%w: remote pairing secret generation failed", kernel.ErrBusy)
 	}
 	expiry := time.UnixMilli(expires.Int64())
 	ticket := relayhost.PairTicket(relay.identity, controller, expiry)
 	if ticket == "" {
-		return api.RemoteInvitation{}, fmt.Errorf("%w: relay pairing ticket could not be minted", kernel.ErrBusy)
+		return RemoteInvitation{}, fmt.Errorf("%w: relay pairing ticket could not be minted", kernel.ErrBusy)
 	}
 	digest := kernel.HashBrowserChallenge(challenge[:])
 	// A commit-uncertain mint is a plain failure here. There is no exact
 	// cleanup identity to hand back, and an unopened challenge simply expires.
 	if _, err := daemon.store.CreateBrowserPairingChallenge(ctx, digest, runtime.backend.boot, webProductionOrigin, remoteCapabilities, at, expires); err != nil {
-		return api.RemoteInvitation{}, err
+		return RemoteInvitation{}, err
 	}
 	// Every value is already URL-safe, so the fragment is built literally
 	// rather than through Values.Encode, which would escape the relay origin's
@@ -106,12 +114,7 @@ func (daemon *Daemon) RemotePair(ctx context.Context) (api.RemoteInvitation, err
 	if relay.browserAddress != DefaultBrowserAddress {
 		link += "&host=" + relay.browserAddress
 	}
-	return api.RemoteInvitation{
-		Link:            link,
-		NodeID:          relay.identity.NodeID(),
-		Expires:         expiry.Unix(),
-		ChallengeDigest: hex.EncodeToString(digest.Bytes()),
-	}, nil
+	return RemoteInvitation{Link: link, Expires: expiry.Unix()}, nil
 }
 
 // qrSVG draws one QR code as an SVG: a light square with one path segment per
