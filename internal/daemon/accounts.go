@@ -7,12 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/install"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
+	"github.com/dark-factory-build/dark-factory/internal/provider"
 )
 
 // An account is a provider plus the configuration directory that CLI logs in
@@ -23,10 +23,28 @@ import (
 // label, not authority.
 const maxDiscoveredAccounts = browserprotocol.MaxJSONArray
 
+// accountProviders is the closed set of providers that have logins at all.
+// Their configuration directory names come from internal/provider, which is
+// what a run is actually launched against, so discovery cannot drift from it.
+var accountProviders = []kernel.Provider{kernel.ProviderClaudeCode, kernel.ProviderCodex}
+
+// providerForConfigDir matches one home entry against the provider whose
+// configuration directory it is named after. A second login for the same
+// provider is a suffixed sibling of that name (.codex-dogfood), so the match
+// is by prefix.
+func providerForConfigDir(name string) (kernel.Provider, bool) {
+	for _, kind := range accountProviders {
+		if strings.HasPrefix(name, provider.ConfigDirName(kind)) {
+			return kind, true
+		}
+	}
+	return 0, false
+}
+
 // discoverAccounts lists the provider logins present directly under home. It
 // never recurses: a login is one directory named .claude* or .codex* holding
 // that CLI's own credential file.
-func discoverAccounts(home string) []browserprotocol.DiscoveredAccount {
+func (daemon *Daemon) discoverAccounts(home string) []browserprotocol.DiscoveredAccount {
 	entries, err := os.ReadDir(home)
 	if err != nil {
 		return nil
@@ -34,20 +52,15 @@ func discoverAccounts(home string) []browserprotocol.DiscoveredAccount {
 	result := make([]browserprotocol.DiscoveredAccount, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		var provider kernel.Provider
-		switch {
-		case strings.HasPrefix(name, ".claude"):
-			provider = kernel.ProviderClaudeCode
-		case strings.HasPrefix(name, ".codex"):
-			provider = kernel.ProviderCodex
-		default:
+		kind, ok := providerForConfigDir(name)
+		if !ok {
 			continue
 		}
 		directory := filepath.Join(home, name)
 		if info, err := os.Stat(directory); err != nil || !info.IsDir() {
 			continue
 		}
-		account, ok := describeAccount(provider, home, directory, name)
+		account, ok := daemon.describeAccount(kind, home, directory, name)
 		if !ok {
 			continue
 		}
@@ -60,9 +73,9 @@ func discoverAccounts(home string) []browserprotocol.DiscoveredAccount {
 	return result
 }
 
-func describeAccount(provider kernel.Provider, home, directory, name string) (browserprotocol.DiscoveredAccount, bool) {
-	account := browserprotocol.DiscoveredAccount{Provider: provider.String(), Home: directory, Label: name}
-	switch provider {
+func (daemon *Daemon) describeAccount(kind kernel.Provider, home, directory, name string) (browserprotocol.DiscoveredAccount, bool) {
+	account := browserprotocol.DiscoveredAccount{Provider: kind.String(), Home: directory, Label: name}
+	switch kind {
 	case kernel.ProviderClaudeCode:
 		// The default ~/.claude keeps its identity beside itself in
 		// ~/.claude.json; a second config directory carries its own copy.
@@ -87,17 +100,18 @@ func describeAccount(provider kernel.Provider, home, directory, name string) (br
 		if !login {
 			return browserprotocol.DiscoveredAccount{}, false
 		}
-		account.DefaultModel = claudeDefaultModel(filepath.Join(directory, "settings.json"))
 	case kernel.ProviderCodex:
 		email, ok := codexIdentity(filepath.Join(directory, "auth.json"))
 		if !ok {
 			return browserprotocol.DiscoveredAccount{}, false
 		}
 		account.Email = email
-		account.DefaultModel, account.DefaultReasoningEffort = codexDefaults(filepath.Join(directory, "config.toml"))
 	default:
 		return browserprotocol.DiscoveredAccount{}, false
 	}
+	// The same reader the console's effective model uses, so a login's listed
+	// default is exactly what an agent assigned to it would be shown.
+	account.DefaultModel, account.DefaultReasoningEffort, _ = daemon.providerDefaults(kind.String(), directory)
 	if browserprotocol.ValidDiscoveredAccount(account) != nil {
 		return browserprotocol.DiscoveredAccount{}, false
 	}
@@ -144,10 +158,6 @@ func claudeIdentity(path string) (email, organization string) {
 	return jsonString(account, "emailAddress"), jsonString(account, "organizationName")
 }
 
-func claudeDefaultModel(path string) string {
-	return jsonString(readJSONFile(path), "model")
-}
-
 // codexIdentity reads the e-mail out of the stored OIDC identity token's
 // payload. The signature is not checked and no token value is returned: this
 // is a label for a login the operator already owns.
@@ -177,38 +187,6 @@ func codexIdentity(path string) (string, bool) {
 		return "", true
 	}
 	return jsonString(claims, "email"), true
-}
-
-// codexDefaults reads the two top-level keys the launch controls mirror.
-// ponytail: line scan rather than a TOML parser, because only bare top-level
-// `key = "value"` before the first table is in play; add a parser if a nested
-// or multi-line default is ever needed.
-func codexDefaults(path string) (model, effort string) {
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) > 1<<22 {
-		return "", ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[") {
-			break
-		}
-		key, value, found := strings.Cut(line, "=")
-		if !found {
-			continue
-		}
-		unquoted, err := strconv.Unquote(strings.TrimSpace(value))
-		if err != nil {
-			continue
-		}
-		switch strings.TrimSpace(key) {
-		case "model":
-			model = unquoted
-		case "model_reasoning_effort":
-			effort = unquoted
-		}
-	}
-	return model, effort
 }
 
 // agentAccountConfigDir is the configuration directory one agent's selected

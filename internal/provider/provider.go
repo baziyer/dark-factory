@@ -22,6 +22,7 @@ const (
 	maxPathBytes         = 4096
 	maxClaudePrompt      = 8 << 10
 	maxCodexTask         = 8 << 10
+	claudeConfigDir      = ".claude"
 	codexConfigDir       = ".codex"
 	claudeTaskLead       = "Complete this Dark Factory task. Before exiting, report the durable outcome with $DARK_FACTORY_FACTORYCTL attempt succeed, block, or fail. Task: "
 	codexBootstrapPrompt = "Run \"$DARK_FACTORY_FACTORYCTL\" attempt task before doing anything else. The returned JSON task field is the exact task: complete only that task. Before exiting, report the durable outcome with \"$DARK_FACTORY_FACTORYCTL\" attempt succeed, block, or fail."
@@ -81,6 +82,21 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 		return Installation{provider: kind, executable: executable}, nil
 	}
 	return Installation{}, unavailable(kind)
+}
+
+// ConfigDirName is the directory a provider CLI keeps its login and
+// configuration in, under an account home. Shell keeps none, so it answers
+// empty. This is the one definition of those names: the launch environment
+// below and the daemon's account discovery and default reader all derive
+// their paths from it, so a launch and a reading of it cannot disagree.
+func ConfigDirName(kind kernel.Provider) string {
+	switch kind {
+	case kernel.ProviderClaudeCode:
+		return claudeConfigDir
+	case kernel.ProviderCodex:
+		return codexConfigDir
+	}
+	return ""
 }
 
 func (Installation) String() string   { return "provider installation (private)" }
@@ -329,7 +345,7 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 	// as it was.
 	switch kind {
 	case kernel.ProviderCodex:
-		codexHome := filepath.Join(runtime.accountHome, codexConfigDir)
+		codexHome := filepath.Join(runtime.accountHome, ConfigDirName(kind))
 		if runtime.accountConfig != "" {
 			codexHome = runtime.accountConfig
 		}

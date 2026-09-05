@@ -6,7 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// discoveryDaemon is the smallest daemon discovery needs: a clock, because it
+// reads provider defaults through the same cached reader the console uses.
+func discoveryDaemon() *Daemon { return &Daemon{now: time.Now} }
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
@@ -41,7 +46,7 @@ func TestDiscoverAccountsReadsLoginsAndNeverTokens(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(home, ".claudette"), "not a directory")
 
-	found := discoverAccounts(home)
+	found := discoveryDaemon().discoverAccounts(home)
 	if len(found) != 3 {
 		t.Fatalf("discovered %d logins: %+v", len(found), found)
 	}
@@ -81,18 +86,18 @@ func TestDiscoverAccountsRequiresTheLoginFile(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".claude-work"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if found := discoverAccounts(home); len(found) != 0 {
+	if found := discoveryDaemon().discoverAccounts(home); len(found) != 0 {
 		t.Fatalf("logins without credentials discovered: %+v", found)
 	}
 	// The default directory borrows the home-level identity file.
 	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"operator@example.com"}}`)
-	found := discoverAccounts(home)
+	found := discoveryDaemon().discoverAccounts(home)
 	if len(found) != 1 || found[0].Home != filepath.Join(home, ".claude") {
 		t.Fatalf("default claude login = %+v", found)
 	}
 	// A second directory needs its own.
 	writeFile(t, filepath.Join(home, ".claude-work", ".claude.json"), `{"oauthAccount":{"emailAddress":"work@example.com"}}`)
-	found = discoverAccounts(home)
+	found = discoveryDaemon().discoverAccounts(home)
 	if len(found) != 2 || found[1].Email != "work@example.com" {
 		t.Fatalf("second claude login = %+v", found)
 	}

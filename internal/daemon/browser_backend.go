@@ -171,7 +171,7 @@ func (backend *browserBackend) StateSnapshot(ctx context.Context, rawClient [bro
 	if err != nil {
 		return browserprotocol.StateSnapshot{}, mapBrowserError(err)
 	}
-	return projectPublicSnapshot(snapshot)
+	return projectPublicSnapshot(snapshot, backend.owner.providerAccountDefaults)
 }
 
 func (backend *browserBackend) HumanRequestDetail(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.HumanRequestDetailGet) (browserprotocol.HumanRequestDetail, error) {
@@ -564,7 +564,7 @@ func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [
 	if err != nil {
 		return browserprotocol.Accounts{}, mapBrowserError(err)
 	}
-	found := discoverAccounts(home)
+	found := backend.owner.discoverAccounts(home)
 	for index, candidate := range found {
 		for _, account := range linked {
 			if account.Provider.String() == candidate.Provider && account.Home == candidate.Home {
@@ -595,7 +595,7 @@ func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [brows
 		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
 	}
 	present := false
-	for _, candidate := range discoverAccounts(home) {
+	for _, candidate := range backend.owner.discoverAccounts(home) {
 		if candidate.Provider == request.Provider && candidate.Home == request.Home {
 			present = true
 			break
@@ -727,7 +727,7 @@ func projectBrowserAuthentication(client kernel.BrowserClient) (browser.Authenti
 
 // projectPublicSnapshot is the one positive-allowlist conversion from the
 // kernel public snapshot to the wire. Nothing private is reachable from here.
-func projectPublicSnapshot(snapshot kernel.PublicSnapshot) (browserprotocol.StateSnapshot, error) {
+func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func(string, string) (string, string, string)) (browserprotocol.StateSnapshot, error) {
 	result := browserprotocol.StateSnapshot{
 		Head:          decimalSequence(snapshot.Head),
 		Factory:       projectFactory(snapshot.Factory),
@@ -740,8 +740,14 @@ func projectPublicSnapshot(snapshot kernel.PublicSnapshot) (browserprotocol.Stat
 	for _, item := range snapshot.Projects {
 		result.Projects = append(result.Projects, projectProject(item))
 	}
+	// An agent's defaults are read from the account it launches under, so the
+	// snapshot's own account rows resolve the directory before the agents do.
+	homes := make(map[kernel.AccountID]string, len(snapshot.Accounts))
+	for _, item := range snapshot.Accounts {
+		homes[item.ID] = item.Home
+	}
 	for _, item := range snapshot.Agents {
-		result.Agents = append(result.Agents, projectAgent(item))
+		result.Agents = append(result.Agents, projectAgent(item, homes[item.AccountID], providerDefaults))
 	}
 	for _, item := range snapshot.Tasks {
 		result.Tasks = append(result.Tasks, projectTask(item))
@@ -767,8 +773,26 @@ func projectProject(item kernel.ProjectSummary) browserprotocol.ProjectItem {
 	return browserprotocol.ProjectItem{ID: item.ID.String(), Name: item.Name, Revision: decimalRevision(item.Revision)}
 }
 
-func projectAgent(item kernel.AgentSummary) browserprotocol.AgentItem {
-	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, Revision: decimalRevision(item.Revision)}
+// projectAgent resolves what the agent will actually run with. An agent that
+// names no model is launched without one and the provider CLI picks its own,
+// so the console is served that CLI's configured default and the file it came
+// from rather than a blank the operator cannot interpret. configHome is the
+// account's own directory when the agent selects one, so the default shown is
+// the one that account will actually launch with; empty means the operator's
+// own login, which is what the daemon falls back to.
+func projectAgent(item kernel.AgentSummary, configHome string, providerDefaults func(string, string) (string, string, string)) browserprotocol.AgentItem {
+	defaultModel, defaultEffort, source := providerDefaults(item.Provider, configHome)
+	effectiveModel, effectiveEffort := item.Model, item.ReasoningEffort
+	if effectiveModel == "" {
+		effectiveModel = defaultModel
+	}
+	if effectiveEffort == "" {
+		effectiveEffort = defaultEffort
+	}
+	if item.Model != "" {
+		source = "agent"
+	}
+	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision)}
 	if (item.AccountID != kernel.AccountID{}) {
 		projected.AccountID = item.AccountID.String()
 	}

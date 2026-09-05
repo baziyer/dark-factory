@@ -436,7 +436,7 @@ func TestAgentItemServesExactlyThePublicFields(t *testing.T) {
 	for _, field := range fields {
 		actual = append(actual, field.Tag.Get("json"))
 	}
-	want := []string{"id", "project_id", "name", "role", "provider", "paused", "model", "reasoning_effort", "revision", "account_id"}
+	want := []string{"id", "project_id", "name", "role", "provider", "paused", "model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "revision", "account_id"}
 	if !reflect.DeepEqual(actual, want) {
 		t.Fatalf("public AgentItem fields drifted: got %v want %v", actual, want)
 	}
@@ -456,6 +456,11 @@ func TestAgentItemServesExactlyThePublicFields(t *testing.T) {
 		}
 		// The launch controls the console edits are public by owner decision on
 		// 5 September 2026; the budget columns beside them are still private.
+		// model_source deliberately serves a filesystem path. It is the local
+		// provider CLI's own configuration file, which the operator reading the
+		// console already owns and can open; without it "inherited" is a claim
+		// the console cannot attribute. No path outside the operator's account
+		// reaches this field, and nothing inside those files is served.
 		for _, private := range []string{`"tool_budget`, `"tool_calls`} {
 			if bytes.Contains(wire, []byte(private)) {
 				t.Fatalf("public agent item exposed %q: %s", private, wire)

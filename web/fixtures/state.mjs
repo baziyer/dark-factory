@@ -18,9 +18,9 @@ export const fixtureState = {
     [secondProjectID, { id: secondProjectID, name: "South Workshop", revision: 5n }],
   ]),
   agents: new Map([
-    [agentID, { id: agentID, project_id: projectID, name: "Builder One", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", revision: 10n, account_id: accountID }],
-    [secondAgentID, { id: secondAgentID, project_id: secondProjectID, name: "Dispatch Lead", role: "orchestrator", provider: "claude_code", paused: true, model: "claude-opus-5", reasoning_effort: "", revision: 11n, account_id: "" }],
-    [thirdAgentID, { id: thirdAgentID, project_id: projectID, name: "Builder Two", role: "worker", provider: "codex", paused: false, model: "", reasoning_effort: "", revision: 12n, account_id: "" }],
+    [agentID, { id: agentID, project_id: projectID, name: "Builder One", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision: 10n, account_id: accountID }],
+    [secondAgentID, { id: secondAgentID, project_id: secondProjectID, name: "Dispatch Lead", role: "orchestrator", provider: "claude_code", paused: true, model: "claude-opus-5", reasoning_effort: "", effective_model: "claude-opus-5", effective_reasoning_effort: "", model_source: "agent", revision: 11n, account_id: "" }],
+    [thirdAgentID, { id: thirdAgentID, project_id: projectID, name: "Builder Two", role: "worker", provider: "codex", paused: false, model: "", reasoning_effort: "", effective_model: "gpt-6-astra", effective_reasoning_effort: "high", model_source: "/Users/operator/.codex/config.toml", revision: 12n, account_id: "" }],
   ]),
   tasks: new Map([
     [taskID, { id: taskID, project_id: projectID, assigned_agent_id: agentID, title: "Review the state projection", status: "running", priority: 10, revision: 12n }],

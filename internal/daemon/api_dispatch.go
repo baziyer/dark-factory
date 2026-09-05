@@ -34,6 +34,12 @@ type Daemon struct {
 	topologyMu sync.Mutex
 	topologies map[kernel.ProjectID]topologySnapshot
 
+	// providerDefaultCache holds the last read of each provider account's own
+	// configured model for a short window, on the same terms as topologies:
+	// a cost guard over a file read, never state.
+	providerDefaultMu    sync.Mutex
+	providerDefaultCache map[providerAccount]providerDefault
+
 	// operationMu is the single linearization gate for live-attempt operations
 	// that combine durable state with an owner-side action. It is deliberately
 	// concrete and global: the local operator has no throughput requirement,
@@ -41,9 +47,12 @@ type Daemon struct {
 	operationMu sync.Mutex
 
 	// changeParent is the changes root the supervisor was given, published
-	// without a lock so RunNext never waits on a console read. runPathsMu
-	// guards only the map of bounded directory walks, never a walk itself.
+	// without a lock so RunNext never waits on a console read. accountHome is
+	// the account every run launches under, published the same way and for the
+	// same reason. runPathsMu guards only the map of bounded directory walks,
+	// never a walk itself.
 	changeParent atomic.Pointer[string]
+	accountHome  atomic.Pointer[string]
 	runPathsMu   sync.Mutex
 	runPaths     map[kernel.RunID]runPathsResult
 

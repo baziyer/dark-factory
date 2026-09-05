@@ -159,7 +159,7 @@ test("the floor maps topology to rooms and agents to workers deterministically",
 test("hostile names and titles are escaped as text and private detail is absent", () => {
   const hostile = "<img src=x onerror=alert(1)>";
   const hostileState = baseState({
-    agents: new Map([[ids.agent, { id: ids.agent, project_id: ids.project, name: hostile, role: "worker", provider: "claude_code", paused: false, model: hostile, reasoning_effort: "", revision: 10n }]]),
+    agents: new Map([[ids.agent, { id: ids.agent, project_id: ids.project, name: hostile, role: "worker", provider: "claude_code", paused: false, model: hostile, reasoning_effort: "", effective_model: hostile, effective_reasoning_effort: "", model_source: "agent", revision: 10n }]]),
     tasks: new Map([[ids.task, { id: ids.task, project_id: ids.project, assigned_agent_id: ids.agent, title: hostile, status: "running", priority: 10, revision: 12n }]]),
   });
   for (const view of VIEWS) {
@@ -172,7 +172,7 @@ test("hostile names and titles are escaped as text and private detail is absent"
     }
   }
   assert.match(render({ state: hostileState }), /&lt;img src=x onerror=alert\(1\)&gt;/);
-  assert.match(render({ state: hostileState, selectedAgent: agentSelection(), onSaveAgentConfig: () => {} }), /<input id="df-model-[0-9a-f]+" value="&lt;img src=x onerror=alert\(1\)&gt;"/);
+  assert.match(render({ state: hostileState, selectedAgent: agentSelection(), onSaveAgentConfig: () => {} }), /<input id="df-model-[0-9a-f]+"[^>]*value="&lt;img src=x onerror=alert\(1\)&gt;"/);
 });
 
 test("the console never shows a kernel-grammar or retired vocabulary word", () => {
@@ -373,7 +373,7 @@ test("selecting an agent opens the agent sidebar with its config and queue", () 
     onCloseAgent: () => {},
   });
   assert.match(markup, /aria-label="Agent Builder One"/);
-  assert.match(markup, />WORKER · claude_code</);
+  assert.match(markup, />WORKER · claude_code · claude-opus-5</);
   assert.match(markup, /aria-label="NOW"[\s\S]*?Review the state projection/);
   assert.match(markup, /aria-label="Agent configuration"/);
   assert.match(markup, /value="claude-opus-5"/);
@@ -690,6 +690,59 @@ test("PAIR A PHONE appears in settings only with authority, and shows the minted
   assert.equal(render({ ...settings, remoteInviteAllowed: true }).includes("DISMISS"), false);
 });
 
+const shellAgent = { id: ids.agent, project_id: ids.project, name: "Shell Hand", role: "worker", provider: "shell", paused: true, model: "", reasoning_effort: "", effective_model: "", effective_reasoning_effort: "", model_source: "", revision: 10n };
+
+const withAgent = (agent) => render({
+  view: "agents",
+  state: baseState({ agents: new Map([[agent.id, agent]]) }),
+  selectedAgent: { id: agent.id, name: agent.name, revision: agent.revision },
+  onSaveAgentConfig: () => {},
+});
+
+const inheritingAgent = () => fixtureState.agents.get("23".repeat(16));
+
+test("the console shows the model an agent will actually run with", () => {
+  // An agent that names no model still runs with one. The row and the panel
+  // header say which, so a blank is never read as "no model".
+  const rows = render({ view: "agents" });
+  assert.match(rows, /codex · gpt-6-astra/);
+  assert.match(rows, /claude_code · claude-opus-5/);
+  assert.match(withAgent(inheritingAgent()), />WORKER · codex · gpt-6-astra</);
+  // The provider with no model says nothing extra rather than a dangling dot.
+  assert.match(withAgent(shellAgent), />WORKER · shell</);
+});
+
+test("the config inputs stay the agent's own override and caption where it came from", () => {
+  // Own: the served value is in the box and the caption names the agent.
+  const own = withAgent(fixtureState.agents.get(ids.agent));
+  assert.match(own, /<input id="df-model-[0-9a-f]+"[^>]*placeholder="claude-opus-5"/);
+  assert.match(own, /<input id="df-model-[0-9a-f]+"[^>]*value="claude-opus-5"/);
+  assert.match(own, />set on this agent</);
+
+  // Inherited: the box is empty because the override is, and the placeholder
+  // plus the caption say what the run gets and which file decided it.
+  const inherited = withAgent(inheritingAgent());
+  assert.match(inherited, /<input id="df-model-[0-9a-f]+"[^>]*placeholder="gpt-6-astra"/);
+  assert.match(inherited, /<input id="df-model-[0-9a-f]+"[^>]*value=""/);
+  assert.match(inherited, /<input id="df-effort-[0-9a-f]+"[^>]*placeholder="high"/);
+  assert.match(inherited, /inherited from \/Users\/operator\/\.codex\/config\.toml/);
+
+  // Unknown: an older daemon, or a CLI whose configuration the factory cannot
+  // read. The console says so rather than implying the model is unset.
+  const unknown = withAgent({ ...inheritingAgent(), effective_model: "", effective_reasoning_effort: "", model_source: "" });
+  assert.match(unknown, /CLI default \(not visible to the factory\)/);
+  assert.equal(unknown.includes("inherited from"), false);
+});
+
+test("the shell provider has no model inputs but keeps PAUSED", () => {
+  const markup = withAgent(shellAgent);
+  assert.match(markup, />shell has no model</);
+  assert.equal(markup.includes("df-model-"), false);
+  assert.equal(markup.includes("df-effort-"), false);
+  // The daemon rejects a model for shell; pausing it is still an edit.
+  assert.match(markup, /id="df-paused-[0-9a-f]+"/);
+  assert.match(markup, />PAUSED</);
+});
 
 test("the agent config offers its provider's linked accounts and the provider default", async () => {
   const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;

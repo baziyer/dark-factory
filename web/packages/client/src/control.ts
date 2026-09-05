@@ -5,6 +5,7 @@ import {
   ERROR_CODES,
   MAX_AGENT_MODEL_BYTES,
   MAX_AGENT_NAME_BYTES,
+  MAX_MODEL_SOURCE_BYTES,
   MAX_ARRAY_ITEMS,
   MAX_CONTROL_BYTES,
   MAX_FACTORY_CAPACITY,
@@ -39,7 +40,15 @@ export type ErrorBody = { code: ErrorCode; retryable: boolean };
 
 export type FactoryItem = { dispatch_enabled: boolean; capacity: number; active_runs: number; revision: bigint };
 export type ProjectItem = { id: string; name: string; revision: bigint };
-export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; revision: bigint; account_id: string };
+/**
+ * `model` and `reasoning_effort` are the agent's own overrides; empty means it
+ * inherits. `effective_*` is what the run will actually use, and `model_source`
+ * says where the model came from: "agent" when the agent names one, the
+ * provider CLI configuration path the default was read from, or "" when that
+ * CLI keeps a default nobody can see. `account_id` is the linked provider
+ * login it launches under; empty means that provider's default directory.
+ */
+export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string };
 export type AccountItem = { id: string; provider: "claude_code" | "codex"; home: string; label: string; revision: bigint };
 export type TaskItem = { id: string; project_id: string; assigned_agent_id: string; title: string; status: "queued" | "running" | "blocked" | "succeeded" | "failed" | "cancelled"; priority: number; revision: bigint };
 export type HumanRequestItem = {
@@ -372,15 +381,20 @@ function factoryItem(value: unknown, wire: boolean): FactoryItem {
 }
 function projectItem(value: unknown, wire: boolean): ProjectItem { if (!isObject(value)) malformed(); requireKeys(value, ["id", "name", "revision"], wire); return { id: dynamicID(value.id), name: boundedText(value.name, 1, MAX_PROJECT_NAME_BYTES), revision: decimal(value.revision, wire, true) }; }
 function agentItem(value: unknown, wire: boolean): AgentItem {
-  // An older daemon does not send the launch controls; they read as unset.
-  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "account_id"]);
+  // An older daemon does not send the launch controls, the resolved model or
+  // the account; they read as unset, which the console shows as an unknowable
+  // CLI default under that provider's own directory.
+  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id"]);
   if (value.role !== "orchestrator" && value.role !== "worker" || typeof value.paused !== "boolean") malformed();
   if (value.provider !== "claude_code" && value.provider !== "codex" && value.provider !== "shell") malformed();
   const model = present(value, "model") ? boundedText(value.model, 0, MAX_AGENT_MODEL_BYTES) : "";
   const reasoning_effort = present(value, "reasoning_effort") ? boundedText(value.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES) : "";
+  const effective_model = present(value, "effective_model") ? boundedText(value.effective_model, 0, MAX_AGENT_MODEL_BYTES) : "";
+  const effective_reasoning_effort = present(value, "effective_reasoning_effort") ? boundedText(value.effective_reasoning_effort, 0, MAX_AGENT_MODEL_BYTES) : "";
+  const model_source = present(value, "model_source") ? boundedText(value.model_source, 0, MAX_MODEL_SOURCE_BYTES) : "";
   const account_id = present(value, "account_id") && value.account_id !== "" ? dynamicID(value.account_id) : "";
   if (account_id !== "" && value.provider === "shell") malformed();
-  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, revision: decimal(value.revision, wire, true), account_id };
+  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id };
 }
 function accountProvider(value: unknown): "claude_code" | "codex" { if (value !== "claude_code" && value !== "codex") malformed(); return value; }
 /** One absolute configuration directory, bounded exactly as the daemon does. */
@@ -397,6 +411,7 @@ function discoveredAccount(value: unknown, wire: boolean): DiscoveredAccount {
     default_model: boundedText(value.default_model, 0, MAX_AGENT_MODEL_BYTES), default_reasoning_effort: boundedText(value.default_reasoning_effort, 0, MAX_AGENT_MODEL_BYTES),
     linked_id: value.linked_id === "" ? "" : dynamicID(value.linked_id),
   };
+
 }
 const TOPOLOGY_KINDS = ["repository", "module", "package", "directory"] as const;
 const TOPOLOGY_BUCKETS = ["empty", "tiny", "small", "medium", "large"] as const;

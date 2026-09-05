@@ -218,7 +218,7 @@ function AgentRow({
     <>
       <span className="dfConsoleRow__glyph" aria-hidden="true">{agentGlyph(agent)}</span>
       <span className="dfConsoleRow__title">{agent.name}</span>
-      <span className="dfAgentList__provider">{agent.provider}</span>
+      <span className="dfAgentList__provider">{agent.effective_model === "" ? agent.provider : `${agent.provider} · ${agent.effective_model}`}</span>
       <span className="dfAgentList__activity">{activity === "needs-you" ? "! needs you" : activity}</span>
       <span className="dfConsoleRow__agent">{task?.title ?? "no current task"}</span>
       <span className="dfAgentList__count">{queued} queued</span>

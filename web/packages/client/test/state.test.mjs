@@ -8,6 +8,7 @@ import {
   MAX_AGENT_MODEL_BYTES,
   MAX_CONTROL_BYTES,
   MAX_HUMAN_QUESTION_BYTES,
+  MAX_MODEL_SOURCE_BYTES,
   MAX_SNAPSHOT_BYTES,
   MAX_SNAPSHOT_ENTITIES,
   MAX_SQLITE_INTEGER,
@@ -42,7 +43,7 @@ const ids = {
 };
 const factoryItem = (revision = 1n) => ({ dispatch_enabled: true, capacity: 8, active_runs: 2, revision });
 const projectItem = (revision = 1n) => ({ id: ids.project, name: "Factory", revision });
-const agentItem = (revision = 1n) => ({ id: ids.agent, project_id: ids.project, name: "Worker", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", revision });
+const agentItem = (revision = 1n) => ({ id: ids.agent, project_id: ids.project, name: "Worker", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision });
 const taskItem = (revision = 1n, title = "Ship") => ({ id: ids.task, project_id: ids.project, assigned_agent_id: ids.agent, title, status: "queued", priority: 1, revision });
 const requestItem = (revision = 1n) => ({ id: ids.request, project_id: ids.project, agent_id: ids.agent, task_id: ids.task, created_at: 10n, updated_at: 11n, revision, kind: "question", status: "open", reply_max_bytes: 8192, can_reply: true });
 const snapshotBody = (overrides = {}) => ({
@@ -221,15 +222,36 @@ test("the agent provider is exact on the wire in both roles", () => {
 });
 
 test("an older daemon's agent reads back as unset launch controls, never as absent", () => {
-  // The console renders these two directly, so the view must never hand it
-  // undefined: a daemon that predates the contract simply has them unset.
+  // The console renders these directly, so the view must never hand it
+  // undefined: a daemon that predates the contract simply has them unset,
+  // which the console shows as a CLI default it cannot see.
   const wire = encodeStateSnapshot("older", snapshotBody())
-    .replace('"model":"claude-opus-5","reasoning_effort":"high",', "");
+    .replace('"model":"claude-opus-5","reasoning_effort":"high","effective_model":"claude-opus-5","effective_reasoning_effort":"high","model_source":"agent",', "");
   assert.equal(wire.includes("model"), false);
   const agent = snapshotView(decodeServerControl(wire).body).agents.get(ids.agent);
   assert.equal(agent.model, "");
   assert.equal(agent.reasoning_effort, "");
+  assert.equal(agent.effective_model, "");
+  assert.equal(agent.effective_reasoning_effort, "");
+  assert.equal(agent.model_source, "");
   assert.equal(snapshotView(decodeServerControl(encodeStateSnapshot("newer", snapshotBody())).body).agents.get(ids.agent).reasoning_effort, "high");
+});
+
+test("the resolved model is served beside the agent's own override", () => {
+  // Three source states reach the console: the agent named it, a provider
+  // configuration file named it, or nobody the factory can read did.
+  const inherited = { ...agentItem(), model: "", reasoning_effort: "", provider: "codex", effective_model: "gpt-6-astra", effective_reasoning_effort: "high", model_source: "/Users/operator/.codex/config.toml" };
+  const decoded = snapshotView(decodeServerControl(encodeStateSnapshot("effective", snapshotBody({ agents: [inherited] }))).body).agents.get(ids.agent);
+  assert.equal(decoded.model, "");
+  assert.equal(decoded.effective_model, "gpt-6-astra");
+  assert.equal(decoded.model_source, "/Users/operator/.codex/config.toml");
+  const own = snapshotView(decodeServerControl(encodeStateSnapshot("effective", snapshotBody())).body).agents.get(ids.agent);
+  assert.equal(own.model_source, "agent");
+  const blind = { ...agentItem(), model: "", reasoning_effort: "", provider: "shell", effective_model: "", effective_reasoning_effort: "", model_source: "" };
+  assert.equal(snapshotView(decodeServerControl(encodeStateSnapshot("effective", snapshotBody({ agents: [blind] }))).body).agents.get(ids.agent).model_source, "");
+  // The resolved pair shares the agent model bound; the source is a path.
+  expectMalformed(() => encodeStateSnapshot("effective", snapshotBody({ agents: [{ ...agentItem(), effective_model: "m".repeat(MAX_AGENT_MODEL_BYTES + 1) }] })));
+  expectMalformed(() => encodeStateSnapshot("effective", snapshotBody({ agents: [{ ...agentItem(), model_source: "/".repeat(MAX_MODEL_SOURCE_BYTES + 1) }] })));
 });
 
 test("public state cannot carry private fields and detail is separately bounded", () => {
@@ -238,7 +260,10 @@ test("public state cannot carry private fields and detail is separately bounded"
     assert.equal(wire.includes(`"${field}":`), false, field);
   }
   // The agent's launch controls are served, not private.
-  for (const field of ["model", "reasoning_effort"]) assert.equal(wire.includes(`"${field}":`), true, field);
+  // model_source is a served filesystem path on purpose: it is the operator's
+  // own provider CLI configuration file, the only way the console can say
+  // where an inherited model came from. Nothing inside that file is served.
+  for (const field of ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source"]) assert.equal(wire.includes(`"${field}":`), true, field);
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ human_requests: [{ ...requestItem(), question: "private" }] })));
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ projects: [{ ...projectItem(), root: "/private" }] })));
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ tasks: [{ ...taskItem(), body: "private" }] })));
@@ -298,6 +323,7 @@ test("manifest bounds and registry are an exact readable mirror", () => {
     maxTerminalRows: manifest.bounds.max_terminal_rows,
     maxTerminalCols: manifest.bounds.max_terminal_cols,
     maxAgentModelBytes: manifest.bounds.max_agent_model_bytes,
+    maxModelSourceBytes: manifest.bounds.max_model_source_bytes,
     maxRemoteInviteLinkBytes: manifest.bounds.max_remote_invite_link_bytes,
     maxRemoteInviteSvgBytes: manifest.bounds.max_remote_invite_svg_bytes,
   });
