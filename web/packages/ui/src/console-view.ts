@@ -134,7 +134,8 @@ export function floorScene(
   const shown = new Map(projects.map((project, index) => [project.id, blocks[index]!.filter((room) => kept.has(room.id))]));
   const workers = state === undefined ? [] : [...state.agents.values()].map((agent) => {
     // A run only ever names paths in its own project, and that project's own
-    // room is the first one, so an unmapped path is never a stranded worker.
+    // room is the first one it keeps, so an unmapped path costs no worker its
+    // room. Only an agent whose project the cap never reached has none.
     const block = shown.get(agent.project_id) ?? [];
     const nodeId = roomOfRunPaths(block, runPaths?.get(agent.id) ?? []) ?? block[0]?.id;
     return {
@@ -200,7 +201,9 @@ function projectBlock(project: { id: string; name: string }, topology: TopologyV
     id: `${project.id}:${node.id}`,
     parentId: node.parent_id === "" ? "" : `${project.id}:${node.parent_id}`,
     path: node.path,
-    label: node.label,
+    // Every repository is served the same fixed label, so on a floor of many
+    // projects only the project's own name tells its root room apart.
+    label: node.path === "." ? project.name : node.label,
     kind: node.kind,
     sizeBucket: node.size_bucket,
   }));

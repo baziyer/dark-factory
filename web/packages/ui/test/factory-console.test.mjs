@@ -91,8 +91,10 @@ test("the left view toggles between the floor and the ranked agent list", () => 
 test("the floor maps topology to rooms and agents to workers deterministically", () => {
   const scene = floorScene(fixtureState, fixtureTopologies);
   // The repository root and the code it holds become rooms, largest first, and
-  // every project keeps its own room before any project keeps a second.
-  assert.deepEqual(scene.topology.nodes.map((node) => node.label), ["north-workshop", "South Workshop", "kernel", "web"]);
+  // every project keeps its own room before any project keeps a second. The
+  // root room carries the project's name: the served one names no project.
+  assert.deepEqual(scene.topology.nodes.map((node) => node.label), ["North Workshop", "South Workshop", "kernel", "web"]);
+  assert.equal(scene.topology.nodes.some((node) => node.label === fixtureTopology.nodes[0].label), false);
   assert.deepEqual(scene.topology.nodes.map((node) => node.sizeBucket), ["large", undefined, "medium", "small"]);
   assert.equal(scene.topology.digest, fixtureTopology.digest);
   assert.deepEqual(scene, floorScene(fixtureState, new Map([[fixtureTopology.projectId, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }]])));
@@ -184,9 +186,11 @@ function topologyFor(projectId, entries) {
 
 const served = (...views) => new Map(views.map((view) => [view.projectId, view]));
 
+const PROJECT_NAME = "Any Project";
+
 const soloState = (projectId) => ({
   ...fixtureState,
-  projects: new Map([[projectId, { id: projectId, name: "Any Project", revision: 1n }]]),
+  projects: new Map([[projectId, { id: projectId, name: PROJECT_NAME, revision: 1n }]]),
   agents: new Map(),
   tasks: new Map(),
   humanRequests: new Map(),
@@ -204,7 +208,7 @@ test("the floor is whatever the daemon served, with no shape or name known to th
     ["module", ".", "large", 0],
     ["package", "gamma", "medium", 1],
     ["directory", "delta", "small", 1],
-  ), ["root", "gamma", "delta"]);
+  ), [PROJECT_NAME, "gamma", "delta"]);
 
   // A package.json at the root: the same, one node deeper.
   assert.deepEqual(labels(
@@ -212,7 +216,7 @@ test("the floor is whatever the daemon served, with no shape or name known to th
     ["package", ".", "large", 0],
     ["directory", "one", "medium", 1],
     ["directory", "two", "small", 1],
-  ), ["root", "one", "two"]);
+  ), [PROJECT_NAME, "one", "two"]);
 
   // A tree in no language the daemon analyses is directories and nothing else,
   // and size, not order of service, decides which rooms are shown first.
@@ -220,14 +224,14 @@ test("the floor is whatever the daemon served, with no shape or name known to th
     ["repository", ".", "large"],
     ["directory", "docs", "small", 0],
     ["directory", "src", "medium", 0],
-  ), ["root", "src", "docs"]);
+  ), [PROJECT_NAME, "src", "docs"]);
 
   // Adding, renaming and removing a directory moves the floor with it.
   const tree = (...names) => labels(["repository", ".", "large"], ...names.map((name) => ["directory", name, "medium", 0]));
-  assert.deepEqual(tree("one", "two"), ["root", "one", "two"]);
-  assert.deepEqual(tree("one", "renamed"), ["root", "one", "renamed"]);
-  assert.deepEqual(tree("one"), ["root", "one"]);
-  assert.deepEqual(tree("added", "one"), ["root", "added", "one"]);
+  assert.deepEqual(tree("one", "two"), [PROJECT_NAME, "one", "two"]);
+  assert.deepEqual(tree("one", "renamed"), [PROJECT_NAME, "one", "renamed"]);
+  assert.deepEqual(tree("one"), [PROJECT_NAME, "one"]);
+  assert.deepEqual(tree("added", "one"), [PROJECT_NAME, "added", "one"]);
 
   // Past the cap the largest rooms are the ones worth a tile.
   const many = floorScene(state, served(topologyFor(ids.project, [
@@ -250,6 +254,10 @@ test("every project is its own block of rooms and its own workers", () => {
   const nodeOf = (agentId) => scene.workers.find((worker) => worker.id === agentId).nodeId;
   assert.notEqual(nodeOf(ids.agent), nodeOf(ids.orchestrator));
   assert.equal(scene.topology.digest, [...topologies.values()].map((view) => view.digest).join(" "));
+  // Two structures have arrived and neither root room reads as the served
+  // label: on a floor of many projects only the project name tells them apart.
+  assert.deepEqual(scene.topology.nodes.filter((node) => node.path === ".").map((node) => node.label),
+    [fixtureState.projects.get(ids.project).name, fixtureState.projects.get(ids.secondProject).name]);
 
   // More projects than the floor can detail: every one keeps its own room
   // before any one keeps a second, and none of them is served first.
@@ -263,6 +271,28 @@ test("every project is its own block of rooms and its own workers", () => {
   );
   assert.equal(crowd.topology.nodes.length, 24);
   assert.equal(crowd.topology.nodes.filter((node) => node.path === ".").length, projects.length);
+
+  // Past one room per project the floor cannot detail them all. The projects
+  // the cap reaches keep their own room; an agent whose project it never
+  // reached stands off the floor rather than in another project's room.
+  const overflow = Array.from({ length: 30 }, (_, index) => ({ id: `${index}`.padStart(32, "d"), name: `Project ${index}`, revision: 1n }));
+  const posted = [overflow[0], overflow.at(-1)].map((project, index) => ({
+    id: `${index}`.padStart(32, "e"), project_id: project.id, name: project.name,
+    role: "worker", provider: "shell", paused: false, model: "", reasoning_effort: "", revision: 1n,
+  }));
+  const stranded = floorScene(
+    {
+      ...fixtureState,
+      projects: new Map(overflow.map((project) => [project.id, project])),
+      agents: new Map(posted.map((agent) => [agent.id, agent])),
+      tasks: new Map(),
+      humanRequests: new Map(),
+    },
+    served(...overflow.map((project) => topologyFor(project.id, [["repository", ".", "large"], ["directory", "src", "medium", 0]]))),
+  );
+  assert.deepEqual(stranded.topology.nodes.map((node) => node.path), Array.from({ length: 24 }, () => "."));
+  assert.equal(stranded.workers[0].nodeId !== undefined, true);
+  assert.equal(stranded.workers.at(-1).nodeId, undefined);
 });
 
 test("hostile names and titles are escaped as text and private detail is absent", () => {

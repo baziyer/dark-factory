@@ -297,7 +297,12 @@ func discover(ctx context.Context, root string, bounds limits) (*discovery, erro
 		}
 		parsed, _ := parser.ParseFile(token.NewFileSet(), rel, body, parser.ImportsOnly)
 		if parsed != nil {
-			pkg.names[parsed.Name.Name]++
+			// A file with no package clause the parser could read — an oversize
+			// one included — reports the empty name, which would otherwise win
+			// the sorted vote and cost the package its name.
+			if parsed.Name.Name != "" {
+				pkg.names[parsed.Name.Name]++
+			}
 			for _, imported := range parsed.Imports {
 				if value, err := strconv.Unquote(imported.Path.Value); err == nil {
 					pkg.imports[value]++

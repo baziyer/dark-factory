@@ -226,7 +226,7 @@ func TestBuildSkipsDotDirectoriesAndOversizeAnalyzerFiles(t *testing.T) {
 		"go.mod": "module example.com/cart\n",
 		".tools/local-ci/go-mod/example.com/huge/huge.go": oversize,
 		"lib/lib.go":  "package lib\nconst Name = \"cart\"\n",
-		"app/app.go":  "package app\n",
+		"app/app.go":  "package builder\n",
 		"app/huge.go": oversize,
 	})
 	snapshot, err := Build(context.Background(), root, nil)
@@ -242,6 +242,11 @@ func TestBuildSkipsDotDirectoriesAndOversizeAnalyzerFiles(t *testing.T) {
 		if _, ok := findNode(snapshot, want); !ok {
 			t.Errorf("missing %s node %q", want.kind, want.path)
 		}
+	}
+	// The unread file names no package either: the directory keeps the name its
+	// readable file declares, not the basename an empty vote falls back to.
+	if node, _ := findNode(snapshot, nodeKey{NodePackage, "app"}); node.Label != "builder" {
+		t.Errorf("package label = %q, want the package clause that was read", node.Label)
 	}
 	// The import sits in the first bytes of the oversize file, so a truncated
 	// read would still find it. Nothing is read: it contributes no imports.
