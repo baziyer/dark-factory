@@ -1,4 +1,5 @@
-import type { AgentItem, StateView, TaskItem } from "@dark-factory/client";
+import type { AgentItem, StateView, TaskItem, TopologyView } from "@dark-factory/client";
+import type { SceneNode, SceneTopology, SceneWorker, SceneWorkItem } from "./factory-scene/scene.js";
 
 /** The task stages the daemon actually serves today. */
 export type TaskStage = "queued" | "building" | "blocked" | "done" | "failed";
@@ -98,4 +99,68 @@ export function orderTasksForHome(state: StateView): readonly TaskItem[] {
   });
 }
 
-export type ConsoleScreen = { kind: "home" } | { kind: "queue" } | { kind: "needs-you" };
+/** One floor holds the repository root and its direct children, and no more. */
+const MAX_FLOOR_ROOMS = 24;
+
+export type FloorScene = Readonly<{
+  topology: SceneTopology;
+  workers: readonly SceneWorker[];
+  workItems: readonly SceneWorkItem[];
+}>;
+
+/**
+ * The floor is a projection, never a second source of truth: rooms come from
+ * the served topology (or one room per project until it arrives), and every
+ * worker stands in its own project's room.
+ */
+export function floorScene(state: StateView | undefined, topology: TopologyView | undefined): FloorScene {
+  const projects = state === undefined ? [] : [...state.projects.values()];
+  // Topology is served one project at a time. Every other project still gets
+  // its own room, so no agent is stranded in the overflow bay.
+  const detailed = topology === undefined ? [] : topologyRooms(topology);
+  const rooms = [...detailed, ...projectRooms(projects.filter((project) => project.id !== topology?.projectId))]
+    .slice(0, MAX_FLOOR_ROOMS);
+  const roomIDs = new Set(rooms.map((room) => room.id));
+  const rootID = detailed[0]?.id;
+  const roomOfProject = (projectID: string): string | undefined =>
+    projectID === topology?.projectId ? rootID : roomIDs.has(projectID) ? projectID : undefined;
+  const workers = state === undefined ? [] : [...state.agents.values()].map((agent) => {
+    const nodeId = roomOfProject(agent.project_id);
+    return {
+      id: agent.id,
+      name: agent.name,
+      role: agent.role,
+      provider: agent.provider,
+      activity: agentActivity(agent, state),
+      ...(nodeId === undefined ? {} : { nodeId }),
+    };
+  });
+  const workItems = state === undefined ? [] : [...state.tasks.values()]
+    .filter((task) => task.status === "succeeded" || task.status === "running" || task.status === "blocked")
+    .map((task) => ({ id: task.id, stage: task.status === "succeeded" ? "release-ready" as const : "staged" as const }));
+  return { topology: { digest: topology?.digest ?? "", nodes: rooms }, workers, workItems };
+}
+
+function topologyRooms(topology: TopologyView): readonly SceneNode[] {
+  const root = topology.nodes.find((node) => node.parent_id === "");
+  if (root === undefined) return [];
+  const children = topology.nodes.filter((node) => node.parent_id === root.id);
+  return [root, ...children].slice(0, MAX_FLOOR_ROOMS).map((node) => ({
+    id: node.id,
+    parentId: node.parent_id,
+    path: node.path,
+    label: node.label,
+    kind: node.kind,
+    sizeBucket: node.size_bucket,
+  }));
+}
+
+function projectRooms(projects: readonly { id: string; name: string }[]): readonly SceneNode[] {
+  return projects.map((project) => ({
+    id: project.id,
+    parentId: "",
+    path: project.name,
+    label: project.name,
+    kind: "repository" as const,
+  }));
+}

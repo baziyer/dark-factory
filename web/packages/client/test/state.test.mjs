@@ -215,6 +215,18 @@ test("the agent provider is exact on the wire in both roles", () => {
   expectIgnoredMember(wire, wire.replace('"provider":"claude_code"', '"provider":"claude_code","tool_budget_limit":9'), "server");
 });
 
+test("an older daemon's agent reads back as unset launch controls, never as absent", () => {
+  // The console renders these two directly, so the view must never hand it
+  // undefined: a daemon that predates the contract simply has them unset.
+  const wire = encodeStateSnapshot("older", snapshotBody())
+    .replace('"model":"claude-opus-5","reasoning_effort":"high",', "");
+  assert.equal(wire.includes("model"), false);
+  const agent = snapshotView(decodeServerControl(wire).body).agents.get(ids.agent);
+  assert.equal(agent.model, "");
+  assert.equal(agent.reasoning_effort, "");
+  assert.equal(snapshotView(decodeServerControl(encodeStateSnapshot("newer", snapshotBody())).body).agents.get(ids.agent).reasoning_effort, "high");
+});
+
 test("public state cannot carry private fields and detail is separately bounded", () => {
   const wire = encodeStateSnapshot("state", snapshotBody());
   for (const field of ["run_id", "question", "reply", "terminal_target", "cancel_run", "action", "project_name", "agent_name", "task_title", "summary", "why_human_needed", "root", "instruction"]) {

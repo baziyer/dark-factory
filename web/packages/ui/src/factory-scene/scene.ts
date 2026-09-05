@@ -8,8 +8,9 @@ export type SceneNode = Readonly<{
   parentId: string;
   path: string;
   label: string;
-  kind: "repository" | "package" | "directory";
-  fileCount: number;
+  kind: "repository" | "module" | "package" | "directory";
+  /** Absent when the room stands for a project rather than a served node. */
+  sizeBucket?: "empty" | "tiny" | "small" | "medium" | "large";
 }>;
 
 export type SceneWorker = Readonly<{

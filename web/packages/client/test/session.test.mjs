@@ -19,6 +19,7 @@ import {
   encodeHumanRequestCancelRunResult,
   encodeHumanRequestDetail,
   encodeHumanRequestReplyResult,
+  encodeServerControl,
   encodeRemoteInviteResult,
   encodeTaskEnqueueResult,
   encodeStateChanged,
@@ -285,6 +286,54 @@ test("authenticated task enqueue mints exact IDs and correlates the durable resu
     agent_revision: 7n,
   }));
   await unicodeWhitespace;
+  session.close();
+});
+
+test("console edits and topology carry exact bodies and correlate their results", async () => {
+  const { session, socket } = await openHumanSession();
+  const agentId = "78".repeat(16);
+  const taskId = "79".repeat(16);
+  const projectId = "7d".repeat(16);
+
+  const agentPending = session.updateAgent({ agentId, expectedRevision: 7n, model: "claude-opus-5", paused: true });
+  const agentFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(agentFrame.type, "AGENT_UPDATE");
+  // An omitted member never reaches the wire, so it cannot overwrite a value.
+  assert.deepEqual(agentFrame.body, { agent_id: agentId, expected_revision: 7n, model: "claude-opus-5", paused: true });
+  socket.reply(encodeServerControl({ type: "AGENT_UPDATE_RESULT", id: agentFrame.id, body: { agent_id: agentId, revision: 8n } }));
+  assert.deepEqual(await agentPending, { agentId, revision: 8n });
+
+  const taskPending = session.updateTask({ taskId, expectedRevision: 3n, priority: 5, cancel: true });
+  const taskFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(taskFrame.type, "TASK_UPDATE");
+  assert.deepEqual(taskFrame.body, { task_id: taskId, expected_revision: 3n, priority: 5, status: "cancelled" });
+  socket.reply(encodeServerControl({ type: "TASK_UPDATE_RESULT", id: taskFrame.id, body: { task_id: taskId, revision: 4n } }));
+  assert.deepEqual(await taskPending, { taskId, revision: 4n });
+
+  const node = { id: "a1".repeat(32), parent_id: "", kind: "repository", path: ".", label: "repo", language: "", size_bucket: "medium" };
+  const topologyPending = session.getTopology(projectId);
+  const topologyFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(topologyFrame.type, "TOPOLOGY_GET");
+  socket.reply(encodeServerControl({ type: "TOPOLOGY", id: topologyFrame.id, body: { project_id: projectId, digest: "ab".repeat(32), source_revision: "", nodes: [node] } }));
+  const topology = await topologyPending;
+  assert.equal(topology.digest, "ab".repeat(32));
+  assert.deepEqual(topology.nodes, [node]);
+
+  // A result for another entity is a protocol fault, not a resolution.
+  const mismatched = session.updateAgent({ agentId, expectedRevision: 9n, paused: false });
+  const mismatchedFrame = decodeClientControl(socket.sent.at(-1));
+  await assert.rejects(Promise.all([
+    mismatched,
+    socket.reply(encodeServerControl({ type: "AGENT_UPDATE_RESULT", id: mismatchedFrame.id, body: { agent_id: "7e".repeat(16), revision: 10n } })),
+  ]), (error) => error instanceof ProtocolError && error.code === "malformed");
+
+  // Bounds are refused before anything reaches the socket.
+  const closed = new BrowserSession({ url: "ws://127.0.0.1:1/browser", host: "127.0.0.1:1", origin: "http://127.0.0.1:1" });
+  for (const request of [
+    () => closed.updateAgent({ agentId, expectedRevision: 1n, model: "m".repeat(129) }),
+    () => closed.updateTask({ taskId, expectedRevision: 1n, title: "" }),
+  ]) await assert.rejects(request(), (error) => error instanceof SessionError);
+  closed.close();
   session.close();
 });
 

@@ -2,9 +2,8 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
 import { FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
-import { FactoryConsole } from "./factory-console.js";
+import { FactoryConsole, type ConsoleView } from "./factory-console.js";
 import { XtermTerminal } from "./xterm-terminal.js";
-import type { ConsoleScreen } from "./console-view.js";
 
 const INITIAL_SNAPSHOT: FactoryAppSnapshot = { status: "idle" };
 
@@ -16,7 +15,9 @@ export type FactoryAppProps = {
 /** Complete browser application lifecycle; hosts only render this component. */
 export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   const [snapshot, setSnapshot] = useState<FactoryAppSnapshot>(INITIAL_SNAPSHOT);
-  const [screen, setScreen] = useState<ConsoleScreen>({ kind: "home" });
+  const [view, setView] = useState<ConsoleView>("floor");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
   const owner = useRef<FactoryAppController | undefined>(undefined);
   const statusChange = useRef(onStatusChange);
   statusChange.current = onStatusChange;
@@ -37,28 +38,60 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
     };
   }, []);
 
+  // The floor's rooms are regenerable, so they are fetched when the floor is
+  // shown, whenever a fresh session becomes ready, and whenever the set of
+  // projects changes under them.
+  const projectKey = snapshot.state === undefined ? "" : [...snapshot.state.projects.keys()].join(" ");
+  useEffect(() => {
+    if (view === "floor" && snapshot.status === "ready") owner.current?.loadTopology();
+  }, [view, snapshot.status, projectKey]);
+
   const controller = owner.current;
-  const terminal = controller === undefined || snapshot.selectedAgent === undefined || snapshot.terminal === undefined ? undefined : (
+  const agentTerminal = controller === undefined || snapshot.selectedAgent === undefined ? undefined : snapshot.terminal;
+  const terminal = agentTerminal === undefined || controller === undefined || !terminalOpen ? undefined : (
     <TerminalPanel
-      terminal={snapshot.terminal}
-      onClose={() => controller.clearAgentTerminal()}
+      terminal={agentTerminal}
+      onClose={() => { setTerminalOpen(false); controller.closeAgentTerminal(); }}
     >
-      <TerminalContent terminal={snapshot.terminal} controller={controller} />
+      <TerminalContent terminal={agentTerminal} controller={controller} />
     </TerminalPanel>
   );
+  // An agent with no running task has no terminal to show, only the composer
+  // that gives it its next task; the sidebar puts that under its queue.
+  const instruction = agentTerminal === undefined || controller === undefined || agentTerminal.taskTitle !== undefined ? undefined : (
+    <TerminalContent terminal={agentTerminal} controller={controller} />
+  );
+
+  const openSidebar = (open: () => void) => {
+    setSettingsOpen(false);
+    setTerminalOpen(false);
+    open();
+  };
 
   return (
     <FactoryConsole
       {...snapshot}
-      screen={screen}
-      onNavigate={setScreen}
-      onSelectAgent={(agent) => { void owner.current?.selectAgent(agent); }}
-      onOpenTerminalForHumanRequest={(request) => { owner.current?.openTerminalForHumanRequest(request); }}
-      onSelectHumanRequest={(request) => { void owner.current?.selectHumanRequest(request); }}
+      view={view}
+      onView={setView}
+      settingsOpen={settingsOpen}
+      onToggleSettings={() => {
+        setTerminalOpen(false);
+        owner.current?.clearAgentTerminal();
+        owner.current?.clearHumanRequest();
+        setSettingsOpen((open) => !open);
+      }}
+      onSelectAgent={(agent) => openSidebar(() => { owner.current?.clearHumanRequest(); owner.current?.selectAgent(agent); })}
+      onCloseAgent={() => { setTerminalOpen(false); owner.current?.clearAgentTerminal(); }}
+      onOpenAgentTerminal={() => setTerminalOpen(true)}
+      onSaveAgentConfig={(config) => { void owner.current?.updateAgentConfig(config); }}
+      onEditTask={(task, change) => { void owner.current?.editTask(task, change); }}
+      onOpenTerminalForHumanRequest={(request) => { setTerminalOpen(true); owner.current?.openTerminalForHumanRequest(request); }}
+      onSelectHumanRequest={(request) => openSidebar(() => { void owner.current?.selectHumanRequest(request); })}
       onHumanReplyChange={(reply) => owner.current?.setHumanReply(reply)}
       onReplyHumanRequest={() => { void owner.current?.replyHumanRequest(); }}
       onCancelHumanRequest={() => { void owner.current?.cancelHumanRequest(); }}
       onCloseHumanRequest={() => owner.current?.clearHumanRequest()}
+      instructionContent={instruction}
       onInviteRemote={() => { void owner.current?.inviteRemote(); }}
       onDismissRemoteInvite={() => owner.current?.dismissRemoteInvite()}
       terminalContent={terminal}

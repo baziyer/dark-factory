@@ -3,12 +3,14 @@ import { createRoot } from "react-dom/client";
 import { FactoryApp, FactoryConsole, type FactoryConsoleProps } from "@dark-factory/ui";
 import "@dark-factory/ui/styles.css";
 import "./styles.css";
-import { fixtureState } from "../../../fixtures/state.mjs";
+import { fixtureState, fixtureTopology } from "../../../fixtures/state.mjs";
 
-// Fixture tour: sample data, no daemon, no authority. Reply/cancel handlers
-// are deliberately absent so one-shot actions cannot pretend to succeed.
+// Fixture tour: sample data, no daemon, no authority. Reply/cancel and edit
+// handlers are deliberately absent so one-shot actions cannot pretend to
+// succeed.
 function FixtureTour() {
-  const [screen, setScreen] = useState<FactoryConsoleProps["screen"]>({ kind: "home" });
+  const [view, setView] = useState<FactoryConsoleProps["view"]>("floor");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState<FactoryConsoleProps["selectedAgent"]>();
   const [selectedHumanRequest, setSelectedHumanRequest] = useState<FactoryConsoleProps["selectedHumanRequest"]>();
   return (
@@ -19,12 +21,25 @@ function FixtureTour() {
       <FactoryConsole
         status="ready"
         state={fixtureState}
-        screen={screen}
+        topology={fixtureTopology}
+        view={view}
+        onView={setView}
+        settingsOpen={settingsOpen}
+        onToggleSettings={() => {
+          setSelectedAgent(undefined);
+          setSelectedHumanRequest(undefined);
+          setSettingsOpen((open) => !open);
+        }}
         selectedAgent={selectedAgent}
         selectedHumanRequest={selectedHumanRequest}
-        onNavigate={setScreen}
-        onSelectAgent={(agent) => setSelectedAgent({ id: agent.id, name: agent.name, revision: agent.revision })}
-        onSelectHumanRequest={(request) =>
+        onSelectAgent={(agent) => {
+          setSettingsOpen(false);
+          setSelectedHumanRequest(undefined);
+          setSelectedAgent({ id: agent.id, name: agent.name, revision: agent.revision });
+        }}
+        onCloseAgent={() => setSelectedAgent(undefined)}
+        onSelectHumanRequest={(request) => {
+          setSettingsOpen(false);
           setSelectedHumanRequest({
             request,
             phase: "ready",
@@ -33,16 +48,9 @@ function FixtureTour() {
             canCancel: false,
             replyMaxBytes: request.reply_max_bytes,
             reply: "",
-          })
-        }
+          });
+        }}
         onCloseHumanRequest={() => setSelectedHumanRequest(undefined)}
-        terminalContent={
-          selectedAgent === undefined ? undefined : (
-            <pre className="devFixtureTerminal">
-              fixture tour — the terminal attaches only to a live daemon
-            </pre>
-          )
-        }
       />
     </>
   );

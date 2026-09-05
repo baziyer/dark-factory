@@ -16,12 +16,14 @@ import {
   type SessionStatus,
   type StateView,
   type TaskItem,
+  type TopologyView,
 } from "@dark-factory/client";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
 
 const BROWSER_ENDPOINT = new URL("ws://127.0.0.1:43123/browser");
 const BROWSER_URL = BROWSER_ENDPOINT.toString();
-const BROWSER_HOST = BROWSER_ENDPOINT.host;
+/** The one loopback address this console dials; SETTINGS shows exactly it. */
+export const BROWSER_HOST = BROWSER_ENDPOINT.host;
 // terminal_input is the bit a remote grant never carries: only a client paired
 // on this machine's own loopback may invite a phone.
 const LOOPBACK_GRANT = CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
@@ -68,6 +70,12 @@ export type FactoryTerminalView = Readonly<{
   surfaceVersion: number;
 }>;
 
+/** One console edit at a time: the sidebar shows exactly one form. */
+export type FactoryEditView = Readonly<{
+  pending: boolean;
+  error?: SessionError | ProtocolError;
+}>;
+
 export type FactoryAppSnapshot = Readonly<{
   status: SessionStatus;
   state?: StateView;
@@ -75,6 +83,9 @@ export type FactoryAppSnapshot = Readonly<{
   selectedHumanRequest?: FactoryHumanRequestView;
   selectedAgent?: FactoryAgentSelection;
   terminal?: FactoryTerminalView;
+  /** Regenerable project structure, absent until the daemon serves it. */
+  topology?: TopologyView;
+  edit?: FactoryEditView;
   /** True only while a ready session carries the full loopback grant. */
   remoteInviteAllowed?: boolean;
   remoteInvite?: FactoryRemoteInvite;
@@ -88,8 +99,9 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
-type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & RemoteInviteSession };
+type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
 
 export type FactoryAppControllerOptions = {
@@ -166,6 +178,9 @@ export class FactoryAppController {
   #terminalReplacement: TerminalReplacement | undefined;
   #pendingTerminalInput = new Uint8Array(0);
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
+  #topology: TopologyView | undefined;
+  #topologyPending = false;
+  #edit: FactoryEditView | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
   #remoteInviteError: string | undefined;
   #remoteInvitePending = false;
@@ -258,9 +273,84 @@ export class FactoryAppController {
     this.selectAgent(agent);
   }
 
+  /**
+   * The floor's rooms. Topology is regenerable, not durable state: it is
+   * fetched on demand and a daemon that cannot serve it simply leaves the
+   * floor showing one room per project.
+   */
+  loadTopology(): void {
+    const session = this.#client?.session;
+    const project = this.#state === undefined ? undefined : [...this.#state.projects.values()][0];
+    if (this.#closed || this.#status !== "ready" || session === undefined || project === undefined || this.#topologyPending) return;
+    this.#topologyPending = true;
+    const generation = this.#generation;
+    void session.getTopology(project.id).then(
+      (topology) => {
+        this.#topologyPending = false;
+        if (!this.#current(generation)) return;
+        this.#topology = topology;
+        this.#publish();
+      },
+      () => { this.#topologyPending = false; },
+    );
+  }
+
+  /**
+   * Save the selected agent's configuration against its exact revision. Only
+   * the controls the caller changed are sent; an omitted one is left alone,
+   * and an empty change is not a write at all.
+   */
+  async updateAgentConfig(config: { model?: string; reasoningEffort?: string; paused?: boolean }): Promise<void> {
+    const selected = this.#selectedAgent;
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || selected === undefined || session === undefined || this.#edit?.pending === true) return;
+    if (Object.values(config).every((value) => value === undefined)) return;
+    const generation = this.#generation;
+    this.#edit = { pending: true };
+    this.#publish();
+    try {
+      await session.updateAgent({ agentId: selected.agent.id, expectedRevision: selected.agent.revision, ...config });
+      if (!this.#current(generation)) return;
+      this.#edit = undefined;
+    } catch (error) {
+      if (!this.#current(generation)) return;
+      this.#edit = { pending: false, error: finiteError(error) };
+    }
+    this.#publish();
+  }
+
+  /** Edit one queued task against its exact revision. */
+  async editTask(task: Pick<TaskItem, "id" | "revision">, change: { title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<void> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
+    const generation = this.#generation;
+    this.#edit = { pending: true };
+    this.#publish();
+    try {
+      await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
+      if (!this.#current(generation)) return;
+      this.#edit = undefined;
+    } catch (error) {
+      if (!this.#current(generation)) return;
+      this.#edit = { pending: false, error: finiteError(error) };
+    }
+    this.#publish();
+  }
+
   clearAgentTerminal(): void {
     if (this.#closed) return;
     this.#replaceTerminal({});
+  }
+
+  /**
+   * Leave the terminal without dropping the agent the sidebar is showing.
+   * Replacing the terminal with the same exact agent detaches through the one
+   * teardown path, so the protocol handle is released exactly as CLOSE does.
+   */
+  closeAgentTerminal(): void {
+    const selected = this.#selectedAgent;
+    if (this.#closed) return;
+    this.#replaceTerminal(selected === undefined ? {} : { agentId: selected.agent.id, agentRevision: selected.agent.revision });
   }
 
   async enqueueAgentInstruction(instruction: string): Promise<boolean> {
@@ -558,6 +648,8 @@ export class FactoryAppController {
   #receiveState(generation: number, state: StateView): void {
     if (!this.#current(generation)) return;
     this.#state = state;
+    // Topology belongs to one project; a project that is gone has no floor.
+    if (this.#topology !== undefined && !state.projects.has(this.#topology.projectId)) this.#topology = undefined;
     const selectedAgent = this.#selectedAgent;
     const replacementAgentID = this.#terminalReplacement?.agentId;
     if (replacementAgentID !== undefined) {
@@ -813,6 +905,9 @@ export class FactoryAppController {
     }
     this.#terminalReplacement = replacement;
     this.#error = undefined;
+    // Release the display token before detaching: the view may unmount the
+    // surface during teardown, and that is this teardown, not a fault.
+    this.#terminalSurfaceToken = undefined;
     void terminal.detach().catch(() => undefined);
     this.#publish();
   }
@@ -823,6 +918,9 @@ export class FactoryAppController {
     this.#terminalReplacement = undefined;
     this.#dropPendingTerminalInput();
     this.#retireTerminal();
+    // A refused edit belongs to the agent it was made against; a new selection
+    // must not inherit its error.
+    this.#edit = undefined;
     const candidate = replacement.agentId === undefined ? undefined : this.#state?.agents.get(replacement.agentId);
     const agent = candidate?.revision === replacement.agentRevision ? candidate : undefined;
     const task = agent === undefined || this.#state === undefined ? undefined : agentCurrentTask(agent, this.#state);
@@ -874,6 +972,8 @@ export class FactoryAppController {
       status: this.#status,
       state: this.#state,
       error: this.#error,
+      topology: this.#topology,
+      edit: this.#edit,
       selectedHumanRequest: selection === undefined ? undefined : {
         request: selection.request,
         phase: selection.phase,

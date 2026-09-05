@@ -29,11 +29,21 @@ try {
     });
   });
   await waitFor(() => counters.states === 2, "factory state did not render");
-  const open = renderer.root.findAllByType("button").find((button) => typeof button.props.className === "string" && button.props.className.includes("dfConsoleStrip__agent"));
-  assert.ok(open, "public FactoryApp must expose the agent strip terminal action");
-  await act(async () => {
-    open.props.onClick();
-  });
+  // The agent list is the keyboard-reachable way in; the sidebar it opens
+  // carries the explicit action that attaches the terminal.
+  const agentsView = () => renderer.root.findAllByType("button").find((button) => button.props.children === "AGENTS");
+  const agentRow = () => renderer.root.findAllByType("button").find((button) => typeof button.props.className === "string" && button.props.className.includes("dfAgentList__row"));
+  const openTerminal = () => renderer.root.findAllByType("button").find((button) => button.props.children === "OPEN TERMINAL");
+  await act(async () => { agentsView().props.onClick(); });
+  const open = async () => {
+    const row = agentRow();
+    assert.ok(row, "public FactoryApp must expose a selectable agent");
+    await act(async () => { row.props.onClick(); });
+    const terminal = openTerminal();
+    assert.ok(terminal, "the selected agent's sidebar must expose the terminal action");
+    await act(async () => { terminal.props.onClick(); });
+  };
+  await open();
   await waitFor(() => globalThis.__darkFactoryStrictProbe.acquires === 1 && globalThis.__darkFactoryStrictProbe.terminals - globalThis.__darkFactoryStrictProbe.disposes === 1, "first terminal did not become live");
 
   assert.equal(counters.clients, 2, "StrictMode must create two public app sessions");
@@ -50,13 +60,15 @@ try {
     close.props.onClick();
   });
   await waitFor(() => counters.detaches === 1 && counters.terminals === counters.disposes, "terminal did not detach and unmount");
+  // Leaving the terminal returns to the agent's own sidebar, and unmounting
+  // the surface as part of that teardown is not reported as a fault.
+  assert.ok(openTerminal(), "closing the terminal must return to the agent panel");
+  assert.equal(renderer.root.findAll((node) => node.props?.role === "alert").length, 0, "a deliberate close raises no error");
   assert.equal(counters.detaches, 1, "close must detach exactly one terminal observer");
   assert.equal(counters.sessionCloses, 1, "terminal close must preserve the active browser session");
   assert.equal(counters.terminals, counters.disposes, "closed terminal surface must unmount");
 
-  await act(async () => {
-    open.props.onClick();
-  });
+  await open();
   await waitFor(() => counters.acquires === 2 && counters.terminals - counters.disposes === 1, "terminal did not reopen");
   assert.equal(counters.resolves, 2);
   assert.equal(counters.opens, 2);

@@ -12,7 +12,9 @@
   box-sizing: border-box;
   display: flex;
   align-items: flex-start;
-  min-height: 100%;
+  /* A percentage resolves against an auto-height body, which is zero: one
+     screen of console leaves the host's white page showing below it. */
+  min-height: 100svh;
   background: var(--df-console-background);
 }
 
@@ -33,7 +35,11 @@
 .dfFactoryConsole__terminalPanel,
 .dfFactoryConsole__terminalPanel *,
 .dfFactoryConsole__terminalPanel *::before,
-.dfFactoryConsole__terminalPanel *::after {
+.dfFactoryConsole__terminalPanel *::after,
+.dfConsoleSidebar,
+.dfConsoleSidebar *,
+.dfConsoleSidebar *::before,
+.dfConsoleSidebar *::after {
   box-sizing: inherit;
 }
 
@@ -73,6 +79,7 @@
 .dfFactoryConsole__status,
 .dfFactoryConsole button,
 .dfFactoryConsole__terminalPanel button,
+.dfConsoleSidebar button,
 .dfFactoryConsole__reply label {
   font-size: 0.7rem;
   letter-spacing: 0.08em;
@@ -86,7 +93,8 @@
   color: var(--df-console-muted);
 }
 
-.dfFactoryConsole :where(h1, h2, p, dl, ul) {
+.dfFactoryConsole :where(h1, h2, p, dl, ul),
+.dfConsoleSidebar :where(h1, h2, h3, p, dl, ul) {
   margin: 0;
 }
 
@@ -129,7 +137,8 @@
 .dfFactoryConsole__statusDot--idle { background: var(--df-console-warning); }
 
 .dfFactoryConsole button,
-.dfFactoryConsole__terminalPanel button {
+.dfFactoryConsole__terminalPanel button,
+.dfConsoleSidebar button {
   padding: 0.6rem 0.75rem;
   color: var(--df-console-text);
   background: transparent;
@@ -138,17 +147,20 @@
 }
 
 .dfFactoryConsole button:hover:not(:disabled),
-.dfFactoryConsole__terminalPanel button:hover:not(:disabled) { border-color: var(--df-console-accent); }
+.dfFactoryConsole__terminalPanel button:hover:not(:disabled),
+.dfConsoleSidebar button:hover:not(:disabled) { border-color: var(--df-console-accent); }
 .dfFactoryConsole button:focus-visible,
 .dfFactoryConsole textarea:focus-visible,
 .dfFactoryConsole__terminalPanel button:focus-visible,
-.dfFactoryConsole__terminalPanel textarea:focus-visible {
+.dfFactoryConsole__terminalPanel textarea:focus-visible,
+.dfConsoleSidebar :where(button, textarea, input, select):focus-visible {
   outline: 2px solid var(--df-console-accent);
   outline-offset: 3px;
 }
 
 .dfFactoryConsole button:disabled,
-.dfFactoryConsole__terminalPanel button:disabled { cursor: default; opacity: 0.5; }
+.dfFactoryConsole__terminalPanel button:disabled,
+.dfConsoleSidebar button:disabled { cursor: default; opacity: 0.5; }
 
 .dfFactoryConsole__error {
   max-width: 90rem;
@@ -234,21 +246,15 @@
 .dfFactoryConsole__empty { color: var(--df-console-muted); font-size: 0.75rem; }
 
 .dfFactoryConsole__humanRequest {
-  margin-top: 1rem;
   padding: 1rem;
   border: 1px solid var(--df-console-accent);
 }
 
-.dfFactoryConsole__humanRequest > p {
-  margin-top: 0.75rem;
-  color: var(--df-console-muted);
-  font-size: 0.75rem;
-  line-height: 1.5;
-}
-
 .dfFactoryConsole__humanRequest .dfFactoryConsole__question {
+  margin-top: 1rem;
   color: var(--df-console-text);
   font-size: 1rem;
+  line-height: 1.5;
   text-transform: none;
   overflow-wrap: anywhere;
 }
@@ -533,6 +539,153 @@
 
 @media (max-width: 960px) {
   .dfConsoleStrip { flex-direction: column; align-items: flex-start; }
+}
+
+/* single screen ------------------------------------------------------------
+   One screen: the floor or the agent list on the left, what needs you on the
+   right, and one sidebar that replaces the right column while it is open.
+   ------------------------------------------------------------------------ */
+
+.dfFactoryConsole__header { flex-wrap: wrap; }
+
+.dfConsoleBar__counters {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  margin: 0;
+}
+
+.dfConsoleBar__counter dt {
+  margin-bottom: 0.2rem;
+  color: var(--df-console-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+}
+
+.dfConsoleBar__counter dd { margin: 0; font-size: 1.1rem; }
+.dfConsoleBar__counter--alert dd { color: var(--df-console-warning); }
+
+.dfConsoleBar__actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.dfConsoleBar__toggle { display: flex; }
+.dfConsoleBar__toggle button + button { margin-left: -1px; }
+.dfConsoleShell .dfConsoleBar__toggle button[aria-pressed="true"],
+.dfConsoleShell .dfConsoleBar__actions > button[aria-pressed="true"] {
+  color: var(--df-console-accent);
+  border-color: var(--df-console-accent);
+}
+
+.dfConsoleLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  max-width: 90rem;
+  margin: 0 auto;
+}
+
+.dfConsoleLayout--narrow { grid-template-columns: minmax(0, 1fr); }
+.dfConsoleLayout .dfFactoryConsole__section { margin: 0 0 1.5rem; }
+.dfConsoleLayout__left { min-width: 0; }
+.dfConsoleLayout__right { min-width: 0; }
+
+/* The sidebar is a sibling of the console main element, so every rule the
+   console scopes to its own subtree has to name it too. */
+.dfConsoleSidebar {
+  position: sticky;
+  top: 1rem;
+  flex: 0 0 clamp(22rem, 40vw, 44rem);
+  min-width: 0;
+  max-height: calc(100svh - 2rem);
+  overflow-y: auto;
+  padding: 1rem 1rem 1rem 0;
+  color: var(--df-console-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.dfConsoleSidebar__panel {
+  padding: 1rem;
+  background: var(--df-console-surface);
+  border: 1px solid var(--df-console-accent);
+}
+
+.dfConsoleSidebar__panel h2 { font-size: 1.1rem; letter-spacing: 0.06em; overflow-wrap: anywhere; }
+.dfConsoleSidebar__panel h3 { margin-bottom: 0.6rem; font-size: 0.8rem; letter-spacing: 0.12em; color: var(--df-console-muted); }
+
+.dfConsoleSidebar__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--df-console-rule);
+}
+
+.dfConsoleSidebar__status { margin: 0.75rem 0 0; color: var(--df-console-accent); font-size: 0.875rem; }
+.dfConsoleSidebar__now { font-size: 0.9rem; line-height: 1.5; overflow-wrap: anywhere; }
+.dfConsoleSidebar__address { font-size: 0.875rem; overflow-wrap: anywhere; }
+
+.dfConsoleSidebar__section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--df-console-rule);
+}
+
+.dfConsoleSidebar__config { display: grid; gap: 0.5rem; }
+.dfConsoleSidebar__config label { color: var(--df-console-muted); font-size: 0.8rem; letter-spacing: 0.08em; }
+.dfConsoleSidebar__config button { justify-self: start; margin-top: 0.5rem; }
+
+.dfConsoleSidebar__toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.25rem;
+}
+
+.dfConsoleSidebar :where(input[type="text"], input:not([type]), select) {
+  width: 100%;
+  padding: 0.6rem;
+  color: var(--df-console-text);
+  background: var(--df-console-background);
+  border: 1px solid var(--df-console-rule);
+  font: inherit;
+  font-size: 0.875rem;
+}
+
+.dfConsoleSidebar__task {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.7rem;
+  border: 1px solid var(--df-console-rule);
+}
+
+.dfConsoleSidebar__taskActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.dfConsoleSidebar__taskActions select { width: auto; flex: 1 1 8rem; }
+.dfConsoleSidebar__terminal { margin-top: 1.25rem; width: 100%; }
+
+.dfAgentList { display: grid; gap: 1.5rem; }
+.dfAgentList__row { width: 100%; border: 1px solid var(--df-console-rule); }
+.dfAgentList__provider,
+.dfAgentList__activity,
+.dfAgentList__count { flex: 0 0 auto; color: var(--df-console-muted); font-size: 0.8rem; }
+.dfAgentList__activity { color: var(--df-console-accent); }
+
+@media (max-width: 1024px) {
+  .dfConsoleShell { display: block; }
+  .dfConsoleLayout { grid-template-columns: minmax(0, 1fr); }
+  .dfConsoleSidebar { position: static; max-height: none; padding: 0 clamp(1rem, 3vw, 3rem) 1.5rem; }
 }
 
 /* remote ------------------------------------------------------------------

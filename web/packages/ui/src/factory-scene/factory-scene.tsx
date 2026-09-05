@@ -24,6 +24,8 @@ export type FactorySceneProps = Readonly<{
   topology: SceneTopology;
   workers: readonly SceneWorker[];
   workItems: readonly SceneWorkItem[];
+  /** Pointer convenience only; the AGENTS list is the keyboard path. */
+  onSelectWorker?: (workerId: string) => void;
 }>;
 
 const PADDING = 12;
@@ -31,6 +33,7 @@ const SERVICE_HEIGHT = 52;
 
 const roomFill: Record<SceneNode["kind"], string> = {
   repository: "#16364a",
+  module: "#1b3a4a",
   package: "#193d38",
   directory: "#282f42",
 };
@@ -59,7 +62,7 @@ function SpriteSymbol({ sprite }: { sprite: SceneWorkerSprite }) {
 }
 
 /** A disposable SVG projection of topology and current factory state. */
-export function FactoryScene({ topology, workers, workItems }: FactorySceneProps) {
+export function FactoryScene({ topology, workers, workItems, onSelectWorker }: FactorySceneProps) {
   const layout = layoutScene(topology);
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
@@ -87,7 +90,7 @@ export function FactoryScene({ topology, workers, workItems }: FactorySceneProps
       style={{ display: "block", width: "100%", height: "auto", background: "#08131d" }}
     >
       <title>Dark Factory codebase floor</title>
-      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} work items`}</desc>
+      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks`}</desc>
       <defs>{orderedSprites.map((sprite) => <SpriteSymbol key={sprite.key} sprite={sprite} />)}</defs>
       <rect width={layout.width} height={sceneHeight} fill="#08131d" />
       <text x={PADDING} y="20" fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="10" fontWeight="700">
@@ -105,7 +108,7 @@ export function FactoryScene({ topology, workers, workItems }: FactorySceneProps
               {shortLabel(node.label)}
             </text>
             <text x={room.x + 8} y={room.y + 34} fill="#9db1be" fontFamily="ui-monospace, monospace" fontSize="8">
-              {node.kind.toUpperCase()} · {node.fileCount} FILES
+              {node.kind.toUpperCase()}{node.sizeBucket === undefined ? "" : ` · ${node.sizeBucket.toUpperCase()}`}
             </text>
           </g>
         );
@@ -139,6 +142,7 @@ export function FactoryScene({ topology, workers, workItems }: FactorySceneProps
             transform={`translate(${placement.x} ${placement.y})`}
             role="img"
             aria-label={`${worker.name}, ${worker.role}, ${worker.activity}, ${location}`}
+            {...(onSelectWorker === undefined ? {} : { onClick: () => onSelectWorker(worker.id), style: { cursor: "pointer" } })}
           >
             <title>{worker.name}</title>
             <use href={`#df-worker-${sprite.key}`} x="-8" y="-8" width="16" height="16" />
@@ -153,11 +157,11 @@ export function FactoryScene({ topology, workers, workItems }: FactorySceneProps
       ], [
         "STAGED",
         staged,
-        `${staged} staged work items`,
+        `${staged} staged tasks`,
       ], [
         "READY",
         ready,
-        `${ready} release-ready work items`,
+        `${ready} release-ready tasks`,
       ]] as const).map(([label, count, ariaLabel], index) => {
         const x = PADDING + index * (bayWidth + bayGap);
         return (

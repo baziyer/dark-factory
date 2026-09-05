@@ -8,9 +8,9 @@ import { layoutScene, placeWorkers, workerSprite } from "../../dist/src/factory-
 const topology = {
   digest: "fixture-1",
   nodes: [
-    { id: "repo", parentId: "", path: ".", label: "Repository", kind: "repository", fileCount: 9 },
-    { id: "lib", parentId: "repo", path: "packages/lib", label: "<Shared & Library> 📦📦", kind: "package", fileCount: 4 },
-    { id: "src", parentId: "lib", path: "packages/lib/src", label: "Source", kind: "directory", fileCount: 3 },
+    { id: "repo", parentId: "", path: ".", label: "Repository", kind: "repository", sizeBucket: "large" },
+    { id: "lib", parentId: "repo", path: "packages/lib", label: "<Shared & Library> 📦📦", kind: "package", sizeBucket: "medium" },
+    { id: "src", parentId: "lib", path: "packages/lib/src", label: "Source", kind: "directory", sizeBucket: "small" },
   ],
 };
 
@@ -51,6 +51,14 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.equal(first, reordered);
   assert.match(first, /data-topology-digest="fixture-1"/);
   assert.match(first, /data-room-id="src"/);
+  // The room subtitle carries the served size bucket, and nothing when the
+  // room stands for a project rather than a topology node.
+  assert.match(first, />PACKAGE · MEDIUM</);
+  assert.match(renderToStaticMarkup(createElement(FactoryScene, {
+    topology: { digest: "d", nodes: [{ id: "p", parentId: "", path: "Project", label: "Project", kind: "repository" }] },
+    workers: [],
+    workItems: [],
+  })), />REPOSITORY<\/text>/);
   assert.match(first, /&lt;Shared &amp; Library…/);
   assert.equal(first.includes("�"), false);
   assert.equal((first.match(/data-worker-id=/g) ?? []).length, workers.length);
@@ -101,7 +109,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   const changed = layoutScene({
     digest: "fixture-2",
-    nodes: [...topology.nodes, { id: "docs", parentId: "repo", path: "docs", label: "Docs", kind: "directory", fileCount: 2 }],
+    nodes: [...topology.nodes, { id: "docs", parentId: "repo", path: "docs", label: "Docs", kind: "directory", sizeBucket: "tiny" }],
   });
   assert.equal(changed.rooms.some((room) => room.id === "docs"), true);
   assert.notDeepEqual(changed, layout);

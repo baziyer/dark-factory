@@ -22,6 +22,11 @@ export function createBrowserClient(options) {
   counters.clients += 1;
   let closed = false;
   const session = {
+    // A daemon older than the console edit contract refuses all three; the
+    // console must still mount, show its floor, and open a terminal.
+    getTopology: async () => { throw new SessionError("not_found"); },
+    updateAgent: async () => { throw new SessionError("not_found"); },
+    updateTask: async () => { throw new SessionError("not_found"); },
     resolveAgentTerminal: async () => { counters.resolves += 1; return Object.freeze({}); },
     openTerminal: (_target, callbacks) => {
       counters.opens += 1;
