@@ -139,11 +139,13 @@ type HumanPending = {
   reject: (error: unknown) => void;
 };
 type TaskPending = { taskId: string; expectedAgentRevision: bigint; resolve: (value: { taskId: string; revision: bigint }) => void; reject: (error: unknown) => void };
-type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
+type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 export type AgentUpdateResult = Readonly<{ agentId: string; revision: bigint }>;
 export type TaskUpdateResult = Readonly<{ taskId: string; revision: bigint }>;
 export type TopologyView = Readonly<{ projectId: string; digest: string; sourceRevision: string; nodes: readonly TopologyBody["nodes"][number][] }>;
+/** One agent's live run and the repository directories it has changed. */
+export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
 
 /** One minted remote pairing invitation and the code that carries it. */
@@ -282,6 +284,11 @@ export class BrowserSession {
   /** The project's regenerable structure, computed on demand by the daemon. */
   getTopology(projectId: string): Promise<TopologyView> {
     return this.#consoleRequest("TOPOLOGY", projectId, 1n, "topology", (id) => encodeClientControl({ type: "TOPOLOGY_GET", id, body: { project_id: projectId } }));
+  }
+
+  /** The directories one agent's live run has changed; no run, no paths. */
+  getRunPaths(agentId: string): Promise<RunPathsView> {
+    return this.#consoleRequest("RUN_PATHS", agentId, 1n, "run-paths", (id) => encodeClientControl({ type: "RUN_PATHS_GET", id, body: { agent_id: agentId } }));
   }
 
   /** Mints one remote pairing invitation. The mint is never retried: a failed
@@ -583,7 +590,7 @@ export class BrowserSession {
       this.#taskResult(frame.body, frame.id);
       return;
     }
-    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY") {
+    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS") {
       this.#consoleResult(frame);
       return;
     }
@@ -893,11 +900,11 @@ export class BrowserSession {
     this.#taskPending.clear();
   }
 
-  /** One shape for the three console request/result pairs. */
+  /** One shape for the four console request/result pairs. */
   #consoleRequest<T>(kind: ConsolePending["kind"], entityId: string, expectedRevision: bigint, prefix: string, encode: (id: string) => string): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
     if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
-    const capability = kind === "TOPOLOGY" ? CAPABILITIES.observe : CAPABILITIES.human_actions;
+    const capability = kind === "TOPOLOGY" || kind === "RUN_PATHS" ? CAPABILITIES.observe : CAPABILITIES.human_actions;
     if ((this.#capabilities & capability) === 0) return Promise.reject(new SessionError("unauthorized"));
     if (!validDynamicID(entityId) || expectedRevision < 1n || expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
     if (this.#consolePending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
@@ -909,14 +916,15 @@ export class BrowserSession {
     return result;
   }
 
-  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" }>): void {
+  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" }>): void {
     const pending = this.#consolePending.get(frame.id);
     if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
-    const identity = frame.type === "AGENT_UPDATE_RESULT" ? frame.body.agent_id : frame.type === "TASK_UPDATE_RESULT" ? frame.body.task_id : frame.body.project_id;
+    const identity = frame.type === "AGENT_UPDATE_RESULT" || frame.type === "RUN_PATHS" ? frame.body.agent_id : frame.type === "TASK_UPDATE_RESULT" ? frame.body.task_id : frame.body.project_id;
     if (identity !== pending.entityId) throw new ProtocolError("malformed");
     this.#consolePending.delete(frame.id);
     if (frame.type === "AGENT_UPDATE_RESULT") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, revision: frame.body.revision }) as never); return; }
     if (frame.type === "TASK_UPDATE_RESULT") { pending.resolve(Object.freeze({ taskId: frame.body.task_id, revision: frame.body.revision }) as never); return; }
+    if (frame.type === "RUN_PATHS") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, runId: frame.body.run_id, paths: Object.freeze([...frame.body.paths]) }) as never); return; }
     pending.resolve(Object.freeze({ projectId: frame.body.project_id, digest: frame.body.digest, sourceRevision: frame.body.source_revision, nodes: Object.freeze(frame.body.nodes.map((node) => Object.freeze({ ...node }))) }) as never);
   }
 

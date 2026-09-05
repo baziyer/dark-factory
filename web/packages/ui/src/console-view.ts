@@ -1,5 +1,5 @@
 import type { AgentItem, StateView, TaskItem, TopologyView } from "@dark-factory/client";
-import type { SceneNode, SceneTopology, SceneWorker, SceneWorkItem } from "./factory-scene/scene.js";
+import { compareText, type SceneNode, type SceneTopology, type SceneWorker, type SceneWorkItem } from "./factory-scene/scene.js";
 
 /** The task stages the daemon actually serves today. */
 export type TaskStage = "queued" | "building" | "blocked" | "done" | "failed";
@@ -111,13 +111,18 @@ export type FloorScene = Readonly<{
 /**
  * The floor is a projection, never a second source of truth: rooms come from
  * the served topology (or one room per project until it arrives), and every
- * worker stands in its own project's room.
+ * worker stands in the room of the code its live run is changing, falling back
+ * to its own project's room.
  */
-export function floorScene(state: StateView | undefined, topology: TopologyView | undefined): FloorScene {
+export function floorScene(
+  state: StateView | undefined,
+  topology: TopologyView | undefined,
+  runPaths?: ReadonlyMap<string, readonly string[]>,
+): FloorScene {
   const projects = state === undefined ? [] : [...state.projects.values()];
-  // Topology is served one project at a time. Every other project keeps its
-  // own room and the served root keeps its own: the cap falls on the root's
-  // children, so no agent is stranded in the overflow bay for want of a room.
+  // Topology is served one project at a time. The cap eats the root's children
+  // first, so the served root and the other projects keep their rooms until the
+  // projects alone overrun the floor, past which the last ones lose theirs.
   const detailed = topology === undefined ? [] : topologyRooms(topology);
   const others = projectRooms(projects.filter((project) => project.id !== topology?.projectId));
   const rooms = [...detailed.slice(0, Math.max(1, MAX_FLOOR_ROOMS - others.length)), ...others]
@@ -126,8 +131,12 @@ export function floorScene(state: StateView | undefined, topology: TopologyView 
   const rootID = detailed[0]?.id;
   const roomOfProject = (projectID: string): string | undefined =>
     projectID === topology?.projectId ? rootID : roomIDs.has(projectID) ? projectID : undefined;
+  const shown = detailed.filter((room) => roomIDs.has(room.id));
   const workers = state === undefined ? [] : [...state.agents.values()].map((agent) => {
-    const nodeId = roomOfProject(agent.project_id);
+    const project = roomOfProject(agent.project_id);
+    // Only the served project has rooms below its root, so only its runs can
+    // walk into one; every other agent stays in its project's room.
+    const nodeId = project !== rootID ? project : roomOfRunPaths(shown, runPaths?.get(agent.id) ?? []) ?? project;
     return {
       id: agent.id,
       name: agent.name,
@@ -141,6 +150,24 @@ export function floorScene(state: StateView | undefined, topology: TopologyView 
     .filter((task) => task.status === "succeeded" || task.status === "running" || task.status === "blocked")
     .map((task) => ({ id: task.id, stage: task.status === "succeeded" ? "release-ready" as const : "staged" as const }));
   return { topology: { digest: topology?.digest ?? "", nodes: rooms }, workers, workItems };
+}
+
+/**
+ * The room a live run's changed paths stand a worker in: each path picks the
+ * deepest displayed room whose own path prefixes it (the root's "." prefixes
+ * everything), and the room holding the most paths wins, ties going to the
+ * room the floor sorts first. No paths means no answer and no move.
+ */
+function roomOfRunPaths(rooms: readonly SceneNode[], paths: readonly string[]): string | undefined {
+  const counts = new Map<SceneNode, number>();
+  for (const path of paths) {
+    const room = rooms
+      .filter((candidate) => candidate.path === "." || path === candidate.path || path.startsWith(`${candidate.path}/`))
+      .sort((left, right) => right.path.length - left.path.length)[0];
+    if (room !== undefined) counts.set(room, (counts.get(room) ?? 0) + 1);
+  }
+  return [...counts]
+    .sort(([left, leftCount], [right, rightCount]) => rightCount - leftCount || compareText(left.path, right.path))[0]?.[0].id;
 }
 
 function topologyRooms(topology: TopologyView): readonly SceneNode[] {

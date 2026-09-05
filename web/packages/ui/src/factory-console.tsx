@@ -74,6 +74,7 @@ export function FactoryConsole({
   state,
   error,
   topology,
+  runPaths,
   edit,
   view = "floor",
   onView,
@@ -193,7 +194,7 @@ export function FactoryConsole({
         <div className={`dfConsoleLayout${sidebar === undefined ? "" : " dfConsoleLayout--narrow"}`}>
           <section className="dfConsoleLayout__left dfFactoryConsole__section" aria-label={view === "floor" ? "Factory floor" : "Agents"}>
             {view === "floor"
-              ? <FactoryFloor state={state} topology={topology} onSelectAgent={ready ? onSelectAgent : undefined} />
+              ? <FactoryFloor state={state} topology={topology} runPaths={runPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />}
           </section>
 

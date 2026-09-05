@@ -55,12 +55,15 @@ export type SceneWorkerPlacement = Readonly<{
 
 const ROOM_WIDTH = 152;
 const ROOM_HEIGHT = 96;
-const ROOM_GAP = 12;
+const ROOM_GAP = 16;
 const PADDING = 12;
-const FLOOR_TOP = 40;
+// The floor and wall patterns are anchored at the SVG origin, so a room shows
+// whole tiles only while its top and the row pitch stay multiples of the frame.
+const FLOOR_TOP = 48;
 const WORKER_GAP = 18;
 
-function compareText(left: string, right: string) {
+/** Ordering for the floor: byte order over paths and ids, never a locale. */
+export function compareText(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 

@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { SessionError } from "@dark-factory/client";
 import { FactoryAppController } from "../dist/src/factory-app-controller.js";
 import { fixtureState } from "../../../fixtures/state.mjs";
 
 const challenge = "51".repeat(32);
 const request = [...fixtureState.humanRequests.values()][0];
+const runningAgentID = [...fixtureState.agents.keys()][0];
+
+/** Drain the microtasks one poll round settles through. */
+const settle = async () => { for (let turn = 0; turn < 5; turn += 1) await Promise.resolve(); };
 
 function deferred() {
   let resolve;
@@ -47,6 +51,7 @@ function harness(overrides = {}) {
     updateAgent: overrides.updateAgent ?? (async () => { throw new SessionError("not_found"); }),
     updateTask: overrides.updateTask ?? (async () => { throw new SessionError("not_found"); }),
     getTopology: overrides.getTopology ?? (async () => { throw new SessionError("not_found"); }),
+    getRunPaths: overrides.getRunPaths ?? (async () => { throw new SessionError("not_found"); }),
     inviteRemote: overrides.inviteRemote ?? (async () => remoteInvite),
     capabilities: overrides.capabilities ?? 15,
   };
@@ -495,6 +500,63 @@ test("the floor's topology is fetched once per demand and absence is tolerated",
   // A floor belongs to its project; when that project is gone, so is it.
   context.emitState({ ...fixtureState, projects: new Map() });
   assert.equal(context.latest().topology, undefined);
+});
+
+test("run paths are polled for running agents only while the floor is shown", async (t) => {
+  mock.timers.enable({ apis: ["setInterval"] });
+  t.after(() => mock.timers.reset());
+  const asked = [];
+  let answer = async (agentId) => ({ agentId, runId: "0a".repeat(16), paths: ["web/packages/ui"] });
+  const context = harness({ getRunPaths: (agentId) => { asked.push(agentId); return answer(agentId); } });
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+
+  // One timer however many times the floor asks, and only the agents that are
+  // on a running task are asked at all.
+  context.controller.watchRunPaths(true);
+  context.controller.watchRunPaths(true);
+  await settle();
+  assert.deepEqual(asked, [runningAgentID]);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
+
+  // Ten seconds is the cadence, and an unchanged round is not a new snapshot.
+  const published = context.snapshots.length;
+  mock.timers.tick(10_000);
+  await settle();
+  assert.equal(asked.length, 2);
+  assert.equal(context.snapshots.length, published);
+
+  // A refused answer leaves the worker where it was last seen.
+  answer = async () => { throw new SessionError("not_found"); };
+  mock.timers.tick(10_000);
+  await settle();
+  assert.equal(asked.length, 3);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
+
+  // An agent that is no longer running loses its entry.
+  context.emitState({ ...fixtureState, tasks: new Map() });
+  mock.timers.tick(10_000);
+  await settle();
+  assert.equal(asked.length, 3);
+  assert.equal(context.latest().runPaths.size, 0);
+
+  // A hidden floor stops the timer, and so does leaving ready.
+  context.controller.watchRunPaths(false);
+  context.emitState(fixtureState);
+  mock.timers.tick(10_000);
+  await settle();
+  assert.equal(asked.length, 3);
+
+  answer = async (agentId) => ({ agentId, runId: "0a".repeat(16), paths: ["internal/kernel"] });
+  context.controller.watchRunPaths(true);
+  await settle();
+  assert.equal(asked.length, 4);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["internal/kernel"]]]);
+  context.emitStatus("syncing");
+  mock.timers.tick(10_000);
+  await settle();
+  assert.equal(asked.length, 4);
 });
 
 test("a remote invitation is offered, stored, dismissed, and its failure reported", async () => {

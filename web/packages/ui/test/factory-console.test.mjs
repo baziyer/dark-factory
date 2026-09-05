@@ -49,6 +49,8 @@ test("error banner keeps its centered layout after the paragraph reset", () => {
   // The sidebar is a sibling of the console, so it needs the same reset.
   assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),\s*\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
+  // The floor's sprite flip is CSS so that reduced motion can stop it dead.
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?dfFactoryScene__alternate \{ animation: none/);
 });
 
 test("one screen shows the floor, the counters, and what needs you at once", () => {
@@ -104,6 +106,28 @@ test("the floor maps topology to rooms and agents to workers deterministically",
     ["Builder Two", "waiting", root],
   ]);
   assert.deepEqual(scene.workItems.map((item) => item.stage), ["staged", "release-ready"]);
+
+  // A live run stands its worker in the room of the code it is changing: the
+  // deepest displayed room that prefixes a path, and the room most paths sit in.
+  const kernel = fixtureTopology.nodes.find((entry) => entry.path === "internal/kernel").id;
+  const web = fixtureTopology.nodes.find((entry) => entry.path === "web").id;
+  const placed = (paths) => floorScene(fixtureState, fixtureTopology, new Map([[ids.agent, paths]]))
+    .workers.find((worker) => worker.id === ids.agent).nodeId;
+  assert.equal(placed(["internal/kernel/store"]), kernel);
+  assert.equal(placed(["web"]), web);
+  // The repository root is a room like any other, and an unmapped path is its.
+  assert.equal(placed(["."]), root);
+  assert.equal(placed(["cmd/factoryd"]), root);
+  // Several paths: the room holding the most of them, ties by sorted path.
+  assert.equal(placed(["web", "internal/kernel", "internal/kernel/store"]), kernel);
+  assert.equal(placed(["web", "internal/kernel"]), kernel);
+  assert.equal(placed(["web", "web/packages/ui", "internal/kernel"]), web);
+  // No paths, or an agent the poll never covered, keeps the project room.
+  assert.equal(placed([]), root);
+  assert.equal(floorScene(fixtureState, fixtureTopology, new Map()).workers.at(-1).nodeId, root);
+  // Another project's agent has no rooms below its own, whatever it reports.
+  assert.equal(floorScene(fixtureState, fixtureTopology, new Map([[ids.orchestrator, ["internal/kernel"]]]))
+    .workers.find((worker) => worker.id === ids.orchestrator).nodeId, ids.secondProject);
 
   // Without topology the floor still has a room per project.
   const fallback = floorScene(fixtureState, undefined);

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
 import { alternateFrame, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
-import { spriteAtlas, spriteSheet } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
+import { spriteAtlas, spriteSheet, spriteSheetSize } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
 const topology = {
   digest: "fixture-1",
@@ -37,6 +41,8 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     x: layout.rooms[0].x + layout.rooms[0].width / 2,
     y: layout.rooms[0].y + layout.rooms[0].height / 2,
   });
+
+  for (const room of layout.rooms) assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
@@ -87,13 +93,20 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.equal(first.includes("<line"), false);
   assert.equal(first.includes("<animate"), false);
 
-  // The sheet the renderer reads is 47 frames on a 16px grid inside 128 × 96.
-  assert.equal(Object.keys(spriteAtlas.frames).length, 47);
+  // The sheet the renderer reads is every frame it can draw, on a 16px grid,
+  // inside the size the generator wrote next to it.
+  assert.equal(Object.keys(spriteAtlas.frames).length, 43);
   assert.equal(spriteAtlas.frame, 16);
+  assert.deepEqual(spriteSheetSize, { width: 128, height: 96 });
+  assert.match(first, new RegExp(`width="${spriteSheetSize.width}" height="${spriteSheetSize.height}"`));
   for (const [name, cell] of Object.entries(spriteAtlas.frames)) {
     assert.ok(cell.x % 16 === 0 && cell.y % 16 === 0, name);
-    assert.ok(cell.x >= 0 && cell.y >= 0 && cell.x + 16 <= 128 && cell.y + 16 <= 96, name);
+    assert.ok(cell.x >= 0 && cell.y >= 0 && cell.x + 16 <= spriteSheetSize.width && cell.y + 16 <= spriteSheetSize.height, name);
   }
+  // Every packed frame is one a render can reach, so no symbol is dead weight.
+  assert.deepEqual(
+    Object.keys(spriteAtlas.frames).filter((name) => name.startsWith("tile.") || name.startsWith("bay.")).sort(),
+    ["bay.free", "bay.ready", "bay.staged", "tile.door", "tile.floor.0", "tile.floor.1", "tile.wall"]);
 
   const denseWorkers = Array.from({ length: 100 }, (_, index) => ({
     id: `worker-${index}`,
@@ -146,5 +159,20 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.equal(new Set(emptyPlacements.map(({ x, y }) => `${x},${y}`)).size, emptyWorkers.length);
   const emptySvg = render({ topology: { digest: "empty", nodes: [] }, workers: emptyWorkers, workItems: [] });
   assert.match(emptySvg, /EMPTY FLOOR/);
+  // An empty floor in a wide column stays a panel, not a poster.
+  assert.match(emptySvg, new RegExp(`max-width:${emptyLayout.width * 3}px`));
   assert.match(emptySvg, /aria-label="20 unassigned workers"/);
+});
+
+// Nothing else runs the generator, so the shipped module could drift from it.
+test("the committed sprite module is exactly what the generator writes", () => {
+  const sprites = new URL("./sprites/", import.meta.url);
+  const scratch = mkdtempSync(join(tmpdir(), "df-sprites-"));
+  try {
+    copyFileSync(new URL("gen-sprites.mjs", sprites), join(scratch, "gen-sprites.mjs"));
+    execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "ignore" });
+    assert.deepEqual(readFileSync(join(scratch, "sprites.generated.ts")), readFileSync(new URL("sprites.generated.ts", sprites)));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });

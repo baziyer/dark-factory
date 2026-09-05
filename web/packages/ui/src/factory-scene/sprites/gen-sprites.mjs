@@ -180,60 +180,6 @@ const door = grid(`
   ..lmmmmmmmmmml..
   ..oooooooooooo..
 `);
-const machine = grid(`
-  ................
-  ..oooooooooooo..
-  .ollllllllllllo.
-  .olmmmmmmmmmmmo.
-  .omooooooooommo.
-  .omodddddddommo.
-  .omodkkkdddouuo.
-  .omodddddddouuo.
-  .omooooooooommo.
-  .ommmmmmmmmmmmo.
-  .ollllllllllllo.
-  .omomomomomommo.
-  .ommmmmmmmmmmmo.
-  .oooooooooooooo.
-  ..ommo....ommo..
-  ..oooo....oooo..
-`);
-const desk = grid(`
-  ................
-  ................
-  ................
-  .....oooooo.....
-  .....ommmmo.....
-  .....oddddo.....
-  .....oooooo.....
-  .......oo.......
-  .oooooooooooooo.
-  ollllllllllllllo
-  ommmmmmmmmmmmmmo
-  oooooooooooooooo
-  .ommo......ommo.
-  .ommo......ommo.
-  .ommo......ommo.
-  .oooo......oooo.
-`);
-const crate = grid(`
-  ................
-  .oooooooooooooo.
-  .owwwwwwwwwwwwo.
-  .owhhhhhhhhhwho.
-  .owwbhhhhhhwwho.
-  .owhwwhhhhwwhho.
-  .owhhwwhhwwhhho.
-  .owhhhwwwwhhhho.
-  .owhhhhwwhhhhho.
-  .owhhhwwwwhhhho.
-  .owhhwwhhwwhhho.
-  .owhwwhhhhwwhho.
-  .owwwhhhhhhwwho.
-  .owwwwwwwwwwwwo.
-  .oooooooooooooo.
-  ................
-`);
 const pad = grid(`
   ................
   .mmmmmmmmmmmmmm.
@@ -276,10 +222,6 @@ const floorVariant = tile('tile.floor.1', mirror(floor));
 draw(floorVariant, grid(`mmm`), 6, 1);
 tile('tile.wall', wall);
 tile('tile.door', door);
-tile('tile.machine.0', tint(machine, 'k'));
-tile('tile.machine.1', tint(machine, 'c'));
-tile('tile.desk', desk);
-tile('tile.crate', crate);
 tile('bay.free', pad);
 const staged = tile('bay.staged', pad);
 draw(staged, Array(5).fill('yyyyyyyyyy'), 3, 8);
@@ -387,8 +329,7 @@ image.src = ${JSON.stringify(dataUrl)};
 const root = new URL('./', import.meta.url);
 for (const [name, data] of Object.entries({
   'sprites.png': png,
-  'atlas.json': atlasJson,
-  'sprites.generated.ts': `export const spriteSheet = ${JSON.stringify(dataUrl)};\nexport const spriteAtlas = ${atlasJson.trim()} as const;\n`,
+  'sprites.generated.ts': `export const spriteSheet = ${JSON.stringify(dataUrl)};\nexport const spriteSheetSize = ${JSON.stringify({ width, height })} as const;\nexport const spriteAtlas = ${atlasJson.trim()} as const;\n`,
   'preview.html': preview,
 })) writeFileSync(new URL(name, root), data);
 
@@ -426,9 +367,11 @@ for (const role of ['worker', 'overseer']) {
     }
   }
 }
-expectedNames.push('tile.floor.0', 'tile.floor.1', 'tile.wall', 'tile.door', 'tile.machine.0', 'tile.machine.1', 'tile.desk', 'tile.crate', 'bay.free', 'bay.staged', 'bay.ready');
-const savedAtlas = JSON.parse(readFileSync(new URL('atlas.json', root), 'utf8'));
+expectedNames.push('tile.floor.0', 'tile.floor.1', 'tile.wall', 'tile.door', 'bay.free', 'bay.staged', 'bay.ready');
+const generated = readFileSync(new URL('sprites.generated.ts', root), 'utf8');
+const savedAtlas = JSON.parse(generated.slice(generated.indexOf('spriteAtlas = ') + 14, generated.lastIndexOf(' as const;')));
 assert.deepEqual(savedAtlas, atlas);
+assert.match(generated, new RegExp(`spriteSheetSize = \\{"width":${width},"height":${height}\\}`));
 assert.deepEqual(Object.keys(savedAtlas.frames).sort(), expectedNames.sort());
 const occupied = new Set();
 for (const {x, y} of Object.values(savedAtlas.frames)) {
@@ -448,7 +391,7 @@ for (const role of ['worker', 'overseer']) {
 }
 console.log(`Verified PNG decode, 16-colour palette, exact atlas names, bounds, and animation frames.`);
 console.log(`Sheet: ${width} × ${height} RGBA; frames: ${sprites.size}`);
-for (const name of ['gen-sprites.mjs', 'sprites.png', 'atlas.json', 'sprites.generated.ts', 'preview.html']) {
+for (const name of ['gen-sprites.mjs', 'sprites.png', 'sprites.generated.ts', 'preview.html']) {
   const path = fileURLToPath(new URL(name, root));
   console.log(`${name}: ${statSync(path).size} bytes; sha256 ${createHash('sha256').update(readFileSync(path)).digest('hex')}`);
 }

@@ -7,7 +7,7 @@ import {
   type SceneWorker,
   type SceneWorkItem,
 } from "./scene.js";
-import { spriteAtlas, spriteSheet } from "./sprites/sprites.generated.js";
+import { spriteAtlas, spriteSheet, spriteSheetSize } from "./sprites/sprites.generated.js";
 
 export type {
   SceneLayout,
@@ -29,8 +29,6 @@ export type FactorySceneProps = Readonly<{
 
 const PADDING = 12;
 const SERVICE_HEIGHT = 52;
-const SHEET_WIDTH = 128;
-const SHEET_HEIGHT = 96;
 const FRAME = spriteAtlas.frame;
 
 function shortLabel(label: string) {
@@ -58,6 +56,9 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
   const bayWidth = (layout.width - PADDING * 2 - bayGap * 2) / 3;
   const staged = workItems.filter((item) => item.stage === "staged").length;
   const ready = workItems.length - staged;
+  // A wide column must not blow 16px frames up to poster size: the scene stops
+  // at three device pixels per sheet pixel and centres in whatever is left.
+  const maxWidth = layout.width * 3;
 
   return (
     <svg
@@ -65,13 +66,13 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
       role="group"
       aria-label="Dark Factory codebase floor"
       data-topology-digest={topology.digest}
-      style={{ display: "block", width: "100%", height: "auto", background: "#08131d" }}
+      style={{ display: "block", width: "100%", maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
     >
       <title>Dark Factory codebase floor</title>
       <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks`}</desc>
       <defs>
         {/* The sheet enters the document once; every frame is a window on it. */}
-        <image id="df-sheet" href={spriteSheet} width={SHEET_WIDTH} height={SHEET_HEIGHT} style={{ imageRendering: "pixelated" }} />
+        <image id="df-sheet" href={spriteSheet} width={spriteSheetSize.width} height={spriteSheetSize.height} style={{ imageRendering: "pixelated" }} />
         {Object.entries(spriteAtlas.frames).map(([name, cell]) => (
           <symbol key={name} id={`df-frame-${name}`} viewBox={`${cell.x} ${cell.y} ${FRAME} ${FRAME}`}>
             <use href="#df-sheet" />

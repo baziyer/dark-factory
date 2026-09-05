@@ -27,6 +27,9 @@ export const BROWSER_HOST = BROWSER_ENDPOINT.host;
 // terminal_input is the bit a remote grant never carries: only a client paired
 // on this machine's own loopback may invite a phone.
 const LOOPBACK_GRANT = CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+// The daemon caches run paths for five seconds, so one timer at ten never
+// outruns the cache and never lets a room go more than a cycle stale.
+const RUN_PATHS_POLL_MS = 10_000;
 
 export type FactoryHumanRequestView = Readonly<{
   request: HumanRequestItem;
@@ -87,6 +90,8 @@ export type FactoryAppSnapshot = Readonly<{
   terminal?: FactoryTerminalView;
   /** Regenerable project structure, absent until the daemon serves it. */
   topology?: TopologyView;
+  /** Repository directories each running agent's live run is changing. */
+  runPaths?: ReadonlyMap<string, readonly string[]>;
   edit?: FactoryEditView;
   /** True only while a ready session carries the full loopback grant. */
   remoteInviteAllowed?: boolean;
@@ -101,7 +106,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -182,6 +187,9 @@ export class FactoryAppController {
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
   #topology: TopologyView | undefined;
   #topologyPending = false;
+  #runPaths: ReadonlyMap<string, readonly string[]> = new Map();
+  #runPathsTimer: ReturnType<typeof setInterval> | undefined;
+  #runPathsPending = false;
   #edit: FactoryEditView | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
   #remoteInviteError: string | undefined;
@@ -247,6 +255,7 @@ export class FactoryAppController {
     this.#terminalReplacement = undefined;
     this.#dropPendingTerminalInput();
     this.#closeTerminal();
+    this.watchRunPaths(false);
     this.#client?.close();
   }
 
@@ -295,6 +304,48 @@ export class FactoryAppController {
       },
       () => { this.#topologyPending = false; },
     );
+  }
+
+  /**
+   * Where each running agent is working. The rooms are a live hint, not durable
+   * state, so they are polled only while the floor is on screen and the poll
+   * stops the moment the floor is hidden or the session leaves ready.
+   */
+  watchRunPaths(active: boolean): void {
+    if (!active || this.#closed || this.#status !== "ready") {
+      if (this.#runPathsTimer !== undefined) clearInterval(this.#runPathsTimer);
+      this.#runPathsTimer = undefined;
+      return;
+    }
+    if (this.#runPathsTimer !== undefined) return;
+    this.#runPathsTimer = setInterval(() => this.#pollRunPaths(), RUN_PATHS_POLL_MS);
+    this.#pollRunPaths();
+  }
+
+  /** One round: every agent on a running task, and nobody else. */
+  #pollRunPaths(): void {
+    const session = this.#client?.session;
+    const state = this.#state;
+    if (session === undefined || state === undefined || this.#runPathsPending) return;
+    const running = [...new Set([...state.tasks.values()]
+      .filter((task) => task.status === "running" && task.assigned_agent_id !== "")
+      .map((task) => task.assigned_agent_id))];
+    this.#runPathsPending = true;
+    const generation = this.#generation;
+    void Promise.all(running.map((agentId) => session.getRunPaths(agentId).then(
+      (answer) => [agentId, answer.paths] as const,
+      // A refused answer keeps the last known room rather than bouncing the
+      // worker back to its project room for one cycle.
+      () => [agentId, this.#runPaths.get(agentId) ?? []] as const,
+    ))).then((answers) => {
+      this.#runPathsPending = false;
+      if (!this.#current(generation)) return;
+      // An agent that stopped running loses its entry; an unchanged round is
+      // not a new snapshot, so the floor does not re-render on a heartbeat.
+      if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;
+      this.#runPaths = new Map(answers);
+      this.#publish();
+    });
   }
 
   /**
@@ -643,6 +694,7 @@ export class FactoryAppController {
       if (this.#terminal !== undefined) this.#closeTerminal();
     }
     if (status !== "closed") this.#error = undefined;
+    if (status !== "ready") this.watchRunPaths(false);
     this.#publish();
     if (status === "ready") this.#reconcileTerminal();
   }
@@ -975,6 +1027,7 @@ export class FactoryAppController {
       state: this.#state,
       error: this.#error,
       topology: this.#topology,
+      runPaths: this.#runPaths,
       edit: this.#edit,
       selectedHumanRequest: selection === undefined ? undefined : {
         request: selection.request,
@@ -1028,6 +1081,10 @@ export class FactoryAppController {
 
 function finiteError(error: unknown): SessionError | ProtocolError {
   return error instanceof SessionError || error instanceof ProtocolError ? error : new SessionError("connection");
+}
+
+function sameText(left: readonly string[] | undefined, right: readonly string[]): boolean {
+  return left !== undefined && left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function sameStatus(left: FactoryAppStatus | undefined, right: FactoryAppStatus): boolean {
