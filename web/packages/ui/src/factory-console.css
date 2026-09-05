@@ -36,6 +36,10 @@
 .dfFactoryConsole__terminalPanel *,
 .dfFactoryConsole__terminalPanel *::before,
 .dfFactoryConsole__terminalPanel *::after,
+.dfConsoleDialog,
+.dfConsoleDialog *,
+.dfConsoleDialog *::before,
+.dfConsoleDialog *::after,
 .dfConsoleSidebar,
 .dfConsoleSidebar *,
 .dfConsoleSidebar *::before,
@@ -79,6 +83,7 @@
 .dfFactoryConsole__status,
 .dfFactoryConsole button,
 .dfFactoryConsole__terminalPanel button,
+.dfConsoleDialog button,
 .dfConsoleSidebar button,
 .dfFactoryConsole__reply label {
   font-size: 0.7rem;
@@ -138,6 +143,7 @@
 
 .dfFactoryConsole button,
 .dfFactoryConsole__terminalPanel button,
+.dfConsoleDialog button,
 .dfConsoleSidebar button {
   padding: 0.6rem 0.75rem;
   color: var(--df-console-text);
@@ -148,11 +154,13 @@
 
 .dfFactoryConsole button:hover:not(:disabled),
 .dfFactoryConsole__terminalPanel button:hover:not(:disabled),
+.dfConsoleDialog button:hover:not(:disabled),
 .dfConsoleSidebar button:hover:not(:disabled) { border-color: var(--df-console-accent); }
 .dfFactoryConsole button:focus-visible,
 .dfFactoryConsole textarea:focus-visible,
 .dfFactoryConsole__terminalPanel button:focus-visible,
 .dfFactoryConsole__terminalPanel textarea:focus-visible,
+.dfConsoleDialog :where(button, textarea, input, select):focus-visible,
 .dfConsoleSidebar :where(button, textarea, input, select):focus-visible {
   outline: 2px solid var(--df-console-accent);
   outline-offset: 3px;
@@ -160,6 +168,7 @@
 
 .dfFactoryConsole button:disabled,
 .dfFactoryConsole__terminalPanel button:disabled,
+.dfConsoleDialog button:disabled,
 .dfConsoleSidebar button:disabled { cursor: default; opacity: 0.5; }
 
 .dfFactoryConsole__error {
@@ -345,17 +354,26 @@
 
 .dfFactoryConsole__instruction {
   display: flex;
-  flex: 1 1 auto;
-  min-height: 0;
   flex-direction: column;
   gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 0;
+}
+
+.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction textarea {
+  flex: 1 1 auto;
+  min-height: 12rem;
+  resize: none;
 }
 
 .dfFactoryConsole__instruction textarea {
-  flex: 1 1 auto;
-  min-height: 12rem;
   width: 100%;
-  resize: none;
+  resize: vertical;
   padding: 0.75rem;
   color: var(--df-console-text);
   background: #000;
@@ -574,9 +592,9 @@
   gap: 0.5rem;
 }
 
-.dfConsoleBar__toggle { display: flex; }
-.dfConsoleBar__toggle button + button { margin-left: -1px; }
-.dfConsoleShell .dfConsoleBar__toggle button[aria-pressed="true"],
+.dfConsoleViewToggle { display: flex; flex: 0 0 auto; }
+.dfConsoleViewToggle button + button { margin-left: -1px; }
+.dfConsoleShell .dfConsoleViewToggle button[aria-pressed="true"],
 .dfConsoleShell .dfConsoleBar__actions > button[aria-pressed="true"] {
   color: var(--df-console-accent);
   border-color: var(--df-console-accent);
@@ -674,6 +692,22 @@
 
 .dfConsoleSidebar__taskActions select { width: auto; flex: 1 1 8rem; }
 .dfConsoleSidebar__terminal { margin-top: 1.25rem; width: 100%; }
+
+/* SETTINGS is a modal over the console, not a panel that squeezes it. */
+.dfConsoleDialog {
+  width: min(34rem, 100%);
+  max-height: calc(100svh - 4rem);
+  padding: 0;
+  overflow: auto;
+  color: var(--df-console-text);
+  background: transparent;
+  border: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.dfConsoleDialog::backdrop { background: rgb(7 10 9 / 0.8); }
+.dfConsoleDialog :where(h1, h2, h3, p, dl, ul) { margin: 0; }
+.dfConsoleDialog .dfFactoryConsole__section { margin: 0; }
 
 .dfAgentList { display: grid; gap: 1.5rem; }
 .dfAgentList__row { width: 100%; border: 1px solid var(--df-console-rule); }

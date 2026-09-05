@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { AgentItem, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor, StageMeter } from "./console-screens.js";
-import { AgentPanel, HumanRequestPanel, SettingsPanel, type AgentConfigEdit, type TaskEdit } from "./console-sidebar.js";
+import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type TaskEdit } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
 
@@ -32,7 +32,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onDismissRemoteInvite?: () => void;
   /** The loopback address this console is served from. */
   address?: string;
-  /** Overrides the pairing surface the settings panel mounts by default. */
+  /** Overrides the pairing surface the settings modal mounts by default. */
   pairing?: ReactNode;
   /** The agent's enqueue composer, shown under the sidebar queue. */
   instructionContent?: ReactNode;
@@ -133,15 +133,6 @@ export function FactoryConsole({
       >
         {instructionContent}
       </AgentPanel>
-    ) : settingsOpen === true ? (
-      <SettingsPanel
-        state={state}
-        address={address}
-        pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
-          <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
-        ))}
-        onClose={onToggleSettings}
-      />
     ) : undefined
   );
 
@@ -159,19 +150,6 @@ export function FactoryConsole({
             <Counter label="NEEDS YOU" value={`${counters.needsYou ?? "—"}`} alert={(counters.needsYou ?? 0) > 0} />
           </dl>
           <div className="dfConsoleBar__actions">
-            <div className="dfConsoleBar__toggle" role="group" aria-label="Left view">
-              {(["floor", "agents"] as const).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  aria-pressed={view === option}
-                  disabled={onView === undefined}
-                  onClick={() => onView?.(option)}
-                >
-                  {option.toUpperCase()}
-                </button>
-              ))}
-            </div>
             <button type="button" aria-pressed={settingsOpen === true} disabled={onToggleSettings === undefined} onClick={onToggleSettings}>SETTINGS</button>
           </div>
           <div
@@ -193,6 +171,22 @@ export function FactoryConsole({
 
         <div className={`dfConsoleLayout${sidebar === undefined ? "" : " dfConsoleLayout--narrow"}`}>
           <section className="dfConsoleLayout__left dfFactoryConsole__section" aria-label={view === "floor" ? "Factory floor" : "Agents"}>
+            <div className="dfFactoryConsole__sectionHeading">
+              <h2>{view === "floor" ? "FACTORY FLOOR" : "AGENTS"}</h2>
+              <div className="dfConsoleViewToggle" role="group" aria-label="Left view">
+                {(["floor", "agents"] as const).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    aria-pressed={view === option}
+                    disabled={onView === undefined}
+                    onClick={() => onView?.(option)}
+                  >
+                    {option.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
             {view === "floor"
               ? <FactoryFloor state={state} topology={topology} runPaths={runPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />}
@@ -212,6 +206,16 @@ export function FactoryConsole({
         </div>
       </main>
       {sidebar === undefined ? null : <aside className="dfConsoleSidebar" aria-label="Selected detail">{sidebar}</aside>}
+      {settingsOpen !== true ? null : (
+        <SettingsDialog
+          state={state}
+          address={address}
+          pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
+            <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
+          ))}
+          onClose={onToggleSettings}
+        />
+      )}
     </div>
   );
 }

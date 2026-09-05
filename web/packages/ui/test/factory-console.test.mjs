@@ -482,9 +482,9 @@ test("a rejected edit says plainly that the durable value did not change", () =>
   assert.match(render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { pending: true } }), />SAVING</);
 });
 
-test("the settings sidebar carries the factory readout and a pairing mount point", () => {
+test("the settings modal carries the factory readout and a pairing mount point", () => {
   const markup = render({ settingsOpen: true, onToggleSettings: () => {} });
-  assert.match(markup, /aria-label="Settings"/);
+  assert.match(markup, /<dialog class="dfConsoleDialog" aria-label="Settings">/);
   assert.match(markup, /aria-label="BUILDING"/);
   assert.match(markup, /<dt>DISPATCH<\/dt><dd>ENABLED<\/dd>/);
   assert.match(markup, /<dt>REVISION<\/dt><dd>42<\/dd>/);
@@ -495,10 +495,56 @@ test("the settings sidebar carries the factory readout and a pairing mount point
   const paired = render({ settingsOpen: true, onToggleSettings: () => {}, pairing: createElement("p", null, "PAIR A PHONE") });
   assert.match(paired, /PAIR A PHONE/);
   assert.equal(paired.includes("phone pairing arrives here"), false);
-  // A selected agent outranks settings: only one sidebar is ever open.
+  // The modal is over the console, so it neither closes nor replaces a sidebar.
   const both = render({ settingsOpen: true, onToggleSettings: () => {}, selectedAgent: agentSelection() });
-  assert.equal(both.includes('aria-label="Settings"'), false);
+  assert.match(both, /aria-label="Settings"/);
   assert.match(both, /aria-label="Agent Builder One"/);
+});
+
+test("SETTINGS opens and closes as a native modal, over whatever sidebar is open", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const calls = [];
+    const node = { showModal: () => calls.push("showModal"), close: () => calls.push("close") };
+    let renderer;
+    await act(async () => {
+      renderer = create(createElement(FactoryConsole, {
+        status: "ready",
+        state: baseState(),
+        settingsOpen: true,
+        selectedAgent: agentSelection(),
+        onToggleSettings: () => calls.push("toggle"),
+      }), { createNodeMock: () => node });
+    });
+    // The browser opens it, so ESC, the backdrop and the focus trap are its.
+    assert.deepEqual(calls, ["showModal"]);
+    const dialog = renderer.root.findByType("dialog");
+    // The agent sidebar is still mounted underneath.
+    assert.equal(renderer.root.findAll((instance) => instance.props["aria-label"] === "Agent Builder One").length, 1);
+
+    // Every exit goes through close(), so focus always returns to SETTINGS,
+    // and the close event is what tells the console the modal is gone.
+    renderer.root.findAllByType("button").find((button) => button.props.children === "CLOSE").props.onClick();
+    dialog.props.onClick({ target: node });
+    dialog.props.onClick({ target: {} });
+    assert.deepEqual(calls, ["showModal", "close", "close"]);
+    await act(async () => { dialog.props.onClose(); });
+    assert.deepEqual(calls.at(-1), "toggle");
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("the view toggle rides in the left panel's heading, not the top bar", () => {
+  const floor = render();
+  assert.match(floor, /class="dfConsoleLayout__left[^"]*"[^>]*><div class="dfFactoryConsole__sectionHeading"><h2>FACTORY FLOOR<\/h2><div class="dfConsoleViewToggle" role="group" aria-label="Left view">/);
+  assert.match(render({ view: "agents" }), /<h2>AGENTS<\/h2><div class="dfConsoleViewToggle"/);
+  // The top bar keeps the wordmark, the counters, and SETTINGS.
+  const actions = floor.split('class="dfConsoleBar__actions"')[1];
+  assert.match(actions.slice(0, actions.indexOf("</div>")), />SETTINGS</);
+  assert.equal(floor.indexOf("Left view") > floor.indexOf("dfConsoleLayout__left"), true);
 });
 
 test("FactoryApp server-renders without reading browser globals", () => {
@@ -594,9 +640,9 @@ test("the view toggle and settings forward exactly one intent each", () => {
     onToggleSettings: () => calls.push(["settings"]),
   }));
   const chrome = elements.filter((element) => element.type === "button" && element.props.disabled !== true);
-  assert.deepEqual(chrome.map((element) => element.props.children), ["FLOOR", "AGENTS", "SETTINGS"]);
+  assert.deepEqual(chrome.map((element) => element.props.children), ["SETTINGS", "FLOOR", "AGENTS"]);
   for (const button of chrome) button.props.onClick();
-  assert.deepEqual(calls, [["view", "floor"], ["view", "agents"], ["settings"]]);
+  assert.deepEqual(calls, [["settings"], ["view", "floor"], ["view", "agents"]]);
 });
 
 function expand(node, result = []) {
@@ -622,7 +668,7 @@ test("PAIR A PHONE appears in settings only with authority, and shows the minted
   assert.equal(render({ ...settings }).includes("PAIR A PHONE"), false);
   assert.match(render({ ...settings, remoteInviteAllowed: true }), /PAIR A PHONE/);
   assert.equal(render({ remoteInviteAllowed: true }).includes("PAIR A PHONE"), false, "not without settings");
-  assert.equal(render({ ...settings, remoteInviteAllowed: true, selectedAgent: agentSelection() }).includes("PAIR A PHONE"), false, "not behind another sidebar");
+  assert.match(render({ ...settings, remoteInviteAllowed: true, selectedAgent: agentSelection() }), /PAIR A PHONE/, "the modal is over the sidebar, not behind it");
   // Its slot still takes an explicit override.
   assert.match(render({ ...settings, remoteInviteAllowed: true, pairing: createElement("p", null, "OTHER") }), /OTHER/);
 

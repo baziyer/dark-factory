@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -74,6 +75,21 @@ test("an idle configured agent accepts one compact instruction", async () => {
   } finally {
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
   }
+});
+
+test("the composer is a modest box wherever it flows after other content", () => {
+  const markup = renderToStaticMarkup(createElement(AgentInstruction, {
+    terminal: terminalView({ phase: "idle", writable: false }),
+    onSubmit: async () => true,
+  }));
+  assert.match(markup, /<textarea[^>]* rows="3"/);
+  const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
+  assert.match(css, /\.dfFactoryConsole__instruction textarea \{[^}]*resize: vertical;/);
+  // Only the terminal panel, whose whole body the composer is, lets it grow:
+  // under the sidebar queue it would otherwise swallow the section it sits in.
+  assert.match(css, /\.dfFactoryConsole__terminalPanel \.dfFactoryConsole__instruction textarea \{[^}]*flex: 1 1 auto;/);
+  assert.doesNotMatch(css, /\n\.dfFactoryConsole__instruction \{[^}]*flex: 1 1 auto;/);
+  assert.doesNotMatch(css, /\n\.dfFactoryConsole__instruction textarea \{[^}]*flex: 1 1 auto;/);
 });
 
 test("paused agents remain identifiable without a false input", () => {

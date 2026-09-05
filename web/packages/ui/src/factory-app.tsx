@@ -72,7 +72,6 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   );
 
   const openSidebar = (open: () => void) => {
-    setSettingsOpen(false);
     setTerminalOpen(false);
     open();
   };
@@ -83,12 +82,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       view={view}
       onView={setView}
       settingsOpen={settingsOpen}
-      onToggleSettings={() => {
-        setTerminalOpen(false);
-        owner.current?.clearAgentTerminal();
-        owner.current?.clearHumanRequest();
-        setSettingsOpen((open) => !open);
-      }}
+      onToggleSettings={() => setSettingsOpen((open) => !open)}
       onSelectAgent={(agent) => openSidebar(() => { owner.current?.clearHumanRequest(); owner.current?.selectAgent(agent); })}
       onCloseAgent={() => { setTerminalOpen(false); owner.current?.clearAgentTerminal(); }}
       onOpenAgentTerminal={() => setTerminalOpen(true)}
@@ -202,6 +196,7 @@ export function AgentInstruction({
       <textarea
         id={`df-instruction-${terminal.agentId}`}
         value={instruction}
+        rows={3}
         autoFocus
         disabled={terminal.instructionPending}
         placeholder="Add an instruction…"
