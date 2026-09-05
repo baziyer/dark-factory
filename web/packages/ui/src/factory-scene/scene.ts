@@ -7,7 +7,6 @@ export type SceneTopology = Readonly<{
 
 export type SceneNode = Readonly<{
   id: string;
-  parentId: string;
   path: string;
   label: string;
   kind: "repository" | "module" | "package" | "directory";

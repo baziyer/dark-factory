@@ -46,3 +46,6 @@ export const fixtureTopology = {
     { id: nodeID("d4"), parent_id: nodeID("b2"), kind: "directory", path: "internal/kernel/store", label: "store", language: "go", size_bucket: "tiny" },
   ],
 };
+
+/** The floor takes one structure per project; the second one is unserved. */
+export const fixtureTopologies = new Map([[projectID, fixtureTopology]]);

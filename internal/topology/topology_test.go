@@ -215,6 +215,49 @@ func TestBuildIgnoresExcludedAndSymlinkedTreesAndRunsNothing(t *testing.T) {
 	}
 }
 
+// A local toolchain cache under a dot directory and a generated file past the
+// analyzer bound are both ordinary facts of a real checkout. Neither may cost
+// the whole snapshot: this repository served zero nodes until they stopped
+// being fatal.
+func TestBuildSkipsDotDirectoriesAndOversizeAnalyzerFiles(t *testing.T) {
+	// The root is exempt from the skip, so a checkout that lives under a dot
+	// directory still builds its whole structure. Only the walk's own guard on
+	// its first entry makes that true.
+	root := filepath.Join(t.TempDir(), ".checkout")
+	oversize := "package huge\nimport \"example.com/cart/lib\"\n" + strings.Repeat("// pad\n", maxAnalyzerFileBytes/7+1)
+	writeFixture(t, root, map[string]string{
+		"go.mod": "module example.com/cart\n",
+		".tools/local-ci/go-mod/example.com/huge/huge.go": oversize,
+		"lib/lib.go":  "package lib\nconst Name = \"cart\"\n",
+		"app/app.go":  "package builder\n",
+		"app/huge.go": oversize,
+	})
+	snapshot, err := Build(context.Background(), root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range snapshot.Nodes {
+		if strings.HasPrefix(node.RelativePath, ".tools") {
+			t.Errorf("dot directory was discovered: %q", node.RelativePath)
+		}
+	}
+	for _, want := range []nodeKey{{NodeRepository, "."}, {NodeModule, "."}, {NodePackage, "lib"}, {NodePackage, "app"}} {
+		if _, ok := findNode(snapshot, want); !ok {
+			t.Errorf("missing %s node %q", want.kind, want.path)
+		}
+	}
+	// The unread file names no package either: the directory keeps the name its
+	// readable file declares, not the basename an empty vote falls back to.
+	if node, _ := findNode(snapshot, nodeKey{NodePackage, "app"}); node.Label != "builder" {
+		t.Errorf("package label = %q, want the package clause that was read", node.Label)
+	}
+	// The import sits in the first bytes of the oversize file, so a truncated
+	// read would still find it. Nothing is read: it contributes no imports.
+	if got := importPaths(snapshot); len(got) != 0 {
+		t.Errorf("imports = %v, want none", got)
+	}
+}
+
 func TestBuildBoundsFailClearly(t *testing.T) {
 	tests := []struct {
 		name   string

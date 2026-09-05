@@ -99,7 +99,7 @@ export function orderTasksForHome(state: StateView): readonly TaskItem[] {
   });
 }
 
-/** One floor holds the repository root and its direct children, and no more. */
+/** One floor holds this many rooms, shared out across every project. */
 const MAX_FLOOR_ROOMS = 24;
 
 export type FloorScene = Readonly<{
@@ -109,34 +109,35 @@ export type FloorScene = Readonly<{
 }>;
 
 /**
- * The floor is a projection, never a second source of truth: rooms come from
- * the served topology (or one room per project until it arrives), and every
- * worker stands in the room of the code its live run is changing, falling back
- * to its own project's room.
+ * The floor is a projection, never a second source of truth: every project is a
+ * block of rooms taken from its own served topology, or the one room that
+ * stands for a project whose structure the daemon has not served yet, and every
+ * worker stands in the room of the code its live run is changing inside its own
+ * project. The floor is a grid because the served nodes carry no edges: it
+ * shows what the code is, not what depends on what.
  */
 export function floorScene(
   state: StateView | undefined,
-  topology: TopologyView | undefined,
+  topologies: ReadonlyMap<string, TopologyView> | undefined,
   runPaths?: ReadonlyMap<string, readonly string[]>,
 ): FloorScene {
   const projects = state === undefined ? [] : [...state.projects.values()];
-  // Topology is served one project at a time. The cap eats the root's children
-  // first, so the served root and the other projects keep their rooms until the
-  // projects alone overrun the floor, past which the last ones lose theirs.
-  const detailed = topology === undefined ? [] : topologyRooms(topology);
-  const others = projectRooms(projects.filter((project) => project.id !== topology?.projectId));
-  const rooms = [...detailed.slice(0, Math.max(1, MAX_FLOOR_ROOMS - others.length)), ...others]
-    .slice(0, MAX_FLOOR_ROOMS);
-  const roomIDs = new Set(rooms.map((room) => room.id));
-  const rootID = detailed[0]?.id;
-  const roomOfProject = (projectID: string): string | undefined =>
-    projectID === topology?.projectId ? rootID : roomIDs.has(projectID) ? projectID : undefined;
-  const shown = detailed.filter((room) => roomIDs.has(room.id));
+  const blocks = projects.map((project) => projectBlock(project, topologies?.get(project.id)));
+  // The cap is shared, never first come: every project keeps its own room
+  // before any project keeps a second, and past that the largest rooms win.
+  const rooms = blocks
+    .flatMap((block, project) => block.map((room, rank) => ({ project, rank, room })))
+    .sort((left, right) => left.rank - right.rank || left.project - right.project)
+    .slice(0, MAX_FLOOR_ROOMS)
+    .map((entry) => entry.room);
+  const kept = new Set(rooms.map((room) => room.id));
+  const shown = new Map(projects.map((project, index) => [project.id, blocks[index]!.filter((room) => kept.has(room.id))]));
   const workers = state === undefined ? [] : [...state.agents.values()].map((agent) => {
-    const project = roomOfProject(agent.project_id);
-    // Only the served project has rooms below its root, so only its runs can
-    // walk into one; every other agent stays in its project's room.
-    const nodeId = project !== rootID ? project : roomOfRunPaths(shown, runPaths?.get(agent.id) ?? []) ?? project;
+    // A run only ever names paths in its own project, and that project's own
+    // room is the first one it keeps, so an unmapped path costs no worker its
+    // room. Only an agent whose project the cap never reached has none.
+    const block = shown.get(agent.project_id) ?? [];
+    const nodeId = roomOfRunPaths(block, runPaths?.get(agent.id) ?? []) ?? block[0]?.id;
     return {
       id: agent.id,
       name: agent.name,
@@ -149,7 +150,8 @@ export function floorScene(
   const workItems = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.status === "succeeded" || task.status === "running" || task.status === "blocked")
     .map((task) => ({ id: task.id, stage: task.status === "succeeded" ? "release-ready" as const : "staged" as const }));
-  return { topology: { digest: topology?.digest ?? "", nodes: rooms }, workers, workItems };
+  const digest = projects.map((project) => topologies?.get(project.id)?.digest).filter((value) => value !== undefined).join(" ");
+  return { topology: { digest, nodes: rooms }, workers, workItems };
 }
 
 /**
@@ -170,26 +172,38 @@ function roomOfRunPaths(rooms: readonly SceneNode[], paths: readonly string[]): 
     .sort(([left, leftCount], [right, rightCount]) => rightCount - leftCount || compareText(left.path, right.path))[0]?.[0].id;
 }
 
-function topologyRooms(topology: TopologyView): readonly SceneNode[] {
-  const root = topology.nodes.find((node) => node.parent_id === "");
-  if (root === undefined) return [];
-  const children = topology.nodes.filter((node) => node.parent_id === root.id);
+/** Room size, largest first: past the cap the biggest rooms keep their tile. */
+const SIZE_BUCKETS = ["large", "medium", "small", "tiny", "empty"];
+
+/**
+ * One project's rooms: the code its repository root holds, largest first. A Go
+ * module or a JS package rooted at "." is the same place as the repository, not
+ * a room of its own, so every node at "." is root and the rooms are their
+ * children. The repository is always the first room, the one a worker with no
+ * path of its own stands in and the one a project keeps when the cap bites; a
+ * project the daemon has not served a structure for has only that room.
+ */
+function projectBlock(project: { id: string; name: string }, topology: TopologyView | undefined): readonly SceneNode[] {
+  const root = topology?.nodes.find((node) => node.parent_id === "");
+  if (topology === undefined || root === undefined) {
+    return [{ id: project.id, path: project.name, label: project.name, kind: "repository" }];
+  }
+  const roots = new Set(topology.nodes.filter((node) => node.path === ".").map((node) => node.id));
+  roots.add(root.id);
+  const children = topology.nodes
+    .filter((node) => node.path !== "." && roots.has(node.parent_id))
+    .sort((left, right) =>
+      SIZE_BUCKETS.indexOf(left.size_bucket) - SIZE_BUCKETS.indexOf(right.size_bucket)
+      || compareText(left.path, right.path));
   return [root, ...children].slice(0, MAX_FLOOR_ROOMS).map((node) => ({
-    id: node.id,
-    parentId: node.parent_id,
+    // Node ids are minted per project, so two projects holding the same path
+    // are served the same id. Two rooms on one floor may not share one.
+    id: `${project.id}:${node.id}`,
     path: node.path,
-    label: node.label,
+    // Every repository is served the same fixed label, so on a floor of many
+    // projects only the project's own name tells its root room apart.
+    label: node.path === "." ? project.name : node.label,
     kind: node.kind,
     sizeBucket: node.size_bucket,
-  }));
-}
-
-function projectRooms(projects: readonly { id: string; name: string }[]): readonly SceneNode[] {
-  return projects.map((project) => ({
-    id: project.id,
-    parentId: "",
-    path: project.name,
-    label: project.name,
-    kind: "repository" as const,
   }));
 }
