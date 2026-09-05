@@ -561,6 +561,9 @@ func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [
 		return browserprotocol.Accounts{}, err
 	}
 	defer release()
+	if backend.owner == nil {
+		return browserprotocol.Accounts{}, browser.ErrNotFound
+	}
 	home, err := backend.home()
 	if err != nil {
 		return browserprotocol.Accounts{}, browser.ErrNotFound
@@ -591,6 +594,9 @@ func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [brows
 		return browserprotocol.AccountLinkResult{}, err
 	}
 	defer release()
+	if backend.owner == nil {
+		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
+	}
 	provider, err := kernel.ParseProvider(request.Provider)
 	if err != nil {
 		return browserprotocol.AccountLinkResult{}, browser.ErrStale

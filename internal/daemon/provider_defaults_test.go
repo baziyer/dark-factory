@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
 )
@@ -69,11 +71,46 @@ func TestProviderDefaultsTreatUnreadableConfigurationAsUnknown(t *testing.T) {
 		{"codex model only under a profile", "codex", ".codex/config.toml", "[profiles.only]\nmodel = \"gpt-4\"\n"},
 		{"codex model too large for the wire", "codex", ".codex/config.toml", "model = \"" + strings.Repeat("m", browserprotocol.MaxAgentModelBytes+1) + "\"\n"},
 		{"codex multi-line string", "codex", ".codex/config.toml", "model = \"\"\"gpt-4\"\"\"\n"},
+		// readBoundedFile answers only for a bounded regular file. Each of
+		// these would otherwise be read whole, on a path a browser request
+		// reaches: "" means the case builds the path itself below.
+		{"claude settings larger than the bound", "claude_code", ".claude/settings.json", `{"model":"gpt-6-astra","pad":"` + strings.Repeat("x", maxProviderConfigBytes) + `"}`},
+		{"codex config that is a directory", "codex", ".codex/config.toml", ""},
+		{"codex config that is a fifo", "codex", ".codex/config.toml", ""},
 	} {
 		t.Run(unusable.name, func(t *testing.T) {
 			accountHome := t.TempDir()
-			writeProviderConfig(t, filepath.Join(accountHome, unusable.file), unusable.content)
-			if model, effort, source := accountDaemon(accountHome).providerAccountDefaults(unusable.provider, ""); model != "" || effort != "" || source != "" {
+			path := filepath.Join(accountHome, unusable.file)
+			switch {
+			case strings.HasSuffix(unusable.name, "is a directory"):
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case strings.HasSuffix(unusable.name, "is a fifo"):
+				// A named pipe with no writer blocks forever on read, so a
+				// reader that skipped the stat would hang this test rather
+				// than fail it. That is the point of refusing it unread.
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := unix.Mkfifo(path, 0o600); err != nil {
+					t.Skipf("mkfifo unavailable: %v", err)
+				}
+			default:
+				writeProviderConfig(t, path, unusable.content)
+			}
+			done := make(chan [3]string, 1)
+			go func() {
+				model, effort, source := accountDaemon(accountHome).providerAccountDefaults(unusable.provider, "")
+				done <- [3]string{model, effort, source}
+			}()
+			var answer [3]string
+			select {
+			case answer = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("reading the configuration blocked; it was not refused unread")
+			}
+			if model, effort, source := answer[0], answer[1], answer[2]; model != "" || effort != "" || source != "" {
 				t.Fatalf("%s = %q/%q/%q", unusable.name, model, effort, source)
 			}
 		})

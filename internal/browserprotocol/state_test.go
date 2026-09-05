@@ -13,11 +13,13 @@ import (
 )
 
 const (
-	projectID = "01010101010101010101010101010101"
-	agentID   = "02020202020202020202020202020202"
-	taskID    = "03030303030303030303030303030303"
-	requestID = "04040404040404040404040404040404"
-	runID     = "05050505050505050505050505050505"
+	projectID       = "01010101010101010101010101010101"
+	agentID         = "02020202020202020202020202020202"
+	taskID          = "03030303030303030303030303030303"
+	requestID       = "04040404040404040404040404040404"
+	runID           = "05050505050505050505050505050505"
+	accountID       = "06060606060606060606060606060606"
+	accountHomePath = "/Users/operator/.codex"
 )
 
 func factoryItem() FactoryItem {
@@ -34,12 +36,22 @@ func humanRequestItem() HumanRequestItem {
 	return HumanRequestItem{ID: requestID, ProjectID: projectID, AgentID: agentID, TaskID: taskID, CreatedAt: 10, UpdatedAt: 11, Revision: 1, Kind: "question", Status: "open", ReplyMaxBytes: MaxHumanReplyBytes, CanReply: true}
 }
 
-// snapshotWith is one valid snapshot the individual bound tests mutate.
+func accountItem() AccountItem {
+	return AccountItem{ID: accountID, Provider: "codex", Home: accountHomePath, Label: "codex", Revision: 1}
+}
+
+// snapshotWith is one valid snapshot the individual bound tests mutate. The
+// agent selects the account beside it, so the linked pair is the default the
+// negative cases below break one member of at a time.
 func snapshotWith() StateSnapshot {
+	agent := agentItem()
+	agent.Provider = "codex"
+	agent.AccountID = accountID
 	return StateSnapshot{
 		Head: 1, Factory: factoryItem(),
-		Projects: []ProjectItem{projectItem()}, Agents: []AgentItem{agentItem()},
+		Projects: []ProjectItem{projectItem()}, Agents: []AgentItem{agent},
 		Tasks: []TaskItem{taskItem()}, HumanRequests: []HumanRequestItem{humanRequestItem()},
+		Accounts: []AccountItem{accountItem()},
 	}
 }
 
@@ -636,4 +648,135 @@ func TestErrorTooLargeIsFinite(t *testing.T) {
 	if err != nil || frame.Body.(Error).Code != ErrorTooLarge {
 		t.Fatalf("too_large round trip: %+v %v", frame, err)
 	}
+}
+
+// Every account rule on the wire, one broken member at a time. Without these
+// each clause could be deleted and every other gate would stay green.
+func TestAccountWireRulesAreClosed(t *testing.T) {
+	// An agent's account must be one canonical identity, and shell has no
+	// logins at all, so it can never name one.
+	for _, broken := range []struct {
+		name             string
+		provider, accoun string
+	}{
+		{"shell agent with an account", "shell", accountID},
+		{"malformed account identity", "codex", "not-hex"},
+		{"zero account identity", "codex", strings.Repeat("0", 32)},
+		{"short account identity", "codex", strings.Repeat("ab", 8)},
+	} {
+		value := snapshotWith()
+		item := agentItem()
+		item.Provider, item.AccountID = broken.provider, broken.accoun
+		value.Agents = []AgentItem{item}
+		if _, err := EncodeStateSnapshot("x", value); err == nil {
+			t.Fatalf("%s accepted", broken.name)
+		}
+	}
+	// A shell agent with no account is still fine: the clause is about the
+	// pairing, not about shell agents in a snapshot.
+	value := snapshotWith()
+	shell := agentItem()
+	shell.Provider, shell.Model, shell.ReasoningEffort, shell.EffectiveModel, shell.EffectiveReasoningEffort = "shell", "", "", "", ""
+	value.Agents = []AgentItem{shell}
+	if _, err := EncodeStateSnapshot("x", value); err != nil {
+		t.Fatalf("shell agent without an account refused: %v", err)
+	}
+
+	for _, broken := range []struct {
+		name string
+		item AccountItem
+	}{
+		{"relative home", AccountItem{ID: accountID, Provider: "codex", Home: "Users/operator/.codex", Label: "codex", Revision: 1}},
+		{"empty home", AccountItem{ID: accountID, Provider: "codex", Home: "", Label: "codex", Revision: 1}},
+		{"oversized home", AccountItem{ID: accountID, Provider: "codex", Home: "/" + strings.Repeat("d", MaxTaskTitleBytes), Label: "codex", Revision: 1}},
+		{"home with a NUL", AccountItem{ID: accountID, Provider: "codex", Home: "/Users/operator/.co\x00dex", Label: "codex", Revision: 1}},
+		{"shell provider", AccountItem{ID: accountID, Provider: "shell", Home: accountHomePath, Label: "codex", Revision: 1}},
+		{"unknown provider", AccountItem{ID: accountID, Provider: "CODEX", Home: accountHomePath, Label: "codex", Revision: 1}},
+		{"empty label", AccountItem{ID: accountID, Provider: "codex", Home: accountHomePath, Label: "", Revision: 1}},
+		{"oversized label", AccountItem{ID: accountID, Provider: "codex", Home: accountHomePath, Label: strings.Repeat("l", MaxAgentNameBytes+1), Revision: 1}},
+		{"malformed identity", AccountItem{ID: "nope", Provider: "codex", Home: accountHomePath, Label: "codex", Revision: 1}},
+		{"zero revision", AccountItem{ID: accountID, Provider: "codex", Home: accountHomePath, Label: "codex", Revision: 0}},
+	} {
+		value := snapshotWith()
+		value.Accounts = []AccountItem{broken.item}
+		value.Agents = []AgentItem{agentItem()}
+		if _, err := EncodeStateSnapshot("x", value); err == nil {
+			t.Fatalf("account item %s accepted", broken.name)
+		}
+	}
+	// Two accounts cannot share one identity, on the same terms as every
+	// other collection in the snapshot.
+	duplicate := snapshotWith()
+	duplicate.Accounts = []AccountItem{accountItem(), accountItem()}
+	if _, err := EncodeStateSnapshot("x", duplicate); err == nil {
+		t.Fatal("duplicate account identity accepted")
+	}
+}
+
+// ACCOUNTS and ACCOUNT_LINK carry the same closed rules, and no field on a
+// discovered login is wide enough to smuggle a credential through.
+func TestDiscoveredAccountAndLinkRulesAreClosed(t *testing.T) {
+	good := DiscoveredAccount{Provider: "codex", Home: accountHomePath, Label: "codex", Email: "operator@example.com", DefaultModel: "gpt-6-astra", DefaultReasoningEffort: "high"}
+	if _, err := EncodeAccounts("x", Accounts{Accounts: []DiscoveredAccount{good}}); err != nil {
+		t.Fatalf("valid discovered account refused: %v", err)
+	}
+	token := strings.Repeat("t", MaxAgentNameBytes+1)
+	for _, broken := range []struct {
+		name   string
+		mutate func(*DiscoveredAccount)
+	}{
+		{"shell provider", func(a *DiscoveredAccount) { a.Provider = "shell" }},
+		{"relative home", func(a *DiscoveredAccount) { a.Home = "Users/operator/.codex" }},
+		{"empty home", func(a *DiscoveredAccount) { a.Home = "" }},
+		{"empty label", func(a *DiscoveredAccount) { a.Label = "" }},
+		{"oversized label", func(a *DiscoveredAccount) { a.Label = token }},
+		// A token-shaped value is exactly what must not fit in a display
+		// field: the bound is the reason discovery drops one instead.
+		{"token-sized email", func(a *DiscoveredAccount) { a.Email = token }},
+		{"token-sized organization", func(a *DiscoveredAccount) { a.Organization = token }},
+		{"token-sized default model", func(a *DiscoveredAccount) { a.DefaultModel = strings.Repeat("m", MaxAgentModelBytes+1) }},
+		{"token-sized default effort", func(a *DiscoveredAccount) { a.DefaultReasoningEffort = strings.Repeat("e", MaxAgentModelBytes+1) }},
+		{"malformed linked identity", func(a *DiscoveredAccount) { a.LinkedID = "nope" }},
+	} {
+		item := good
+		broken.mutate(&item)
+		if _, err := EncodeAccounts("x", Accounts{Accounts: []DiscoveredAccount{item}}); err == nil {
+			t.Fatalf("discovered account %s accepted", broken.name)
+		}
+	}
+	// More logins than one frame may carry is malformed, never a trimmed list.
+	many := make([]DiscoveredAccount, MaxJSONArray+1)
+	for index := range many {
+		item := good
+		item.Home = fmt.Sprintf("/Users/operator/.codex-%d", index)
+		many[index] = item
+	}
+	if _, err := EncodeAccounts("x", Accounts{Accounts: many}); err == nil {
+		t.Fatal("oversized discovery list accepted")
+	}
+
+	for _, broken := range []AccountLink{
+		{Provider: "codex", Home: "Users/operator/.codex", Label: "codex"},
+		{Provider: "codex", Home: "", Label: "codex"},
+		{Provider: "shell", Home: accountHomePath, Label: "shell"},
+		{Provider: "", Home: accountHomePath, Label: "codex"},
+		{Provider: "codex", Home: accountHomePath, Label: ""},
+		{Provider: "codex", Home: accountHomePath, Label: strings.Repeat("l", MaxAgentNameBytes+1)},
+	} {
+		if _, err := rawEncodeAccountLink(broken); err == nil {
+			t.Fatalf("account link %+v accepted", broken)
+		}
+	}
+	if _, err := rawEncodeAccountLink(AccountLink{Provider: "codex", Home: accountHomePath, Label: "codex"}); err != nil {
+		t.Fatalf("valid account link refused: %v", err)
+	}
+	for _, broken := range []AccountLinkResult{{AccountID: "nope", Revision: 1}, {AccountID: accountID, Revision: 0}} {
+		if _, err := EncodeAccountLinkResult("x", broken); err == nil {
+			t.Fatalf("account link result %+v accepted", broken)
+		}
+	}
+}
+
+func rawEncodeAccountLink(value AccountLink) ([]byte, error) {
+	return encodeControl(TypeAccountLink, "x", value)
 }
