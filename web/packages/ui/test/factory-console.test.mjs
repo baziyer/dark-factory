@@ -116,6 +116,20 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.match(markup, />kernel<\/text>/);
   assert.match(markup, />PACKAGE · MEDIUM<\/text>/);
   assert.equal(markup.includes("FILES"), false);
+
+  // A wide root must not crowd the other projects off the floor: the cap eats
+  // the root's children, never a project room, so no agent loses its room.
+  const topRoom = fixtureTopology.nodes[0];
+  const wide = floorScene(fixtureState, {
+    ...fixtureTopology,
+    nodes: [topRoom, ...Array.from({ length: 30 }, (_, index) => ({
+      id: `${index}`.padStart(64, "0"), parent_id: topRoom.id, kind: "directory",
+      path: `dir-${index}`, label: `dir-${index}`, language: "", size_bucket: "tiny",
+    }))],
+  });
+  assert.equal(wide.topology.nodes.length, 24);
+  assert.equal(wide.topology.nodes.at(-1).id, ids.secondProject);
+  assert.equal(wide.workers.every((worker) => worker.nodeId !== undefined), true);
 });
 
 test("hostile names and titles are escaped as text and private detail is absent", () => {
@@ -394,9 +408,16 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     // A refused rename reverts to the served title. A refusal never moves the
     // revision, so without this the input would resend it on the next blur.
     const titleValue = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.value;
+    const modelInput = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-model-${ids.agent}`);
     assert.equal(titleValue(), "Renamed");
-    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { pending: false, error: new SessionError("stale") } })); });
+    // A refusal belongs to the form that earned it: the config form the
+    // operator is still typing into keeps what it holds.
+    await act(async () => { modelInput().props.onChange({ currentTarget: { value: "half-typed" } }); });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: queued.id, pending: false, error: new SessionError("stale") } })); });
     assert.equal(titleValue(), queued.title);
+    assert.equal(modelInput().props.value, "half-typed");
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: ids.agent, pending: false, error: new SessionError("stale") } })); });
+    assert.equal(modelInput().props.value, fixtureState.agents.get(ids.agent).model);
     await act(async () => { renderer.update(createElement(FactoryConsole, props)); });
 
     // A save carries only what changed. Sending an untouched model would make

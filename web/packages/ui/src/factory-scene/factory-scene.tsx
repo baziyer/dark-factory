@@ -1,13 +1,13 @@
 import {
+  alternateFrame,
   layoutScene,
   placeWorkers,
-  workerSprite,
-  type SceneNode,
+  workerFrame,
   type SceneTopology,
   type SceneWorker,
-  type SceneWorkerSprite,
   type SceneWorkItem,
 } from "./scene.js";
+import { spriteAtlas, spriteSheet } from "./sprites/sprites.generated.js";
 
 export type {
   SceneLayout,
@@ -16,7 +16,6 @@ export type {
   SceneTopology,
   SceneWorker,
   SceneWorkerPlacement,
-  SceneWorkerSprite,
   SceneWorkItem,
 } from "./scene.js";
 
@@ -30,35 +29,18 @@ export type FactorySceneProps = Readonly<{
 
 const PADDING = 12;
 const SERVICE_HEIGHT = 52;
-
-const roomFill: Record<SceneNode["kind"], string> = {
-  repository: "#16364a",
-  module: "#1b3a4a",
-  package: "#193d38",
-  directory: "#282f42",
-};
+const SHEET_WIDTH = 128;
+const SHEET_HEIGHT = 96;
+const FRAME = spriteAtlas.frame;
 
 function shortLabel(label: string) {
   const glyphs = [...label];
   return glyphs.length > 18 ? `${glyphs.slice(0, 17).join("")}…` : label;
 }
 
-function SpriteSymbol({ sprite }: { sprite: SceneWorkerSprite }) {
-  return (
-    <symbol id={`df-worker-${sprite.key}`} viewBox="0 0 16 16">
-      {sprite.rects.map((rect, index) => (
-        <rect
-          key={index}
-          x={rect.x}
-          y={rect.y}
-          width={rect.width}
-          height={rect.height}
-          fill={rect.color}
-          opacity={rect.opacity}
-        />
-      ))}
-    </symbol>
-  );
+/** One 16px frame of the sheet, sized and placed in scene coordinates. */
+function Frame({ name, x, y, className }: { name: string; x: number; y: number; className?: string }) {
+  return <use href={`#df-frame-${name}`} x={x} y={y} width={FRAME} height={FRAME} className={className} />;
 }
 
 /** A disposable SVG projection of topology and current factory state. */
@@ -67,10 +49,6 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
-  const spriteByWorker = new Map(workers.map((worker) => [worker.id, workerSprite(worker)]));
-  const sprites = new Map<string, SceneWorkerSprite>();
-  for (const sprite of spriteByWorker.values()) sprites.set(sprite.key, sprite);
-  const orderedSprites = [...sprites.values()].sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
   const unassigned = placements.filter((placement) => placement.roomId === undefined);
   const outside = placements.filter((placement) => placement.y > layout.height);
   const workerBottom = Math.max(layout.height, ...placements.map((placement) => placement.y + 8));
@@ -91,7 +69,24 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
     >
       <title>Dark Factory codebase floor</title>
       <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks`}</desc>
-      <defs>{orderedSprites.map((sprite) => <SpriteSymbol key={sprite.key} sprite={sprite} />)}</defs>
+      <defs>
+        {/* The sheet enters the document once; every frame is a window on it. */}
+        <image id="df-sheet" href={spriteSheet} width={SHEET_WIDTH} height={SHEET_HEIGHT} style={{ imageRendering: "pixelated" }} />
+        {Object.entries(spriteAtlas.frames).map(([name, cell]) => (
+          <symbol key={name} id={`df-frame-${name}`} viewBox={`${cell.x} ${cell.y} ${FRAME} ${FRAME}`}>
+            <use href="#df-sheet" />
+          </symbol>
+        ))}
+        <pattern id="df-floor" patternUnits="userSpaceOnUse" width={FRAME * 2} height={FRAME * 2}>
+          <Frame name="tile.floor.0" x={0} y={0} />
+          <Frame name="tile.floor.1" x={FRAME} y={0} />
+          <Frame name="tile.floor.1" x={0} y={FRAME} />
+          <Frame name="tile.floor.0" x={FRAME} y={FRAME} />
+        </pattern>
+        <pattern id="df-wall" patternUnits="userSpaceOnUse" width={FRAME} height={FRAME}>
+          <Frame name="tile.wall" x={0} y={0} />
+        </pattern>
+      </defs>
       <rect width={layout.width} height={sceneHeight} fill="#08131d" />
       <text x={PADDING} y="20" fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="10" fontWeight="700">
         FACTORY FLOOR · {layout.rooms.length} SPACES
@@ -103,7 +98,9 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         return (
           <g key={room.id} data-room-id={room.id}>
             <title>{node.path}</title>
-            <rect x={room.x} y={room.y} width={room.width} height={room.height} rx="3" fill={roomFill[node.kind]} stroke="#638095" />
+            <rect x={room.x} y={room.y} width={room.width} height={room.height} rx="3" fill="url(#df-floor)" stroke="#638095" />
+            <rect x={room.x} y={room.y} width={room.width} height={FRAME} fill="url(#df-wall)" />
+            <Frame name="tile.door" x={room.x + room.width / 2 - FRAME / 2} y={room.y + room.height - FRAME} />
             <text x={room.x + 8} y={room.y + 18} fill="#f2f6f8" fontFamily="ui-monospace, monospace" fontSize="11" fontWeight="700">
               {shortLabel(node.label)}
             </text>
@@ -131,10 +128,13 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
 
       {placements.map((placement) => {
         const worker = workerById.get(placement.id);
-        const sprite = spriteByWorker.get(placement.id);
-        if (worker === undefined || sprite === undefined) return null;
+        if (worker === undefined) return null;
         const room = placement.roomId === undefined ? undefined : nodes.get(placement.roomId);
         const location = room === undefined ? "unassigned" : room.label;
+        const frame = workerFrame(worker);
+        // The second frame sits on top and blinks in; without it, and under
+        // reduced motion, frame zero is all that shows.
+        const alternate = alternateFrame(frame);
         return (
           <g
             key={worker.id}
@@ -145,7 +145,8 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
             {...(onSelectWorker === undefined ? {} : { onClick: () => onSelectWorker(worker.id), style: { cursor: "pointer" } })}
           >
             <title>{worker.name}</title>
-            <use href={`#df-worker-${sprite.key}`} x="-8" y="-8" width="16" height="16" />
+            <Frame name={frame} x={-8} y={-8} />
+            {alternate === undefined ? null : <Frame name={alternate} x={-8} y={-8} className="dfFactoryScene__alternate" />}
           </g>
         );
       })}
@@ -154,19 +155,23 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         "FREE",
         unassigned.length,
         `${unassigned.length} unassigned workers`,
+        "bay.free",
       ], [
         "STAGED",
         staged,
         `${staged} staged tasks`,
+        "bay.staged",
       ], [
         "READY",
         ready,
         `${ready} release-ready tasks`,
-      ]] as const).map(([label, count, ariaLabel], index) => {
+        "bay.ready",
+      ]] as const).map(([label, count, ariaLabel, bay], index) => {
         const x = PADDING + index * (bayWidth + bayGap);
         return (
           <g key={label} role="group" aria-label={ariaLabel}>
             <rect x={x} y={serviceY} width={bayWidth} height={SERVICE_HEIGHT} rx="3" fill="#101f2b" stroke="#385164" />
+            <Frame name={bay} x={x + 6} y={serviceY + (SERVICE_HEIGHT - FRAME) / 2} />
             <text x={x + bayWidth / 2} y={serviceY + 17} textAnchor="middle" fill="#9db1be" fontFamily="ui-monospace, monospace" fontSize="7">{label}</text>
             <text x={x + bayWidth / 2} y={serviceY + 40} textAnchor="middle" fill="#f2f6f8" fontFamily="ui-monospace, monospace" fontSize="16" fontWeight="700">{count}</text>
           </g>

@@ -115,10 +115,12 @@ export type FloorScene = Readonly<{
  */
 export function floorScene(state: StateView | undefined, topology: TopologyView | undefined): FloorScene {
   const projects = state === undefined ? [] : [...state.projects.values()];
-  // Topology is served one project at a time. Every other project still gets
-  // its own room, so no agent is stranded in the overflow bay.
+  // Topology is served one project at a time. Every other project keeps its
+  // own room and the served root keeps its own: the cap falls on the root's
+  // children, so no agent is stranded in the overflow bay for want of a room.
   const detailed = topology === undefined ? [] : topologyRooms(topology);
-  const rooms = [...detailed, ...projectRooms(projects.filter((project) => project.id !== topology?.projectId))]
+  const others = projectRooms(projects.filter((project) => project.id !== topology?.projectId));
+  const rooms = [...detailed.slice(0, Math.max(1, MAX_FLOOR_ROOMS - others.length)), ...others]
     .slice(0, MAX_FLOOR_ROOMS);
   const roomIDs = new Set(rooms.map((room) => room.id));
   const rootID = detailed[0]?.id;

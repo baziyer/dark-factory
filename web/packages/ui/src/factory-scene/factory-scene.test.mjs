@@ -3,7 +3,8 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
-import { layoutScene, placeWorkers, workerSprite } from "../../dist/src/factory-scene/scene.js";
+import { alternateFrame, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
+import { spriteAtlas, spriteSheet } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
 const topology = {
   digest: "fixture-1",
@@ -39,8 +40,11 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
-  assert.deepEqual(workerSprite(workers[0]), workerSprite({ ...workers[0] }));
-  assert.equal(workerSprite(workers[0]).size, 16);
+  assert.equal(workerFrame(workers[0]), "worker.codex.busy.0");
+  assert.equal(workerFrame(workers[1]), "overseer.shell.needs-you.0");
+  assert.equal(workerFrame({ ...workers[0], provider: "made_up" }), "worker.shell.busy.0");
+  assert.equal(alternateFrame("worker.codex.busy.0"), "worker.codex.busy.1");
+  assert.equal(alternateFrame("overseer.shell.needs-you.0"), undefined);
 
   const first = render();
   const reordered = render({
@@ -62,12 +66,34 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.match(first, /&lt;Shared &amp; Library…/);
   assert.equal(first.includes("�"), false);
   assert.equal((first.match(/data-worker-id=/g) ?? []).length, workers.length);
-  assert.equal((first.match(/<use /g) ?? []).length, workers.length);
-  assert.equal((first.match(/<symbol /g) ?? []).length, new Set(workers.map((worker) => workerSprite(worker).key)).size);
   assert.equal((first.match(/data-worker-id="[^"]+" transform="translate\([^)]+\)"/g) ?? []).length, workers.length);
-  assert.equal(first.includes("<image"), false);
+  // The sheet is one <defs> entry, not one copy per worker, and every frame a
+  // worker stands on is a real window on it.
+  assert.equal(first.split(spriteSheet).length - 1, 1);
+  assert.equal((first.match(/<symbol /g) ?? []).length, Object.keys(spriteAtlas.frames).length);
+  for (const worker of workers) {
+    const rendered = first.slice(first.indexOf(`data-worker-id="${worker.id}"`));
+    const frame = rendered.slice(0, rendered.indexOf("</g>")).match(/href="#df-frame-([^"]+)"/g)
+      .map((match) => match.slice('href="#df-frame-'.length, -1));
+    const role = worker.role === "orchestrator" ? "overseer" : "worker";
+    assert.deepEqual(frame, [`${role}.${worker.provider ?? "shell"}.${worker.activity}.0`]
+      .concat(worker.activity === "busy" || worker.activity === "idle" ? [`${role}.${worker.provider ?? "shell"}.${worker.activity}.1`] : []));
+    for (const name of frame) assert.ok(name in spriteAtlas.frames, name);
+  }
+  // Only a two-frame activity animates, and it does so in CSS so that the
+  // reduced-motion rule can stop it.
+  assert.equal((first.match(/dfFactoryScene__alternate/g) ?? []).length,
+    workers.filter((worker) => worker.activity === "busy" || worker.activity === "idle").length);
   assert.equal(first.includes("<line"), false);
   assert.equal(first.includes("<animate"), false);
+
+  // The sheet the renderer reads is 47 frames on a 16px grid inside 128 × 96.
+  assert.equal(Object.keys(spriteAtlas.frames).length, 47);
+  assert.equal(spriteAtlas.frame, 16);
+  for (const [name, cell] of Object.entries(spriteAtlas.frames)) {
+    assert.ok(cell.x % 16 === 0 && cell.y % 16 === 0, name);
+    assert.ok(cell.x >= 0 && cell.y >= 0 && cell.x + 16 <= 128 && cell.y + 16 <= 96, name);
+  }
 
   const denseWorkers = Array.from({ length: 100 }, (_, index) => ({
     id: `worker-${index}`,
