@@ -122,16 +122,16 @@ export function StageMeter({ stage }: { stage: TaskStage }) {
 /** The floor: every agent standing in the room of the code it is changing. */
 export function FactoryFloor({
   state,
-  topology,
+  topologies,
   runPaths,
   onSelectAgent,
 }: {
   state: StateView | undefined;
-  topology: TopologyView | undefined;
+  topologies: ReadonlyMap<string, TopologyView> | undefined;
   runPaths?: ReadonlyMap<string, readonly string[]>;
   onSelectAgent?: (agent: AgentItem) => void;
 }) {
-  const scene = floorScene(state, topology, runPaths);
+  const scene = floorScene(state, topologies, runPaths);
   return (
     <FactoryScene
       topology={scene.topology}

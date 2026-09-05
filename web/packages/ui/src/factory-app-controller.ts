@@ -30,6 +30,9 @@ const LOOPBACK_GRANT = CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
 // The daemon caches run paths for five seconds, so one timer at ten never
 // outruns the cache and never lets a room go more than a cycle stale.
 const RUN_PATHS_POLL_MS = 10_000;
+// Structure changes as slowly as an edit lands, so the floor re-reads it once a
+// minute off the same timer rather than watching a filesystem it cannot see.
+const TOPOLOGY_POLL_TICKS = 6;
 
 export type FactoryHumanRequestView = Readonly<{
   request: HumanRequestItem;
@@ -88,8 +91,8 @@ export type FactoryAppSnapshot = Readonly<{
   selectedHumanRequest?: FactoryHumanRequestView;
   selectedAgent?: FactoryAgentSelection;
   terminal?: FactoryTerminalView;
-  /** Regenerable project structure, absent until the daemon serves it. */
-  topology?: TopologyView;
+  /** Regenerable structure per project, empty until the daemon serves it. */
+  topologies?: ReadonlyMap<string, TopologyView>;
   /** Repository directories each running agent's live run is changing. */
   runPaths?: ReadonlyMap<string, readonly string[]>;
   edit?: FactoryEditView;
@@ -185,10 +188,11 @@ export class FactoryAppController {
   #terminalReplacement: TerminalReplacement | undefined;
   #pendingTerminalInput = new Uint8Array(0);
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
-  #topology: TopologyView | undefined;
+  #topologies: ReadonlyMap<string, TopologyView> = new Map();
   #topologyPending = false;
   #runPaths: ReadonlyMap<string, readonly string[]> = new Map();
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
+  #runPathsTicks = 0;
   #runPathsPending = false;
   #edit: FactoryEditView | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
@@ -285,31 +289,39 @@ export class FactoryAppController {
   }
 
   /**
-   * The floor's rooms. Topology is regenerable, not durable state: it is
-   * fetched on demand and a daemon that cannot serve it simply leaves the
-   * floor showing one room per project.
+   * The floor's rooms, for every configured project and no other: topology is
+   * regenerable, not durable state, so it is fetched on demand, and a project
+   * the daemon cannot serve simply keeps the one room that stands for it.
    */
   loadTopology(): void {
     const session = this.#client?.session;
-    const project = this.#state === undefined ? undefined : [...this.#state.projects.values()][0];
-    if (this.#closed || this.#status !== "ready" || session === undefined || project === undefined || this.#topologyPending) return;
+    const state = this.#state;
+    if (this.#closed || this.#status !== "ready" || session === undefined || state === undefined || this.#topologyPending) return;
     this.#topologyPending = true;
     const generation = this.#generation;
-    void session.getTopology(project.id).then(
-      (topology) => {
-        this.#topologyPending = false;
-        if (!this.#current(generation)) return;
-        this.#topology = topology;
-        this.#publish();
-      },
-      () => { this.#topologyPending = false; },
-    );
+    void Promise.all([...state.projects.keys()].map((projectId) => session.getTopology(projectId).then(
+      (topology) => [projectId, topology] as const,
+      // A refused answer keeps the structure last served for that project
+      // rather than emptying its block of rooms for one cycle.
+      () => [projectId, this.#topologies.get(projectId)] as const,
+    ))).then((answers) => {
+      this.#topologyPending = false;
+      if (!this.#current(generation)) return;
+      const next = new Map<string, TopologyView>();
+      for (const [projectId, topology] of answers) if (topology !== undefined) next.set(projectId, topology);
+      // A round that changed no digest is not a new snapshot, so an unchanged
+      // repository does not re-render the floor once a minute.
+      if (next.size === this.#topologies.size && [...next].every(([id, topology]) => this.#topologies.get(id)?.digest === topology.digest)) return;
+      this.#topologies = next;
+      this.#publish();
+    });
   }
 
   /**
-   * Where each running agent is working. The rooms are a live hint, not durable
-   * state, so they are polled only while the floor is on screen and the poll
-   * stops the moment the floor is hidden or the session leaves ready.
+   * Where each running agent is working, and every sixth tick the structure it
+   * is working on. Both are live hints, not durable state, so they are polled
+   * only while the floor is on screen and the poll stops the moment the floor
+   * is hidden or the session leaves ready.
    */
   watchRunPaths(active: boolean): void {
     if (!active || this.#closed || this.#status !== "ready") {
@@ -318,7 +330,12 @@ export class FactoryAppController {
       return;
     }
     if (this.#runPathsTimer !== undefined) return;
-    this.#runPathsTimer = setInterval(() => this.#pollRunPaths(), RUN_PATHS_POLL_MS);
+    this.#runPathsTicks = 0;
+    this.#runPathsTimer = setInterval(() => {
+      this.#pollRunPaths();
+      this.#runPathsTicks += 1;
+      if (this.#runPathsTicks % TOPOLOGY_POLL_TICKS === 0) this.loadTopology();
+    }, RUN_PATHS_POLL_MS);
     this.#pollRunPaths();
   }
 
@@ -702,8 +719,10 @@ export class FactoryAppController {
   #receiveState(generation: number, state: StateView): void {
     if (!this.#current(generation)) return;
     this.#state = state;
-    // Topology belongs to one project; a project that is gone has no floor.
-    if (this.#topology !== undefined && !state.projects.has(this.#topology.projectId)) this.#topology = undefined;
+    // Topology belongs to a project; a project that is gone has no rooms.
+    if ([...this.#topologies.keys()].some((projectId) => !state.projects.has(projectId))) {
+      this.#topologies = new Map([...this.#topologies].filter(([projectId]) => state.projects.has(projectId)));
+    }
     const selectedAgent = this.#selectedAgent;
     const replacementAgentID = this.#terminalReplacement?.agentId;
     if (replacementAgentID !== undefined) {
@@ -1026,7 +1045,7 @@ export class FactoryAppController {
       status: this.#status,
       state: this.#state,
       error: this.#error,
-      topology: this.#topology,
+      topologies: this.#topologies,
       runPaths: this.#runPaths,
       edit: this.#edit,
       selectedHumanRequest: selection === undefined ? undefined : {

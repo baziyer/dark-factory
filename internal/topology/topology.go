@@ -271,7 +271,11 @@ func discover(ctx context.Context, root string, bounds limits) (*discovery, erro
 		}
 		body, err := readSmallRoot(rootFS, rel, maxAnalyzerFileBytes)
 		if errors.Is(err, ErrBounds) {
-			return fmt.Errorf("%w: analyzer file bytes exceed %d at %q", ErrBounds, maxAnalyzerFileBytes, rel)
+			// A generated or vendored file past the analyzer bound contributes no
+			// imports rather than failing the whole tree. Its bytes already count
+			// toward its directory, and the tree-wide bounds stay hard stops. The
+			// body must stay non-nil: a nil one sends the parser to the disk.
+			body, err = []byte{}, nil
 		}
 		if err != nil {
 			return err
@@ -638,9 +642,15 @@ func readOpened(file *os.File, before fs.FileInfo, limit int64) ([]byte, error) 
 	return body, err
 }
 
+// A dot directory at any depth is tooling state, not the project's code: .git,
+// caches, and local toolchains such as .tools all hide there. The root itself
+// is exempt, so a project checked out under a dot directory still builds.
 func ignored(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
 	switch name {
-	case ".git", "node_modules", "vendor", "dist", "build", "target", ".cache", ".next", ".nuxt", ".parcel-cache", ".turbo", ".vite", "coverage", "__pycache__":
+	case "node_modules", "vendor", "dist", "build", "target", "coverage", "__pycache__":
 		return true
 	}
 	return false

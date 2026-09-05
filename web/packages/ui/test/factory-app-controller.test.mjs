@@ -470,36 +470,63 @@ test("leaving the terminal keeps the agent selected; closing the sidebar does no
   assert.equal(context.latest().selectedAgent, undefined);
 });
 
-test("the floor's topology is fetched once per demand and absence is tolerated", async () => {
-  const project = [...fixtureState.projects.values()][0];
-  const topology = { projectId: project.id, digest: "ab".repeat(32), sourceRevision: "", nodes: [] };
-  let pending = deferred();
-  let requests = 0;
-  const context = harness({ getTopology: (id) => { requests += 1; assert.equal(id, project.id); return pending.promise; } });
+test("every project's topology is fetched, kept by id, and refreshed while the floor is shown", async (t) => {
+  mock.timers.enable({ apis: ["setInterval"] });
+  t.after(() => mock.timers.reset());
+  const projects = [...fixtureState.projects.keys()];
+  const asked = [];
+  const digests = new Map(projects.map((id, index) => [id, `a${index}`.repeat(32)]));
+  let answer = async (id) => ({ projectId: id, digest: digests.get(id), sourceRevision: "", nodes: [] });
+  const context = harness({ getTopology: (id) => { asked.push(id); return answer(id); } });
   context.controller.start();
   context.emitState(fixtureState);
   context.emitStatus("ready");
 
+  // Every configured project is asked, none is preferred, and one round is in
+  // flight at a time however many times the floor asks.
   context.controller.loadTopology();
   context.controller.loadTopology();
-  assert.equal(requests, 1, "one request is in flight at a time");
-  pending.resolve(topology);
-  await pending.promise;
-  await Promise.resolve();
-  assert.deepEqual(context.latest().topology, topology);
+  await settle();
+  assert.deepEqual(asked, projects);
+  assert.deepEqual([...context.latest().topologies.keys()], projects);
 
-  // A daemon that cannot serve topology leaves the last floor standing.
-  pending = deferred();
+  // An unchanged round is not a new snapshot; a changed digest is.
+  const published = context.snapshots.length;
   context.controller.loadTopology();
-  pending.reject(new SessionError("not_found"));
-  await pending.promise.catch(() => {});
-  await Promise.resolve();
-  assert.deepEqual(context.latest().topology, topology);
-  assert.equal(requests, 2);
+  await settle();
+  assert.equal(context.snapshots.length, published);
+  digests.set(projects[0], "cd".repeat(32));
+  context.controller.loadTopology();
+  await settle();
+  assert.equal(context.snapshots.length, published + 1);
+  assert.equal(context.latest().topologies.get(projects[0]).digest, "cd".repeat(32));
+
+  // A project the daemon cannot serve keeps the structure last served for it,
+  // and never costs the other projects theirs.
+  const refused = answer;
+  answer = async (id) => { if (id === projects[1]) throw new SessionError("not_found"); return refused(id); };
+  context.controller.loadTopology();
+  await settle();
+  assert.deepEqual([...context.latest().topologies.keys()], projects);
+  answer = refused;
+
+  // Code changes while the floor stays open: the run-paths timer re-reads the
+  // structure every sixth tick, and only then.
+  const rounds = asked.length;
+  context.controller.watchRunPaths(true);
+  for (let tick = 0; tick < 5; tick += 1) {
+    mock.timers.tick(10_000);
+    await settle();
+  }
+  assert.equal(asked.length, rounds);
+  mock.timers.tick(10_000);
+  await settle();
+  assert.deepEqual(asked.slice(rounds), projects);
+  context.controller.watchRunPaths(false);
 
   // A floor belongs to its project; when that project is gone, so is it.
-  context.emitState({ ...fixtureState, projects: new Map() });
-  assert.equal(context.latest().topology, undefined);
+  context.emitState({ ...fixtureState, projects: new Map([[projects[0], fixtureState.projects.get(projects[0])]]) });
+  assert.deepEqual([...context.latest().topologies.keys()], [projects[0]]);
 });
 
 test("run paths are polled for running agents only while the floor is shown", async (t) => {

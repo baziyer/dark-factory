@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { FactoryApp, FactoryConsole, type FactoryConsoleProps } from "@dark-factory/ui";
 import "@dark-factory/ui/styles.css";
 import "./styles.css";
-import { fixtureState, fixtureTopology } from "../../../fixtures/state.mjs";
+import { fixtureState, fixtureTopologies } from "../../../fixtures/state.mjs";
 
 // Fixture tour: sample data, no daemon, no authority. Reply/cancel and edit
 // handlers are deliberately absent so one-shot actions cannot pretend to
@@ -21,7 +21,7 @@ function FixtureTour() {
       <FactoryConsole
         status="ready"
         state={fixtureState}
-        topology={fixtureTopology}
+        topologies={fixtureTopologies}
         view={view}
         onView={setView}
         settingsOpen={settingsOpen}

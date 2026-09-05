@@ -7,7 +7,7 @@ import { act, create } from "react-test-renderer";
 import { ProtocolError, SessionError } from "@dark-factory/client";
 import { FactoryApp, FactoryConsole, floorScene } from "../dist/src/index.js";
 import { TerminalPanel } from "../dist/src/factory-app.js";
-import { fixtureState, fixtureTopology } from "../../../fixtures/state.mjs";
+import { fixtureState, fixtureTopologies, fixtureTopology } from "../../../fixtures/state.mjs";
 
 const ids = {
   project: [...fixtureState.projects.keys()][0],
@@ -89,17 +89,18 @@ test("the left view toggles between the floor and the ranked agent list", () => 
 });
 
 test("the floor maps topology to rooms and agents to workers deterministically", () => {
-  const scene = floorScene(fixtureState, fixtureTopology);
-  // Only the repository root and its direct children become rooms.
-  assert.deepEqual(scene.topology.nodes.map((node) => node.label), ["north-workshop", "kernel", "web", "South Workshop"]);
-  assert.deepEqual(scene.topology.nodes.map((node) => node.sizeBucket), ["large", "medium", "small", undefined]);
+  const scene = floorScene(fixtureState, fixtureTopologies);
+  // The repository root and the code it holds become rooms, largest first, and
+  // every project keeps its own room before any project keeps a second.
+  assert.deepEqual(scene.topology.nodes.map((node) => node.label), ["north-workshop", "South Workshop", "kernel", "web"]);
+  assert.deepEqual(scene.topology.nodes.map((node) => node.sizeBucket), ["large", undefined, "medium", "small"]);
   assert.equal(scene.topology.digest, fixtureTopology.digest);
-  assert.deepEqual(scene, floorScene(fixtureState, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }));
+  assert.deepEqual(scene, floorScene(fixtureState, new Map([[fixtureTopology.projectId, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }]])));
 
   // The detailed project's agents stand in its repository root; a project the
   // topology does not cover still gets a room, so nobody is stranded.
-  const root = scene.topology.nodes[0].id;
-  assert.deepEqual(scene.topology.nodes.at(-1).label, "South Workshop");
+  const room = (path) => scene.topology.nodes.find((node) => node.path === path).id;
+  const root = room(".");
   assert.deepEqual(scene.workers.map((worker) => [worker.name, worker.activity, worker.nodeId]), [
     ["Builder One", "needs-you", root],
     ["Dispatch Lead", "idle", ids.secondProject],
@@ -109,9 +110,9 @@ test("the floor maps topology to rooms and agents to workers deterministically",
 
   // A live run stands its worker in the room of the code it is changing: the
   // deepest displayed room that prefixes a path, and the room most paths sit in.
-  const kernel = fixtureTopology.nodes.find((entry) => entry.path === "internal/kernel").id;
-  const web = fixtureTopology.nodes.find((entry) => entry.path === "web").id;
-  const placed = (paths) => floorScene(fixtureState, fixtureTopology, new Map([[ids.agent, paths]]))
+  const kernel = room("internal/kernel");
+  const web = room("web");
+  const placed = (paths) => floorScene(fixtureState, fixtureTopologies, new Map([[ids.agent, paths]]))
     .workers.find((worker) => worker.id === ids.agent).nodeId;
   assert.equal(placed(["internal/kernel/store"]), kernel);
   assert.equal(placed(["web"]), web);
@@ -124,9 +125,9 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.equal(placed(["web", "web/packages/ui", "internal/kernel"]), web);
   // No paths, or an agent the poll never covered, keeps the project room.
   assert.equal(placed([]), root);
-  assert.equal(floorScene(fixtureState, fixtureTopology, new Map()).workers.at(-1).nodeId, root);
+  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map()).workers.at(-1).nodeId, root);
   // Another project's agent has no rooms below its own, whatever it reports.
-  assert.equal(floorScene(fixtureState, fixtureTopology, new Map([[ids.orchestrator, ["internal/kernel"]]]))
+  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map([[ids.orchestrator, ["internal/kernel"]]]))
     .workers.find((worker) => worker.id === ids.orchestrator).nodeId, ids.secondProject);
 
   // Without topology the floor still has a room per project.
@@ -136,24 +137,132 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [ids.project, ids.secondProject, ids.project]);
   assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [] });
   // The size bucket, not a file count, is what the room subtitle carries.
-  const markup = render({ topology: fixtureTopology });
+  const markup = render({ topologies: fixtureTopologies });
   assert.match(markup, />kernel<\/text>/);
   assert.match(markup, />PACKAGE · MEDIUM<\/text>/);
   assert.equal(markup.includes("FILES"), false);
 
   // A wide root must not crowd the other projects off the floor: the cap eats
-  // the root's children, never a project room, so no agent loses its room.
+  // the root's smallest children, never a project room, so no agent loses its.
   const topRoom = fixtureTopology.nodes[0];
-  const wide = floorScene(fixtureState, {
+  const wide = floorScene(fixtureState, served({
     ...fixtureTopology,
     nodes: [topRoom, ...Array.from({ length: 30 }, (_, index) => ({
       id: `${index}`.padStart(64, "0"), parent_id: topRoom.id, kind: "directory",
-      path: `dir-${index}`, label: `dir-${index}`, language: "", size_bucket: "tiny",
+      path: `dir-${index}`, label: `dir-${index}`, language: "", size_bucket: index < 4 ? "medium" : "tiny",
     }))],
-  });
+  }));
   assert.equal(wide.topology.nodes.length, 24);
-  assert.equal(wide.topology.nodes.at(-1).id, ids.secondProject);
+  assert.equal(wide.topology.nodes.filter((node) => node.path === ".").length, 1);
+  assert.equal(wide.topology.nodes.some((node) => node.id === ids.secondProject), true);
+  assert.deepEqual(wide.topology.nodes.filter((node) => node.sizeBucket === "medium").map((node) => node.label),
+    ["dir-0", "dir-1", "dir-2", "dir-3"]);
   assert.equal(wide.workers.every((worker) => worker.nodeId !== undefined), true);
+});
+
+/**
+ * A served structure for any tree at all: each entry is [kind, path, size] with
+ * its parent given by index, so a repository, a module and a package can all
+ * sit at "." exactly as the daemon serves them.
+ */
+function topologyFor(projectId, entries) {
+  return {
+    projectId,
+    digest: `${projectId}`.slice(0, 64),
+    sourceRevision: "",
+    nodes: entries.map(([kind, path, sizeBucket, parent], index) => ({
+      id: `${index}`.padStart(64, "0"),
+      parent_id: parent === undefined ? "" : `${parent}`.padStart(64, "0"),
+      kind,
+      path,
+      label: path === "." ? "root" : path.slice(path.lastIndexOf("/") + 1),
+      language: "",
+      size_bucket: sizeBucket,
+    })),
+  };
+}
+
+const served = (...views) => new Map(views.map((view) => [view.projectId, view]));
+
+const soloState = (projectId) => ({
+  ...fixtureState,
+  projects: new Map([[projectId, { id: projectId, name: "Any Project", revision: 1n }]]),
+  agents: new Map(),
+  tasks: new Map(),
+  humanRequests: new Map(),
+});
+
+test("the floor is whatever the daemon served, with no shape or name known to the code", () => {
+  const state = soloState(ids.project);
+  const labels = (...entries) => floorScene(state, served(topologyFor(ids.project, entries)))
+    .topology.nodes.map((node) => node.label);
+
+  // A go.mod at the root: repository "." holds a module at ".", and the rooms
+  // are the module's packages, never the module standing in for the whole tree.
+  assert.deepEqual(labels(
+    ["repository", ".", "large"],
+    ["module", ".", "large", 0],
+    ["package", "gamma", "medium", 1],
+    ["directory", "delta", "small", 1],
+  ), ["root", "gamma", "delta"]);
+
+  // A package.json at the root: the same, one node deeper.
+  assert.deepEqual(labels(
+    ["repository", ".", "large"],
+    ["package", ".", "large", 0],
+    ["directory", "one", "medium", 1],
+    ["directory", "two", "small", 1],
+  ), ["root", "one", "two"]);
+
+  // A tree in no language the daemon analyses is directories and nothing else,
+  // and size, not order of service, decides which rooms are shown first.
+  assert.deepEqual(labels(
+    ["repository", ".", "large"],
+    ["directory", "docs", "small", 0],
+    ["directory", "src", "medium", 0],
+  ), ["root", "src", "docs"]);
+
+  // Adding, renaming and removing a directory moves the floor with it.
+  const tree = (...names) => labels(["repository", ".", "large"], ...names.map((name) => ["directory", name, "medium", 0]));
+  assert.deepEqual(tree("one", "two"), ["root", "one", "two"]);
+  assert.deepEqual(tree("one", "renamed"), ["root", "one", "renamed"]);
+  assert.deepEqual(tree("one"), ["root", "one"]);
+  assert.deepEqual(tree("added", "one"), ["root", "added", "one"]);
+
+  // Past the cap the largest rooms are the ones worth a tile.
+  const many = floorScene(state, served(topologyFor(ids.project, [
+    ["repository", ".", "large"],
+    ...Array.from({ length: 40 }, (_, index) => ["directory", `dir-${index}`, index < 10 ? "large" : "tiny", 0]),
+  ])));
+  assert.equal(many.topology.nodes.length, 24);
+  assert.equal(many.topology.nodes.filter((node) => node.sizeBucket === "large").length, 11);
+});
+
+test("every project is its own block of rooms and its own workers", () => {
+  // Two projects holding the same path are served the same node id; two rooms
+  // on one floor may not share one, and a worker may not walk into the other
+  // project's code.
+  const shape = [["repository", ".", "large"], ["directory", "src", "medium", 0]];
+  const topologies = served(topologyFor(ids.project, shape), topologyFor(ids.secondProject, shape));
+  const scene = floorScene(fixtureState, topologies, new Map([[ids.agent, ["src"]], [ids.orchestrator, ["src"]]]));
+  assert.equal(scene.topology.nodes.length, 4);
+  assert.equal(new Set(scene.topology.nodes.map((node) => node.id)).size, 4);
+  const nodeOf = (agentId) => scene.workers.find((worker) => worker.id === agentId).nodeId;
+  assert.notEqual(nodeOf(ids.agent), nodeOf(ids.orchestrator));
+  assert.equal(scene.topology.digest, [...topologies.values()].map((view) => view.digest).join(" "));
+
+  // More projects than the floor can detail: every one keeps its own room
+  // before any one keeps a second, and none of them is served first.
+  const projects = Array.from({ length: 8 }, (_, index) => ({ id: `${index}`.padStart(32, "b"), name: `Project ${index}`, revision: 1n }));
+  const crowd = floorScene(
+    { ...fixtureState, projects: new Map(projects.map((project) => [project.id, project])), agents: new Map(), tasks: new Map() },
+    served(...projects.map((project) => topologyFor(project.id, [
+      ["repository", ".", "large"],
+      ...Array.from({ length: 10 }, (_, index) => ["directory", `dir-${index}`, "medium", 0]),
+    ]))),
+  );
+  assert.equal(crowd.topology.nodes.length, 24);
+  assert.equal(crowd.topology.nodes.filter((node) => node.path === ".").length, projects.length);
 });
 
 test("hostile names and titles are escaped as text and private detail is absent", () => {
