@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { AgentItem, StateView, TaskItem } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
@@ -205,8 +205,12 @@ function QueuedTask({
   );
 }
 
-/** The whole-factory readout, the address it is served from, and pairing. */
-export function SettingsPanel({
+/**
+ * The whole-factory readout, the address it is served from, and pairing, over
+ * the console rather than squeezing it: <dialog> owns ESC, the backdrop, the
+ * focus trap and focus return, so every exit goes through close().
+ */
+export function SettingsDialog({
   state,
   address,
   pairing,
@@ -218,32 +222,43 @@ export function SettingsPanel({
   pairing?: ReactNode;
   onClose?: () => void;
 }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  const close = () => dialog.current?.close();
   return (
-    <section className="dfConsoleSidebar__panel" aria-label="Settings">
-      <div className="dfConsoleSidebar__heading">
-        <h2>SETTINGS</h2>
-        {onClose === undefined ? null : <button type="button" onClick={onClose}>CLOSE</button>}
+    <dialog
+      className="dfConsoleDialog"
+      ref={dialog}
+      aria-label="Settings"
+      onClose={onClose}
+      onClick={(event) => { if (event.target === dialog.current) close(); }}
+    >
+      <div className="dfConsoleSidebar__panel">
+        <div className="dfConsoleSidebar__heading">
+          <h2>SETTINGS</h2>
+          {onClose === undefined ? null : <button type="button" onClick={close}>CLOSE</button>}
+        </div>
+        <div className="dfConsoleSidebar__section" aria-label="BUILDING">
+          <h3>BUILDING</h3>
+          {state === undefined ? <p className="dfFactoryConsole__empty">BUILDING STATE UNAVAILABLE</p> : (
+            <dl className="dfFactoryConsole__metrics">
+              <div><dt>DISPATCH</dt><dd>{state.factory.dispatch_enabled ? "ENABLED" : "PAUSED"}</dd></div>
+              <div><dt>CAPACITY</dt><dd>{String(state.factory.capacity)}</dd></div>
+              <div><dt>ACTIVE RUNS</dt><dd>{String(state.factory.active_runs)}</dd></div>
+              <div><dt>REVISION</dt><dd>{state.factory.revision.toString()}</dd></div>
+            </dl>
+          )}
+        </div>
+        <div className="dfConsoleSidebar__section" aria-label="This factory">
+          <h3>THIS FACTORY</h3>
+          <p className="dfConsoleSidebar__address">{address}</p>
+        </div>
+        <div className="dfConsoleSidebar__section" aria-label="PAIRING">
+          <h3>PAIRING</h3>
+          {pairing ?? <p className="dfFactoryConsole__empty">phone pairing arrives here</p>}
+        </div>
       </div>
-      <div className="dfConsoleSidebar__section" aria-label="BUILDING">
-        <h3>BUILDING</h3>
-        {state === undefined ? <p className="dfFactoryConsole__empty">BUILDING STATE UNAVAILABLE</p> : (
-          <dl className="dfFactoryConsole__metrics">
-            <div><dt>DISPATCH</dt><dd>{state.factory.dispatch_enabled ? "ENABLED" : "PAUSED"}</dd></div>
-            <div><dt>CAPACITY</dt><dd>{String(state.factory.capacity)}</dd></div>
-            <div><dt>ACTIVE RUNS</dt><dd>{String(state.factory.active_runs)}</dd></div>
-            <div><dt>REVISION</dt><dd>{state.factory.revision.toString()}</dd></div>
-          </dl>
-        )}
-      </div>
-      <div className="dfConsoleSidebar__section" aria-label="This factory">
-        <h3>THIS FACTORY</h3>
-        <p className="dfConsoleSidebar__address">{address}</p>
-      </div>
-      <div className="dfConsoleSidebar__section" aria-label="PAIRING">
-        <h3>PAIRING</h3>
-        {pairing ?? <p className="dfFactoryConsole__empty">phone pairing arrives here</p>}
-      </div>
-    </section>
+    </dialog>
   );
 }
 

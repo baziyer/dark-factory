@@ -25,21 +25,15 @@ function FixtureTour() {
         view={view}
         onView={setView}
         settingsOpen={settingsOpen}
-        onToggleSettings={() => {
-          setSelectedAgent(undefined);
-          setSelectedHumanRequest(undefined);
-          setSettingsOpen((open) => !open);
-        }}
+        onToggleSettings={() => setSettingsOpen((open) => !open)}
         selectedAgent={selectedAgent}
         selectedHumanRequest={selectedHumanRequest}
         onSelectAgent={(agent) => {
-          setSettingsOpen(false);
           setSelectedHumanRequest(undefined);
           setSelectedAgent({ id: agent.id, name: agent.name, revision: agent.revision });
         }}
         onCloseAgent={() => setSelectedAgent(undefined)}
         onSelectHumanRequest={(request) => {
-          setSettingsOpen(false);
           setSelectedHumanRequest({
             request,
             phase: "ready",
