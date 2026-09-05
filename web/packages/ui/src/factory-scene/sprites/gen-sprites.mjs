@@ -31,97 +31,163 @@ function draw(target, rows, x = 0, y = 0) {
   }));
 }
 
+// Art lives here: shared face/boots, chosen hair + outfit, then pose/equipment.
+// a/b are skin/light-shadow; u is the sleeve colour. All parts face forward.
 const head = grid(`
   .oooo.
-  ouuuuo
-  ohbaoa
-  .obaa.
+  oaaaao
+  oaoaoo
+  oaaaao
+  .obbo.
   ..ba..
 `);
-const hat = grid(`
-  ..yy..
-  .yyyy.
-  oyyyyo
-`);
-const torso = grid(`
-  .uuuu.
-  ouuuuo
-  ouuuuo
-  ouuluo
-  oommoo
-`);
+const hair = [
+  grid(`
+    ..oooo..
+    .ohhhho.
+    .ohwwho.
+    ..h.....
+  `),
+  grid(`
+    .oooooo.
+    .oppppo.
+    .opphho.
+    ..p...h.
+  `),
+  grid(`
+    ..oo.oo.
+    .ohhohho
+    ohwhhhho
+    .h....h.
+  `),
+  grid(`
+    ..oooo..
+    .owwwwo.
+    .owwwwo.
+    ow....o.
+    owo.....
+  `),
+];
+const outfits = [
+  grid(`
+    .occo.
+    ocpcco
+    occcco
+    ocwmco
+    .oooo.
+  `),
+  grid(`
+    .osso.
+    osmsmo
+    omssmo
+    ommmmo
+    .oooo.
+  `),
+  grid(`
+    .oppo.
+    opoppo
+    oppppo
+    opwwpo
+    .oooo.
+  `),
+  grid(`
+    .ollo.
+    olpllo
+    olsslo
+    ollllo
+    .oooo.
+  `),
+];
+// Stable slots: revise a part in place rather than reorder identities.
+const identities = [
+  { name: 'Copper / cropped hair', hair: hair[0], outfit: outfits[0], sleeve: 'c', skin: 'a', shadow: 'b' },
+  { name: 'Slate / side part', hair: hair[1], outfit: outfits[1], sleeve: 's', skin: 'a', shadow: 'b' },
+  { name: 'Linen / curls', hair: hair[2], outfit: outfits[2], sleeve: 'p', skin: 'b', shadow: 'w' },
+  { name: 'Steel / tied hair', hair: hair[3], outfit: outfits[3], sleeve: 'l', skin: 'b', shadow: 'w' },
+];
 const legs = grid(`
-  omoomo
-  om..mo
-  oo..oo
+  .omoomo.
+  osmoomso
+  ooo..ooo
 `);
 const relaxedArm = grid(`
-  .ou
-  oau
-  oba
-  .oo
+  ou
+  ou
+  oa
+  oo
 `);
 const foldedArms = grid(`
   ouuuuuuo
-  ouaaaaao
-  .oobbuo.
+  oabbaaoo
+  .oooooo.
 `);
 const raisedArm = grid(`
-  .aa.
-  oaao
-  ouuo
-  ouuo
-  .ouo
-  .ouu
-  ..oo
+  .oo
+  oaa
+  oao
+  ouo
+  ouo
+  .ou
+  ..o
 `);
-const typingArms = grid(`
+const typingArms = [grid(`
   ouu...uo
-  .ouaaaao
+  .oa..oao
+  ..aooa..
+`), grid(`
+  ouu...uo
+  .ouaaauo
   ..ooooo.
-`);
+`)];
 const keyboard = grid(`
-  olllllo
-  ommmmmo
+  .oooooo.
+  olslsllo
+  .oooooo.
 `);
 const clipboard = grid(`
-  .mm.
+  .ss.
   oppo
   opmo
   oppo
-  .oo.
+  oooo
+`);
+const hat = grid(`
+  ..oooo..
+  .oyyyyo.
+  oyyyyyyo
 `);
 const alert = grid(`
-  r
-  r
-  .
-  r
+  oro
+  oro
+  .o.
+  oro
 `);
-
-function person(role, colour, activity, n) {
+// Equipment is plain part/position data, keyed only by a served role.
+const equipment = { worker: [], overseer: [
+  { part: hat, x: 4, y: 0 }, { part: clipboard, x: 11, y: 9 },
+] };
+function person(role, colour, activity, n, identity) {
   const pixels = blank();
   const bob = activity === 'idle' ? n : 0;
-  const lean = activity === 'busy' ? n : 0;
-  draw(pixels, legs, 5, 12 + bob);
-  draw(pixels, tint(torso, colour), 5, 8 + bob);
+  const skin = rows => rows.map(row => row.replace(/[ab]/g, key => key === 'a' ? identity.skin : identity.shadow));
+  const arm = rows => skin(tint(rows, identity.sleeve));
+  draw(pixels, legs, 4, 13);
+  draw(pixels, identity.outfit, 5, 8 + bob);
+  draw(pixels, skin(head), 5, 2 + bob);
+  draw(pixels, identity.hair, 4, 1 + bob);
   if (activity === 'waiting') {
-    draw(pixels, tint(foldedArms, colour), 4, 9);
+    draw(pixels, arm(foldedArms), 4, 9);
   } else if (activity === 'busy') {
-    draw(pixels, keyboard, 8, 12);
-    draw(pixels, tint(typingArms, colour), 4 + lean, 9);
+    draw(pixels, keyboard, 7, 12);
+    draw(pixels, arm(typingArms[n]), 4, 9);
   } else {
-    draw(pixels, tint(relaxedArm, colour), 3, 9 + bob);
-    draw(pixels, tint(mirror(relaxedArm), colour), 10, 9 + bob);
-    if (activity === 'needs-you') {
-      draw(pixels, tint(raisedArm, colour), 2, 5);
-      draw(pixels, alert, 12, 0);
-    }
+    draw(pixels, arm(relaxedArm), 3, 9 + bob);
+    draw(pixels, arm(mirror(relaxedArm)), 11, 9 + bob);
+    if (activity === 'needs-you') draw(pixels, arm(raisedArm), 2, 4);
   }
-  draw(pixels, tint(head, colour), 5 + lean, 3 + bob);
-  if (role === 'overseer') {
-    draw(pixels, hat, 5 + lean, 2 + bob);
-    draw(pixels, clipboard, 10, 9 + bob);
-  }
+  draw(pixels, [colour], 9, 8 + bob); // One provider badge, never the identity.
+  for (const { part, x, y } of equipment[role]) draw(pixels, part, x, y + bob);
+  if (activity === 'needs-you') draw(pixels, alert, 13, 0);
   return pixels;
 }
 
@@ -202,11 +268,13 @@ const pad = grid(`
 const sprites = new Map();
 const providers = { claude_code: 'c', codex: 't', shell: 's' };
 const activities = { busy: 2, waiting: 1, 'needs-you': 1, idle: 2 };
-for (const role of ['worker', 'overseer']) {
-  for (const [provider, colour] of Object.entries(providers)) {
-    for (const [activity, count] of Object.entries(activities)) {
-      for (let n = 0; n < count; n++) {
-        sprites.set(`${role}.${provider}.${activity}.${n}`, person(role, colour, activity, n));
+for (const identity of identities.keys()) {
+  for (const role of ['worker', 'overseer']) {
+    for (const [provider, colour] of Object.entries(providers)) {
+      for (const [activity, count] of Object.entries(activities)) {
+        for (let n = 0; n < count; n++) {
+          sprites.set(`${role}.${provider}.${identity}.${activity}.${n}`, person(role, colour, activity, n, identities[identity]));
+        }
       }
     }
   }
@@ -281,46 +349,54 @@ const preview = `<!doctype html>
 <title>Dark Factory · Sprite atlas</title>
 <style>
   * { box-sizing: border-box; }
-  body { margin: 32px; background: #0b0b0b; color: #e5d5ad; font: 13px system-ui,sans-serif; }
+  body { margin: 24px; background: #08131d; color: #e5d5ad; font: 13px system-ui,sans-serif; }
   h1 { font-size: 24px; margin-bottom: 8px; }
-  p { color: #8b95a5; }
-  h2 { font-size: 15px; margin-top: 32px; }
-  section { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 12px; max-width: 1440px; }
-  figure { margin: 0; padding: 16px 10px; border: 1px solid #303741; background: #101318; text-align: center; }
-  canvas { display: block; width: 64px; height: 64px; margin: 0 auto 12px; image-rendering: pixelated; }
-  figcaption { color: #8b95a5; font: 11px ui-monospace,monospace; overflow-wrap: anywhere; }
+  p, figcaption { color: #8b95a5; }
+  h2 { font-size: 15px; margin-top: 24px; }
+  section { display: grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap: 12px; max-width: 1100px; }
+  figure { margin: 0; padding: 12px; border: 1px solid #303741; background: #101f2b; }
+  .scales { display: flex; align-items: end; justify-content: space-between; margin: 12px 0; }
+  canvas { display: block; image-rendering: pixelated; }
+  small { display: block; margin-top: 6px; text-align: center; color: #8b95a5; }
+  label { display: inline-block; margin: 0 16px 12px 0; }
+  select { font: inherit; color: inherit; background: #191d24; padding: 6px; }
 </style>
-<h1>Dark Factory / Sprite atlas</h1>
-<p>${sprites.size} frames · 16 × 16 pixels · ${width} × ${height} sheet · 4× nearest-neighbour preview</p>
-<main id="frames"></main>
+<h1>Dark Factory / Sprite workbench</h1>
+<p>${sprites.size} frames · shared 16-colour palette · 16 × 16 footprint. Four appearances repeat; names identify agents.</p>
+<label>Role <select id="role"><option value="worker">Worker</option><option value="overseer">Overseer</option></select></label>
+<label>Provider badge <select id="provider">${Object.keys(providers).map(provider => `<option>${provider}</option>`).join('')}</select></label>
+<label>Inspect <select id="motion"><option value="0">Still · frame 0</option><option value="1">Still · frame 1</option><option value="animate">Animated · 600ms per frame</option></select></label>
+<p>Each pose: native 1×, normal display 3×, enlarged 8×, over the factory floor tile. Reduced motion holds frame 0 during animation.</p>
+${identities.map((identity, index) => `<h2>${index} · ${identity.name}</h2><section>${Object.keys(activities).map(activity => `<figure><figcaption>${activity}</figcaption><div class="scales">${[1, 3, 8].map(scale => `<div><canvas width="16" height="16" style="width:${16 * scale}px;height:${16 * scale}px" data-pose="${index}.${activity}" role="img" aria-label="${identity.name}, ${activity}, ${scale}×"></canvas><small>${scale}×</small></div>`).join('')}</div></figure>`).join('')}</section>`).join('')}
+<h2>Floor / equipment bays</h2>
+<section>${[...sprites.keys()].filter(name => /^(tile|bay)\./.test(name)).map(name => `<figure><figcaption>${name}</figcaption><canvas width="16" height="16" style="width:48px;height:48px" data-tile="${name}" role="img" aria-label="${name}"></canvas></figure>`).join('')}</section>
+<p>Edit hair, outfits, identities or equipment in gen-sprites.mjs, run <code>node web/packages/ui/src/factory-scene/sprites/gen-sprites.mjs</code>, reload this page, then inspect the console fixture floor.</p>
 <script>
 const atlas = ${JSON.stringify(atlas)};
 const image = new Image();
-image.onload = () => {
-  const groups = new Map();
-  for (const [name, {x,y}] of Object.entries(atlas.frames)) {
-    const parts = name.split('.');
-    const group = parts[0] === 'tile' || parts[0] === 'bay' ? parts[0] : parts.slice(0,2).join(' / ');
-    if (!groups.has(group)) {
-      const title = document.createElement('h2');
-      title.textContent = group;
-      const section = document.createElement('section');
-      document.getElementById('frames').append(title, section);
-      groups.set(group, section);
-    }
-    const figure = document.createElement('figure');
-    const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = 64;
-    canvas.setAttribute('role', 'img');
-    canvas.setAttribute('aria-label', name);
+const role = document.getElementById('role');
+const provider = document.getElementById('provider');
+const motion = document.getElementById('motion');
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+let frame = 0;
+function paint() {
+  for (const canvas of document.querySelectorAll('canvas')) {
+    const prefix = role.value + '.' + provider.value + '.' + canvas.dataset.pose;
+    const n = motion.value === 'animate' ? (reduced.matches ? 0 : frame) : Number(motion.value);
+    const name = canvas.dataset.tile || (prefix + '.' + (atlas.frames[prefix + '.' + n] ? n : 0));
+    const {x,y} = atlas.frames[name];
     const context = canvas.getContext('2d');
-    context.imageSmoothingEnabled = false;
-    context.drawImage(image, x, y, 16, 16, 0, 0, 64, 64);
-    const label = document.createElement('figcaption');
-    label.textContent = name;
-    figure.append(canvas, label);
-    groups.get(group).append(figure);
+    context.clearRect(0, 0, 16, 16);
+    const floor = atlas.frames['tile.floor.0'];
+    context.drawImage(image, floor.x, floor.y, 16, 16, 0, 0, 16, 16);
+    context.drawImage(image, x, y, 16, 16, 0, 0, 16, 16);
   }
+}
+image.onload = () => {
+  paint();
+  for (const select of [role, provider, motion]) select.onchange = () => { frame = 0; paint(); };
+  reduced.onchange = paint;
+  setInterval(() => { if (motion.value === 'animate' && !reduced.matches) { frame = 1 - frame; paint(); } }, 600);
 };
 image.src = ${JSON.stringify(dataUrl)};
 </script>
@@ -360,10 +436,12 @@ for (let y = 0; y < height; y++) {
   assert.deepEqual(inflated.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)), pixels.subarray(y * stride, (y + 1) * stride));
 }
 const expectedNames = [];
-for (const role of ['worker', 'overseer']) {
-  for (const provider of ['claude_code', 'codex', 'shell']) {
-    for (const suffix of ['busy.0', 'busy.1', 'waiting.0', 'needs-you.0', 'idle.0', 'idle.1']) {
-      expectedNames.push(`${role}.${provider}.${suffix}`);
+for (const identity of identities.keys()) {
+  for (const role of ['worker', 'overseer']) {
+    for (const provider of ['claude_code', 'codex', 'shell']) {
+      for (const suffix of ['busy.0', 'busy.1', 'waiting.0', 'needs-you.0', 'idle.0', 'idle.1']) {
+        expectedNames.push(`${role}.${provider}.${identity}.${suffix}`);
+      }
     }
   }
 }
@@ -381,12 +459,14 @@ for (const {x, y} of Object.values(savedAtlas.frames)) {
   occupied.add(`${x},${y}`);
 }
 assert.equal(Object.keys(palette).length, 16);
-for (const role of ['worker', 'overseer']) {
-  for (const provider of Object.keys(providers)) {
-    for (const activity of ['busy', 'idle']) {
-      assert.notDeepEqual(sprites.get(`${role}.${provider}.${activity}.0`), sprites.get(`${role}.${provider}.${activity}.1`));
+for (const identity of identities.keys()) {
+  for (const role of ['worker', 'overseer']) {
+    for (const provider of Object.keys(providers)) {
+      for (const activity of ['busy', 'idle']) {
+        assert.notDeepEqual(sprites.get(`${role}.${provider}.${identity}.${activity}.0`), sprites.get(`${role}.${provider}.${identity}.${activity}.1`));
+      }
+      assert.equal(sprites.get(`${role}.${provider}.${identity}.needs-you.0`).flat().filter(key => key === 'r').length, 3);
     }
-    assert.equal(sprites.get(`${role}.${provider}.needs-you.0`).flat().filter(key => key === 'r').length, 3);
   }
 }
 console.log(`Verified PNG decode, 16-colour palette, exact atlas names, bounds, and animation frames.`);

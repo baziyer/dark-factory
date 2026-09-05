@@ -129,10 +129,14 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
 
 /** The sheet frame a worker stands as; an unknown provider wears shell. */
 export function workerFrame(worker: SceneWorker): string {
+  // FNV-1a over the id only; four appearances aid recognition, names identify.
+  let hash = 2166136261;
+  for (let i = 0; i < worker.id.length; i++) hash = Math.imul(hash ^ worker.id.charCodeAt(i), 16777619) >>> 0;
+  const identity = hash % 4;
   const role = worker.role === "orchestrator" ? "overseer" : "worker";
   const provider = worker.provider === "claude_code" || worker.provider === "codex" ? worker.provider : "shell";
-  const frame = `${role}.${provider}.${worker.activity}.0`;
-  return frame in spriteAtlas.frames ? frame : `${role}.${provider}.idle.0`;
+  const frame = `${role}.${provider}.${identity}.${worker.activity}.0`;
+  return frame in spriteAtlas.frames ? frame : `${role}.${provider}.${identity}.idle.0`;
 }
 
 /** busy and idle carry a second frame; every other activity holds still. */
