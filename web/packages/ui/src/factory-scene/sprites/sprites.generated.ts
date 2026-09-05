@@ -1,0 +1,195 @@
+export const spriteSheet = "data:image/png;base64,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";
+export const spriteAtlas = {
+  "frame": 16,
+  "sheet": "sprites.png",
+  "frames": {
+    "worker.claude_code.busy.0": {
+      "x": 0,
+      "y": 0
+    },
+    "worker.claude_code.busy.1": {
+      "x": 16,
+      "y": 0
+    },
+    "worker.claude_code.waiting.0": {
+      "x": 32,
+      "y": 0
+    },
+    "worker.claude_code.needs-you.0": {
+      "x": 48,
+      "y": 0
+    },
+    "worker.claude_code.idle.0": {
+      "x": 64,
+      "y": 0
+    },
+    "worker.claude_code.idle.1": {
+      "x": 80,
+      "y": 0
+    },
+    "worker.codex.busy.0": {
+      "x": 96,
+      "y": 0
+    },
+    "worker.codex.busy.1": {
+      "x": 112,
+      "y": 0
+    },
+    "worker.codex.waiting.0": {
+      "x": 0,
+      "y": 16
+    },
+    "worker.codex.needs-you.0": {
+      "x": 16,
+      "y": 16
+    },
+    "worker.codex.idle.0": {
+      "x": 32,
+      "y": 16
+    },
+    "worker.codex.idle.1": {
+      "x": 48,
+      "y": 16
+    },
+    "worker.shell.busy.0": {
+      "x": 64,
+      "y": 16
+    },
+    "worker.shell.busy.1": {
+      "x": 80,
+      "y": 16
+    },
+    "worker.shell.waiting.0": {
+      "x": 96,
+      "y": 16
+    },
+    "worker.shell.needs-you.0": {
+      "x": 112,
+      "y": 16
+    },
+    "worker.shell.idle.0": {
+      "x": 0,
+      "y": 32
+    },
+    "worker.shell.idle.1": {
+      "x": 16,
+      "y": 32
+    },
+    "overseer.claude_code.busy.0": {
+      "x": 32,
+      "y": 32
+    },
+    "overseer.claude_code.busy.1": {
+      "x": 48,
+      "y": 32
+    },
+    "overseer.claude_code.waiting.0": {
+      "x": 64,
+      "y": 32
+    },
+    "overseer.claude_code.needs-you.0": {
+      "x": 80,
+      "y": 32
+    },
+    "overseer.claude_code.idle.0": {
+      "x": 96,
+      "y": 32
+    },
+    "overseer.claude_code.idle.1": {
+      "x": 112,
+      "y": 32
+    },
+    "overseer.codex.busy.0": {
+      "x": 0,
+      "y": 48
+    },
+    "overseer.codex.busy.1": {
+      "x": 16,
+      "y": 48
+    },
+    "overseer.codex.waiting.0": {
+      "x": 32,
+      "y": 48
+    },
+    "overseer.codex.needs-you.0": {
+      "x": 48,
+      "y": 48
+    },
+    "overseer.codex.idle.0": {
+      "x": 64,
+      "y": 48
+    },
+    "overseer.codex.idle.1": {
+      "x": 80,
+      "y": 48
+    },
+    "overseer.shell.busy.0": {
+      "x": 96,
+      "y": 48
+    },
+    "overseer.shell.busy.1": {
+      "x": 112,
+      "y": 48
+    },
+    "overseer.shell.waiting.0": {
+      "x": 0,
+      "y": 64
+    },
+    "overseer.shell.needs-you.0": {
+      "x": 16,
+      "y": 64
+    },
+    "overseer.shell.idle.0": {
+      "x": 32,
+      "y": 64
+    },
+    "overseer.shell.idle.1": {
+      "x": 48,
+      "y": 64
+    },
+    "tile.floor.0": {
+      "x": 64,
+      "y": 64
+    },
+    "tile.floor.1": {
+      "x": 80,
+      "y": 64
+    },
+    "tile.wall": {
+      "x": 96,
+      "y": 64
+    },
+    "tile.door": {
+      "x": 112,
+      "y": 64
+    },
+    "tile.machine.0": {
+      "x": 0,
+      "y": 80
+    },
+    "tile.machine.1": {
+      "x": 16,
+      "y": 80
+    },
+    "tile.desk": {
+      "x": 32,
+      "y": 80
+    },
+    "tile.crate": {
+      "x": 48,
+      "y": 80
+    },
+    "bay.free": {
+      "x": 64,
+      "y": 80
+    },
+    "bay.staged": {
+      "x": 80,
+      "y": 80
+    },
+    "bay.ready": {
+      "x": 96,
+      "y": 80
+    }
+  }
+} as const;
