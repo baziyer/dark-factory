@@ -203,6 +203,7 @@ type ConsoleBackend interface {
 	UpdateAgent(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AgentUpdate) (browserprotocol.AgentUpdateResult, error)
 	UpdateTask(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskUpdate) (browserprotocol.TaskUpdateResult, error)
 	Topology(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TopologyGet) (browserprotocol.Topology, error)
+	RunPaths(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error)
 }
 
 // TerminalBackend is the optional effect half of browser v1. Keeping it

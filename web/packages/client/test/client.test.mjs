@@ -42,10 +42,15 @@ const expectIgnoredMember = (base, mutated, role = "client") => {
 };
 
 test("canonical control fixtures decode by sender role and re-encode exactly", () => {
-  const client = ["pair_prove", "auth_prove", "remote_invite"];
-  const server = ["hello", "pair_result", "auth_result", "remote_invite_result"];
+  const client = ["pair_prove", "auth_prove", "remote_invite", "run_paths_get"];
+  const server = ["hello", "pair_result", "auth_result", "remote_invite_result", "run_paths"];
   for (const name of client) assert.equal(encodeClientControl(decodeClientControl(fixture(`${name}.json`))), fixture(`${name}.json`));
   for (const name of server) assert.equal(encodeServerControl(decodeServerControl(fixture(`${name}.json`))), fixture(`${name}.json`));
+  // An agent with no live run is in no room, so an empty run identity may not
+  // carry paths and the array keeps the generic item bound.
+  const rooms = fixture("run_paths.json");
+  expectMalformed(() => decodeServerControl(rooms.replace(/"run_id":"[0-9a-f]+"/, '"run_id":""')));
+  expectMalformed(() => decodeServerControl(rooms.replace('"internal/kernel"', '""')));
   const error = fixture("error.json");
   assert.equal(encodeClientControl(decodeClientControl(error)), error);
   assert.equal(encodeServerControl(decodeServerControl(error)), error);

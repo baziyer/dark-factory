@@ -70,6 +70,13 @@ func (backend *consoleDispatchBackend) Topology(_ context.Context, client [brows
 	return backend.topology, nil
 }
 
+func (backend *consoleDispatchBackend) RunPaths(_ context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.RunPaths{}, err
+	}
+	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
+}
+
 const (
 	consoleAgentID   = "606162636465666768696a6b6c6d6e6f"
 	consoleTaskID    = "404142434445464748494a4b4c4d4e4f"

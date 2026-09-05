@@ -39,6 +39,13 @@ type Daemon struct {
 	// and one gate avoids a second digest-to-owner authority index.
 	operationMu sync.Mutex
 
+	// runPathsMu guards the console's regenerable view of where a live worker
+	// is editing: the changes root the supervisor was given, and one bounded
+	// directory walk per run.
+	runPathsMu   sync.Mutex
+	changeParent string
+	runPaths     map[kernel.RunID]runPathsResult
+
 	attemptMu sync.Mutex
 	attempts  map[kernel.RunID]*liveAttempt
 	closing   bool

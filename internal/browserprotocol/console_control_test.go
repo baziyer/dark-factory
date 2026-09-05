@@ -107,3 +107,30 @@ func TestTopologyIsBoundedBySnapshotBytesNotControlBytes(t *testing.T) {
 		t.Fatalf("oversized frame decoded: %v", err)
 	}
 }
+
+// The manifest fixture loop proves RUN_PATHS decodes and round-trips. This
+// proves the bounds beside it: an agent with no live run is in no room.
+func TestRunPathsBounds(t *testing.T) {
+	agent := "02020202020202020202020202020202"
+	run := "04040404040404040404040404040404"
+	runPaths := func(runID, paths string) string {
+		return `{"type":"RUN_PATHS","id":"x","body":{"agent_id":"` + agent + `","run_id":"` + runID + `","paths":[` + paths + `]}}`
+	}
+	if _, err := DecodeServerControl([]byte(runPaths("", ""))); err != nil {
+		t.Fatalf("idle agent refused: %v", err)
+	}
+	rooms := make([]string, MaxJSONArray+1)
+	for index := range rooms {
+		rooms[index] = `"internal/kernel"`
+	}
+	for _, frame := range []string{
+		runPaths("", `"internal/kernel"`),
+		runPaths(run, `""`),
+		runPaths(run, strings.Join(rooms, ",")),
+		`{"type":"RUN_PATHS","id":"x","body":{"agent_id":"` + agent + `","run_id":"` + run + `","paths":null}}`,
+	} {
+		if _, err := DecodeServerControl([]byte(frame)); err != ErrMalformed {
+			t.Fatalf("%s accepted: %v", frame, err)
+		}
+	}
+}
