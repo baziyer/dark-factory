@@ -1067,6 +1067,9 @@ func TestInputBoundsFailBeforeConnection(t *testing.T) {
 		"shell model":      {ID: id('2'), ProjectID: id('1'), Name: "agent", Role: "worker", Provider: "shell", Model: "private", ToolBudgetLimit: 1},
 		"claude ultra":     {ID: id('2'), ProjectID: id('1'), Name: "agent", Role: "worker", Provider: "claude_code", ReasoningEffort: "ultra", ToolBudgetLimit: 1},
 		"large model":      {ID: id('2'), ProjectID: id('1'), Name: "agent", Role: "worker", Provider: "codex", Model: strings.Repeat("m", 129), ToolBudgetLimit: 1},
+		// An account is one canonical identity, and shell has no logins to name.
+		"malformed account": {ID: id('2'), ProjectID: id('1'), Name: "agent", Role: "worker", Provider: "codex", AccountID: "nope", ToolBudgetLimit: 1},
+		"shell account":     {ID: id('2'), ProjectID: id('1'), Name: "agent", Role: "worker", Provider: "shell", AccountID: id('3'), ToolBudgetLimit: 1},
 	} {
 		t.Run("create agent "+name, func(t *testing.T) {
 			if _, err := operator.CreateAgent(context.Background(), input); !errors.Is(err, ErrInvalidInput) {

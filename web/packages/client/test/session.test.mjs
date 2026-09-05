@@ -1710,3 +1710,59 @@ test("a pairing survives the versionless transcript domain", async () => {
   assert.equal(await verifyP256Signature(paired.publicKeySEC1, hexBytes(prove.body.signature), transcript), true);
   client.close();
 });
+
+
+test("account discovery and linking correlate by request id and gate on capability", async () => {
+  const { session, socket } = await openHumanSession();
+  const discovered = {
+    provider: "codex",
+    home: "/Users/operator/.codex-dogfood",
+    label: ".codex-dogfood",
+    email: "operator@example.com",
+    organization: "",
+    default_model: "gpt-6-astra",
+    default_reasoning_effort: "high",
+    linked_id: "",
+  };
+  const pending = session.discoverAccounts();
+  const ask = decodeClientControl(socket.sent.at(-1));
+  assert.equal(ask.type, "ACCOUNTS_DISCOVER");
+  assert.deepEqual(ask.body, {});
+  socket.reply(encodeServerControl({ type: "ACCOUNTS", id: ask.id, body: { accounts: [discovered] } }));
+  const accounts = await pending;
+  assert.deepEqual([...accounts], [discovered]);
+  assert.equal(Object.isFrozen(accounts[0]), true);
+
+  const accountId = "5a".repeat(16);
+  const linking = session.linkAccount({ provider: "codex", home: discovered.home, label: "dogfood" });
+  const link = decodeClientControl(socket.sent.at(-1));
+  assert.equal(link.type, "ACCOUNT_LINK");
+  assert.deepEqual(link.body, { provider: "codex", home: discovered.home, label: "dogfood" });
+  socket.reply(encodeServerControl({ type: "ACCOUNT_LINK_RESULT", id: link.id, body: { account_id: accountId, revision: 1n } }));
+  assert.deepEqual(await linking, { accountId, revision: 1n });
+
+  // The agent edit carries the selection, and an empty string clears it.
+  const agentId = "7c".repeat(16);
+  for (const selection of [accountId, ""]) {
+    const edit = session.updateAgent({ agentId, expectedRevision: 3n, accountId: selection });
+    const frame = decodeClientControl(socket.sent.at(-1));
+    assert.equal(frame.body.account_id, selection);
+    socket.reply(encodeServerControl({ type: "AGENT_UPDATE_RESULT", id: frame.id, body: { agent_id: agentId, revision: 4n } }));
+    await edit;
+  }
+
+  // A result nobody asked for is a protocol fault, not a second answer.
+  const errors = [];
+  const forged = await openHumanSession((error) => errors.push(error));
+  forged.socket.reply(encodeServerControl({ type: "ACCOUNTS", id: "forged-accounts", body: { accounts: [] } }));
+  await tick();
+  assert.equal(forged.session.status, "closed");
+  assert.equal(errors.at(-1) instanceof ProtocolError, true);
+
+  // Linking is a human action; a session that only observes cannot ask for it.
+  const closed = new BrowserSession({ url: "ws://127.0.0.1:1/browser", host: "127.0.0.1:1", origin: "http://127.0.0.1:1" });
+  await assert.rejects(closed.linkAccount({ provider: "codex", home: "/x", label: "x" }), (error) => error instanceof SessionError);
+  await assert.rejects(closed.discoverAccounts(), (error) => error instanceof SessionError);
+  closed.close();
+  session.close();
+});

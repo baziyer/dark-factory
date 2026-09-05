@@ -45,9 +45,11 @@ export type ProjectItem = { id: string; name: string; revision: bigint };
  * inherits. `effective_*` is what the run will actually use, and `model_source`
  * says where the model came from: "agent" when the agent names one, the
  * provider CLI configuration path the default was read from, or "" when that
- * CLI keeps a default nobody can see.
+ * CLI keeps a default nobody can see. `account_id` is the linked provider
+ * login it launches under; empty means that provider's default directory.
  */
-export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint };
+export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string };
+export type AccountItem = { id: string; provider: "claude_code" | "codex"; home: string; label: string; revision: bigint };
 export type TaskItem = { id: string; project_id: string; assigned_agent_id: string; title: string; status: "queued" | "running" | "blocked" | "succeeded" | "failed" | "cancelled"; priority: number; revision: bigint };
 export type HumanRequestItem = {
   id: string; project_id: string; agent_id: string; task_id: string;
@@ -65,6 +67,7 @@ export type StateSnapshotBody = {
   agents: AgentItem[];
   tasks: TaskItem[];
   human_requests: HumanRequestItem[];
+  accounts: AccountItem[];
 };
 export type StateWatchBody = { after_head: bigint };
 export type StateChangedBody = { head: bigint };
@@ -77,7 +80,7 @@ export type HumanRequestCancelRunBody = { request_id: string; expected_request_r
 export type HumanRequestCancelRunResultBody = { run_id: string; run_revision: bigint; request_id: string; request_revision: bigint };
 export type TaskEnqueueBody = { task_id: string; incarnation_id: string; agent_id: string; expected_agent_revision: bigint; instruction: string };
 export type TaskEnqueueResultBody = { task_id: string; revision: bigint; agent_revision: bigint };
-export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; paused?: boolean };
+export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean };
 export type AgentUpdateResultBody = { agent_id: string; revision: bigint };
 export type TaskUpdateBody = { task_id: string; expected_revision: bigint; title?: string; priority?: number; assigned_agent_id?: string; status?: "cancelled" };
 export type TaskUpdateResultBody = { task_id: string; revision: bigint };
@@ -86,6 +89,11 @@ export type TopologyNode = { id: string; parent_id: string; kind: "repository" |
 export type TopologyBody = { project_id: string; digest: string; source_revision: string; nodes: TopologyNode[] };
 export type RunPathsGetBody = { agent_id: string };
 export type RunPathsBody = { agent_id: string; run_id: string; paths: string[] };
+export type AccountsDiscoverBody = Record<string, never>;
+export type DiscoveredAccount = { provider: "claude_code" | "codex"; home: string; label: string; email: string; organization: string; default_model: string; default_reasoning_effort: string; linked_id: string };
+export type AccountsBody = { accounts: DiscoveredAccount[] };
+export type AccountLinkBody = { provider: "claude_code" | "codex"; home: string; label: string };
+export type AccountLinkResultBody = { account_id: string; revision: bigint };
 export type TerminalTargetGetBody = { agent_id: string; expected_agent_revision: bigint; expected_head: bigint };
 export type TerminalTargetDescriptor = { run_id: string; session_id: string; run_revision: bigint; session_revision: bigint };
 export type TerminalTargetBody = { agent_id: string; agent_revision: bigint; head: bigint; target: TerminalTargetDescriptor | null };
@@ -150,6 +158,8 @@ export type ServerControlFrame = HelloFrame | PairResultFrame | AuthResultFrame 
   | { type: "TASK_UPDATE_RESULT"; id: string; body: TaskUpdateResultBody }
   | { type: "TOPOLOGY"; id: string; body: TopologyBody }
   | { type: "RUN_PATHS"; id: string; body: RunPathsBody }
+  | { type: "ACCOUNTS"; id: string; body: AccountsBody }
+  | { type: "ACCOUNT_LINK_RESULT"; id: string; body: AccountLinkResultBody }
   | { type: "TERMINAL_TARGET"; id: string; body: TerminalTargetBody }
   | { type: "REMOTE_INVITE_RESULT"; id: string; body: RemoteInviteResultBody }
   | TerminalServerControlFrame | ErrorFrame;
@@ -161,14 +171,16 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
   | { type: "TASK_UPDATE"; id: string; body: TaskUpdateBody }
   | { type: "TOPOLOGY_GET"; id: string; body: TopologyGetBody }
   | { type: "RUN_PATHS_GET"; id: string; body: RunPathsGetBody }
+  | { type: "ACCOUNTS_DISCOVER"; id: string; body: AccountsDiscoverBody }
+  | { type: "ACCOUNT_LINK"; id: string; body: AccountLinkBody }
   | { type: "TERMINAL_TARGET_GET"; id: string; body: TerminalTargetGetBody }
   | { type: "REMOTE_INVITE"; id: string; body: RemoteInviteBody }
   | TerminalControlFrame | ErrorFrame;
 type ControlBody = ClientControlFrame["body"] | ServerControlFrame["body"];
 
 const HEX_BYTES = { daemon_id: 16, boot_id: 16, connection_nonce: 32, challenge: 32, client_id: 16, public_key_sec1: 65, signature: 64 } as const;
-const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_UPDATE", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
-const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_UPDATE_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
+const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_UPDATE", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
+const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_UPDATE_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
 
 export function encodeClientControl(frame: ClientControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "client"))); }
 export function encodePairProve(id: string, body: PairProveBody): string { return encodeClientControl({ type: "PAIR_PROVE", id, body }); }
@@ -302,7 +314,7 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "HUMAN_REQUEST_CANCEL_RUN_RESULT": requireKeys(body, ["run_id", "run_revision", "request_id", "request_revision"], wire); return { run_id: dynamicID(body.run_id), run_revision: decimal(body.run_revision, wire, true), request_id: dynamicID(body.request_id), request_revision: decimal(body.request_revision, wire, true) };
     case "TASK_ENQUEUE": requireKeys(body, ["task_id", "incarnation_id", "agent_id", "expected_agent_revision", "instruction"], wire); return { task_id: dynamicID(body.task_id), incarnation_id: dynamicID(body.incarnation_id), agent_id: dynamicID(body.agent_id), expected_agent_revision: decimal(body.expected_agent_revision, wire, true), instruction: boundedText(body.instruction, 1, MAX_TASK_INSTRUCTION_BYTES) };
     case "TASK_ENQUEUE_RESULT": requireKeys(body, ["task_id", "revision", "agent_revision"], wire); return { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true), agent_revision: decimal(body.agent_revision, wire, true) };
-    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "paused"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } return result; }
+    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "account_id", "paused"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } return result; }
     case "AGENT_UPDATE_RESULT": requireKeys(body, ["agent_id", "revision"], wire); return { agent_id: dynamicID(body.agent_id), revision: decimal(body.revision, wire, true) };
     case "TASK_UPDATE": requireKeys(body, ["task_id", "expected_revision"], wire, ["title", "priority", "assigned_agent_id", "status"]); { const result: TaskUpdateBody = { task_id: dynamicID(body.task_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "title")) result.title = boundedText(body.title, 1, MAX_TASK_TITLE_BYTES); if (present(body, "priority")) result.priority = integer(body.priority, -MAX_TASK_PRIORITY, MAX_TASK_PRIORITY); if (present(body, "assigned_agent_id")) result.assigned_agent_id = dynamicID(body.assigned_agent_id); if (present(body, "status")) { if (body.status !== "cancelled") malformed(); result.status = body.status; } return result; }
     case "TASK_UPDATE_RESULT": requireKeys(body, ["task_id", "revision"], wire); return { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true) };
@@ -311,6 +323,10 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "RUN_PATHS_GET": requireKeys(body, ["agent_id"], wire); return { agent_id: dynamicID(body.agent_id) };
     // No live run means no rooms, so an empty run identity carries no paths.
     case "RUN_PATHS": requireKeys(body, ["agent_id", "run_id", "paths"], wire); { if (!Array.isArray(body.paths) || body.paths.length > MAX_ARRAY_ITEMS) malformed(); if (body.run_id === "" && body.paths.length !== 0) malformed(); return { agent_id: dynamicID(body.agent_id), run_id: body.run_id === "" ? "" : dynamicID(body.run_id), paths: body.paths.map((item) => boundedText(item, 1, MAX_TASK_TITLE_BYTES)) }; }
+    case "ACCOUNTS_DISCOVER": requireKeys(body, [], wire); return {};
+    case "ACCOUNTS": requireKeys(body, ["accounts"], wire); { if (!Array.isArray(body.accounts) || body.accounts.length > MAX_ARRAY_ITEMS) malformed(); return { accounts: body.accounts.map((item) => discoveredAccount(item, wire)) }; }
+    case "ACCOUNT_LINK": requireKeys(body, ["provider", "home", "label"], wire); return { provider: accountProvider(body.provider), home: accountHome(body.home), label: boundedText(body.label, 1, MAX_AGENT_NAME_BYTES) };
+    case "ACCOUNT_LINK_RESULT": requireKeys(body, ["account_id", "revision"], wire); return { account_id: dynamicID(body.account_id), revision: decimal(body.revision, wire, true) };
     case "TERMINAL_TARGET_GET": requireKeys(body, ["agent_id", "expected_agent_revision", "expected_head"], wire); return { agent_id: dynamicID(body.agent_id), expected_agent_revision: decimal(body.expected_agent_revision, wire, true), expected_head: decimal(body.expected_head, wire) };
     case "TERMINAL_TARGET": requireKeys(body, ["agent_id", "agent_revision", "head", "target"], wire); { const target = body.target === null ? null : terminalTargetDescriptor(body.target, wire); return { agent_id: dynamicID(body.agent_id), agent_revision: decimal(body.agent_revision, wire, true), head: decimal(body.head, wire), target }; }
     case "TERMINAL_ATTACH": requireKeys(body, ["run_id", "session_id", "expected_run_revision", "expected_session_revision", "after_sequence"], wire); return { run_id: dynamicID(body.run_id), session_id: dynamicID(body.session_id), expected_run_revision: decimal(body.expected_run_revision, wire, true), expected_session_revision: decimal(body.expected_session_revision, wire, true), after_sequence: decimal(body.after_sequence, wire) };
@@ -334,7 +350,8 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
 }
 
 function stateSnapshot(body: Record<string, unknown>, wire: boolean): StateSnapshotBody {
-  requireKeys(body, ["head", "factory", "projects", "agents", "tasks", "human_requests"], wire);
+  // An older daemon sends no accounts at all; the console then shows none.
+  requireKeys(body, ["head", "factory", "projects", "agents", "tasks", "human_requests"], wire, ["accounts"]);
   const head = decimal(body.head, wire);
   if (!isObject(body.factory)) malformed();
   const factory = factoryItem(body.factory, wire);
@@ -342,11 +359,12 @@ function stateSnapshot(body: Record<string, unknown>, wire: boolean): StateSnaps
   const agents = itemArray(body.agents, (item) => agentItem(item, wire));
   const tasks = itemArray(body.tasks, (item) => taskItem(item, wire));
   const human_requests = itemArray(body.human_requests, (item) => humanRequestItem(item, wire));
+  const accounts = present(body, "accounts") ? itemArray(body.accounts, (item) => accountItem(item, wire)) : [];
   // The bound is exact and fails closed. A server that cannot fit its state
   // returns a too_large error; it never sends a trimmed snapshot.
-  if (1 + projects.length + agents.length + tasks.length + human_requests.length > MAX_SNAPSHOT_ENTITIES) malformed();
-  for (const collection of [projects, agents, tasks, human_requests]) uniqueIDs(collection);
-  return { head, factory, projects, agents, tasks, human_requests };
+  if (1 + projects.length + agents.length + tasks.length + human_requests.length + accounts.length > MAX_SNAPSHOT_ENTITIES) malformed();
+  for (const collection of [projects, agents, tasks, human_requests, accounts]) uniqueIDs(collection);
+  return { head, factory, projects, agents, tasks, human_requests, accounts };
 }
 function itemArray<T>(value: unknown, decode: (item: unknown) => T): T[] {
   if (!Array.isArray(value) || value.length > MAX_SNAPSHOT_ENTITIES) malformed();
@@ -363,9 +381,10 @@ function factoryItem(value: unknown, wire: boolean): FactoryItem {
 }
 function projectItem(value: unknown, wire: boolean): ProjectItem { if (!isObject(value)) malformed(); requireKeys(value, ["id", "name", "revision"], wire); return { id: dynamicID(value.id), name: boundedText(value.name, 1, MAX_PROJECT_NAME_BYTES), revision: decimal(value.revision, wire, true) }; }
 function agentItem(value: unknown, wire: boolean): AgentItem {
-  // An older daemon does not send the launch controls or the resolved model;
-  // they read as unset, which the console shows as an unknowable CLI default.
-  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source"]);
+  // An older daemon does not send the launch controls, the resolved model or
+  // the account; they read as unset, which the console shows as an unknowable
+  // CLI default under that provider's own directory.
+  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id"]);
   if (value.role !== "orchestrator" && value.role !== "worker" || typeof value.paused !== "boolean") malformed();
   if (value.provider !== "claude_code" && value.provider !== "codex" && value.provider !== "shell") malformed();
   const model = present(value, "model") ? boundedText(value.model, 0, MAX_AGENT_MODEL_BYTES) : "";
@@ -373,7 +392,26 @@ function agentItem(value: unknown, wire: boolean): AgentItem {
   const effective_model = present(value, "effective_model") ? boundedText(value.effective_model, 0, MAX_AGENT_MODEL_BYTES) : "";
   const effective_reasoning_effort = present(value, "effective_reasoning_effort") ? boundedText(value.effective_reasoning_effort, 0, MAX_AGENT_MODEL_BYTES) : "";
   const model_source = present(value, "model_source") ? boundedText(value.model_source, 0, MAX_MODEL_SOURCE_BYTES) : "";
-  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true) };
+  const account_id = present(value, "account_id") && value.account_id !== "" ? dynamicID(value.account_id) : "";
+  if (account_id !== "" && value.provider === "shell") malformed();
+  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id };
+}
+function accountProvider(value: unknown): "claude_code" | "codex" { if (value !== "claude_code" && value !== "codex") malformed(); return value; }
+/** One absolute configuration directory, bounded exactly as the daemon does. */
+function accountHome(value: unknown): string { const home = boundedText(value, 1, MAX_TASK_TITLE_BYTES); if (!home.startsWith("/") || home.includes("\u0000")) malformed(); return home; }
+function accountItem(value: unknown, wire: boolean): AccountItem {
+  if (!isObject(value)) malformed(); requireKeys(value, ["id", "provider", "home", "label", "revision"], wire);
+  return { id: dynamicID(value.id), provider: accountProvider(value.provider), home: accountHome(value.home), label: boundedText(value.label, 1, MAX_AGENT_NAME_BYTES), revision: decimal(value.revision, wire, true) };
+}
+function discoveredAccount(value: unknown, wire: boolean): DiscoveredAccount {
+  if (!isObject(value)) malformed(); requireKeys(value, ["provider", "home", "label", "email", "organization", "default_model", "default_reasoning_effort", "linked_id"], wire);
+  return {
+    provider: accountProvider(value.provider), home: accountHome(value.home), label: boundedText(value.label, 1, MAX_AGENT_NAME_BYTES),
+    email: boundedText(value.email, 0, MAX_AGENT_NAME_BYTES), organization: boundedText(value.organization, 0, MAX_AGENT_NAME_BYTES),
+    default_model: boundedText(value.default_model, 0, MAX_AGENT_MODEL_BYTES), default_reasoning_effort: boundedText(value.default_reasoning_effort, 0, MAX_AGENT_MODEL_BYTES),
+    linked_id: value.linked_id === "" ? "" : dynamicID(value.linked_id),
+  };
+
 }
 const TOPOLOGY_KINDS = ["repository", "module", "package", "directory"] as const;
 const TOPOLOGY_BUCKETS = ["empty", "tiny", "small", "medium", "large"] as const;

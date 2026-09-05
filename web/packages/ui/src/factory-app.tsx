@@ -95,6 +95,8 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       onCancelHumanRequest={() => { void owner.current?.cancelHumanRequest(); }}
       onCloseHumanRequest={() => owner.current?.clearHumanRequest()}
       instructionContent={instruction}
+      onLoadAccounts={() => { void owner.current?.loadAccounts(); }}
+      onLinkAccount={(login, label) => { void owner.current?.linkAccount({ provider: login.provider, home: login.home, label }); }}
       onInviteRemote={() => { void owner.current?.inviteRemote(); }}
       onDismissRemoteInvite={() => owner.current?.dismissRemoteInvite()}
       terminalContent={terminal}

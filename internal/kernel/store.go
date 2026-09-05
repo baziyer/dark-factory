@@ -92,11 +92,14 @@ func (store *Store) CreateAgent(ctx context.Context, spec NewAgent, at UnixMilli
 		}
 		return Agent{}, tx.Rollback(ErrConflict)
 	}
+	if err := requireAccountForProvider(ctx, tx.connection, spec.Provider, spec.AccountID); err != nil {
+		return Agent{}, tx.Rollback(err)
+	}
 	if _, err := tx.connection.ExecContext(ctx, `INSERT INTO agents(
-		id, project_id, name, role, provider, model, reasoning_effort,
+		id, project_id, name, role, provider, model, reasoning_effort, account_id,
 		paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms
-	) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 1, ?, ?)`,
-		spec.ID.Bytes(), spec.ProjectID.Bytes(), spec.Name, spec.Role.String(), spec.Provider.String(), nullableString(spec.Model), nullableString(spec.ReasoningEffort), int64(spec.ToolBudgetLimit), at.Int64(), at.Int64()); err != nil {
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 1, ?, ?)`,
+		spec.ID.Bytes(), spec.ProjectID.Bytes(), spec.Name, spec.Role.String(), spec.Provider.String(), nullableString(spec.Model), nullableString(spec.ReasoningEffort), nullableID(spec.AccountID), int64(spec.ToolBudgetLimit), at.Int64(), at.Int64()); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}
 	if err := appendInvalidations(ctx, tx.connection, at, []pendingInvalidation{{kind: EntityAgent, id: spec.ID.Bytes(), revision: 1}}); err != nil {
@@ -365,12 +368,119 @@ func nullableString(value string) any {
 	return value
 }
 
+func nullableID(id AccountID) any {
+	if id.zero() {
+		return nil
+	}
+	return id.Bytes()
+}
+
+// requireAccountForProvider is the one place the account rule lives: shell
+// cannot carry one, and a selected account must exist and be that provider's.
+func requireAccountForProvider(ctx context.Context, connection *sql.Conn, provider Provider, id AccountID) error {
+	if id.zero() {
+		return nil
+	}
+	if provider == ProviderShell {
+		return fmt.Errorf("%w: shell agents have no account", ErrInvalidValue)
+	}
+	account, found, err := accountByID(ctx, connection, id)
+	if err != nil {
+		return err
+	}
+	if !found || account.Provider != provider {
+		return fmt.Errorf("%w: account does not match agent provider", ErrInvalidValue)
+	}
+	return nil
+}
+
+func validateAccountFields(provider Provider, home, label string) error {
+	if provider != ProviderClaudeCode && provider != ProviderCodex ||
+		!validOwnedLocator(home) || byteLen(home) > 1024 || !utf8.ValidString(home) ||
+		byteLen(label) < 1 || byteLen(label) > 128 || !utf8.ValidString(label) || strings.ContainsRune(label, 0) {
+		return fmt.Errorf("%w: invalid account", ErrInvalidValue)
+	}
+	return nil
+}
+
+// LinkAccount registers one CLI login that already exists on this machine.
+// (provider, home) is the login's identity, so relinking the same directory
+// returns the row that is already there instead of making a second one.
+func (store *Store) LinkAccount(ctx context.Context, spec NewAccount, at UnixMillis) (Account, error) {
+	if spec.ID.zero() || validateAccountFields(spec.Provider, spec.Home, spec.Label) != nil {
+		return Account{}, fmt.Errorf("%w: invalid account", ErrInvalidValue)
+	}
+	tx, err := store.beginValidatedWrite(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Close()
+	existing, found, err := scanAccount(tx.connection.QueryRowContext(ctx, `SELECT `+accountColumns+` FROM accounts WHERE provider = ? AND home = ?`, spec.Provider.String(), spec.Home))
+	if err != nil {
+		return Account{}, tx.Rollback(err)
+	}
+	if found {
+		if err := tx.Rollback(nil); err != nil {
+			return Account{}, err
+		}
+		return existing, nil
+	}
+	if _, err := tx.connection.ExecContext(ctx, `INSERT INTO accounts(id, provider, home, label, revision, created_at_ms, updated_at_ms) VALUES(?, ?, ?, ?, 1, ?, ?)`,
+		spec.ID.Bytes(), spec.Provider.String(), spec.Home, spec.Label, at.Int64(), at.Int64()); err != nil {
+		return Account{}, tx.Rollback(err)
+	}
+	if err := appendInvalidations(ctx, tx.connection, at, []pendingInvalidation{{kind: EntityAccount, id: spec.ID.Bytes(), revision: 1}}); err != nil {
+		return Account{}, tx.Rollback(err)
+	}
+	result, found, err := accountByID(ctx, tx.connection, spec.ID)
+	if err != nil || !found {
+		if err == nil {
+			err = ErrCorruptState
+		}
+		return Account{}, tx.Rollback(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return result, nil
+}
+
+// ListAccounts reads every linked account in identity order.
+func (store *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	connection, err := store.readerConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+	return readAccounts(ctx, connection)
+}
+
+func readAccounts(ctx context.Context, connection *sql.Conn) ([]Account, error) {
+	rows, err := connection.QueryContext(ctx, `SELECT `+accountColumns+` FROM accounts ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("read accounts: %w", err)
+	}
+	defer rows.Close()
+	result := make([]Account, 0)
+	for rows.Next() {
+		account, found, err := scanAccount(rows)
+		if err != nil || !found {
+			if err == nil {
+				err = ErrCorruptState
+			}
+			return nil, err
+		}
+		result = append(result, account)
+	}
+	return result, rows.Err()
+}
+
 func projectMatchesCreation(existing Project, spec NewProject) bool {
 	return existing.Name == spec.Name && existing.Root == spec.Root && existing.VerificationPolicy == spec.VerificationPolicy && existing.Revision.Int64() == 1 && existing.UpdatedAt == existing.CreatedAt
 }
 
 func agentMatchesCreation(existing Agent, spec NewAgent) bool {
-	return existing.ProjectID == spec.ProjectID && existing.Name == spec.Name && existing.Role == spec.Role && existing.Provider == spec.Provider && existing.Model == spec.Model && existing.ReasoningEffort == spec.ReasoningEffort && existing.ToolBudgetLimit == spec.ToolBudgetLimit && existing.ToolCallsUsed == 0 && !existing.Paused && existing.Revision.Int64() == 1 && existing.UpdatedAt == existing.CreatedAt
+	return existing.ProjectID == spec.ProjectID && existing.Name == spec.Name && existing.Role == spec.Role && existing.Provider == spec.Provider && existing.Model == spec.Model && existing.ReasoningEffort == spec.ReasoningEffort && existing.AccountID == spec.AccountID && existing.ToolBudgetLimit == spec.ToolBudgetLimit && existing.ToolCallsUsed == 0 && !existing.Paused && existing.Revision.Int64() == 1 && existing.UpdatedAt == existing.CreatedAt
 }
 
 func taskMatchesCreation(existing Task, spec NewTask) bool {

@@ -217,6 +217,12 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if project.VerificationPolicy != run.VerificationPolicy || project.VerificationPolicy != kernel.VerificationNone {
 		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSpawn, fmt.Errorf("%w: verification is not part of the kernel spike", kernel.ErrInvalidValue))
 	}
+	// The account is read from the agent at launch, not copied onto the run:
+	// it is configuration, not part of the admitted work.
+	accountConfigDir, err := daemon.agentAccountConfigDir(ctx, run.AgentID)
+	if err != nil {
+		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, err)
+	}
 	factoryctl, err := runner.CommitExecutableLocator(spec.FactoryctlExecutable)
 	if err != nil {
 		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSpawn, err)
@@ -314,7 +320,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	config := changeworker.Config{
 		Provider: run.Provider, Model: run.Model, ReasoningEffort: run.ReasoningEffort,
 		RuntimePath: gotRuntimePath, RuntimeIdentity: runtimeFileIdentity,
-		GitExecutable: spec.GitExecutable, FactoryctlExecutable: factoryctl.Path(), ToolPath: spec.ToolPath, AccountHome: spec.AccountHome, RepositoryRoot: project.Root, RepositoryIdentity: repositoryIdentity,
+		GitExecutable: spec.GitExecutable, FactoryctlExecutable: factoryctl.Path(), ToolPath: spec.ToolPath, AccountHome: spec.AccountHome, AccountConfigDir: accountConfigDir, RepositoryRoot: project.Root, RepositoryIdentity: repositoryIdentity,
 		Revision: spec.BaseRevision, ChangeParent: spec.ChangeParent, FinalName: finalName, StagingName: stagingName,
 		AttemptSocket: spec.AttemptSocket, Retained: retained, ProviderTask: providerTask,
 	}

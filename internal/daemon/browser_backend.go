@@ -37,6 +37,11 @@ type browserBackend struct {
 
 	clientGates *browserClientGates
 
+	// home answers the operator home discovery reads. Production wires the
+	// account record; a test points it at a directory it owns, because
+	// user.Current() is not something a test can redirect.
+	home func() (string, error)
+
 	inviteMu    sync.Mutex
 	inviteMints [4]time.Time
 	inviteNext  int
@@ -64,7 +69,7 @@ func newBrowserBackend(store *kernel.Store, now func() time.Time, random io.Read
 		return nil, fmt.Errorf("%w: invalid browser backend", kernel.ErrInvalidValue)
 	}
 	backend := &browserBackend{
-		store: store, now: now, random: random,
+		store: store, now: now, random: random, home: operatorHome,
 		clientGates: &browserClientGates{gates: make(map[kernel.BrowserClientID]*browserClientGate)},
 		subs:        make(map[*browserStateWatch]struct{}),
 	}
@@ -318,6 +323,17 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 		return browserprotocol.AgentUpdateResult{}, mapBrowserError(err)
 	}
 	patch := kernel.AgentPatch{Model: request.Model, ReasoningEffort: request.ReasoningEffort}
+	if request.AccountID != nil {
+		// An empty account clears the selection back to the provider default;
+		// anything else must be one canonical account identity.
+		selected := kernel.AccountID{}
+		if *request.AccountID != "" {
+			if selected, err = browserID(*request.AccountID, kernel.AccountIDFromBytes); err != nil {
+				return browserprotocol.AgentUpdateResult{}, browser.ErrStale
+			}
+		}
+		patch.AccountID = &selected
+	}
 	if request.Paused != nil {
 		paused := bool(*request.Paused)
 		patch.Paused = &paused
@@ -536,6 +552,88 @@ func (backend *browserBackend) RunPaths(ctx context.Context, rawClient [browserp
 	return result, nil
 }
 
+// DiscoverAccounts reports the provider logins that already exist under the
+// operator's home, marked with the account row each one is linked to. It reads
+// the login directories' own identity files and never a token value.
+func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityObserve)
+	if err != nil {
+		return browserprotocol.Accounts{}, err
+	}
+	defer release()
+	if backend.owner == nil {
+		return browserprotocol.Accounts{}, browser.ErrNotFound
+	}
+	home, err := backend.home()
+	if err != nil {
+		return browserprotocol.Accounts{}, browser.ErrNotFound
+	}
+	linked, err := backend.store.ListAccounts(ctx)
+	if err != nil {
+		return browserprotocol.Accounts{}, mapBrowserError(err)
+	}
+	found := backend.owner.discoverAccounts(home)
+	for index, candidate := range found {
+		for _, account := range linked {
+			if account.Provider.String() == candidate.Provider && account.Home == candidate.Home {
+				found[index].LinkedID = account.ID.String()
+				found[index].Label = account.Label
+				break
+			}
+		}
+	}
+	return browserprotocol.Accounts{Accounts: found}, nil
+}
+
+// LinkAccount registers one login the operator can point an agent at. Only a
+// directory discovery actually found may be linked: the browser names a login,
+// it does not name an arbitrary directory for a provider to read.
+func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, err
+	}
+	defer release()
+	if backend.owner == nil {
+		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
+	}
+	provider, err := kernel.ParseProvider(request.Provider)
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, browser.ErrStale
+	}
+	home, err := backend.home()
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
+	}
+	present := false
+	for _, candidate := range backend.owner.discoverAccounts(home) {
+		if candidate.Provider == request.Provider && candidate.Home == request.Home {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
+	}
+	id, err := backend.randomIdentifier()
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, mapBrowserError(err)
+	}
+	accountID, err := kernel.AccountIDFromBytes(id[:])
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, mapBrowserError(err)
+	}
+	at, err := backend.timestamp()
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, mapBrowserError(err)
+	}
+	account, err := backend.store.LinkAccount(ctx, kernel.NewAccount{ID: accountID, Provider: provider, Home: request.Home, Label: request.Label}, at)
+	if err != nil {
+		return browserprotocol.AccountLinkResult{}, consoleUpdateError(err)
+	}
+	return browserprotocol.AccountLinkResult{AccountID: account.ID.String(), Revision: decimalRevision(account.Revision)}, nil
+}
+
 func (backend *browserBackend) authorize(ctx context.Context, rawID [browserprotocol.ClientIDSize]byte, capability kernel.BrowserCapabilityMask) (kernel.BrowserClientID, func(), kernel.BrowserClient, error) {
 	clientID, err := kernel.BrowserClientIDFromBytes(rawID[:])
 	if err != nil {
@@ -640,7 +738,7 @@ func projectBrowserAuthentication(client kernel.BrowserClient) (browser.Authenti
 
 // projectPublicSnapshot is the one positive-allowlist conversion from the
 // kernel public snapshot to the wire. Nothing private is reachable from here.
-func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func(string) (string, string, string)) (browserprotocol.StateSnapshot, error) {
+func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func(string, string) (string, string, string)) (browserprotocol.StateSnapshot, error) {
 	result := browserprotocol.StateSnapshot{
 		Head:          decimalSequence(snapshot.Head),
 		Factory:       projectFactory(snapshot.Factory),
@@ -648,12 +746,19 @@ func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func
 		Agents:        make([]browserprotocol.AgentItem, 0, len(snapshot.Agents)),
 		Tasks:         make([]browserprotocol.TaskItem, 0, len(snapshot.Tasks)),
 		HumanRequests: make([]browserprotocol.HumanRequestItem, 0, len(snapshot.HumanRequests)),
+		Accounts:      make([]browserprotocol.AccountItem, 0, len(snapshot.Accounts)),
 	}
 	for _, item := range snapshot.Projects {
 		result.Projects = append(result.Projects, projectProject(item))
 	}
+	// An agent's defaults are read from the account it launches under, so the
+	// snapshot's own account rows resolve the directory before the agents do.
+	homes := make(map[kernel.AccountID]string, len(snapshot.Accounts))
+	for _, item := range snapshot.Accounts {
+		homes[item.ID] = item.Home
+	}
 	for _, item := range snapshot.Agents {
-		result.Agents = append(result.Agents, projectAgent(item, providerDefaults))
+		result.Agents = append(result.Agents, projectAgent(item, homes[item.AccountID], providerDefaults))
 	}
 	for _, item := range snapshot.Tasks {
 		result.Tasks = append(result.Tasks, projectTask(item))
@@ -664,6 +769,9 @@ func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func
 			return browserprotocol.StateSnapshot{}, err
 		}
 		result.HumanRequests = append(result.HumanRequests, projected)
+	}
+	for _, item := range snapshot.Accounts {
+		result.Accounts = append(result.Accounts, browserprotocol.AccountItem{ID: item.ID.String(), Provider: item.Provider, Home: item.Home, Label: item.Label, Revision: decimalRevision(item.Revision)})
 	}
 	return result, nil
 }
@@ -679,9 +787,12 @@ func projectProject(item kernel.ProjectSummary) browserprotocol.ProjectItem {
 // projectAgent resolves what the agent will actually run with. An agent that
 // names no model is launched without one and the provider CLI picks its own,
 // so the console is served that CLI's configured default and the file it came
-// from rather than a blank the operator cannot interpret.
-func projectAgent(item kernel.AgentSummary, providerDefaults func(string) (string, string, string)) browserprotocol.AgentItem {
-	defaultModel, defaultEffort, source := providerDefaults(item.Provider)
+// from rather than a blank the operator cannot interpret. configHome is the
+// account's own directory when the agent selects one, so the default shown is
+// the one that account will actually launch with; empty means the operator's
+// own login, which is what the daemon falls back to.
+func projectAgent(item kernel.AgentSummary, configHome string, providerDefaults func(string, string) (string, string, string)) browserprotocol.AgentItem {
+	defaultModel, defaultEffort, source := providerDefaults(item.Provider, configHome)
 	effectiveModel, effectiveEffort := item.Model, item.ReasoningEffort
 	if effectiveModel == "" {
 		effectiveModel = defaultModel
@@ -692,7 +803,11 @@ func projectAgent(item kernel.AgentSummary, providerDefaults func(string) (strin
 	if item.Model != "" {
 		source = "agent"
 	}
-	return browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision)}
+	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision)}
+	if (item.AccountID != kernel.AccountID{}) {
+		projected.AccountID = item.AccountID.String()
+	}
+	return projected
 }
 
 func projectTask(item kernel.TaskSummary) browserprotocol.TaskItem {

@@ -1,11 +1,23 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { AgentItem, StateView, TaskItem } from "@dark-factory/client";
+import type { AccountItem, AgentItem, StateView, TaskItem } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
 import { agentActivity, agentCurrentTask } from "./console-view.js";
 
 /** Only the controls the operator actually changed; the rest are left alone. */
-export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; paused?: boolean }>;
+export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean }>;
+
+/** One discovered login and the account row it is linked to, if any. */
+export type DiscoveredAccount = Readonly<{
+  provider: "claude_code" | "codex";
+  home: string;
+  label: string;
+  email: string;
+  organization: string;
+  default_model: string;
+  default_reasoning_effort: string;
+  linked_id: string;
+}>;
 
 export type TaskEdit = Readonly<{ title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
 
@@ -79,7 +91,7 @@ export function AgentPanel({
 
       {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
 
-      <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
+      <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} accounts={state === undefined ? [] : [...state.accounts.values()]} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
 
       <div className="dfConsoleSidebar__section" aria-label="Agent queue">
         <h3>QUEUE</h3>
@@ -122,17 +134,20 @@ function modelSourceCaption(agent: AgentItem): string {
 
 function AgentConfig({
   agent,
+  accounts,
   pending,
   ready,
   onSave,
 }: {
   agent: AgentItem;
+  accounts: readonly AccountItem[];
   pending: boolean;
   ready: boolean;
   onSave?: (config: AgentConfigEdit) => void;
 }) {
   const [model, setModel] = useState(agent.model);
   const [reasoningEffort, setReasoningEffort] = useState(agent.reasoning_effort);
+  const [accountId, setAccountId] = useState(agent.account_id);
   const [paused, setPaused] = useState(agent.paused);
   if (onSave === undefined) return null;
   // Sending a control the operator did not touch would make the daemon
@@ -142,6 +157,7 @@ function AgentConfig({
     onSave({
       ...(model === agent.model ? {} : { model }),
       ...(reasoningEffort === agent.reasoning_effort ? {} : { reasoningEffort }),
+      ...(accountId === agent.account_id ? {} : { accountId }),
       ...(paused === agent.paused ? {} : { paused }),
     });
   };
@@ -155,6 +171,13 @@ function AgentConfig({
           <label htmlFor={`df-effort-${agent.id}`}>REASONING EFFORT</label>
           <input id={`df-effort-${agent.id}`} value={reasoningEffort} placeholder={agent.effective_reasoning_effort} disabled={pending} onChange={(event) => setReasoningEffort(event.currentTarget.value)} />
           <p className="dfConsoleSidebar__inherit">{modelSourceCaption(agent)}</p>
+          <label htmlFor={`df-account-${agent.id}`}>ACCOUNT</label>
+          <select id={`df-account-${agent.id}`} value={accountId} disabled={pending} onChange={(event) => setAccountId(event.currentTarget.value)}>
+            <option value="">provider default</option>
+            {accounts.filter((account) => account.provider === agent.provider).map((account) => (
+              <option key={account.id} value={account.id}>{account.label}</option>
+            ))}
+          </select>
         </>
       )}
       <label className="dfConsoleSidebar__toggle" htmlFor={`df-paused-${agent.id}`}>
@@ -229,17 +252,33 @@ function QueuedTask({
 export function SettingsDialog({
   state,
   address,
+  accounts,
+  accountsPending,
+  accountsError,
+  onLoadAccounts,
+  onLinkAccount,
   pairing,
   onClose,
 }: {
   state: StateView | undefined;
   address: string;
+  /** The logins the daemon found, once it has been asked. */
+  accounts?: readonly DiscoveredAccount[];
+  accountsPending?: boolean;
+  accountsError?: string;
+  onLoadAccounts?: () => void;
+  onLinkAccount?: (login: DiscoveredAccount, label: string) => void;
   /** A self-contained "PAIR A PHONE" surface mounts here. */
   pairing?: ReactNode;
   onClose?: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { dialog.current?.showModal(); }, []);
+  // Discovery is an observation of the daemon's machine, so it is asked for
+  // when the dialog opens rather than carried in the durable snapshot.
+  const load = useRef(onLoadAccounts);
+  load.current = onLoadAccounts;
+  useEffect(() => { load.current?.(); }, []);
   const close = () => dialog.current?.close();
   return (
     <dialog
@@ -269,12 +308,89 @@ export function SettingsDialog({
           <h3>THIS FACTORY</h3>
           <p className="dfConsoleSidebar__address">{address}</p>
         </div>
+        <AccountsSection
+          state={state}
+          accounts={accounts}
+          pending={accountsPending === true}
+          error={accountsError}
+          onLink={onLinkAccount}
+        />
         <div className="dfConsoleSidebar__section" aria-label="PAIRING">
           <h3>PAIRING</h3>
           {pairing ?? <p className="dfFactoryConsole__empty">phone pairing arrives here</p>}
         </div>
       </div>
     </dialog>
+  );
+}
+
+/**
+ * The provider logins on this machine. Linking registers one that already
+ * exists; signing a CLI in is that CLI's own job, so there is no button for it.
+ */
+function AccountsSection({
+  state,
+  accounts,
+  pending,
+  error,
+  onLink,
+}: {
+  state: StateView | undefined;
+  accounts?: readonly DiscoveredAccount[];
+  pending: boolean;
+  error?: string;
+  onLink?: (login: DiscoveredAccount, label: string) => void;
+}) {
+  const [labels, setLabels] = useState<Record<string, string>>({});
+  const linked = state === undefined ? [] : [...state.accounts.values()];
+  const unlinked = (accounts ?? []).filter((login) => login.linked_id === "");
+  return (
+    <div className="dfConsoleSidebar__section" aria-label="ACCOUNTS">
+      <h3>ACCOUNTS</h3>
+      {error === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{EDIT_ERRORS.get(error) ?? "THE FACTORY REFUSED THIS"}</p>}
+      {linked.length === 0 ? <p className="dfFactoryConsole__empty">NO ACCOUNTS LINKED</p> : (
+        <ul className="dfFactoryConsole__list">
+          {linked.map((account) => {
+            const login = (accounts ?? []).find((candidate) => candidate.linked_id === account.id);
+            const identity = [login?.email, login?.organization, login?.default_model].filter((part) => part !== undefined && part !== "").join(" · ");
+            return (
+              <li key={account.id} className="dfConsoleSidebar__account">
+                <p className="dfConsoleRow__title">{account.label} · {account.provider}</p>
+                <p className="dfFactoryConsole__eyebrow">{identity === "" ? account.home : identity}</p>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <h3>DISCOVERED</h3>
+      {accounts === undefined ? <p className="dfFactoryConsole__empty">{pending ? "LOOKING" : "NOT LOOKED YET"}</p>
+        : unlinked.length === 0 ? <p className="dfFactoryConsole__empty">EVERY LOGIN IS LINKED</p> : (
+        <ul className="dfFactoryConsole__list">
+          {unlinked.map((login) => (
+            <li key={login.home} className="dfConsoleSidebar__account">
+              <p className="dfConsoleRow__title">{login.home}</p>
+              <p className="dfFactoryConsole__eyebrow">{[login.provider, login.email, login.default_model].filter((part) => part !== "").join(" · ")}</p>
+              <div className="dfConsoleSidebar__taskActions">
+                <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-account-label-${login.home}`}>Label for {login.home}</label>
+                <input
+                  id={`df-account-label-${login.home}`}
+                  value={labels[login.home] ?? login.label}
+                  disabled={pending || onLink === undefined}
+                  onChange={(event) => { const value = event.currentTarget.value; setLabels((current) => ({ ...current, [login.home]: value })); }}
+                />
+                <button
+                  type="button"
+                  disabled={pending || onLink === undefined || (labels[login.home] ?? login.label).trim() === ""}
+                  onClick={() => onLink?.(login, labels[login.home] ?? login.label)}
+                >
+                  LINK
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

@@ -1,4 +1,5 @@
 import type {
+  AccountItem,
   AgentItem,
   FactoryItem,
   HumanRequestItem,
@@ -18,6 +19,8 @@ export type StateView = {
   agents: ReadonlyMap<string, AgentItem>;
   tasks: ReadonlyMap<string, TaskItem>;
   humanRequests: ReadonlyMap<string, HumanRequestItem>;
+  /** The provider logins the operator has linked, by account identity. */
+  accounts: ReadonlyMap<string, AccountItem>;
 };
 
 /**
@@ -33,6 +36,7 @@ export function snapshotView(body: StateSnapshotBody): StateView {
     agents: indexByID(body.agents),
     tasks: indexByID(body.tasks),
     humanRequests: indexByID(body.human_requests),
+    accounts: indexByID(body.accounts),
   });
 }
 

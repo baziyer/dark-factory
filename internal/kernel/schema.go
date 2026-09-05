@@ -41,6 +41,16 @@ var schemaStatements = []string{
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
 ) STRICT, WITHOUT ROWID`,
 	`CREATE UNIQUE INDEX projects_root_unique ON projects(root)`,
+	`CREATE TABLE accounts (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex')),
+    home TEXT NOT NULL CHECK (length(CAST(home AS BLOB)) BETWEEN 1 AND 1024 AND substr(home, 1, 1) = '/'),
+    label TEXT NOT NULL CHECK (length(CAST(label AS BLOB)) BETWEEN 1 AND 128),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
+) STRICT, WITHOUT ROWID`,
+	`CREATE UNIQUE INDEX accounts_provider_home_unique ON accounts(provider, home)`,
 	`CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
     project_id BLOB NOT NULL CHECK (length(project_id) = 16) REFERENCES projects(id),
@@ -49,13 +59,14 @@ var schemaStatements = []string{
     provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex', 'shell')),
     model TEXT CHECK (model IS NULL OR length(CAST(model AS BLOB)) BETWEEN 1 AND 128),
     reasoning_effort TEXT CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')),
+    account_id BLOB CHECK (account_id IS NULL OR length(account_id) = 16) REFERENCES accounts(id),
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
     tool_budget_limit INTEGER NOT NULL CHECK (tool_budget_limit BETWEEN 1 AND 1000000000),
     tool_calls_used INTEGER NOT NULL CHECK (tool_calls_used >= 0 AND tool_calls_used <= tool_budget_limit),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
-    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL))
+    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL))
 ) STRICT, WITHOUT ROWID`,
 	`CREATE UNIQUE INDEX agents_id_project_unique ON agents(id, project_id)`,
 	`CREATE TABLE tasks (
@@ -304,7 +315,7 @@ var schemaStatements = []string{
 	`CREATE TABLE invalidations (
     sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
-    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request')),
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request', 'account')),
     entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))

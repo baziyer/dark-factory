@@ -8,6 +8,7 @@ const queuedTaskID = "32".repeat(16);
 const doneTaskID = "33".repeat(16);
 const failedTaskID = "34".repeat(16);
 const requestID = "41".repeat(16);
+const accountID = "51".repeat(16);
 
 export const fixtureState = {
   head: 42n,
@@ -17,9 +18,9 @@ export const fixtureState = {
     [secondProjectID, { id: secondProjectID, name: "South Workshop", revision: 5n }],
   ]),
   agents: new Map([
-    [agentID, { id: agentID, project_id: projectID, name: "Builder One", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision: 10n }],
-    [secondAgentID, { id: secondAgentID, project_id: secondProjectID, name: "Dispatch Lead", role: "orchestrator", provider: "claude_code", paused: true, model: "claude-opus-5", reasoning_effort: "", effective_model: "claude-opus-5", effective_reasoning_effort: "", model_source: "agent", revision: 11n }],
-    [thirdAgentID, { id: thirdAgentID, project_id: projectID, name: "Builder Two", role: "worker", provider: "codex", paused: false, model: "", reasoning_effort: "", effective_model: "gpt-6-astra", effective_reasoning_effort: "high", model_source: "/Users/operator/.codex/config.toml", revision: 12n }],
+    [agentID, { id: agentID, project_id: projectID, name: "Builder One", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision: 10n, account_id: accountID }],
+    [secondAgentID, { id: secondAgentID, project_id: secondProjectID, name: "Dispatch Lead", role: "orchestrator", provider: "claude_code", paused: true, model: "claude-opus-5", reasoning_effort: "", effective_model: "claude-opus-5", effective_reasoning_effort: "", model_source: "agent", revision: 11n, account_id: "" }],
+    [thirdAgentID, { id: thirdAgentID, project_id: projectID, name: "Builder Two", role: "worker", provider: "codex", paused: false, model: "", reasoning_effort: "", effective_model: "gpt-6-astra", effective_reasoning_effort: "high", model_source: "/Users/operator/.codex/config.toml", revision: 12n, account_id: "" }],
   ]),
   tasks: new Map([
     [taskID, { id: taskID, project_id: projectID, assigned_agent_id: agentID, title: "Review the state projection", status: "running", priority: 10, revision: 12n }],
@@ -29,6 +30,9 @@ export const fixtureState = {
   ]),
   humanRequests: new Map([
     [requestID, { id: requestID, project_id: projectID, agent_id: agentID, task_id: taskID, created_at: 40n, updated_at: 42n, revision: 13n, kind: "question", status: "open", reply_max_bytes: 8192, can_reply: true }],
+  ]),
+  accounts: new Map([
+    [accountID, { id: accountID, provider: "claude_code", home: "/Users/operator/.claude", label: "work", revision: 1n }],
   ]),
 };
 

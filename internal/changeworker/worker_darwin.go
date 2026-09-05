@@ -104,7 +104,7 @@ func runProvider(ctx context.Context) (resultErr error) {
 	temp := filepath.Join(config.RuntimePath, TempName)
 	token := filepath.Join(config.RuntimePath, AttemptTokenName)
 	runtimePaths, err := provider.NewRuntimePaths(
-		home, temp, config.AttemptSocket, token, factoryctl.Path(), filepath.Dir(publishedPath), config.ToolPath, config.AccountHome,
+		home, temp, config.AttemptSocket, token, factoryctl.Path(), filepath.Dir(publishedPath), config.ToolPath, config.AccountHome, config.AccountConfigDir,
 	)
 	if err != nil {
 		_ = cwd.Close()

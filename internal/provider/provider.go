@@ -22,6 +22,7 @@ const (
 	maxPathBytes         = 4096
 	maxClaudePrompt      = 8 << 10
 	maxCodexTask         = 8 << 10
+	claudeConfigDir      = ".claude"
 	codexConfigDir       = ".codex"
 	claudeTaskLead       = "Complete this Dark Factory task. Before exiting, report the durable outcome with $DARK_FACTORY_FACTORYCTL attempt succeed, block, or fail. Task: "
 	codexBootstrapPrompt = "Run \"$DARK_FACTORY_FACTORYCTL\" attempt task before doing anything else. The returned JSON task field is the exact task: complete only that task. Before exiting, report the durable outcome with \"$DARK_FACTORY_FACTORYCTL\" attempt succeed, block, or fail."
@@ -83,6 +84,33 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 	return Installation{}, unavailable(kind)
 }
 
+// ConfigDirName is the directory a provider CLI keeps its login and
+// configuration in, under an account home. Shell keeps none, so it answers
+// empty. This is the one definition of those names: the launch environment
+// below and the daemon's account discovery and default reader all derive
+// their paths from it, so a launch and a reading of it cannot disagree.
+func ConfigDirName(kind kernel.Provider) string {
+	switch kind {
+	case kernel.ProviderClaudeCode:
+		return claudeConfigDir
+	case kernel.ProviderCodex:
+		return codexConfigDir
+	}
+	return ""
+}
+
+// ConfigHome is the directory a provider CLI reads its configuration from
+// under one account home. It is the one place that join is spelled: the launch
+// environment, the daemon's default reader and its account discovery all ask
+// here, so none of them can name a different directory than a run uses.
+func ConfigHome(kind kernel.Provider, accountHome string) string {
+	name := ConfigDirName(kind)
+	if accountHome == "" || name == "" {
+		return ""
+	}
+	return filepath.Join(accountHome, name)
+}
+
 func (Installation) String() string   { return "provider installation (private)" }
 func (Installation) GoString() string { return "provider.Installation{private}" }
 
@@ -93,12 +121,17 @@ func (Installation) GoString() string { return "provider.Installation{private}" 
 // This value is never authority by itself.
 type RuntimePaths struct {
 	home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome string
+	// accountConfig is one linked provider login's own configuration
+	// directory. Empty means the provider's default, which is what every
+	// launch used before accounts existed.
+	accountConfig string
 }
 
-func NewRuntimePaths(home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome string) (RuntimePaths, error) {
+func NewRuntimePaths(home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome, accountConfig string) (RuntimePaths, error) {
 	runtime := RuntimePaths{
 		home: home, temp: temp, socket: socket, token: token,
 		factoryctl: factoryctl, gitCeiling: gitCeiling, toolPath: toolPath, accountHome: accountHome,
+		accountConfig: accountConfig,
 	}
 	if !runtime.valid() {
 		return RuntimePaths{}, ErrInvalid
@@ -302,7 +335,8 @@ func (runtime RuntimePaths) valid() bool {
 	return len(runtime.socket) <= install.MaxSocketPathBytes && runtime.home != runtime.temp &&
 		validGitCeiling(runtime.gitCeiling) && validToolPath(runtime.toolPath) &&
 		validAbsolute(runtime.accountHome, maxPathBytes-len("/"+codexConfigDir)) &&
-		runtime.accountHome != runtime.home && runtime.accountHome != runtime.temp
+		runtime.accountHome != runtime.home && runtime.accountHome != runtime.temp &&
+		(runtime.accountConfig == "" || validAbsolute(runtime.accountConfig, maxPathBytes))
 }
 
 func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
@@ -318,9 +352,25 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 		"TMPDIR=" + runtime.temp,
 		"PATH=" + runtime.toolPath,
 	}
+	// A run whose agent selects an account points that CLI at the account's
+	// own configuration directory. No account leaves the environment exactly
+	// as it was.
 	switch kind {
 	case kernel.ProviderCodex:
-		environment = append(environment, "CODEX_HOME="+filepath.Join(runtime.accountHome, codexConfigDir))
+		codexHome := ConfigHome(kind, runtime.accountHome)
+		if runtime.accountConfig != "" {
+			codexHome = runtime.accountConfig
+		}
+		environment = append(environment, "CODEX_HOME="+codexHome)
+	case kernel.ProviderClaudeCode:
+		// Only a directory beside the default one is named. The default is
+		// what the CLI already reaches through HOME, and its OAuth account
+		// lives in $HOME/.claude.json rather than inside it, so naming it
+		// would point the CLI at the flags-only file it does contain and
+		// launch the run with no login at all.
+		if runtime.accountConfig != "" && runtime.accountConfig != ConfigHome(kind, runtime.accountHome) {
+			environment = append(environment, "CLAUDE_CONFIG_DIR="+runtime.accountConfig)
+		}
 	}
 	return append(environment,
 		"LANG=C",

@@ -204,6 +204,8 @@ type ConsoleBackend interface {
 	UpdateTask(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskUpdate) (browserprotocol.TaskUpdateResult, error)
 	Topology(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TopologyGet) (browserprotocol.Topology, error)
 	RunPaths(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error)
+	DiscoverAccounts(context.Context, [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error)
+	LinkAccount(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error)
 }
 
 // TerminalBackend is the optional effect half of browser v1. Keeping it

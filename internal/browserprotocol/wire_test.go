@@ -121,6 +121,14 @@ func encodeDecoded(frame ControlFrame) ([]byte, error) {
 		return EncodeTaskEnqueueResult(frame.ID, value)
 	case AgentUpdate:
 		return encodeControl(TypeAgentUpdate, frame.ID, value)
+	case AccountsDiscover:
+		return encodeControl(TypeAccountsDiscover, frame.ID, value)
+	case Accounts:
+		return EncodeAccounts(frame.ID, value)
+	case AccountLink:
+		return encodeControl(TypeAccountLink, frame.ID, value)
+	case AccountLinkResult:
+		return EncodeAccountLinkResult(frame.ID, value)
 	case AgentUpdateResult:
 		return EncodeAgentUpdateResult(frame.ID, value)
 	case TaskUpdate:
@@ -523,7 +531,7 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 	}
 	// The manifest carries a stable name, not a generation: the contract is
 	// unversioned by owner decision on 4 September 2026.
-	if manifest.Name != "dark-factory/browser" || len(manifest.Control) != 45 || len(manifest.Terminal.Opcodes) != 2 {
+	if manifest.Name != "dark-factory/browser" || len(manifest.Control) != 49 || len(manifest.Terminal.Opcodes) != 2 {
 		t.Fatalf("manifest registry incomplete: %+v", manifest)
 	}
 	capabilityNames := []string{"observe", "private_human_request_detail", "human_actions", "terminal_input"}
@@ -592,6 +600,10 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 		{"TOPOLOGY", "server", "required", "topology.json"},
 		{"RUN_PATHS_GET", "client", "required", "run_paths_get.json"},
 		{"RUN_PATHS", "server", "required", "run_paths.json"},
+		{"ACCOUNTS_DISCOVER", "client", "required", "accounts_discover.json"},
+		{"ACCOUNTS", "server", "required", "accounts.json"},
+		{"ACCOUNT_LINK", "client", "required", "account_link.json"},
+		{"ACCOUNT_LINK_RESULT", "server", "required", "account_link_result.json"},
 		{"REMOTE_INVITE", "client", "required", "remote_invite.json"},
 		{"REMOTE_INVITE_RESULT", "server", "required", "remote_invite_result.json"},
 		{"ERROR", "both", "optional", "error.json"},
@@ -667,7 +679,7 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedFiles := map[string]bool{"transcript.json": true, "hello.json": true, "pair_prove.json": true, "pair_result.json": true, "auth_prove.json": true, "auth_result.json": true, "state_get.json": true, "state_snapshot.json": true, "state_watch.json": true, "state_changed.json": true, "human_request_detail_get.json": true, "human_request_detail.json": true, "error.json": true, "terminal_input.hex": true, "terminal_output.hex": true, "human_request_reply.json": true, "human_request_reply_result.json": true, "human_request_cancel_run.json": true, "human_request_cancel_run_result.json": true, "task_enqueue.json": true, "task_enqueue_result.json": true, "terminal_target_get.json": true, "terminal_target.json": true, "terminal_attach.json": true, "terminal_attached.json": true, "terminal_ack.json": true, "terminal_lease_acquire.json": true, "terminal_lease_renew.json": true, "terminal_lease_release.json": true, "terminal_lease_result.json": true, "terminal_resize.json": true, "terminal_resized.json": true, "terminal_detach.json": true, "terminal_detached.json": true, "terminal_input_result.json": true, "terminal_eof.json": true, "terminal_exit.json": true, "terminal_reset.json": true, "agent_update.json": true, "agent_update_result.json": true, "task_update.json": true, "task_update_result.json": true, "topology_get.json": true, "topology.json": true, "remote_invite.json": true, "remote_invite_result.json": true, "run_paths_get.json": true, "run_paths.json": true}
+	expectedFiles := map[string]bool{"transcript.json": true, "hello.json": true, "pair_prove.json": true, "pair_result.json": true, "auth_prove.json": true, "auth_result.json": true, "state_get.json": true, "state_snapshot.json": true, "state_watch.json": true, "state_changed.json": true, "human_request_detail_get.json": true, "human_request_detail.json": true, "error.json": true, "terminal_input.hex": true, "terminal_output.hex": true, "human_request_reply.json": true, "human_request_reply_result.json": true, "human_request_cancel_run.json": true, "human_request_cancel_run_result.json": true, "task_enqueue.json": true, "task_enqueue_result.json": true, "terminal_target_get.json": true, "terminal_target.json": true, "terminal_attach.json": true, "terminal_attached.json": true, "terminal_ack.json": true, "terminal_lease_acquire.json": true, "terminal_lease_renew.json": true, "terminal_lease_release.json": true, "terminal_lease_result.json": true, "terminal_resize.json": true, "terminal_resized.json": true, "terminal_detach.json": true, "terminal_detached.json": true, "terminal_input_result.json": true, "terminal_eof.json": true, "terminal_exit.json": true, "terminal_reset.json": true, "agent_update.json": true, "agent_update_result.json": true, "task_update.json": true, "task_update_result.json": true, "topology_get.json": true, "topology.json": true, "remote_invite.json": true, "remote_invite_result.json": true, "run_paths_get.json": true, "run_paths.json": true, "accounts_discover.json": true, "accounts.json": true, "account_link.json": true, "account_link_result.json": true}
 	if len(entries) != len(expectedFiles) {
 		t.Fatalf("fixture count = %d, want %d", len(entries), len(expectedFiles))
 	}

@@ -481,9 +481,13 @@ test("the sidebar replaces the right column and the terminal owns it outright", 
   assert.match(css, /\.dfConsoleSidebar\s*\{[^}]*flex: 0 0 clamp\(22rem, 40vw, 44rem\);[^}]*min-width: 0;/);
   // Every rule the console scopes to its own subtree names the sidebar too,
   // or the sidebar renders in the browser's default serif on the page ground.
-  for (const rule of [/\.dfConsoleSidebar \*,/, /\.dfConsoleSidebar button \{/, /\.dfConsoleSidebar button:disabled/, /\.dfConsoleSidebar\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleSidebar\s*\{[^}]*color: var\(--df-console-text\)/]) {
+  for (const rule of [/\.dfConsoleSidebar \*,/, /\.dfConsoleSidebar button \{/, /\.dfConsoleSidebar button:disabled/, /\.dfConsoleSidebar\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleSidebar\s*\{[^}]*color: var\(--df-console-text\)/, /\.dfConsoleDialog \*,/, /\.dfConsoleDialog button,/, /\.dfConsoleDialog button:disabled,/, /\.dfConsoleDialog\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleDialog\s*\{[^}]*color: var\(--df-console-text\)/]) {
     assert.match(css, rule);
   }
+  // The panel scrolls, never the <dialog>: a scrollbar click on the dialog
+  // itself has event.target === the dialog and would close SETTINGS.
+  assert.match(css, /\.dfConsoleDialog \.dfConsoleSidebar__panel \{[^}]*max-height:[^}]*overflow: auto;/);
+  assert.equal(/\.dfConsoleDialog\s*\{[^}]*overflow: auto/.test(css), false);
   assert.match(css, /@media \(max-width: 1024px\)[\s\S]*?\.dfConsoleShell \{ display: block; \}/);
   assert.match(css, /:focus-visible\s*\{\s*outline: 2px solid var\(--df-console-accent\);/);
 
@@ -559,7 +563,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { title.props.onBlur(); });
     assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed" }]);
 
-    const assign = renderer.root.findAllByType("select")[0];
+    const assign = renderer.root.findAllByType("select").find((select) => select.props.id === `df-assign-${queued.id}`);
     // Reassignment offers only agents in the same project.
     assert.deepEqual(assign.props.children.map((option) => option.props.children), ["Builder One", "Builder Two"]);
     await act(async () => { assign.props.onChange({ currentTarget: { value: "23".repeat(16) } }); });
@@ -877,4 +881,89 @@ test("the shell provider has no model inputs but keeps PAUSED", () => {
   // The daemon rejects a model for shell; pausing it is still an edit.
   assert.match(markup, /id="df-paused-[0-9a-f]+"/);
   assert.match(markup, />PAUSED</);
+});
+
+test("the agent config offers its provider's linked accounts and the provider default", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const edits = [];
+    const state = baseState();
+    const linked = [...state.accounts.values()][0];
+    const props = {
+      status: "ready",
+      state,
+      selectedAgent: agentSelection(),
+      onSaveAgentConfig: (config) => edits.push(config),
+    };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+    const account = renderer.root.findAllByType("select").find((select) => select.props.id === `df-account-${ids.agent}`);
+    // The selected agent is claude_code, so only claude_code logins are offered.
+    assert.deepEqual(account.props.children[0].props.children, "provider default");
+    assert.deepEqual(account.props.children[1].map((option) => option.props.children), [linked.label]);
+    assert.equal(account.props.value, linked.id);
+
+    // Only what the operator changed is sent, and "" clears the selection.
+    await act(async () => { account.props.onChange({ currentTarget: { value: "" } }); });
+    const form = renderer.root.findAllByProps({ "aria-label": "Agent configuration" })[0];
+    await act(async () => { form.props.onSubmit({ preventDefault() {} }); });
+    assert.deepEqual(edits.at(-1), { accountId: "" });
+
+    // A shell agent has no logins at all, so it has no account control.
+    const shell = { ...state.agents.get(ids.agent), provider: "shell", model: "", reasoning_effort: "", account_id: "" };
+    await act(async () => {
+      renderer.update(createElement(FactoryConsole, { ...props, state: baseState({ agents: new Map([[shell.id, shell]]) }) }));
+    });
+    assert.equal(renderer.root.findAllByType("select").some((select) => select.props.id === `df-account-${ids.agent}`), false);
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("settings asks the daemon for logins on open and links the one the operator names", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const login = {
+      provider: "codex",
+      home: "/Users/operator/.codex-dogfood",
+      label: ".codex-dogfood",
+      email: "operator@example.com",
+      organization: "",
+      default_model: "gpt-6-astra",
+      default_reasoning_effort: "high",
+      linked_id: "",
+    };
+    const asked = [];
+    const linkings = [];
+    const props = {
+      status: "ready",
+      state: baseState(),
+      settingsOpen: true,
+      onToggleSettings: () => {},
+      onLoadAccounts: () => asked.push("asked"),
+      onLinkAccount: (candidate, label) => linkings.push([candidate.home, label]),
+      accounts: [login],
+    };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+    // Discovery is an observation, so opening SETTINGS is what asks for it.
+    assert.deepEqual(asked, ["asked"]);
+    const section = renderer.root.findAllByProps({ "aria-label": "ACCOUNTS" })[0];
+    assert.ok(section !== undefined);
+    const label = renderer.root.findAllByType("input").find((input) => input.props.id === `df-account-label-${login.home}`);
+    await act(async () => { label.props.onChange({ currentTarget: { value: "dogfood" } }); });
+    const link = renderer.root.findAllByType("button").find((button) => button.props.children === "LINK");
+    await act(async () => { link.props.onClick(); });
+    assert.deepEqual(linkings, [[login.home, "dogfood"]]);
+
+    // The daemon's refusal is shown plainly rather than retried.
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, accountsError: "not_found" })); });
+    assert.ok(renderer.root.findAllByProps({ role: "alert" }).length > 0);
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
 });

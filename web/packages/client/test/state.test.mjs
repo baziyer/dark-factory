@@ -78,10 +78,15 @@ test("the Go-produced snapshot fixture becomes one complete TypeScript state vie
   assert.equal(view.agents.size, 1);
   assert.equal(view.tasks.size, 1);
   assert.equal(view.humanRequests.size, 1);
+  assert.equal(view.accounts.size, 1);
   const [project] = view.projects.values();
   const [agent] = view.agents.values();
   const [task] = view.tasks.values();
   const [request] = view.humanRequests.values();
+  const [account] = view.accounts.values();
+  assert.equal(agent.account_id, account.id);
+  assert.equal(account.provider, agent.provider);
+  assert.equal(account.home, "/Users/operator/.codex");
   assert.equal(view.projects.get(project.id), project);
   assert.equal(agent.project_id, project.id);
   assert.equal(task.assigned_agent_id, agent.id);
@@ -359,4 +364,43 @@ test("the client tolerates added members but nothing else", () => {
   // finite refusals.
   expectMalformed(() => decodeServerControl(snapshot.replace('"STATE_SNAPSHOT"', '"STATE_FUTURE"')));
   expectMalformed(() => decodeClientControl(snapshot.replace('"body":{', '"future":1,"body":{')));
+});
+
+
+// An account is a provider login the operator linked. The snapshot serves
+// which login it is, never anything that proves it, and an agent's selection
+// must be one canonical identity of a provider that has logins at all.
+test("linked accounts and agent account selections decode under the closed rules", () => {
+  const valid = fixture("state_snapshot.json");
+  for (const wire of [
+    // A shell agent can never carry an account.
+    valid.replace('"provider":"codex","paused"', '"provider":"shell","paused"'),
+    valid.replace('"account_id":"05050505050505050505050505050505"}]', '"account_id":"05"}]'),
+    valid.replace('"provider":"codex","home"', '"provider":"shell","home"'),
+    valid.replace('"home":"/Users/operator/.codex"', '"home":"Users/operator/.codex"'),
+    valid.replace('"label":"codex","revision":"1"', '"label":"","revision":"1"'),
+  ]) expectMalformed(() => decodeServerControl(wire));
+
+  // A daemon that does not know about accounts sends none, and an agent
+  // without a selection reads as the provider default.
+  const older = valid
+    .replace(',"accounts":[{"id":"05050505050505050505050505050505","provider":"codex","home":"/Users/operator/.codex","label":"codex","revision":"1"}]', "")
+    .replace(',"account_id":"05050505050505050505050505050505"', "");
+  const view = snapshotView(decodeServerControl(older).body);
+  assert.equal(view.accounts.size, 0);
+  assert.equal([...view.agents.values()][0].account_id, "");
+
+  // AGENT_UPDATE carries the selection, and an empty string clears it.
+  const update = fixture("agent_update.json");
+  assert.equal(encodeClientControl(decodeClientControl(update)), update);
+  assert.equal(decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":""')).body.account_id, "");
+  expectMalformed(() => decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":"nope"')));
+  expectMalformed(() => decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":null')));
+
+  // Discovery answers with logins and never a token.
+  const accounts = decodeServerControl(fixture("accounts.json")).body.accounts;
+  assert.equal(accounts.length, 2);
+  assert.deepEqual(Object.keys(accounts[0]), ["provider", "home", "label", "email", "organization", "default_model", "default_reasoning_effort", "linked_id"]);
+  assert.equal(accounts[1].linked_id, "");
+  expectMalformed(() => decodeServerControl(fixture("accounts.json").replace('"provider":"codex"', '"provider":"shell"')));
 });

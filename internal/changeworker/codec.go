@@ -39,14 +39,17 @@ type Config struct {
 	FactoryctlExecutable string
 	ToolPath             string
 	AccountHome          string
-	RepositoryRoot       string
-	RepositoryIdentity   change.RepositoryIdentity
-	Revision             string
-	ChangeParent         string
-	FinalName            string
-	StagingName          string
-	AttemptSocket        string
-	Retained             *Result
+	// AccountConfigDir is the linked provider login this run launches with.
+	// Empty means the provider's own default configuration directory.
+	AccountConfigDir   string
+	RepositoryRoot     string
+	RepositoryIdentity change.RepositoryIdentity
+	Revision           string
+	ChangeParent       string
+	FinalName          string
+	StagingName        string
+	AttemptSocket      string
+	Retained           *Result
 	// ProviderTask selects and verifies the provider's closed delivery path.
 	// Shell seals it on fd 11 and Claude receives a terminal-safe prompt. It is
 	// empty for Codex, whose task remains in the daemon behind the attempt API.
@@ -94,6 +97,7 @@ type configWire struct {
 	FactoryctlExecutable string       `json:"factoryctl_executable"`
 	ToolPath             string       `json:"tool_path"`
 	AccountHome          string       `json:"account_home"`
+	AccountConfigDir     string       `json:"account_config_dir"`
 	RepositoryRoot       string       `json:"repository_root"`
 	RepositoryIdentity   identityWire `json:"repository_identity"`
 	Revision             string       `json:"revision"`
@@ -112,7 +116,7 @@ func EncodeConfig(config Config) ([]byte, error) {
 	wire := configWire{
 		Provider: config.Provider.String(), Model: config.Model, ReasoningEffort: config.ReasoningEffort,
 		RuntimePath: config.RuntimePath, RuntimeIdentity: identityWire{Device: config.RuntimeIdentity.Device, Inode: config.RuntimeIdentity.Inode},
-		GitExecutable: config.GitExecutable, FactoryctlExecutable: config.FactoryctlExecutable, ToolPath: config.ToolPath, AccountHome: config.AccountHome,
+		GitExecutable: config.GitExecutable, FactoryctlExecutable: config.FactoryctlExecutable, ToolPath: config.ToolPath, AccountHome: config.AccountHome, AccountConfigDir: config.AccountConfigDir,
 		RepositoryRoot: config.RepositoryRoot, RepositoryIdentity: identityWire{Device: config.RepositoryIdentity.Device(), Inode: config.RepositoryIdentity.Inode()}, Revision: config.Revision,
 		ChangeParent: config.ChangeParent, FinalName: config.FinalName, StagingName: config.StagingName,
 		AttemptSocket: config.AttemptSocket, ProviderTask: bytes.Clone(config.ProviderTask),
@@ -148,7 +152,7 @@ func DecodeConfig(encoded []byte) (Config, error) {
 	config := Config{
 		Provider: providerKind, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort,
 		RuntimePath: wire.RuntimePath, RuntimeIdentity: runner.FileIdentity{Device: wire.RuntimeIdentity.Device, Inode: wire.RuntimeIdentity.Inode},
-		GitExecutable: wire.GitExecutable, FactoryctlExecutable: wire.FactoryctlExecutable, ToolPath: wire.ToolPath, AccountHome: wire.AccountHome,
+		GitExecutable: wire.GitExecutable, FactoryctlExecutable: wire.FactoryctlExecutable, ToolPath: wire.ToolPath, AccountHome: wire.AccountHome, AccountConfigDir: wire.AccountConfigDir,
 		RepositoryRoot: wire.RepositoryRoot, RepositoryIdentity: repositoryIdentity, Revision: wire.Revision,
 		ChangeParent: wire.ChangeParent, FinalName: wire.FinalName, StagingName: wire.StagingName,
 		AttemptSocket: wire.AttemptSocket, Retained: retained, ProviderTask: bytes.Clone(wire.ProviderTask),
@@ -165,6 +169,9 @@ func validateConfig(config Config) error {
 		if !validAbsolute(path, maximumLocatorBytes) {
 			return invalidContract(nil)
 		}
+	}
+	if config.AccountConfigDir != "" && !validAbsolute(config.AccountConfigDir, maximumLocatorBytes) {
+		return invalidContract(nil)
 	}
 	if len(config.AttemptSocket) > install.MaxSocketPathBytes || config.RuntimeIdentity.Device == 0 || config.RuntimeIdentity.Inode == 0 ||
 		kernel.ValidateProviderLaunchControls(config.Provider, config.Model, config.ReasoningEffort) != nil || provider.ValidateToolPath(config.ToolPath) != nil ||

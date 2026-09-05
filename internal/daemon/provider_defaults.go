@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
+	"github.com/dark-factory-build/dark-factory/internal/kernel"
+	"github.com/dark-factory-build/dark-factory/internal/provider"
 )
 
 // providerDefaultsFreshness bounds how stale a served provider default may be.
@@ -45,31 +48,31 @@ var codexModelLine = regexp.MustCompile(`^[\t ]*(model|model_reasoning_effort)[\
 // this process's: claude_code is given HOME=<accountHome> and codex is given
 // CODEX_HOME=<accountHome>/.codex, so reading os.UserHomeDir or CODEX_HOME
 // here would name a different account than the run uses.
-func providerConfigHome(provider, accountHome string) string {
-	if accountHome == "" {
+func providerConfigHome(kind, accountHome string) string {
+	parsed, err := kernel.ParseProvider(kind)
+	if err != nil {
 		return ""
 	}
-	switch provider {
-	case "claude_code":
-		return filepath.Join(accountHome, ".claude")
-	case "codex":
-		return filepath.Join(accountHome, ".codex")
-	}
-	return ""
+	return provider.ConfigHome(parsed, accountHome)
 }
 
 // providerAccountDefaults reads the configuration of the account the supervisor
-// will actually launch this provider under. It answers unknown until a
-// supervisor has published one, which RunScheduler does with its first probe.
-func (daemon *Daemon) providerAccountDefaults(provider string) (model, effort, source string) {
+// will actually launch this provider under. configHome names it directly when
+// the agent has a linked account; otherwise it is the operator's own login for
+// that provider, which answers unknown until a supervisor has published the
+// account home, as RunScheduler does with its first probe.
+func (daemon *Daemon) providerAccountDefaults(kind, configHome string) (model, effort, source string) {
 	if daemon == nil {
 		return "", "", ""
 	}
-	accountHome := ""
-	if published := daemon.accountHome.Load(); published != nil {
-		accountHome = *published
+	if configHome == "" {
+		accountHome := ""
+		if published := daemon.accountHome.Load(); published != nil {
+			accountHome = *published
+		}
+		configHome = providerConfigHome(kind, accountHome)
 	}
-	return daemon.providerDefaults(provider, providerConfigHome(provider, accountHome))
+	return daemon.providerDefaults(kind, configHome)
 }
 
 // providerDefaults reports the model and reasoning effort the provider CLI
@@ -85,18 +88,52 @@ func (daemon *Daemon) providerDefaults(provider, home string) (model, effort, so
 	}
 	account := providerAccount{provider: provider, home: home}
 	now := daemon.now()
+	if held, ok := daemon.freshProviderDefault(account, now); ok {
+		return held.model, held.effort, held.source
+	}
+	// The read is deliberately outside the lock: a browser request reaches
+	// this path, and two racing readers costing one extra bounded file read is
+	// cheaper than either of them waiting on the other's disk.
+	held := readProviderDefault(account)
+	held.at = now
+	daemon.providerDefaultMu.Lock()
+	if daemon.providerDefaultCache == nil {
+		daemon.providerDefaultCache = make(map[providerAccount]providerDefault, 2)
+	}
+	daemon.providerDefaultCache[account] = held
+	daemon.providerDefaultMu.Unlock()
+	return held.model, held.effort, held.source
+}
+
+func (daemon *Daemon) freshProviderDefault(account providerAccount, now time.Time) (providerDefault, bool) {
 	daemon.providerDefaultMu.Lock()
 	defer daemon.providerDefaultMu.Unlock()
 	held, ok := daemon.providerDefaultCache[account]
 	if !ok || now.Before(held.at) || now.Sub(held.at) >= providerDefaultsFreshness {
-		held = readProviderDefault(account)
-		held.at = now
-		if daemon.providerDefaultCache == nil {
-			daemon.providerDefaultCache = make(map[providerAccount]providerDefault, 2)
-		}
-		daemon.providerDefaultCache[account] = held
+		return providerDefault{}, false
 	}
-	return held.model, held.effort, held.source
+	return held, true
+}
+
+// maxProviderConfigBytes bounds one provider configuration or login file. A
+// bigger one is refused unread: these paths are named by the operator's own
+// home, but a browser request is what triggers reading them.
+const maxProviderConfigBytes = 1 << 20
+
+// readBoundedFile answers only for a regular file that was within the bound
+// when it was measured, so a device, a directory or an enormous file costs a
+// stat instead of a read. A file that grows between the stat and the read is
+// still read whole; the bound is a cost guard on the operator's own home, not
+// a fence against something racing it there.
+func readBoundedFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxProviderConfigBytes {
+		return nil, fmt.Errorf("provider file %q is not a bounded regular file", filepath.Base(path))
+	}
+	return os.ReadFile(path)
 }
 
 func readProviderDefault(account providerAccount) providerDefault {
@@ -106,7 +143,7 @@ func readProviderDefault(account providerAccount) providerDefault {
 		// claude reads its top-level "model" from the account settings file.
 		// It has no configured reasoning effort the factory can name.
 		result.source = filepath.Join(account.home, "settings.json")
-		data, err := os.ReadFile(result.source)
+		data, err := readBoundedFile(result.source)
 		if err != nil {
 			return providerDefault{}
 		}
@@ -119,7 +156,7 @@ func readProviderDefault(account providerAccount) providerDefault {
 		result.model = settings.Model
 	case "codex":
 		result.source = filepath.Join(account.home, "config.toml")
-		data, err := os.ReadFile(result.source)
+		data, err := readBoundedFile(result.source)
 		if err != nil {
 			return providerDefault{}
 		}

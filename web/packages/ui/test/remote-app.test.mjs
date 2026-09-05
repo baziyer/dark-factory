@@ -37,6 +37,7 @@ const southState = {
   agents: new Map([[southAgent, { id: southAgent, project_id: southProject, name: "Harbour One", role: "worker", provider: "codex", paused: false, revision: 3n }]]),
   tasks: new Map([[southTask, { id: southTask, project_id: southProject, assigned_agent_id: southAgent, title: "Re-tile the harbour", status: "running", priority: 5, revision: 4n }]]),
   humanRequests: new Map([[southRequestID, southRequest]]),
+  accounts: new Map(),
 };
 
 const northFactory = (overrides = {}) => ({ nodeId: NORTH, label: "North Shop", status: "ready", state: fixtureState, ...overrides });

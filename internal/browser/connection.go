@@ -472,6 +472,28 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeRunPaths(frame.ID, result)
+	case browserprotocol.AccountsDiscover:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.DiscoverAccounts(ctx, current.principal.ClientID)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		payload, err = browserprotocol.EncodeAccounts(frame.ID, result)
+	case browserprotocol.AccountLink:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.LinkAccount(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		payload, err = browserprotocol.EncodeAccountLinkResult(frame.ID, result)
 	case browserprotocol.RemoteInvite:
 		if current.server.taskBackend == nil {
 			err = ErrUnauthorized

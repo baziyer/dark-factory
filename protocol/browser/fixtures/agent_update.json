@@ -1,1 +1,1 @@
-{"type":"AGENT_UPDATE","id":"agent-update-1","body":{"agent_id":"02020202020202020202020202020202","expected_revision":"7","model":"claude-opus-5","reasoning_effort":"high","paused":false}}
+{"type":"AGENT_UPDATE","id":"agent-update-1","body":{"agent_id":"02020202020202020202020202020202","expected_revision":"7","model":"claude-opus-5","reasoning_effort":"high","account_id":"05050505050505050505050505050505","paused":false}}
