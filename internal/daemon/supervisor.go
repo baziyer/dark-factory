@@ -70,6 +70,7 @@ func (daemon *Daemon) RunNext(ctx context.Context, spec SupervisorSpec) (run ker
 	if err != nil {
 		return kernel.Run{}, err
 	}
+	daemon.rememberChangeParent(spec.ChangeParent)
 	defer func() { daemon.endSupervisor(registration, resultErr) }()
 	run, resultErr = daemon.runNext(registration.ctx, spec)
 	if run.Phase == kernel.RunFinalizing && run.ID != (kernel.RunID{}) {

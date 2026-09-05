@@ -49,6 +49,21 @@ type Topology struct {
 	Nodes          []TopologyNode `json:"nodes"`
 }
 
+type RunPathsGet struct {
+	AgentID string `json:"agent_id"`
+}
+
+// RunPaths places one live worker in the part of the tree it is changing. It
+// is a regenerable observation of that run's working directory, not durable
+// state, so it carries no revision: the run identity is all a client needs to
+// tell one worker's rooms from another's. An agent with no live run answers
+// with an empty run identity and no paths.
+type RunPaths struct {
+	AgentID string   `json:"agent_id"`
+	RunID   string   `json:"run_id"`
+	Paths   []string `json:"paths"`
+}
+
 type TopologyNode struct {
 	ID         string `json:"id"`
 	ParentID   string `json:"parent_id"`
@@ -71,6 +86,15 @@ func EncodeTopology(id string, value Topology) ([]byte, error) {
 	return encodeControl(TypeTopology, id, value)
 }
 
+// EncodeRunPaths normalizes an absent path list to an empty one: JSON null is
+// not an array on either side of the boundary.
+func EncodeRunPaths(id string, value RunPaths) ([]byte, error) {
+	if value.Paths == nil {
+		value.Paths = []string{}
+	}
+	return encodeControl(TypeRunPaths, id, value)
+}
+
 func validConsoleControl(kind MessageType, body any) error {
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	switch value := body.(type) {
@@ -85,6 +109,10 @@ func validConsoleControl(kind MessageType, body any) error {
 	case *TopologyGet:
 		return validConsoleControl(kind, *value)
 	case *Topology:
+		return validConsoleControl(kind, *value)
+	case *RunPathsGet:
+		return validConsoleControl(kind, *value)
+	case *RunPaths:
 		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
@@ -119,6 +147,23 @@ func validConsoleControl(kind MessageType, body any) error {
 		}
 		for _, node := range value.Nodes {
 			if !validTopologyNode(node) {
+				return bad()
+			}
+		}
+	case RunPathsGet:
+		if validateDynamicID(value.AgentID) != nil {
+			return bad()
+		}
+	case RunPaths:
+		// No live run means no rooms, so an empty run identity may not carry
+		// paths. The array itself keeps the generic control item bound.
+		if validateDynamicID(value.AgentID) != nil || value.Paths == nil || len(value.Paths) > MaxJSONArray ||
+			value.RunID == "" && len(value.Paths) != 0 ||
+			value.RunID != "" && validateDynamicID(value.RunID) != nil {
+			return bad()
+		}
+		for _, path := range value.Paths {
+			if validateBoundedText(path, 1, MaxTaskTitleBytes) != nil {
 				return bad()
 			}
 		}

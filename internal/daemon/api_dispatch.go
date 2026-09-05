@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dark-factory-build/dark-factory/internal/api"
@@ -38,6 +39,13 @@ type Daemon struct {
 	// concrete and global: the local operator has no throughput requirement,
 	// and one gate avoids a second digest-to-owner authority index.
 	operationMu sync.Mutex
+
+	// changeParent is the changes root the supervisor was given, published
+	// without a lock so RunNext never waits on a console read. runPathsMu
+	// guards only the map of bounded directory walks, never a walk itself.
+	changeParent atomic.Pointer[string]
+	runPathsMu   sync.Mutex
+	runPaths     map[kernel.RunID]runPathsResult
 
 	attemptMu sync.Mutex
 	attempts  map[kernel.RunID]*liveAttempt

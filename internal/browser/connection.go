@@ -457,6 +457,21 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		return true
+	case browserprotocol.RunPathsGet:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.RunPaths(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.AgentID != body.AgentID {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeRunPaths(frame.ID, result)
 	case browserprotocol.RemoteInvite:
 		if current.server.taskBackend == nil {
 			err = ErrUnauthorized

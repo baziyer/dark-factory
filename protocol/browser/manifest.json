@@ -289,6 +289,18 @@
       "fixture": "topology.json"
     },
     {
+      "type": "RUN_PATHS_GET",
+      "direction": "client",
+      "id": "required",
+      "fixture": "run_paths_get.json"
+    },
+    {
+      "type": "RUN_PATHS",
+      "direction": "server",
+      "id": "required",
+      "fixture": "run_paths.json"
+    },
+    {
       "type": "REMOTE_INVITE",
       "direction": "client",
       "id": "required",

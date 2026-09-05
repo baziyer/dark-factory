@@ -70,6 +70,13 @@ func (backend *consoleDispatchBackend) Topology(_ context.Context, client [brows
 	return backend.topology, nil
 }
 
+func (backend *consoleDispatchBackend) RunPaths(_ context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.RunPaths{}, err
+	}
+	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
+}
+
 const (
 	consoleAgentID   = "606162636465666768696a6b6c6d6e6f"
 	consoleTaskID    = "404142434445464748494a4b4c4d4e4f"
@@ -88,6 +95,8 @@ var consoleRequests = []struct {
 		`{"type":"TASK_UPDATE","id":"console-task","body":{"task_id":"` + consoleTaskID + `","expected_revision":"3","status":"cancelled"}}`},
 	{browserprotocol.TypeTopologyGet, browserprotocol.TypeTopology,
 		`{"type":"TOPOLOGY_GET","id":"console-topology","body":{"project_id":"` + consoleProjectID + `"}}`},
+	{browserprotocol.TypeRunPathsGet, browserprotocol.TypeRunPaths,
+		`{"type":"RUN_PATHS_GET","id":"console-rooms","body":{"agent_id":"` + consoleAgentID + `"}}`},
 }
 
 func TestConsoleControlDispatchesAndCorrelatesExactResults(t *testing.T) {

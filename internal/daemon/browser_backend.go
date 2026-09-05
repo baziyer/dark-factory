@@ -510,6 +510,32 @@ func (backend *browserBackend) admitRemoteInvite() bool {
 	return true
 }
 
+// RunPaths places one live worker in the rooms it is editing. Like Topology it
+// is regenerable observation, so it carries no revision and no head.
+func (backend *browserBackend) RunPaths(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityObserve)
+	if err != nil {
+		return browserprotocol.RunPaths{}, err
+	}
+	defer release()
+	if backend.owner == nil {
+		return browserprotocol.RunPaths{}, browser.ErrNotFound
+	}
+	agentID, err := browserID(request.AgentID, kernel.AgentIDFromBytes)
+	if err != nil {
+		return browserprotocol.RunPaths{}, browser.ErrStale
+	}
+	runID, paths, err := backend.owner.RunPaths(ctx, agentID)
+	if err != nil {
+		return browserprotocol.RunPaths{}, mapBrowserError(err)
+	}
+	result := browserprotocol.RunPaths{AgentID: request.AgentID, Paths: paths}
+	if runID != (kernel.RunID{}) {
+		result.RunID = runID.String()
+	}
+	return result, nil
+}
+
 func (backend *browserBackend) authorize(ctx context.Context, rawID [browserprotocol.ClientIDSize]byte, capability kernel.BrowserCapabilityMask) (kernel.BrowserClientID, func(), kernel.BrowserClient, error) {
 	clientID, err := kernel.BrowserClientIDFromBytes(rawID[:])
 	if err != nil {
