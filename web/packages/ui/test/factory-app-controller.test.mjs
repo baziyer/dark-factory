@@ -503,12 +503,24 @@ test("every project's topology is fetched, kept by id, and refreshed while the f
 
   // A project the daemon cannot serve keeps the structure last served for it,
   // and never costs the other projects theirs.
-  const refused = answer;
-  answer = async (id) => { if (id === projects[1]) throw new SessionError("not_found"); return refused(id); };
+  const ready = answer;
+  answer = async (id) => { if (id === projects[1]) throw new SessionError("not_found"); return ready(id); };
   context.controller.loadTopology();
   await settle();
   assert.deepEqual([...context.latest().topologies.keys()], projects);
-  answer = refused;
+
+  // A project still answering is not asked again; every other one still is.
+  const held = deferred();
+  answer = async (id) => (id === projects[0] ? held.promise : ready(id));
+  context.controller.loadTopology();
+  await settle();
+  const during = asked.length;
+  context.controller.loadTopology();
+  await settle();
+  assert.deepEqual(asked.slice(during), [projects[1]]);
+  held.resolve(await ready(projects[0]));
+  await settle();
+  answer = ready;
 
   // Code changes while the floor stays open: the run-paths timer re-reads the
   // structure every sixth tick, and only then.

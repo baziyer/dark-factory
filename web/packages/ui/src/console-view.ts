@@ -186,7 +186,7 @@ const SIZE_BUCKETS = ["large", "medium", "small", "tiny", "empty"];
 function projectBlock(project: { id: string; name: string }, topology: TopologyView | undefined): readonly SceneNode[] {
   const root = topology?.nodes.find((node) => node.parent_id === "");
   if (topology === undefined || root === undefined) {
-    return [{ id: project.id, parentId: "", path: project.name, label: project.name, kind: "repository" }];
+    return [{ id: project.id, path: project.name, label: project.name, kind: "repository" }];
   }
   const roots = new Set(topology.nodes.filter((node) => node.path === ".").map((node) => node.id));
   roots.add(root.id);
@@ -199,7 +199,6 @@ function projectBlock(project: { id: string; name: string }, topology: TopologyV
     // Node ids are minted per project, so two projects holding the same path
     // are served the same id. Two rooms on one floor may not share one.
     id: `${project.id}:${node.id}`,
-    parentId: node.parent_id === "" ? "" : `${project.id}:${node.parent_id}`,
     path: node.path,
     // Every repository is served the same fixed label, so on a floor of many
     // projects only the project's own name tells its root room apart.

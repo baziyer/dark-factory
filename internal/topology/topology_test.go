@@ -220,7 +220,10 @@ func TestBuildIgnoresExcludedAndSymlinkedTreesAndRunsNothing(t *testing.T) {
 // the whole snapshot: this repository served zero nodes until they stopped
 // being fatal.
 func TestBuildSkipsDotDirectoriesAndOversizeAnalyzerFiles(t *testing.T) {
-	root := t.TempDir()
+	// The root is exempt from the skip, so a checkout that lives under a dot
+	// directory still builds its whole structure. Only the walk's own guard on
+	// its first entry makes that true.
+	root := filepath.Join(t.TempDir(), ".checkout")
 	oversize := "package huge\nimport \"example.com/cart/lib\"\n" + strings.Repeat("// pad\n", maxAnalyzerFileBytes/7+1)
 	writeFixture(t, root, map[string]string{
 		"go.mod": "module example.com/cart\n",

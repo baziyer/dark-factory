@@ -189,7 +189,7 @@ export class FactoryAppController {
   #pendingTerminalInput = new Uint8Array(0);
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
   #topologies: ReadonlyMap<string, TopologyView> = new Map();
-  #topologyPending = false;
+  #topologyPending = new Set<string>();
   #runPaths: ReadonlyMap<string, readonly string[]> = new Map();
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
   #runPathsTicks = 0;
@@ -296,25 +296,28 @@ export class FactoryAppController {
   loadTopology(): void {
     const session = this.#client?.session;
     const state = this.#state;
-    if (this.#closed || this.#status !== "ready" || session === undefined || state === undefined || this.#topologyPending) return;
-    this.#topologyPending = true;
+    if (this.#closed || this.#status !== "ready" || session === undefined || state === undefined) return;
+    // A project still answering the last round is not asked again: one slow
+    // walk costs the floor its own room's refresh, never every other project's.
+    const asked = [...state.projects.keys()].filter((projectId) => !this.#topologyPending.has(projectId));
+    if (asked.length === 0) return;
     const generation = this.#generation;
-    void Promise.all([...state.projects.keys()].map((projectId) => session.getTopology(projectId).then(
-      (topology) => [projectId, topology] as const,
-      // A refused answer keeps the structure last served for that project
-      // rather than emptying its block of rooms for one cycle.
-      () => [projectId, this.#topologies.get(projectId)] as const,
-    ))).then((answers) => {
-      this.#topologyPending = false;
-      if (!this.#current(generation)) return;
-      const next = new Map<string, TopologyView>();
-      for (const [projectId, topology] of answers) if (topology !== undefined) next.set(projectId, topology);
-      // A round that changed no digest is not a new snapshot, so an unchanged
-      // repository does not re-render the floor once a minute.
-      if (next.size === this.#topologies.size && [...next].every(([id, topology]) => this.#topologies.get(id)?.digest === topology.digest)) return;
-      this.#topologies = next;
-      this.#publish();
-    });
+    for (const projectId of asked) {
+      this.#topologyPending.add(projectId);
+      void session.getTopology(projectId).then(
+        (topology) => {
+          this.#topologyPending.delete(projectId);
+          // A structure whose digest did not move is not a new snapshot, so an
+          // unchanged repository does not re-render the floor once a minute.
+          if (!this.#current(generation) || this.#topologies.get(projectId)?.digest === topology.digest) return;
+          this.#topologies = new Map(this.#topologies).set(projectId, topology);
+          this.#publish();
+        },
+        // A refused answer keeps the structure last served for that project
+        // rather than emptying its block of rooms for one cycle.
+        () => { this.#topologyPending.delete(projectId); },
+      );
+    }
   }
 
   /**
