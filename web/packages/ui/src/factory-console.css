@@ -688,6 +688,16 @@
   .dfConsoleSidebar { position: static; max-height: none; padding: 0 clamp(1rem, 3vw, 3rem) 1.5rem; }
 }
 
+/* The floor's two-frame sprites: the second frame is stacked on the first and
+   shown for half the cycle, so a still floor is the reduced-motion default. */
+.dfFactoryScene__alternate { opacity: 0; animation: dfFactorySceneFlip 1.2s steps(1, end) infinite; }
+
+@keyframes dfFactorySceneFlip { 50% { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .dfFactoryScene__alternate { animation: none; }
+}
+
 /* remote ------------------------------------------------------------------
    The phone console. One column by default because the smallest screen is the
    real one; two columns only once there is room. Legibility over density: no

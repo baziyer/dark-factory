@@ -1,3 +1,5 @@
+import { spriteAtlas } from "./sprites/sprites.generated.js";
+
 export type SceneTopology = Readonly<{
   digest: string;
   nodes: readonly SceneNode[];
@@ -49,21 +51,6 @@ export type SceneWorkerPlacement = Readonly<{
   roomId?: string;
   x: number;
   y: number;
-}>;
-
-export type SceneSpriteRect = Readonly<{
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  color: string;
-  opacity?: number;
-}>;
-
-export type SceneWorkerSprite = Readonly<{
-  key: string;
-  size: 16;
-  rects: readonly SceneSpriteRect[];
 }>;
 
 const ROOM_WIDTH = 152;
@@ -137,41 +124,16 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
     });
 }
 
-export function workerSprite(worker: SceneWorker): SceneWorkerSprite {
-  const skins = ["#f1c27d", "#d99b67", "#9c6644", "#6f452f"] as const;
-  const hats = ["#dbe7ee", "#ffd166", "#ef8354", "#8ecae6"] as const;
-  const uniforms = { claude_code: "#d97855", codex: "#55a7d9", shell: "#9c7bd8" } as const;
-  const activities = { busy: "#51d88a", waiting: "#e3b341", "needs-you": "#ff6b6b", idle: "#7890a2" } as const;
-  let hash = 2166136261;
-  for (let index = 0; index < worker.id.length; index += 1) {
-    hash = Math.imul(hash ^ worker.id.charCodeAt(index), 16777619);
-  }
-  hash >>>= 0;
-  const skinIndex = hash % skins.length;
-  const hatIndex = (hash >>> 2) % hats.length;
-  const skin = skins[skinIndex] ?? skins[0];
-  const hat = hats[hatIndex] ?? hats[0];
-  const provider = worker.provider ?? "none";
-  const rects: SceneSpriteRect[] = [
-    { x: 3, y: 15, width: 10, height: 1, color: "#05090d", opacity: 0.55 },
-    { x: 5, y: 2, width: 6, height: 5, color: skin },
-    { x: 4, y: 1, width: 8, height: 2, color: hat },
-    { x: 3, y: 7, width: 10, height: 5, color: worker.provider === undefined ? "#647789" : uniforms[worker.provider] },
-    { x: 4, y: 12, width: 3, height: 3, color: "#172331" },
-    { x: 9, y: 12, width: 3, height: 3, color: "#172331" },
-    { x: 13, y: 2, width: 2, height: 2, color: activities[worker.activity] },
-  ];
-  if (worker.role === "orchestrator") {
-    rects.push(
-      { x: 5, y: 1, width: 1, height: 1, color: "#ffe36e" },
-      { x: 6, y: 0, width: 1, height: 2, color: "#ffe36e" },
-      { x: 8, y: 1, width: 1, height: 1, color: "#ffe36e" },
-      { x: 10, y: 0, width: 1, height: 2, color: "#ffe36e" },
-    );
-  }
-  return {
-    key: `${skinIndex}-${hatIndex}-${worker.role}-${provider}-${worker.activity}`,
-    size: 16,
-    rects,
-  };
+/** The sheet frame a worker stands as; an unknown provider wears shell. */
+export function workerFrame(worker: SceneWorker): string {
+  const role = worker.role === "orchestrator" ? "overseer" : "worker";
+  const provider = worker.provider === "claude_code" || worker.provider === "codex" ? worker.provider : "shell";
+  const frame = `${role}.${provider}.${worker.activity}.0`;
+  return frame in spriteAtlas.frames ? frame : `${role}.${provider}.idle.0`;
+}
+
+/** busy and idle carry a second frame; every other activity holds still. */
+export function alternateFrame(frame: string): string | undefined {
+  const alternate = frame.replace(/\.0$/, ".1");
+  return alternate in spriteAtlas.frames ? alternate : undefined;
 }

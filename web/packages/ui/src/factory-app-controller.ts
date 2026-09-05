@@ -72,6 +72,8 @@ export type FactoryTerminalView = Readonly<{
 
 /** One console edit at a time: the sidebar shows exactly one form. */
 export type FactoryEditView = Readonly<{
+  /** The agent or task the edit was for; a refusal belongs to its form alone. */
+  target: string;
   pending: boolean;
   error?: SessionError | ProtocolError;
 }>;
@@ -306,7 +308,7 @@ export class FactoryAppController {
     if (this.#closed || this.#status !== "ready" || selected === undefined || session === undefined || this.#edit?.pending === true) return;
     if (Object.values(config).every((value) => value === undefined)) return;
     const generation = this.#generation;
-    this.#edit = { pending: true };
+    this.#edit = { target: selected.agent.id, pending: true };
     this.#publish();
     try {
       await session.updateAgent({ agentId: selected.agent.id, expectedRevision: selected.agent.revision, ...config });
@@ -314,7 +316,7 @@ export class FactoryAppController {
       this.#edit = undefined;
     } catch (error) {
       if (!this.#current(generation)) return;
-      this.#edit = { pending: false, error: finiteError(error) };
+      this.#edit = { target: selected.agent.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
   }
@@ -324,7 +326,7 @@ export class FactoryAppController {
     const session = this.#client?.session;
     if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
     const generation = this.#generation;
-    this.#edit = { pending: true };
+    this.#edit = { target: task.id, pending: true };
     this.#publish();
     try {
       await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
@@ -332,7 +334,7 @@ export class FactoryAppController {
       this.#edit = undefined;
     } catch (error) {
       if (!this.#current(generation)) return;
-      this.#edit = { pending: false, error: finiteError(error) };
+      this.#edit = { target: task.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
   }

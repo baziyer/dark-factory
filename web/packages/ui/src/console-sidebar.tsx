@@ -53,10 +53,13 @@ export function AgentPanel({
     .sort((left, right) => right.priority - left.priority);
   const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
   const errorCopy = editErrorCopy(edit);
-  // A form remounts when the served value moves under it and when an edit is
-  // refused, so a rejected change reverts instead of being resent on the next
-  // blur. A refusal never changes the revision, so it needs its own token.
-  const formKey = (id: string, revision: bigint) => `${id}:${revision}:${errorCopy === undefined ? "" : "refused"}`;
+  // A form remounts when the served value moves under it and when its own
+  // edit is refused, so a rejected change reverts instead of being resent on
+  // the next blur. A refusal never changes the revision, so it needs its own
+  // token, and only the refused form's: a refused task edit must not throw
+  // away what the operator has typed into the config form.
+  const formKey = (id: string, revision: bigint) =>
+    `${id}:${revision}:${errorCopy !== undefined && edit?.target === id ? "refused" : ""}`;
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
       <div className="dfConsoleSidebar__heading">
