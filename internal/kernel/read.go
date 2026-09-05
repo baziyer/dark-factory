@@ -77,15 +77,17 @@ func agentByID(ctx context.Context, connection *sql.Conn, id AgentID) (Agent, bo
 	if id.zero() {
 		return Agent{}, false, fmt.Errorf("%w: zero agent identifier", ErrInvalidValue)
 	}
-	return scanAgent(connection.QueryRowContext(ctx, `SELECT id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms FROM agents WHERE id = ?`, id.Bytes()))
+	return scanAgent(connection.QueryRowContext(ctx, `SELECT `+agentColumns+` FROM agents WHERE id = ?`, id.Bytes()))
 }
 
+const agentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
+
 func scanAgent(scanner rowScanner) (Agent, bool, error) {
-	var rawID, rawProjectID []byte
+	var rawID, rawProjectID, rawAccountID []byte
 	var name, rawRole, rawProvider string
 	var model, effort sql.NullString
 	var paused, budget, used, revision, createdAt, updatedAt int64
-	if err := scanner.Scan(&rawID, &rawProjectID, &name, &rawRole, &rawProvider, &model, &effort, &paused, &budget, &used, &revision, &createdAt, &updatedAt); err != nil {
+	if err := scanner.Scan(&rawID, &rawProjectID, &name, &rawRole, &rawProvider, &model, &effort, &rawAccountID, &paused, &budget, &used, &revision, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Agent{}, false, nil
 		}
@@ -101,6 +103,10 @@ func scanAgent(scanner rowScanner) (Agent, bool, error) {
 	if model.Valid && model.String == "" || effort.Valid && effort.String == "" || validateStoredProviderControls(provider, nullStringValue(model), nullStringValue(effort)) != nil {
 		return Agent{}, false, fmt.Errorf("%w: invalid agent controls", ErrCorruptState)
 	}
+	accountID, accountErr := optionalAccountID(rawAccountID)
+	if accountErr != nil || provider == ProviderShell && !accountID.zero() {
+		return Agent{}, false, fmt.Errorf("%w: invalid agent account", ErrCorruptState)
+	}
 	rev, revisionErr := NewRevision(revision)
 	created, createdErr := NewUnixMillis(createdAt)
 	updated, updatedErr := NewUnixMillis(updatedAt)
@@ -109,10 +115,50 @@ func scanAgent(scanner rowScanner) (Agent, bool, error) {
 	}
 	return Agent{
 		ID: id, ProjectID: projectID, Name: name, Role: role, Provider: provider,
-		Model: nullStringValue(model), ReasoningEffort: nullStringValue(effort),
+		Model: nullStringValue(model), ReasoningEffort: nullStringValue(effort), AccountID: accountID,
 		Paused: paused == 1, ToolBudgetLimit: uint64(budget), ToolCallsUsed: uint64(used),
 		Revision: rev, CreatedAt: created, UpdatedAt: updated,
 	}, true, nil
+}
+
+// optionalAccountID reads the nullable agent account column. A NULL is the
+// provider default, not a missing row.
+func optionalAccountID(raw []byte) (AccountID, error) {
+	if raw == nil {
+		return AccountID{}, nil
+	}
+	return AccountIDFromBytes(raw)
+}
+
+const accountColumns = `id, provider, home, label, revision, created_at_ms, updated_at_ms`
+
+func accountByID(ctx context.Context, connection *sql.Conn, id AccountID) (Account, bool, error) {
+	if id.zero() {
+		return Account{}, false, fmt.Errorf("%w: zero account identifier", ErrInvalidValue)
+	}
+	return scanAccount(connection.QueryRowContext(ctx, `SELECT `+accountColumns+` FROM accounts WHERE id = ?`, id.Bytes()))
+}
+
+func scanAccount(scanner rowScanner) (Account, bool, error) {
+	var rawID []byte
+	var rawProvider, home, label string
+	var revision, createdAt, updatedAt int64
+	if err := scanner.Scan(&rawID, &rawProvider, &home, &label, &revision, &createdAt, &updatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Account{}, false, nil
+		}
+		return Account{}, false, fmt.Errorf("scan account: %w", err)
+	}
+	id, idErr := AccountIDFromBytes(rawID)
+	provider, providerErr := ParseProvider(rawProvider)
+	rev, revisionErr := NewRevision(revision)
+	created, createdErr := NewUnixMillis(createdAt)
+	updated, updatedErr := NewUnixMillis(updatedAt)
+	if idErr != nil || providerErr != nil || revisionErr != nil || createdErr != nil || updatedErr != nil ||
+		validateAccountFields(provider, home, label) != nil || updatedAt < createdAt {
+		return Account{}, false, fmt.Errorf("%w: invalid account row", ErrCorruptState)
+	}
+	return Account{ID: id, Provider: provider, Home: home, Label: label, Revision: rev, CreatedAt: created, UpdatedAt: updated}, true, nil
 }
 
 func taskByID(ctx context.Context, connection *sql.Conn, id TaskID) (Task, bool, error) {

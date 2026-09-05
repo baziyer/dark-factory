@@ -44,7 +44,7 @@ const (
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
   factoryctl project create --name TEXT --root ABSOLUTE
-  factoryctl agent create --project ID --name TEXT --provider shell|claude_code|codex --tool-budget N [--role worker|orchestrator] [--model TEXT] [--reasoning-effort low|medium|high|xhigh|max|ultra]
+  factoryctl agent create --project ID --name TEXT --provider shell|claude_code|codex --tool-budget N [--role worker|orchestrator] [--model TEXT] [--reasoning-effort low|medium|high|xhigh|max|ultra] [--account ID]
   factoryctl task add --project ID --agent ID --title TEXT [--body TEXT] [--priority N]
   factoryctl dispatch on|off
   factoryctl web status
@@ -108,6 +108,7 @@ type attemptCommand struct {
 	provider        string
 	model           string
 	reasoningEffort string
+	account         string
 	title           string
 	body            string
 	toolBudget      uint64
@@ -630,6 +631,8 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 			command.model = value
 		case name == "--reasoning-effort" && command.kind == commandAgentCreate:
 			command.reasoningEffort = value
+		case name == "--account" && command.kind == commandAgentCreate && validHumanRequestKey(value):
+			command.account = value
 		case name == "--tool-budget" && command.kind == commandAgentCreate:
 			budget, err := strconv.ParseUint(value, 10, 64)
 			if err != nil || value != strconv.FormatUint(budget, 10) || budget < 1 || budget > 1_000_000_000 {
@@ -785,7 +788,7 @@ func runOperator(ctx context.Context, command attemptCommand, getenv func(string
 		result, callErr := client.CreateAgent(callContext, api.CreateAgentInput{
 			ID: id, ProjectID: command.project, Name: command.name, Role: command.role,
 			Provider: command.provider, Model: command.model, ReasoningEffort: command.reasoningEffort,
-			ToolBudgetLimit: command.toolBudget,
+			AccountID: command.account, ToolBudgetLimit: command.toolBudget,
 		})
 		if callErr != nil {
 			return writeWebFailure(stderr, "agent create", callErr)

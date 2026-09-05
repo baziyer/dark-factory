@@ -998,7 +998,7 @@ func validateProjects(ctx context.Context, connection *sql.Conn) error {
 }
 
 func validateAgents(ctx context.Context, connection *sql.Conn) error {
-	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms FROM agents`)
+	rows, err := connection.QueryContext(ctx, `SELECT `+agentColumns+` FROM agents`)
 	if err != nil {
 		return err
 	}

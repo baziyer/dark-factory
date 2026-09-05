@@ -11,6 +11,8 @@ import {
   encodeStateWatch,
   encodeTaskEnqueue,
   encodeTerminalTargetGet,
+  type AccountLinkResultBody,
+  type AccountsBody,
   type AgentUpdateBody,
   type AuthResultFrame,
   type ErrorFrame,
@@ -147,6 +149,11 @@ export type TopologyView = Readonly<{ projectId: string; digest: string; sourceR
 /** One agent's live run and the repository directories it has changed. */
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
+type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT"; resolve: (value: never) => void; reject: (error: unknown) => void };
+
+/** One provider login found on the daemon's machine, linked or not. */
+export type DiscoveredAccountView = AccountsBody["accounts"][number];
+export type AccountLinkResult = Readonly<{ accountId: string; revision: bigint }>;
 
 /** One minted remote pairing invitation and the code that carries it. */
 export type RemoteInvite = Readonly<{ link: string; expiresAtMs: bigint; svg: string }>;
@@ -223,6 +230,7 @@ export class BrowserSession {
   #taskPending = new Map<string, TaskPending>();
   #consolePending = new Map<string, ConsolePending>();
   #invitePending = new Map<string, InvitePending>();
+  #accountPending = new Map<string, AccountPending>();
   #humanDetails = new WeakSet<HumanRequestDetail>();
   #humanCancelRuns = new WeakMap<HumanRequestCancelRunDescriptor, { detail: HumanRequestDetail; runId: string }>();
   #generationToken: object = {};
@@ -257,10 +265,11 @@ export class BrowserSession {
   }
 
   /** Edit one agent's configuration. An omitted member is left alone. */
-  updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; paused?: boolean }): Promise<AgentUpdateResult> {
+  updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean }): Promise<AgentUpdateResult> {
     const body: AgentUpdateBody = { agent_id: request.agentId, expected_revision: request.expectedRevision };
     if (request.model !== undefined) body.model = request.model;
     if (request.reasoningEffort !== undefined) body.reasoning_effort = request.reasoningEffort;
+    if (request.accountId !== undefined) body.account_id = request.accountId;
     if (request.paused !== undefined) body.paused = request.paused;
     if (bounded(request.model, MAX_AGENT_MODEL_BYTES) || bounded(request.reasoningEffort, MAX_AGENT_MODEL_BYTES)) return Promise.reject(new SessionError("invalid_request"));
     return this.#consoleRequest("AGENT_UPDATE_RESULT", request.agentId, request.expectedRevision, "agent-update", (id) => encodeClientControl({ type: "AGENT_UPDATE", id, body }));
@@ -289,6 +298,17 @@ export class BrowserSession {
   /** The directories one agent's live run has changed; no run, no paths. */
   getRunPaths(agentId: string): Promise<RunPathsView> {
     return this.#consoleRequest("RUN_PATHS", agentId, 1n, "run-paths", (id) => encodeClientControl({ type: "RUN_PATHS_GET", id, body: { agent_id: agentId } }));
+  }
+
+  /** The provider logins present on the daemon's machine. A linked one
+   * carries the account identity an agent selects; nothing secret is served. */
+  discoverAccounts(): Promise<readonly DiscoveredAccountView[]> {
+    return this.#accountRequest("ACCOUNTS", CAPABILITIES.observe, "accounts", (id) => encodeClientControl({ type: "ACCOUNTS_DISCOVER", id, body: {} }));
+  }
+
+  /** Registers one already-existing login so agents can be pointed at it. */
+  linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<AccountLinkResult> {
+    return this.#accountRequest("ACCOUNT_LINK_RESULT", CAPABILITIES.human_actions, "account-link", (id) => encodeClientControl({ type: "ACCOUNT_LINK", id, body: { provider: request.provider, home: request.home, label: request.label } }));
   }
 
   /** Mints one remote pairing invitation. The mint is never retried: a failed
@@ -424,6 +444,7 @@ export class BrowserSession {
     this.#closeTaskPending(new SessionError("closed"));
     this.#closeConsolePending(new SessionError("closed"));
     this.#closeInvitePending(new SessionError("closed"));
+    this.#closeAccountPending(new SessionError("closed"));
     this.#closeHumanPending(new SessionError("closed"));
     for (const handle of this.#terminalHandles) handle.terminate(new SessionError("closed"));
     this.#terminalHandles.clear();
@@ -598,6 +619,10 @@ export class BrowserSession {
       this.#inviteResult(frame.body, frame.id);
       return;
     }
+    if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT") {
+      this.#accountResult(frame);
+      return;
+    }
     if (terminalControlFrame(frame)) {
       if (frame.type === "TERMINAL_EOF") { if (!this.#anyTerminal((handle) => handle.receiveEOF(frame.id, frame.body))) throw new ProtocolError("malformed"); return; }
       if (frame.type === "TERMINAL_EXIT") { if (!this.#anyTerminal((handle) => handle.receiveExit(frame.id, frame.body))) throw new ProtocolError("malformed"); return; }
@@ -696,6 +721,12 @@ export class BrowserSession {
       if (invite !== undefined) {
         this.#invitePending.delete(id);
         invite.reject(new SessionError(frame.body.code, frame.body.retryable));
+        return;
+      }
+      const account = this.#accountPending.get(id);
+      if (account !== undefined) {
+        this.#accountPending.delete(id);
+        account.reject(new SessionError(frame.body.code, frame.body.retryable));
         return;
       }
     }
@@ -816,6 +847,7 @@ export class BrowserSession {
     this.#closeTaskPending(normalized);
     this.#closeConsolePending(normalized);
     this.#closeInvitePending(normalized);
+    this.#closeAccountPending(normalized);
     this.#closeHumanPending(normalized);
     for (const handle of this.#terminalHandles) handle.terminate(normalized);
     this.#terminalHandles.clear();
@@ -936,6 +968,34 @@ export class BrowserSession {
   #closeInvitePending(error: SessionError | ProtocolError): void {
     for (const pending of this.#invitePending.values()) pending.reject(error);
     this.#invitePending.clear();
+  }
+
+  #closeAccountPending(error: SessionError | ProtocolError): void {
+    for (const pending of this.#accountPending.values()) pending.reject(error);
+    this.#accountPending.clear();
+  }
+
+  /** One shape for the two account request/result pairs. Neither names an
+   * entity, so the request id alone correlates the answer. */
+  #accountRequest<T>(kind: AccountPending["kind"], capability: number, prefix: string, encode: (id: string) => string): Promise<T> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
+    if ((this.#capabilities & capability) === 0) return Promise.reject(new SessionError("unauthorized"));
+    if (this.#accountPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID(prefix);
+    let payload: string;
+    try { payload = encode(id); } catch (error) { return Promise.reject(error); }
+    const result = new Promise<T>((resolve, reject) => this.#accountPending.set(id, { kind, resolve: resolve as (value: never) => void, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
+  }
+
+  #accountResult(frame: Extract<ServerControlFrame, { type: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" }>): void {
+    const pending = this.#accountPending.get(frame.id);
+    if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
+    this.#accountPending.delete(frame.id);
+    if (frame.type === "ACCOUNTS") { pending.resolve(Object.freeze(frame.body.accounts.map((account) => Object.freeze({ ...account }))) as never); return; }
+    pending.resolve(Object.freeze({ accountId: frame.body.account_id, revision: frame.body.revision }) as never);
   }
 
   #inviteResult(body: RemoteInviteResultBody, id: string): void {

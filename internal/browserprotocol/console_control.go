@@ -1,6 +1,9 @@
 package browserprotocol
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // AgentUpdate is the console's bounded agent-configuration edit. Model,
 // ReasoningEffort and Paused are each optional: an absent member leaves the
@@ -10,7 +13,10 @@ type AgentUpdate struct {
 	ExpectedRevision Decimal `json:"expected_revision"`
 	Model            *string `json:"model,omitempty"`
 	ReasoningEffort  *string `json:"reasoning_effort,omitempty"`
-	Paused           *Bool   `json:"paused,omitempty"`
+	// AccountID selects a linked provider login; an empty string clears the
+	// selection back to that provider's default configuration directory.
+	AccountID *string `json:"account_id,omitempty"`
+	Paused    *Bool   `json:"paused,omitempty"`
 }
 
 type AgentUpdateResult struct {
@@ -64,6 +70,42 @@ type RunPaths struct {
 	Paths   []string `json:"paths"`
 }
 
+// AccountsDiscover asks what provider logins exist on this machine. It is an
+// observation of the operator's own home directory, not durable state, so it
+// carries no selector and no revision.
+type AccountsDiscover struct{}
+
+// DiscoveredAccount is one CLI login the daemon found. Identity comes from the
+// login's own files; the tokens that prove it never leave the daemon and have
+// no field here. LinkedID is empty until the operator links it.
+type DiscoveredAccount struct {
+	Provider               string `json:"provider"`
+	Home                   string `json:"home"`
+	Label                  string `json:"label"`
+	Email                  string `json:"email"`
+	Organization           string `json:"organization"`
+	DefaultModel           string `json:"default_model"`
+	DefaultReasoningEffort string `json:"default_reasoning_effort"`
+	LinkedID               string `json:"linked_id"`
+}
+
+type Accounts struct {
+	Accounts []DiscoveredAccount `json:"accounts"`
+}
+
+// AccountLink registers one login that already exists. Starting a new CLI
+// login flow is not part of this message.
+type AccountLink struct {
+	Provider string `json:"provider"`
+	Home     string `json:"home"`
+	Label    string `json:"label"`
+}
+
+type AccountLinkResult struct {
+	AccountID string  `json:"account_id"`
+	Revision  Decimal `json:"revision"`
+}
+
 type TopologyNode struct {
 	ID         string `json:"id"`
 	ParentID   string `json:"parent_id"`
@@ -95,6 +137,18 @@ func EncodeRunPaths(id string, value RunPaths) ([]byte, error) {
 	return encodeControl(TypeRunPaths, id, value)
 }
 
+// EncodeAccounts normalizes an absent list the same way EncodeRunPaths does.
+func EncodeAccounts(id string, value Accounts) ([]byte, error) {
+	if value.Accounts == nil {
+		value.Accounts = []DiscoveredAccount{}
+	}
+	return encodeControl(TypeAccounts, id, value)
+}
+
+func EncodeAccountLinkResult(id string, value AccountLinkResult) ([]byte, error) {
+	return encodeControl(TypeAccountLinkResult, id, value)
+}
+
 func validConsoleControl(kind MessageType, body any) error {
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	switch value := body.(type) {
@@ -114,10 +168,19 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case *RunPaths:
 		return validConsoleControl(kind, *value)
+	case *AccountsDiscover:
+		return validConsoleControl(kind, *value)
+	case *Accounts:
+		return validConsoleControl(kind, *value)
+	case *AccountLink:
+		return validConsoleControl(kind, *value)
+	case *AccountLinkResult:
+		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
 			value.Model != nil && validateBoundedText(*value.Model, 0, MaxAgentModelBytes) != nil ||
-			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil {
+			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil ||
+			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil {
 			return bad()
 		}
 	case AgentUpdateResult:
@@ -167,8 +230,57 @@ func validConsoleControl(kind MessageType, body any) error {
 				return bad()
 			}
 		}
+	case AccountsDiscover:
+	case Accounts:
+		if value.Accounts == nil || len(value.Accounts) > MaxJSONArray {
+			return bad()
+		}
+		for _, account := range value.Accounts {
+			if ValidDiscoveredAccount(account) != nil {
+				return bad()
+			}
+		}
+	case AccountLink:
+		if !validProviderAccount(value.Provider) || validAccountHome(value.Home) != nil ||
+			validateBoundedText(value.Label, 1, MaxAgentNameBytes) != nil {
+			return bad()
+		}
+	case AccountLinkResult:
+		if validateDynamicID(value.AccountID) != nil || value.Revision == 0 {
+			return bad()
+		}
 	default:
 		return bad()
+	}
+	return nil
+}
+
+// ValidDiscoveredAccount is the single rule for one discovered login, shared
+// by the wire and by the daemon's discovery, so a login the wire would refuse
+// is dropped where it is found instead of poisoning the whole answer.
+func ValidDiscoveredAccount(value DiscoveredAccount) error {
+	if !validProviderAccount(value.Provider) || validAccountHome(value.Home) != nil ||
+		validateBoundedText(value.Label, 1, MaxAgentNameBytes) != nil ||
+		validateBoundedText(value.Email, 0, MaxAgentNameBytes) != nil ||
+		validateBoundedText(value.Organization, 0, MaxAgentNameBytes) != nil ||
+		validateBoundedText(value.DefaultModel, 0, MaxAgentModelBytes) != nil ||
+		validateBoundedText(value.DefaultReasoningEffort, 0, MaxAgentModelBytes) != nil ||
+		value.LinkedID != "" && validateDynamicID(value.LinkedID) != nil {
+		return fmt.Errorf("%w: discovered account", ErrMalformed)
+	}
+	return nil
+}
+
+// validProviderAccount closes the account provider set: shell has no logins.
+func validProviderAccount(value string) bool {
+	return value == "claude_code" || value == "codex"
+}
+
+// validAccountHome bounds one absolute configuration directory. It is the same
+// 1024-byte bound the durable accounts table enforces.
+func validAccountHome(value string) error {
+	if validateBoundedText(value, 1, MaxTaskTitleBytes) != nil || value[0] != '/' || strings.ContainsRune(value, 0) {
+		return fmt.Errorf("%w: account home", ErrMalformed)
 	}
 	return nil
 }

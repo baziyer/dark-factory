@@ -22,7 +22,7 @@ func runtimeFixture(t *testing.T, toolPath, accountHome string) RuntimePaths {
 	root := t.TempDir()
 	runtime, err := NewRuntimePaths(
 		root+"/home", root+"/tmp", "/private/tmp/df-provider-test.sock", root+"/attempt.token",
-		"/usr/local/bin/factoryctl", root+"/changes", toolPath, accountHome,
+		"/usr/local/bin/factoryctl", root+"/changes", toolPath, accountHome, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -339,13 +339,13 @@ func TestNewRuntimePathsRejectsMissingAndMalformedValues(t *testing.T) {
 		t.Run(string(rune('a'+index)), func(t *testing.T) {
 			values := append([]string(nil), valid...)
 			values[index] = ""
-			if _, err := NewRuntimePaths(values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]); !errors.Is(err, ErrInvalid) {
+			if _, err := NewRuntimePaths(values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], ""); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("missing index %d error=%v, want ErrInvalid", index, err)
 			}
 		})
 	}
 	for _, toolPath := range []string{"relative:/bin", "/usr/bin::/bin", "/usr/bin:/usr/bin"} {
-		if _, err := NewRuntimePaths(valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], toolPath, valid[7]); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRuntimePaths(valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], toolPath, valid[7], ""); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("tool path %q error=%v, want ErrInvalid", toolPath, err)
 		}
 	}
@@ -363,21 +363,21 @@ func TestNewRuntimePathsRejectsMissingAndMalformedValues(t *testing.T) {
 
 	invalid := append([]string(nil), valid...)
 	invalid[0] = "relative/home"
-	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7]); !errors.Is(err, ErrInvalid) {
+	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7], ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("relative home error=%v, want ErrInvalid", err)
 	}
 	invalid = append([]string(nil), valid...)
 	invalid[2] = "/" + strings.Repeat("s", install.MaxSocketPathBytes)
-	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7]); !errors.Is(err, ErrInvalid) {
+	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7], ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("oversized socket error=%v, want ErrInvalid", err)
 	}
 	invalid = append([]string(nil), valid...)
 	invalid[5] = valid[5] + ":/private/other-ceiling"
-	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7]); !errors.Is(err, ErrInvalid) {
+	if _, err := NewRuntimePaths(invalid[0], invalid[1], invalid[2], invalid[3], invalid[4], invalid[5], invalid[6], invalid[7], ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("multi-ceiling git path error=%v, want ErrInvalid", err)
 	}
 	for _, accountHome := range []string{"relative", "/", valid[0], valid[1]} {
-		if _, err := NewRuntimePaths(valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], valid[6], accountHome); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRuntimePaths(valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], valid[6], accountHome, ""); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("account home %q error=%v, want ErrInvalid", accountHome, err)
 		}
 	}

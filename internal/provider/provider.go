@@ -93,12 +93,17 @@ func (Installation) GoString() string { return "provider.Installation{private}" 
 // This value is never authority by itself.
 type RuntimePaths struct {
 	home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome string
+	// accountConfig is one linked provider login's own configuration
+	// directory. Empty means the provider's default, which is what every
+	// launch used before accounts existed.
+	accountConfig string
 }
 
-func NewRuntimePaths(home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome string) (RuntimePaths, error) {
+func NewRuntimePaths(home, temp, socket, token, factoryctl, gitCeiling, toolPath, accountHome, accountConfig string) (RuntimePaths, error) {
 	runtime := RuntimePaths{
 		home: home, temp: temp, socket: socket, token: token,
 		factoryctl: factoryctl, gitCeiling: gitCeiling, toolPath: toolPath, accountHome: accountHome,
+		accountConfig: accountConfig,
 	}
 	if !runtime.valid() {
 		return RuntimePaths{}, ErrInvalid
@@ -302,7 +307,8 @@ func (runtime RuntimePaths) valid() bool {
 	return len(runtime.socket) <= install.MaxSocketPathBytes && runtime.home != runtime.temp &&
 		validGitCeiling(runtime.gitCeiling) && validToolPath(runtime.toolPath) &&
 		validAbsolute(runtime.accountHome, maxPathBytes-len("/"+codexConfigDir)) &&
-		runtime.accountHome != runtime.home && runtime.accountHome != runtime.temp
+		runtime.accountHome != runtime.home && runtime.accountHome != runtime.temp &&
+		(runtime.accountConfig == "" || validAbsolute(runtime.accountConfig, maxPathBytes))
 }
 
 func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
@@ -318,9 +324,20 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 		"TMPDIR=" + runtime.temp,
 		"PATH=" + runtime.toolPath,
 	}
+	// A run whose agent selects an account points that CLI at the account's
+	// own configuration directory. No account leaves the environment exactly
+	// as it was.
 	switch kind {
 	case kernel.ProviderCodex:
-		environment = append(environment, "CODEX_HOME="+filepath.Join(runtime.accountHome, codexConfigDir))
+		codexHome := filepath.Join(runtime.accountHome, codexConfigDir)
+		if runtime.accountConfig != "" {
+			codexHome = runtime.accountConfig
+		}
+		environment = append(environment, "CODEX_HOME="+codexHome)
+	case kernel.ProviderClaudeCode:
+		if runtime.accountConfig != "" {
+			environment = append(environment, "CLAUDE_CONFIG_DIR="+runtime.accountConfig)
+		}
 	}
 	return append(environment,
 		"LANG=C",

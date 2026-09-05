@@ -124,6 +124,19 @@ type AgentItem struct {
 	Model           string  `json:"model"`
 	ReasoningEffort string  `json:"reasoning_effort"`
 	Revision        Decimal `json:"revision"`
+	// AccountID is the linked provider login this agent launches with. Empty
+	// means the provider's own default configuration directory.
+	AccountID string `json:"account_id"`
+}
+
+// AccountItem is one linked provider login. Only which login it is and where
+// its configuration directory lives; nothing that proves it.
+type AccountItem struct {
+	ID       string  `json:"id"`
+	Provider string  `json:"provider"`
+	Home     string  `json:"home"`
+	Label    string  `json:"label"`
+	Revision Decimal `json:"revision"`
 }
 
 type TaskItem struct {
@@ -162,6 +175,7 @@ type StateSnapshot struct {
 	Agents        []AgentItem        `json:"agents"`
 	Tasks         []TaskItem         `json:"tasks"`
 	HumanRequests []HumanRequestItem `json:"human_requests"`
+	Accounts      []AccountItem      `json:"accounts"`
 }
 
 // StateWatch asks to be told when durable state moves past AfterHead. The
@@ -237,6 +251,17 @@ func validateAgentItem(value AgentItem) error {
 	if validateBoundedText(value.Model, 0, MaxAgentModelBytes) != nil || validateBoundedText(value.ReasoningEffort, 0, MaxAgentModelBytes) != nil {
 		return fmt.Errorf("%w: agent launch controls", ErrMalformed)
 	}
+	if value.AccountID != "" && (validateDynamicID(value.AccountID) != nil || value.Provider == "shell") {
+		return fmt.Errorf("%w: agent account", ErrMalformed)
+	}
+	return nil
+}
+
+func validateAccountItem(value AccountItem) error {
+	if validateDynamicID(value.ID) != nil || !validProviderAccount(value.Provider) ||
+		validAccountHome(value.Home) != nil || validateBoundedText(value.Label, 1, MaxAgentNameBytes) != nil || value.Revision == 0 {
+		return fmt.Errorf("%w: account item", ErrMalformed)
+	}
 	return nil
 }
 
@@ -272,7 +297,7 @@ func validateStateSnapshot(value StateSnapshot) error {
 	if err := validateFactoryItem(value.Factory); err != nil {
 		return err
 	}
-	total := 1 + len(value.Projects) + len(value.Agents) + len(value.Tasks) + len(value.HumanRequests)
+	total := 1 + len(value.Projects) + len(value.Agents) + len(value.Tasks) + len(value.HumanRequests) + len(value.Accounts)
 	if total > MaxSnapshotEntities {
 		return fmt.Errorf("%w: snapshot entity count", ErrMalformed)
 	}
@@ -314,6 +339,14 @@ func validateStateSnapshot(value StateSnapshot) error {
 			return err
 		}
 		if err := claim("human_request:", item.ID); err != nil {
+			return err
+		}
+	}
+	for _, item := range value.Accounts {
+		if err := validateAccountItem(item); err != nil {
+			return err
+		}
+		if err := claim("account:", item.ID); err != nil {
 			return err
 		}
 	}

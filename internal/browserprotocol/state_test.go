@@ -436,7 +436,7 @@ func TestAgentItemServesExactlyThePublicFields(t *testing.T) {
 	for _, field := range fields {
 		actual = append(actual, field.Tag.Get("json"))
 	}
-	want := []string{"id", "project_id", "name", "role", "provider", "paused", "model", "reasoning_effort", "revision"}
+	want := []string{"id", "project_id", "name", "role", "provider", "paused", "model", "reasoning_effort", "revision", "account_id"}
 	if !reflect.DeepEqual(actual, want) {
 		t.Fatalf("public AgentItem fields drifted: got %v want %v", actual, want)
 	}

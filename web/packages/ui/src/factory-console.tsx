@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { AgentItem, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor, StageMeter } from "./console-screens.js";
-import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type TaskEdit } from "./console-sidebar.js";
+import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type DiscoveredAccount, type TaskEdit } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
 
@@ -30,6 +30,8 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onCloseHumanRequest?: () => void;
   onInviteRemote?: () => void;
   onDismissRemoteInvite?: () => void;
+  onLoadAccounts?: () => void;
+  onLinkAccount?: (login: DiscoveredAccount, label: string) => void;
   /** The loopback address this console is served from. */
   address?: string;
   /** Overrides the pairing surface the settings modal mounts by default. */
@@ -98,6 +100,11 @@ export function FactoryConsole({
   remoteInviteError,
   onInviteRemote,
   onDismissRemoteInvite,
+  accounts,
+  accountsPending,
+  accountsError,
+  onLoadAccounts,
+  onLinkAccount,
   address = BROWSER_HOST,
   pairing,
   instructionContent,
@@ -210,6 +217,11 @@ export function FactoryConsole({
         <SettingsDialog
           state={state}
           address={address}
+          accounts={accounts}
+          accountsPending={accountsPending}
+          accountsError={accountsError}
+          onLoadAccounts={onLoadAccounts}
+          onLinkAccount={onLinkAccount}
           pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
             <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
           ))}

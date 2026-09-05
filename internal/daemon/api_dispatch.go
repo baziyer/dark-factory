@@ -290,6 +290,16 @@ func (daemon *Daemon) createAgent(ctx context.Context, call api.Call) api.Reply 
 	if err != nil {
 		return newErrorReply(api.RemoteInvalidRequest)
 	}
+	var accountID kernel.AccountID
+	if input.AccountID != "" {
+		decoded, decodeErr := parseID(input.AccountID)
+		if decodeErr != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		if accountID, err = kernel.AccountIDFromBytes(decoded); err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+	}
 	at, err := daemon.timestamp()
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
@@ -299,6 +309,7 @@ func (daemon *Daemon) createAgent(ctx context.Context, call api.Call) api.Reply 
 		Provider:        provider,
 		Model:           input.Model,
 		ReasoningEffort: input.ReasoningEffort,
+		AccountID:       accountID,
 		ToolBudgetLimit: input.ToolBudgetLimit,
 	}, at)
 	if err != nil {

@@ -221,6 +221,9 @@ type CreateAgentInput struct {
 	Provider        string `json:"provider"`
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// AccountID selects one linked provider login. Empty means the provider's
+	// default configuration directory.
+	AccountID       string `json:"account_id,omitempty"`
 	ToolBudgetLimit uint64 `json:"tool_budget_limit"`
 }
 
@@ -231,6 +234,7 @@ func validCreateAgentInput(input CreateAgentInput) bool {
 	}
 	return validID(input.ID) && validID(input.ProjectID) && validText(input.Name, 1, 128) &&
 		(input.Role == "worker" || input.Role == "orchestrator") &&
+		(input.AccountID == "" || validID(input.AccountID) && provider != kernel.ProviderShell) &&
 		kernel.ValidateProviderLaunchControls(provider, input.Model, input.ReasoningEffort) == nil &&
 		input.ToolBudgetLimit >= 1 && input.ToolBudgetLimit <= 1_000_000_000
 }

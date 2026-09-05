@@ -10,7 +10,10 @@ import (
 type AgentPatch struct {
 	Model           *string
 	ReasoningEffort *string
-	Paused          *bool
+	// AccountID selects a linked provider login; the zero identity clears the
+	// selection back to the provider's default configuration directory.
+	AccountID *AccountID
+	Paused    *bool
 }
 
 // TaskPatch is the console's queue edit. A nil member leaves the durable
@@ -51,6 +54,12 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 	if patch.ReasoningEffort != nil {
 		agent.ReasoningEffort = *patch.ReasoningEffort
 	}
+	if patch.AccountID != nil {
+		agent.AccountID = *patch.AccountID
+		if err := requireAccountForProvider(ctx, tx.connection, agent.Provider, agent.AccountID); err != nil {
+			return Agent{}, tx.Rollback(err)
+		}
+	}
 	if patch.Paused != nil {
 		agent.Paused = *patch.Paused
 	}
@@ -64,8 +73,8 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 	} else if err := validateStoredProviderControls(agent.Provider, agent.Model, agent.ReasoningEffort); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}
-	result, err := tx.connection.ExecContext(ctx, `UPDATE agents SET model = ?, reasoning_effort = ?, paused = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
-		nullableString(agent.Model), nullableString(agent.ReasoningEffort), boolInt(agent.Paused), at.Int64(), id.Bytes(), expected.Int64())
+	result, err := tx.connection.ExecContext(ctx, `UPDATE agents SET model = ?, reasoning_effort = ?, account_id = ?, paused = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
+		nullableString(agent.Model), nullableString(agent.ReasoningEffort), nullableID(agent.AccountID), boolInt(agent.Paused), at.Int64(), id.Bytes(), expected.Int64())
 	if err := requireOneRow(result, err); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}

@@ -696,15 +696,16 @@
 /* SETTINGS is a modal over the console, not a panel that squeezes it. */
 .dfConsoleDialog {
   width: min(34rem, 100%);
-  max-height: calc(100svh - 4rem);
   padding: 0;
-  overflow: auto;
   color: var(--df-console-text);
   background: transparent;
   border: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* The panel scrolls, not the dialog: a scrollbar drag or a selection that
+   ends outside the panel must not read as a backdrop click. */
+.dfConsoleDialog .dfConsoleSidebar__panel { max-height: calc(100svh - 4rem); overflow: auto; }
 .dfConsoleDialog::backdrop { background: rgb(7 10 9 / 0.8); }
 .dfConsoleDialog :where(h1, h2, h3, p, dl, ul) { margin: 0; }
 .dfConsoleDialog .dfFactoryConsole__section { margin: 0; }

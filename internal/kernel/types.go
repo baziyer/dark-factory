@@ -46,6 +46,7 @@ func (id identifier) String() string { return hex.EncodeToString(id.b[:]) }
 
 type ProjectID struct{ identifier }
 type AgentID struct{ identifier }
+type AccountID struct{ identifier }
 type TaskID struct{ identifier }
 type IncarnationID struct{ identifier }
 type ChangeID struct{ identifier }
@@ -66,6 +67,11 @@ func ProjectIDFromBytes(value []byte) (ProjectID, error) {
 func AgentIDFromBytes(value []byte) (AgentID, error) {
 	id, err := identifierFromBytes(value)
 	return AgentID{id}, err
+}
+
+func AccountIDFromBytes(value []byte) (AccountID, error) {
+	id, err := identifierFromBytes(value)
+	return AccountID{id}, err
 }
 
 func TaskIDFromBytes(value []byte) (TaskID, error) {
@@ -119,6 +125,7 @@ func HumanRequestDeliveryIDFromBytes(value []byte) (HumanRequestDeliveryID, erro
 
 func (id ProjectID) Bytes() []byte              { return id.bytes() }
 func (id AgentID) Bytes() []byte                { return id.bytes() }
+func (id AccountID) Bytes() []byte              { return id.bytes() }
 func (id TaskID) Bytes() []byte                 { return id.bytes() }
 func (id IncarnationID) Bytes() []byte          { return id.bytes() }
 func (id ChangeID) Bytes() []byte               { return id.bytes() }
@@ -373,6 +380,7 @@ const (
 	EntityChange
 	EntityRun
 	EntityHumanRequest
+	EntityAccount
 )
 
 func parseEntityKind(value string) (EntityKind, error) {
@@ -391,6 +399,8 @@ func parseEntityKind(value string) (EntityKind, error) {
 		return EntityRun, nil
 	case "human_request":
 		return EntityHumanRequest, nil
+	case "account":
+		return EntityAccount, nil
 	default:
 		return 0, corruptControl("entity kind", value)
 	}
@@ -412,6 +422,8 @@ func (value EntityKind) String() string {
 		return "run"
 	case EntityHumanRequest:
 		return "human_request"
+	case EntityAccount:
+		return "account"
 	default:
 		return ""
 	}
@@ -451,7 +463,31 @@ type NewAgent struct {
 	Provider        Provider
 	Model           string
 	ReasoningEffort string
+	// AccountID selects one linked provider login. The zero identity means
+	// the provider's own default configuration directory, which is what every
+	// agent created before accounts existed keeps using.
+	AccountID       AccountID
 	ToolBudgetLimit uint64
+}
+
+// NewAccount registers one CLI login that already exists on this machine.
+// Home is that CLI's own configuration directory: CLAUDE_CONFIG_DIR for
+// claude_code, CODEX_HOME for codex. Nothing secret is durable here.
+type NewAccount struct {
+	ID       AccountID
+	Provider Provider
+	Home     string
+	Label    string
+}
+
+type Account struct {
+	ID        AccountID
+	Provider  Provider
+	Home      string
+	Label     string
+	Revision  Revision
+	CreatedAt UnixMillis
+	UpdatedAt UnixMillis
 }
 
 type NewTask struct {
@@ -492,6 +528,7 @@ type Agent struct {
 	Provider        Provider
 	Model           string
 	ReasoningEffort string
+	AccountID       AccountID
 	Paused          bool
 	ToolBudgetLimit uint64
 	ToolCallsUsed   uint64
@@ -542,7 +579,20 @@ type AgentSummary struct {
 	// on 5 September 2026: the console displays and edits them.
 	Model           string
 	ReasoningEffort string
-	Revision        Revision
+	// AccountID is the linked provider login this agent launches with; the
+	// zero identity means the provider default.
+	AccountID AccountID
+	Revision  Revision
+}
+
+// AccountSummary is the served account fact: which login it is and where its
+// configuration directory lives. Tokens have no field here.
+type AccountSummary struct {
+	ID       AccountID
+	Provider string
+	Home     string
+	Label    string
+	Revision Revision
 }
 
 type TaskSummary struct {

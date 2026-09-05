@@ -18,6 +18,7 @@ type consoleDispatchBackend struct {
 	agent    browserprotocol.AgentUpdateResult
 	task     browserprotocol.TaskUpdateResult
 	topology browserprotocol.Topology
+	account  browserprotocol.AccountLinkResult
 	err      error
 	calls    int
 }
@@ -28,6 +29,7 @@ func newConsoleDispatchBackend() *consoleDispatchBackend {
 	backend := &consoleDispatchBackend{fakeBackend: base}
 	backend.agent = browserprotocol.AgentUpdateResult{AgentID: consoleAgentID, Revision: 8}
 	backend.task = browserprotocol.TaskUpdateResult{TaskID: consoleTaskID, Revision: 4}
+	backend.account = browserprotocol.AccountLinkResult{AccountID: consoleAccountID, Revision: 1}
 	backend.topology = browserprotocol.Topology{
 		ProjectID: consoleProjectID, Digest: strings.Repeat("ab", 32),
 		Nodes: []browserprotocol.TopologyNode{{ID: strings.Repeat("a1", 32), Kind: "repository", Path: ".", Label: "repository", SizeBucket: "small"}},
@@ -77,10 +79,27 @@ func (backend *consoleDispatchBackend) RunPaths(_ context.Context, client [brows
 	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
 }
 
+func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.Accounts{}, err
+	}
+	return browserprotocol.Accounts{Accounts: []browserprotocol.DiscoveredAccount{
+		{Provider: "codex", Home: "/Users/operator/.codex", Label: ".codex"},
+	}}, nil
+}
+
+func (backend *consoleDispatchBackend) LinkAccount(_ context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.AccountLinkResult{}, err
+	}
+	return backend.account, nil
+}
+
 const (
 	consoleAgentID   = "606162636465666768696a6b6c6d6e6f"
 	consoleTaskID    = "404142434445464748494a4b4c4d4e4f"
 	consoleProjectID = "505152535455565758595a5b5c5d5e5f"
+	consoleAccountID = "707172737475767778797a7b7c7d7e7f"
 )
 
 // The console requests as a browser sends them. Only the server direction has
@@ -97,6 +116,10 @@ var consoleRequests = []struct {
 		`{"type":"TOPOLOGY_GET","id":"console-topology","body":{"project_id":"` + consoleProjectID + `"}}`},
 	{browserprotocol.TypeRunPathsGet, browserprotocol.TypeRunPaths,
 		`{"type":"RUN_PATHS_GET","id":"console-rooms","body":{"agent_id":"` + consoleAgentID + `"}}`},
+	{browserprotocol.TypeAccountsDiscover, browserprotocol.TypeAccounts,
+		`{"type":"ACCOUNTS_DISCOVER","id":"console-accounts","body":{}}`},
+	{browserprotocol.TypeAccountLink, browserprotocol.TypeAccountLinkResult,
+		`{"type":"ACCOUNT_LINK","id":"console-account-link","body":{"provider":"codex","home":"/Users/operator/.codex","label":"codex"}}`},
 }
 
 func TestConsoleControlDispatchesAndCorrelatesExactResults(t *testing.T) {
