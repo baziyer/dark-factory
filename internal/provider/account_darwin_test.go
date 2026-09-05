@@ -93,3 +93,44 @@ func namesOnly(environment []string) []string {
 	slices.Sort(names)
 	return names
 }
+
+// The default Claude directory is the one the CLI already reaches through
+// HOME, and its OAuth account lives beside it in $HOME rather than inside it.
+// Naming it in CLAUDE_CONFIG_DIR would point the CLI at the flags-only file it
+// does contain, so selecting it must launch exactly the unnamed environment.
+func TestDefaultClaudeAccountIsNeverNamedInTheEnvironment(t *testing.T) {
+	root := t.TempDir()
+	accountHome := filepath.Join(t.TempDir(), "account")
+	build := func(accountConfig string) RuntimePaths {
+		runtime, err := NewRuntimePaths(
+			root+"/home", root+"/tmp", "/private/tmp/df-default-account.sock", root+"/attempt.token",
+			"/usr/local/bin/factoryctl", root+"/changes", "/usr/bin:/bin", accountHome, accountConfig,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runtime
+	}
+	none := build("").environment(kernel.ProviderClaudeCode)
+	def := build(filepath.Join(accountHome, ConfigDirName(kernel.ProviderClaudeCode))).environment(kernel.ProviderClaudeCode)
+	if !slices.Equal(none, def) {
+		t.Fatalf("default account changed the launch environment:\n none=%q\n default=%q", none, def)
+	}
+	if slices.ContainsFunc(def, func(entry string) bool { return strings.HasPrefix(entry, "CLAUDE_CONFIG_DIR=") }) {
+		t.Fatalf("default account named a config directory: %q", def)
+	}
+
+	// A directory beside it is a different login and must be named.
+	sibling := accountHome + "/.claude-work"
+	chosen := build(sibling).environment(kernel.ProviderClaudeCode)
+	if !slices.Contains(chosen, "CLAUDE_CONFIG_DIR="+sibling) {
+		t.Fatalf("sibling account was not named: %q", chosen)
+	}
+
+	// Codex has no such split: its default directory is exactly what CODEX_HOME
+	// already says, so naming it is the same environment either way.
+	codexDefault := filepath.Join(accountHome, ConfigDirName(kernel.ProviderCodex))
+	if !slices.Equal(build("").environment(kernel.ProviderCodex), build(codexDefault).environment(kernel.ProviderCodex)) {
+		t.Fatal("codex default account changed the launch environment")
+	}
+}

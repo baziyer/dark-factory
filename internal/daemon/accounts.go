@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/install"
@@ -73,33 +74,28 @@ func (daemon *Daemon) discoverAccounts(home string) []browserprotocol.Discovered
 	return result
 }
 
+// claudeIdentityPath is the file that carries one Claude login's OAuth
+// account. The default directory's is beside it in $HOME, because that
+// directory holds only local flags; a directory made by running the CLI with
+// CLAUDE_CONFIG_DIR set carries its own. There is deliberately no fallback
+// between them: a sibling login that reads $HOME's account would report the
+// default login's identity under its own directory.
+func claudeIdentityPath(home, directory string) string {
+	if directory == filepath.Join(home, provider.ConfigDirName(kernel.ProviderClaudeCode)) {
+		return filepath.Join(home, ".claude.json")
+	}
+	return filepath.Join(directory, ".claude.json")
+}
+
 func (daemon *Daemon) describeAccount(kind kernel.Provider, home, directory, name string) (browserprotocol.DiscoveredAccount, bool) {
-	account := browserprotocol.DiscoveredAccount{Provider: kind.String(), Home: directory, Label: name}
+	account := browserprotocol.DiscoveredAccount{Provider: kind.String(), Home: directory, Label: boundedLabel(name)}
 	switch kind {
 	case kernel.ProviderClaudeCode:
-		// The default ~/.claude keeps its identity beside itself in
-		// ~/.claude.json; a second config directory carries its own copy.
-		// The file that proves the login is not always the file that names
-		// it -- ~/.claude/.claude.json can hold only local flags -- so read
-		// every candidate until one carries an account.
-		candidates := []string{filepath.Join(directory, ".claude.json")}
-		if directory == filepath.Join(home, ".claude") {
-			candidates = append(candidates, filepath.Join(home, ".claude.json"))
-		}
-		login := false
-		for _, candidate := range candidates {
-			if _, err := os.Stat(candidate); err != nil {
-				continue
-			}
-			login = true
-			if email, organization := claudeIdentity(candidate); email != "" {
-				account.Email, account.Organization = email, organization
-				break
-			}
-		}
-		if !login {
+		identity := claudeIdentityPath(home, directory)
+		if _, err := os.Stat(identity); err != nil {
 			return browserprotocol.DiscoveredAccount{}, false
 		}
+		account.Email, account.Organization = claudeIdentity(identity)
 	case kernel.ProviderCodex:
 		email, ok := codexIdentity(filepath.Join(directory, "auth.json"))
 		if !ok {
@@ -112,18 +108,45 @@ func (daemon *Daemon) describeAccount(kind kernel.Provider, home, directory, nam
 	// The same reader the console's effective model uses, so a login's listed
 	// default is exactly what an agent assigned to it would be shown.
 	account.DefaultModel, account.DefaultReasoningEffort, _ = daemon.providerDefaults(kind.String(), directory)
+	// A login is not hidden because something it says about itself is too
+	// long for the wire. Only the display field is dropped; the directory is
+	// the login's identity, so an unusable one is the one thing that is fatal.
+	account.Email = displayField(account.Email, browserprotocol.MaxAgentNameBytes)
+	account.Organization = displayField(account.Organization, browserprotocol.MaxAgentNameBytes)
+	account.DefaultModel = displayField(account.DefaultModel, browserprotocol.MaxAgentModelBytes)
+	account.DefaultReasoningEffort = displayField(account.DefaultReasoningEffort, browserprotocol.MaxAgentModelBytes)
 	if browserprotocol.ValidDiscoveredAccount(account) != nil {
 		return browserprotocol.DiscoveredAccount{}, false
 	}
 	return account, true
 }
 
+// displayField keeps a fact the operator only reads, or nothing. It never
+// truncates: half an e-mail address is a worse answer than none.
+func displayField(value string, limit int) string {
+	if len(value) > limit || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
+		return ""
+	}
+	return value
+}
+
+// boundedLabel trims a directory name to the wire's label bound on a rune
+// boundary. The label is the operator's to rename at link time, so a long
+// directory name costs a shortened suggestion, never the login itself.
+func boundedLabel(name string) string {
+	for len(name) > browserprotocol.MaxAgentNameBytes {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	return name
+}
+
 // readJSONFile is deliberately bounded: a login file that is not a small JSON
 // object is simply an account whose identity is unknown, never an error that
 // hides the other logins on the machine.
 func readJSONFile(path string) map[string]json.RawMessage {
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) > 1<<22 {
+	data, err := readBoundedFile(path)
+	if err != nil {
 		return nil
 	}
 	var object map[string]json.RawMessage

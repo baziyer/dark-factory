@@ -76,29 +76,79 @@ func TestDiscoverAccountsReadsLoginsAndNeverTokens(t *testing.T) {
 	}
 }
 
-// A directory named like a login but holding no credential file is not one,
-// and a second Claude config directory must carry its own identity.
-func TestDiscoverAccountsRequiresTheLoginFile(t *testing.T) {
+// The file that carries a Claude login's account is not the same file for the
+// default directory and for a sibling, and neither may borrow the other's: a
+// sibling that read $HOME's account would report the default login's identity.
+func TestClaudeIdentityIsPerDirectoryWithNoFallback(t *testing.T) {
 	home := t.TempDir()
+	for _, name := range []string{".claude", ".claude-work"} {
+		if err := os.MkdirAll(filepath.Join(home, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No account file anywhere: neither directory is a login.
+	if found := discoveryDaemon().discoverAccounts(home); len(found) != 0 {
+		t.Fatalf("logins without an account file discovered: %+v", found)
+	}
+
+	// $HOME's account names the default directory only. The sibling is not a
+	// login at all, and certainly does not inherit that identity.
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"default@example.com"}}`)
+	found := discoveryDaemon().discoverAccounts(home)
+	if len(found) != 1 || found[0].Home != filepath.Join(home, ".claude") || found[0].Email != "default@example.com" {
+		t.Fatalf("default login = %+v", found)
+	}
+
+	// The default directory's own file holds local flags, and is never read
+	// for identity: adding one must not change the answer above.
+	writeFile(t, filepath.Join(home, ".claude", ".claude.json"), `{"firstStartTime":"2026-01-01"}`)
+	if again := discoveryDaemon().discoverAccounts(home); len(again) != 1 || again[0].Email != "default@example.com" {
+		t.Fatalf("default login after local flags = %+v", again)
+	}
+
+	// A sibling becomes a login when it carries its own account, and reports
+	// that one rather than $HOME's.
+	writeFile(t, filepath.Join(home, ".claude-work", ".claude.json"), `{"oauthAccount":{"emailAddress":"work@example.com"}}`)
+	found = discoveryDaemon().discoverAccounts(home)
+	if len(found) != 2 || found[0].Email != "default@example.com" || found[1].Email != "work@example.com" {
+		t.Fatalf("both claude logins = %+v", found)
+	}
+}
+
+// A login is not hidden because something it says about itself is too long for
+// the wire: the display field is dropped and the login stays linkable.
+func TestOversizedIdentityKeepsTheLoginDiscoverable(t *testing.T) {
+	home := t.TempDir()
+	long := strings.Repeat("x", 200)
+	writeFile(t, filepath.Join(home, ".codex", "auth.json"), `{"tokens":{"account_id":"acct-1","id_token":"`+fakeIDToken(`{"email":"`+long+`@example.com"}`)+`"}}`)
+	writeFile(t, filepath.Join(home, ".codex", "config.toml"), "model = \""+long+"\"\n")
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"operator@example.com","organizationName":"`+long+`"}}`)
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(home, ".claude-work"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if found := discoveryDaemon().discoverAccounts(home); len(found) != 0 {
-		t.Fatalf("logins without credentials discovered: %+v", found)
-	}
-	// The default directory borrows the home-level identity file.
-	writeFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"emailAddress":"operator@example.com"}}`)
 	found := discoveryDaemon().discoverAccounts(home)
-	if len(found) != 1 || found[0].Home != filepath.Join(home, ".claude") {
-		t.Fatalf("default claude login = %+v", found)
+	if len(found) != 2 {
+		t.Fatalf("oversized identity dropped a login: %+v", found)
 	}
-	// A second directory needs its own.
-	writeFile(t, filepath.Join(home, ".claude-work", ".claude.json"), `{"oauthAccount":{"emailAddress":"work@example.com"}}`)
-	found = discoveryDaemon().discoverAccounts(home)
-	if len(found) != 2 || found[1].Email != "work@example.com" {
-		t.Fatalf("second claude login = %+v", found)
+	claude, codex := found[0], found[1]
+	if claude.Provider != "claude_code" || claude.Email != "operator@example.com" || claude.Organization != "" {
+		t.Fatalf("claude login = %+v", claude)
 	}
+	if codex.Provider != "codex" || codex.Email != "" || codex.DefaultModel != "" || codex.Home == "" {
+		t.Fatalf("codex login = %+v", codex)
+	}
+
+	// A directory name too long to be a label is shortened, not dropped.
+	name := "." + strings.Repeat("codex", 40)
+	writeFile(t, filepath.Join(home, name, "auth.json"), `{"tokens":{"account_id":"acct-2","id_token":"`+fakeIDToken(`{"email":"two@example.com"}`)+`"}}`)
+	for _, account := range discoveryDaemon().discoverAccounts(home) {
+		if account.Home != filepath.Join(home, name) {
+			continue
+		}
+		if len(account.Label) != 128 || !strings.HasPrefix(name, account.Label) {
+			t.Fatalf("long directory label = %q (%d bytes)", account.Label, len(account.Label))
+		}
+		return
+	}
+	t.Fatal("a long directory name dropped its login")
 }

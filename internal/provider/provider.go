@@ -327,6 +327,16 @@ func (runtime RuntimePaths) valid() bool {
 		(runtime.accountConfig == "" || validAbsolute(runtime.accountConfig, maxPathBytes))
 }
 
+// defaultConfigDir is the configuration directory a provider CLI reaches on
+// its own under this account home, with nothing named in the environment.
+func (runtime RuntimePaths) defaultConfigDir(kind kernel.Provider) string {
+	name := ConfigDirName(kind)
+	if name == "" {
+		return ""
+	}
+	return filepath.Join(runtime.accountHome, name)
+}
+
 func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 	home := runtime.home
 	if kind == kernel.ProviderClaudeCode {
@@ -351,7 +361,12 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 		}
 		environment = append(environment, "CODEX_HOME="+codexHome)
 	case kernel.ProviderClaudeCode:
-		if runtime.accountConfig != "" {
+		// Only a directory beside the default one is named. The default is
+		// what the CLI already reaches through HOME, and its OAuth account
+		// lives in $HOME/.claude.json rather than inside it, so naming it
+		// would point the CLI at the flags-only file it does contain and
+		// launch the run with no login at all.
+		if runtime.accountConfig != "" && runtime.accountConfig != runtime.defaultConfigDir(kind) {
 			environment = append(environment, "CLAUDE_CONFIG_DIR="+runtime.accountConfig)
 		}
 	}

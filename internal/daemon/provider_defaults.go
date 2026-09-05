@@ -124,15 +124,18 @@ func (daemon *Daemon) freshProviderDefault(account providerAccount, now time.Tim
 // home, but a browser request is what triggers reading them.
 const maxProviderConfigBytes = 1 << 20
 
-// readBoundedFile refuses anything that is not a small regular file, so an
-// enormous or non-regular path costs a stat rather than a read.
+// readBoundedFile answers only for a regular file that was within the bound
+// when it was measured, so a device, a directory or an enormous file costs a
+// stat instead of a read. A file that grows between the stat and the read is
+// still read whole; the bound is a cost guard on the operator's own home, not
+// a fence against something racing it there.
 func readBoundedFile(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Size() > maxProviderConfigBytes {
-		return nil, fmt.Errorf("provider configuration %q is not a bounded regular file", filepath.Base(path))
+		return nil, fmt.Errorf("provider file %q is not a bounded regular file", filepath.Base(path))
 	}
 	return os.ReadFile(path)
 }
