@@ -54,7 +54,7 @@ func TestRunPathsAnswersForALiveRunAndCachesTheWalk(t *testing.T) {
 	fixture.pair(t)
 	run := adapterRunningRoleRun(t, fixture.store, 0x70, kernel.RoleWorker)
 	changeParent := t.TempDir()
-	fixture.daemon.rememberChangeParent(changeParent)
+	fixture.daemon.rememberSupervisorAccount(changeParent, "")
 	published, found, err := fixture.store.Change(ctx, *run.ChangeID)
 	if err != nil || !found {
 		t.Fatalf("published change: found=%v err=%v", found, err)

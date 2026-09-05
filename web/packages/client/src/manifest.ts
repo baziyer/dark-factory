@@ -28,6 +28,7 @@ export const TERMINAL_LEASE_RENEW_INTERVAL_MS = 10_000;
 export const MAX_TERMINAL_ROWS = 4096;
 export const MAX_TERMINAL_COLS = 4096;
 export const MAX_AGENT_MODEL_BYTES = 128;
+export const MAX_MODEL_SOURCE_BYTES = 1024;
 export const MAX_REMOTE_INVITE_LINK_BYTES = 8192;
 export const MAX_REMOTE_INVITE_SVG_BYTES = 32768;
 
@@ -132,6 +133,7 @@ export const BROWSER_MANIFEST = {
     maxTerminalRows: MAX_TERMINAL_ROWS,
     maxTerminalCols: MAX_TERMINAL_COLS,
     maxAgentModelBytes: MAX_AGENT_MODEL_BYTES,
+    maxModelSourceBytes: MAX_MODEL_SOURCE_BYTES,
     maxRemoteInviteLinkBytes: MAX_REMOTE_INVITE_LINK_BYTES,
     maxRemoteInviteSvgBytes: MAX_REMOTE_INVITE_SVG_BYTES,
   },

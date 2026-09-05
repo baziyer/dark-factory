@@ -64,7 +64,7 @@ export function AgentPanel({
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
       <div className="dfConsoleSidebar__heading">
         <div>
-          <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}</p>
+          <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
           <h2>{agent.name}</h2>
         </div>
         {onClose === undefined ? null : <button type="button" onClick={onClose}>CLOSE</button>}
@@ -109,6 +109,17 @@ export function AgentPanel({
   );
 }
 
+/**
+ * The two inputs hold the agent's OWN override, so empty means inherit and the
+ * placeholder shows what the run will use instead. This says where that came
+ * from, because "inherited" is useless without the file that decided it.
+ */
+function modelSourceCaption(agent: AgentItem): string {
+  if (agent.model_source === "agent") return "set on this agent";
+  if (agent.model_source === "") return "CLI default (not visible to the factory)";
+  return `inherited from ${agent.model_source}`;
+}
+
 function AgentConfig({
   agent,
   pending,
@@ -137,10 +148,15 @@ function AgentConfig({
   return (
     <form className="dfConsoleSidebar__section dfConsoleSidebar__config" aria-label="Agent configuration" onSubmit={submit}>
       <h3>CONFIG</h3>
-      <label htmlFor={`df-model-${agent.id}`}>MODEL</label>
-      <input id={`df-model-${agent.id}`} value={model} disabled={pending} onChange={(event) => setModel(event.currentTarget.value)} />
-      <label htmlFor={`df-effort-${agent.id}`}>REASONING EFFORT</label>
-      <input id={`df-effort-${agent.id}`} value={reasoningEffort} disabled={pending} onChange={(event) => setReasoningEffort(event.currentTarget.value)} />
+      {agent.provider === "shell" ? <p className="dfConsoleSidebar__inherit">shell has no model</p> : (
+        <>
+          <label htmlFor={`df-model-${agent.id}`}>MODEL</label>
+          <input id={`df-model-${agent.id}`} value={model} placeholder={agent.effective_model} disabled={pending} onChange={(event) => setModel(event.currentTarget.value)} />
+          <label htmlFor={`df-effort-${agent.id}`}>REASONING EFFORT</label>
+          <input id={`df-effort-${agent.id}`} value={reasoningEffort} placeholder={agent.effective_reasoning_effort} disabled={pending} onChange={(event) => setReasoningEffort(event.currentTarget.value)} />
+          <p className="dfConsoleSidebar__inherit">{modelSourceCaption(agent)}</p>
+        </>
+      )}
       <label className="dfConsoleSidebar__toggle" htmlFor={`df-paused-${agent.id}`}>
         <input id={`df-paused-${agent.id}`} type="checkbox" checked={paused} disabled={pending} onChange={(event) => setPaused(event.currentTarget.checked)} />
         PAUSED

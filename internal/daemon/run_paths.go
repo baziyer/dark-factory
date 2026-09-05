@@ -105,12 +105,14 @@ func (daemon *Daemon) rememberedRunPaths(runID kernel.RunID, now time.Time) ([]s
 	return entry.paths, ok
 }
 
-// rememberChangeParent records the one changes root the supervisor was given.
-// The daemon does not own the operational home layout and never derives it;
-// this is the same value every run in the process is published under, so the
-// store is a lock-free publication that RunNext never waits on.
-func (daemon *Daemon) rememberChangeParent(parent string) {
+// rememberSupervisorAccount records the one changes root and the one account
+// home the supervisor was given. The daemon does not own the operational home
+// layout and never derives either; these are the same values every run in the
+// process is published under, so the stores are lock-free publications that
+// RunNext never waits on.
+func (daemon *Daemon) rememberSupervisorAccount(parent, accountHome string) {
 	daemon.changeParent.Store(&parent)
+	daemon.accountHome.Store(&accountHome)
 }
 
 // changedDirectories returns the deepest directory of every file modified
