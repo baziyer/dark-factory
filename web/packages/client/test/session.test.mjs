@@ -319,6 +319,20 @@ test("console edits and topology carry exact bodies and correlate their results"
   assert.equal(topology.digest, "ab".repeat(32));
   assert.deepEqual(topology.nodes, [node]);
 
+  // An agent with no live run answers with no run identity and no rooms.
+  const idlePending = session.getRunPaths(agentId);
+  const idleFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(idleFrame.type, "RUN_PATHS_GET");
+  assert.deepEqual(idleFrame.body, { agent_id: agentId });
+  socket.reply(encodeServerControl({ type: "RUN_PATHS", id: idleFrame.id, body: { agent_id: agentId, run_id: "", paths: [] } }));
+  assert.deepEqual(await idlePending, { agentId, runId: "", paths: [] });
+
+  const runId = "7f".repeat(16);
+  const runPathsPending = session.getRunPaths(agentId);
+  const runPathsFrame = decodeClientControl(socket.sent.at(-1));
+  socket.reply(encodeServerControl({ type: "RUN_PATHS", id: runPathsFrame.id, body: { agent_id: agentId, run_id: runId, paths: ["internal/kernel", "web/packages/ui/src"] } }));
+  assert.deepEqual(await runPathsPending, { agentId, runId, paths: ["internal/kernel", "web/packages/ui/src"] });
+
   // A result for another entity is a protocol fault, not a resolution.
   const mismatched = session.updateAgent({ agentId, expectedRevision: 9n, paused: false });
   const mismatchedFrame = decodeClientControl(socket.sent.at(-1));

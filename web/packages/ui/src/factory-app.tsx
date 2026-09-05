@@ -46,6 +46,15 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
     if (view === "floor" && snapshot.status === "ready") owner.current?.loadTopology();
   }, [view, snapshot.status, projectKey]);
 
+  // Where the running agents are working is live, not regenerable: it is polled
+  // for as long as the floor is on screen and stopped the moment it is not.
+  useEffect(() => {
+    if (view !== "floor" || snapshot.status !== "ready") return;
+    const controller = owner.current;
+    controller?.watchRunPaths(true);
+    return () => controller?.watchRunPaths(false);
+  }, [view, snapshot.status]);
+
   const controller = owner.current;
   const agentTerminal = controller === undefined || snapshot.selectedAgent === undefined ? undefined : snapshot.terminal;
   const terminal = agentTerminal === undefined || controller === undefined || !terminalOpen ? undefined : (
