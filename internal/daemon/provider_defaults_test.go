@@ -21,18 +21,29 @@ func writeProviderConfig(t *testing.T, path, content string) {
 	}
 }
 
-func TestProviderDefaultsReadsEachCLIsOwnConfiguration(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("CODEX_HOME", "")
-	claudeSettings := filepath.Join(home, ".claude", "settings.json")
-	codexConfig := filepath.Join(home, ".codex", "config.toml")
+// accountDaemon is a daemon whose supervisor has published accountHome, which
+// is the only thing the resolver may derive a provider config path from.
+func accountDaemon(accountHome string) *Daemon {
+	daemon := &Daemon{now: time.Now}
+	daemon.rememberSupervisorAccount("", accountHome)
+	return daemon
+}
+
+func TestProviderDefaultsReadTheAccountTheSupervisorLaunchesUnder(t *testing.T) {
+	// internal/provider constructs the run environment from this account home
+	// (claude_code gets HOME=<accountHome>, codex gets CODEX_HOME=<it>/.codex),
+	// so an unrelated HOME or CODEX_HOME in this process must change nothing.
+	accountHome := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	claudeSettings := filepath.Join(accountHome, ".claude", "settings.json")
+	codexConfig := filepath.Join(accountHome, ".codex", "config.toml")
 	writeProviderConfig(t, claudeSettings, `{"model":"claude-fable-5-1[1m]","effortLevel":"xhigh"}`)
 	// The profile table below names a different model. Only the top-level
 	// table describes the run the factory will start.
 	writeProviderConfig(t, codexConfig, "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"high\"\n\n[profiles.other]\nmodel = \"gpt-4\"\n")
 
-	daemon := &Daemon{now: time.Now}
+	daemon := accountDaemon(accountHome)
 	for _, want := range []struct{ provider, model, effort, source string }{
 		{"claude_code", "claude-fable-5-1[1m]", "", claudeSettings},
 		{"codex", "gpt-6-astra", "high", codexConfig},
@@ -44,41 +55,63 @@ func TestProviderDefaultsReadsEachCLIsOwnConfiguration(t *testing.T) {
 			t.Fatalf("%s defaults = %q/%q/%q want %q/%q/%q", want.provider, model, effort, source, want.model, want.effort, want.source)
 		}
 	}
+	// Before a supervisor has published an account, there is nothing to read.
+	if model, _, source := (&Daemon{now: time.Now}).providerAccountDefaults("codex"); model != "" || source != "" {
+		t.Fatalf("unpublished account read %q from %q", model, source)
+	}
 }
 
 func TestProviderDefaultsTreatUnreadableConfigurationAsUnknown(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("CODEX_HOME", "")
-	daemon := &Daemon{now: time.Now}
+	// Each case gets its own account home so none can shadow another.
+	for _, unusable := range []struct{ name, provider, file, content string }{
+		{"claude without a model", "claude_code", ".claude/settings.json", `{"statusLine":{"type":"command"}}`},
+		{"claude that is not JSON", "claude_code", ".claude/settings.json", "model = nope"},
+		{"codex model only under a profile", "codex", ".codex/config.toml", "[profiles.only]\nmodel = \"gpt-4\"\n"},
+		{"codex model too large for the wire", "codex", ".codex/config.toml", "model = \"" + strings.Repeat("m", browserprotocol.MaxAgentModelBytes+1) + "\"\n"},
+		{"codex multi-line string", "codex", ".codex/config.toml", "model = \"\"\"gpt-4\"\"\"\n"},
+	} {
+		t.Run(unusable.name, func(t *testing.T) {
+			accountHome := t.TempDir()
+			writeProviderConfig(t, filepath.Join(accountHome, unusable.file), unusable.content)
+			if model, effort, source := accountDaemon(accountHome).providerAccountDefaults(unusable.provider); model != "" || effort != "" || source != "" {
+				t.Fatalf("%s = %q/%q/%q", unusable.name, model, effort, source)
+			}
+		})
+	}
+	// No file at all is the same unknown, not an error.
+	empty := accountDaemon(t.TempDir())
 	for _, provider := range []string{"claude_code", "codex"} {
-		if model, effort, source := daemon.providerAccountDefaults(provider); model != "" || effort != "" || source != "" {
+		if model, effort, source := empty.providerAccountDefaults(provider); model != "" || effort != "" || source != "" {
 			t.Fatalf("%s with no config = %q/%q/%q", provider, model, effort, source)
 		}
 	}
-	// A file that exists but says nothing usable is equally unknown, and a
-	// value too large for the wire is refused rather than truncated.
-	writeProviderConfig(t, filepath.Join(home, ".claude", "settings.json"), `{"statusLine":{"type":"command"}}`)
-	writeProviderConfig(t, filepath.Join(home, ".codex", "config.toml"), "[profiles.only]\nmodel = \"gpt-4\"\n")
-	oversized := t.TempDir()
-	t.Setenv("CODEX_HOME", oversized)
-	writeProviderConfig(t, filepath.Join(oversized, "config.toml"), "model = \""+strings.Repeat("m", browserprotocol.MaxAgentModelBytes+1)+"\"\n")
-	fresh := &Daemon{now: time.Now}
-	for _, provider := range []string{"claude_code", "codex"} {
-		if model, effort, source := fresh.providerAccountDefaults(provider); model != "" || effort != "" || source != "" {
-			t.Fatalf("%s with unusable config = %q/%q/%q", provider, model, effort, source)
-		}
+}
+
+func TestProviderDefaultsServeAnEffortWithoutClaimingAModelSource(t *testing.T) {
+	// model_source names the model. A config that sets only an effort would
+	// otherwise caption an empty model box "inherited from <path>".
+	accountHome := t.TempDir()
+	writeProviderConfig(t, filepath.Join(accountHome, ".codex", "config.toml"), "model_reasoning_effort = \"high\"\n")
+	model, effort, source := accountDaemon(accountHome).providerAccountDefaults("codex")
+	if model != "" || effort != "high" || source != "" {
+		t.Fatalf("effort-only config = %q/%q/%q", model, effort, source)
+	}
+	// A literal string is the other single-line TOML form codex may be edited
+	// into, and reads the same as a basic one.
+	literal := t.TempDir()
+	writeProviderConfig(t, filepath.Join(literal, ".codex", "config.toml"), "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'low'\n")
+	if model, effort, _ := accountDaemon(literal).providerAccountDefaults("codex"); model != "gpt-6-astra" || effort != "low" {
+		t.Fatalf("literal strings = %q/%q", model, effort)
 	}
 }
 
 func TestProviderDefaultsServeTheCachedReadWithinItsWindow(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("CODEX_HOME", "")
-	settings := filepath.Join(home, ".claude", "settings.json")
+	accountHome := t.TempDir()
+	settings := filepath.Join(accountHome, ".claude", "settings.json")
 	writeProviderConfig(t, settings, `{"model":"first"}`)
 	now := time.Now()
 	daemon := &Daemon{now: func() time.Time { return now }}
+	daemon.rememberSupervisorAccount("", accountHome)
 	if model, _, _ := daemon.providerAccountDefaults("claude_code"); model != "first" {
 		t.Fatalf("first read = %q", model)
 	}

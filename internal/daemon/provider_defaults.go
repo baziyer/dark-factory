@@ -33,36 +33,43 @@ type providerDefault struct {
 }
 
 // codexModelLine matches the top-level TOML `model` and `model_reasoning_effort`
-// assignments. Codex writes both as plain double-quoted basic strings, so a line
-// scan reads them without a TOML dependency.
-var codexModelLine = regexp.MustCompile(`^[\t ]*(model|model_reasoning_effort)[\t ]*=[\t ]*"([^"]*)"`)
+// assignments in either single-line string form, basic ("...") or literal
+// ('...'), so a line scan reads them without a TOML dependency. A multi-line
+// string ("""..."""), which codex does not write, reads as empty and so as
+// unknown rather than as a wrong answer.
+var codexModelLine = regexp.MustCompile(`^[\t ]*(model|model_reasoning_effort)[\t ]*=[\t ]*("[^"]*"|'[^']*')`)
 
-// defaultProviderHome is the account directory today's callers read: the one
-// the operator's own CLI uses, since an agent cannot yet name an account of its
-// own. "" means the provider has no configuration to read (shell) or this
-// process cannot resolve its home.
-func defaultProviderHome(provider string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+// providerConfigHome is the directory a provider CLI reads its configuration
+// from, derived from the one account home the supervisor launches every run
+// under. internal/provider constructs that environment rather than forwarding
+// this process's: claude_code is given HOME=<accountHome> and codex is given
+// CODEX_HOME=<accountHome>/.codex, so reading os.UserHomeDir or CODEX_HOME
+// here would name a different account than the run uses.
+func providerConfigHome(provider, accountHome string) string {
+	if accountHome == "" {
 		return ""
 	}
 	switch provider {
 	case "claude_code":
-		return filepath.Join(home, ".claude")
+		return filepath.Join(accountHome, ".claude")
 	case "codex":
-		// The runner forwards CODEX_HOME from this process's environment, so
-		// resolving it here names the file the provider itself will read.
-		if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
-			return codexHome
-		}
-		return filepath.Join(home, ".codex")
+		return filepath.Join(accountHome, ".codex")
 	}
 	return ""
 }
 
-// providerAccountDefaults resolves a provider's default account and reads it.
+// providerAccountDefaults reads the configuration of the account the supervisor
+// will actually launch this provider under. It answers unknown until a
+// supervisor has published one, which RunScheduler does with its first probe.
 func (daemon *Daemon) providerAccountDefaults(provider string) (model, effort, source string) {
-	return daemon.providerDefaults(provider, defaultProviderHome(provider))
+	if daemon == nil {
+		return "", "", ""
+	}
+	accountHome := ""
+	if published := daemon.accountHome.Load(); published != nil {
+		accountHome = *published
+	}
+	return daemon.providerDefaults(provider, providerConfigHome(provider, accountHome))
 }
 
 // providerDefaults reports the model and reasoning effort the provider CLI
@@ -126,14 +133,20 @@ func readProviderDefault(account providerAccount) providerDefault {
 			if match == nil {
 				continue
 			}
+			value := strings.Trim(match[2], `"'`)
 			if match[1] == "model" {
-				result.model = match[2]
+				result.model = value
 			} else {
-				result.effort = match[2]
+				result.effort = value
 			}
 		}
-		if result.model == "" && result.effort == "" {
-			return providerDefault{}
+		if result.model == "" {
+			// model_source names the model. Without one the path would caption
+			// an empty box "inherited from"; an effort beside it is still real.
+			result.source = ""
+			if result.effort == "" {
+				return providerDefault{}
+			}
 		}
 	default:
 		// shell runs no model, and the daemon rejects one for it.

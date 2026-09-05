@@ -47,9 +47,12 @@ type Daemon struct {
 	operationMu sync.Mutex
 
 	// changeParent is the changes root the supervisor was given, published
-	// without a lock so RunNext never waits on a console read. runPathsMu
-	// guards only the map of bounded directory walks, never a walk itself.
+	// without a lock so RunNext never waits on a console read. accountHome is
+	// the account every run launches under, published the same way and for the
+	// same reason. runPathsMu guards only the map of bounded directory walks,
+	// never a walk itself.
 	changeParent atomic.Pointer[string]
+	accountHome  atomic.Pointer[string]
 	runPathsMu   sync.Mutex
 	runPaths     map[kernel.RunID]runPathsResult
 
