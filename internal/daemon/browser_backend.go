@@ -37,6 +37,11 @@ type browserBackend struct {
 
 	clientGates *browserClientGates
 
+	// home answers the operator home discovery reads. Production wires the
+	// account record; a test points it at a directory it owns, because
+	// user.Current() is not something a test can redirect.
+	home func() (string, error)
+
 	inviteMu    sync.Mutex
 	inviteMints [4]time.Time
 	inviteNext  int
@@ -64,7 +69,7 @@ func newBrowserBackend(store *kernel.Store, now func() time.Time, random io.Read
 		return nil, fmt.Errorf("%w: invalid browser backend", kernel.ErrInvalidValue)
 	}
 	backend := &browserBackend{
-		store: store, now: now, random: random,
+		store: store, now: now, random: random, home: operatorHome,
 		clientGates: &browserClientGates{gates: make(map[kernel.BrowserClientID]*browserClientGate)},
 		subs:        make(map[*browserStateWatch]struct{}),
 	}
@@ -556,7 +561,7 @@ func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [
 		return browserprotocol.Accounts{}, err
 	}
 	defer release()
-	home, err := operatorHome()
+	home, err := backend.home()
 	if err != nil {
 		return browserprotocol.Accounts{}, browser.ErrNotFound
 	}
@@ -590,7 +595,7 @@ func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [brows
 	if err != nil {
 		return browserprotocol.AccountLinkResult{}, browser.ErrStale
 	}
-	home, err := operatorHome()
+	home, err := backend.home()
 	if err != nil {
 		return browserprotocol.AccountLinkResult{}, browser.ErrNotFound
 	}

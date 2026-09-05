@@ -99,6 +99,18 @@ func ConfigDirName(kind kernel.Provider) string {
 	return ""
 }
 
+// ConfigHome is the directory a provider CLI reads its configuration from
+// under one account home. It is the one place that join is spelled: the launch
+// environment, the daemon's default reader and its account discovery all ask
+// here, so none of them can name a different directory than a run uses.
+func ConfigHome(kind kernel.Provider, accountHome string) string {
+	name := ConfigDirName(kind)
+	if accountHome == "" || name == "" {
+		return ""
+	}
+	return filepath.Join(accountHome, name)
+}
+
 func (Installation) String() string   { return "provider installation (private)" }
 func (Installation) GoString() string { return "provider.Installation{private}" }
 
@@ -327,16 +339,6 @@ func (runtime RuntimePaths) valid() bool {
 		(runtime.accountConfig == "" || validAbsolute(runtime.accountConfig, maxPathBytes))
 }
 
-// defaultConfigDir is the configuration directory a provider CLI reaches on
-// its own under this account home, with nothing named in the environment.
-func (runtime RuntimePaths) defaultConfigDir(kind kernel.Provider) string {
-	name := ConfigDirName(kind)
-	if name == "" {
-		return ""
-	}
-	return filepath.Join(runtime.accountHome, name)
-}
-
 func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 	home := runtime.home
 	if kind == kernel.ProviderClaudeCode {
@@ -355,7 +357,7 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 	// as it was.
 	switch kind {
 	case kernel.ProviderCodex:
-		codexHome := filepath.Join(runtime.accountHome, ConfigDirName(kind))
+		codexHome := ConfigHome(kind, runtime.accountHome)
 		if runtime.accountConfig != "" {
 			codexHome = runtime.accountConfig
 		}
@@ -366,7 +368,7 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 		// lives in $HOME/.claude.json rather than inside it, so naming it
 		// would point the CLI at the flags-only file it does contain and
 		// launch the run with no login at all.
-		if runtime.accountConfig != "" && runtime.accountConfig != runtime.defaultConfigDir(kind) {
+		if runtime.accountConfig != "" && runtime.accountConfig != ConfigHome(kind, runtime.accountHome) {
 			environment = append(environment, "CLAUDE_CONFIG_DIR="+runtime.accountConfig)
 		}
 	}

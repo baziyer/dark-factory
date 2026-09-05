@@ -99,11 +99,12 @@ func TestClaudeIdentityIsPerDirectoryWithNoFallback(t *testing.T) {
 		t.Fatalf("default login = %+v", found)
 	}
 
-	// The default directory's own file holds local flags, and is never read
-	// for identity: adding one must not change the answer above.
-	writeFile(t, filepath.Join(home, ".claude", ".claude.json"), `{"firstStartTime":"2026-01-01"}`)
+	// The default directory's own file is never read for identity. It carries
+	// a decoy account here so the assertion tells the two readers apart: one
+	// that preferred the inner file would answer with this address instead.
+	writeFile(t, filepath.Join(home, ".claude", ".claude.json"), `{"firstStartTime":"2026-01-01","oauthAccount":{"emailAddress":"inner-decoy@example.com"}}`)
 	if again := discoveryDaemon().discoverAccounts(home); len(again) != 1 || again[0].Email != "default@example.com" {
-		t.Fatalf("default login after local flags = %+v", again)
+		t.Fatalf("default login read the inner file = %+v", again)
 	}
 
 	// A sibling becomes a login when it carries its own account, and reports

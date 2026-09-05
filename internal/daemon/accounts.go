@@ -81,7 +81,7 @@ func (daemon *Daemon) discoverAccounts(home string) []browserprotocol.Discovered
 // between them: a sibling login that reads $HOME's account would report the
 // default login's identity under its own directory.
 func claudeIdentityPath(home, directory string) string {
-	if directory == filepath.Join(home, provider.ConfigDirName(kernel.ProviderClaudeCode)) {
+	if directory == providerConfigHome(kernel.ProviderClaudeCode.String(), home) {
 		return filepath.Join(home, ".claude.json")
 	}
 	return filepath.Join(directory, ".claude.json")
@@ -240,5 +240,7 @@ func (daemon *Daemon) agentAccountConfigDir(ctx context.Context, id kernel.Agent
 }
 
 // operatorHome is the one home directory discovery and linking look in. It is
-// the account record's home, never a caller-supplied environment value.
+// the account record's home, never a caller-supplied environment value: the
+// CLIs are logged in under the account the daemon runs as, not under whatever
+// HOME this process happens to carry.
 func operatorHome() (string, error) { return install.AccountHome() }

@@ -368,3 +368,94 @@ func TestBrowserConsoleAnswersInvalidRequestForARefusedLaunchControl(t *testing.
 		t.Fatalf("agent after refused updates = %+v, found=%v, err=%v", stored, found, err)
 	}
 }
+
+// accountHomeFixture points the adapter at a home it owns and puts one Codex
+// login in it, so discovery answers from the test's own directory rather than
+// the operator's. user.Current() is not redirectable, so the seam is the
+// backend field production wires to the account record.
+func accountHomeFixture(t *testing.T, fixture *consoleFixture) string {
+	t.Helper()
+	home := t.TempDir()
+	writeFile(t, filepath.Join(home, ".codex", "auth.json"), `{"tokens":{"account_id":"acct-1","id_token":"`+fakeIDToken(`{"email":"operator@example.com"}`)+`"}}`)
+	writeFile(t, filepath.Join(home, ".codex", "config.toml"), "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"high\"\n")
+	fixture.backend.home = func() (string, error) { return home, nil }
+	return home
+}
+
+// Linking names a login discovery found, never an arbitrary directory: the
+// browser may say which of this machine's logins to use, not where a provider
+// should go looking for credentials.
+func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions, consoleRoot(t))
+	home := accountHomeFixture(t, fixture)
+	ctx := context.Background()
+	client := rawBrowserClient(fixture.client.ID)
+
+	discovered, err := fixture.backend.DiscoverAccounts(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovered.Accounts) != 1 {
+		t.Fatalf("discovered = %+v", discovered.Accounts)
+	}
+	login := discovered.Accounts[0]
+	if login.Provider != "codex" || login.Home != filepath.Join(home, ".codex") || login.LinkedID != "" || login.DefaultModel != "gpt-6-astra" {
+		t.Fatalf("discovered login = %+v", login)
+	}
+
+	// A directory nobody found is not a login, whatever the browser calls it.
+	for _, absent := range []string{filepath.Join(home, ".codex-absent"), filepath.Join(t.TempDir(), ".codex")} {
+		if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: absent, Label: "elsewhere"}); !errors.Is(err, browser.ErrNotFound) {
+			t.Fatalf("linking %q = %v, want not found", absent, err)
+		}
+	}
+	// Nor is a login of a provider it does not belong to.
+	if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "claude_code", Home: login.Home, Label: "wrong"}); !errors.Is(err, browser.ErrNotFound) {
+		t.Fatalf("cross-provider link = %v", err)
+	}
+	if accounts, err := fixture.store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
+		t.Fatalf("refused links left %d accounts, err=%v", len(accounts), err)
+	}
+
+	// The one it did find links, and the next discovery says so.
+	result, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: login.Home, Label: "dogfood"})
+	if err != nil || result.Revision != 1 {
+		t.Fatalf("link = %+v, %v", result, err)
+	}
+	again, err := fixture.backend.DiscoverAccounts(ctx, client)
+	if err != nil || len(again.Accounts) != 1 {
+		t.Fatalf("second discovery = %+v, %v", again.Accounts, err)
+	}
+	if again.Accounts[0].LinkedID != result.AccountID || again.Accounts[0].Label != "dogfood" {
+		t.Fatalf("linked login = %+v, want id %q", again.Accounts[0], result.AccountID)
+	}
+
+	// Relinking the same directory is the same login, not a second one.
+	repeat, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: login.Home, Label: "other"})
+	if err != nil || repeat.AccountID != result.AccountID {
+		t.Fatalf("relink = %+v, %v", repeat, err)
+	}
+	accounts, err := fixture.store.ListAccounts(ctx)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts after relink = %d, err=%v", len(accounts), err)
+	}
+}
+
+// Seeing which logins exist is observation; linking one is a human action.
+func TestBrowserAccountsGateLinkingOnHumanActions(t *testing.T) {
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve, consoleRoot(t))
+	home := accountHomeFixture(t, fixture)
+	ctx := context.Background()
+	client := rawBrowserClient(fixture.client.ID)
+
+	discovered, err := fixture.backend.DiscoverAccounts(ctx, client)
+	if err != nil || len(discovered.Accounts) != 1 {
+		t.Fatalf("observe-only discovery = %+v, %v", discovered.Accounts, err)
+	}
+	if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: filepath.Join(home, ".codex"), Label: "dogfood"}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("observe-only link = %v", err)
+	}
+	if accounts, err := fixture.store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
+		t.Fatalf("refused link left %d accounts, err=%v", len(accounts), err)
+	}
+}

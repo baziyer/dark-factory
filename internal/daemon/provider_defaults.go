@@ -50,14 +50,10 @@ var codexModelLine = regexp.MustCompile(`^[\t ]*(model|model_reasoning_effort)[\
 // here would name a different account than the run uses.
 func providerConfigHome(kind, accountHome string) string {
 	parsed, err := kernel.ParseProvider(kind)
-	if accountHome == "" || err != nil {
+	if err != nil {
 		return ""
 	}
-	name := provider.ConfigDirName(parsed)
-	if name == "" {
-		return ""
-	}
-	return filepath.Join(accountHome, name)
+	return provider.ConfigHome(parsed, accountHome)
 }
 
 // providerAccountDefaults reads the configuration of the account the supervisor
