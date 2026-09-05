@@ -948,6 +948,13 @@ func adapterWaitSubscription(t *testing.T, subscription browser.StateSubscriptio
 
 func adapterRunningRun(t *testing.T, store *kernel.Store, seed byte) kernel.Run {
 	t.Helper()
+	return adapterRunningRoleRun(t, store, seed, kernel.RoleOrchestrator)
+}
+
+// Only a worker run carries a candidate change, and therefore a published
+// working directory, so the role is a parameter rather than a fixed fact.
+func adapterRunningRoleRun(t *testing.T, store *kernel.Store, seed byte, role kernel.AgentRole) kernel.Run {
+	t.Helper()
 	ctx := context.Background()
 	projectID, _ := kernel.ProjectIDFromBytes(adapterID(t, seed))
 	agentID, _ := kernel.AgentIDFromBytes(adapterID(t, seed+1))
@@ -957,7 +964,7 @@ func adapterRunningRun(t *testing.T, store *kernel.Store, seed byte) kernel.Run 
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: fmt.Sprintf("run-agent-%d", seed), Role: kernel.RoleOrchestrator, Provider: kernel.ProviderCodex, ToolBudgetLimit: 4}, adapterTime(t, 201))
+	agent, err := store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: fmt.Sprintf("run-agent-%d", seed), Role: role, Provider: kernel.ProviderCodex, ToolBudgetLimit: 4}, adapterTime(t, 201))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1009,6 +1016,11 @@ func adapterRunningRun(t *testing.T, store *kernel.Store, seed byte) kernel.Run 
 	session, found, err := store.TerminalSessionForRun(ctx, runID)
 	if err != nil || !found {
 		t.Fatalf("terminal session = %+v, found=%v, err=%v", session, found, err)
+	}
+	if role == kernel.RoleWorker {
+		// A worker run cannot start until its change directory is published,
+		// so publication always precedes the run's own start.
+		adapterPublishChange(t, store, *admission.Run)
 	}
 	running, err := store.ActivateRun(ctx, runID, session.ID, updated.Revision, session.Revision, adapterTime(t, 330))
 	if err != nil {

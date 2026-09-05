@@ -95,6 +95,8 @@ var consoleRequests = []struct {
 		`{"type":"TASK_UPDATE","id":"console-task","body":{"task_id":"` + consoleTaskID + `","expected_revision":"3","status":"cancelled"}}`},
 	{browserprotocol.TypeTopologyGet, browserprotocol.TypeTopology,
 		`{"type":"TOPOLOGY_GET","id":"console-topology","body":{"project_id":"` + consoleProjectID + `"}}`},
+	{browserprotocol.TypeRunPathsGet, browserprotocol.TypeRunPaths,
+		`{"type":"RUN_PATHS_GET","id":"console-rooms","body":{"agent_id":"` + consoleAgentID + `"}}`},
 }
 
 func TestConsoleControlDispatchesAndCorrelatesExactResults(t *testing.T) {
