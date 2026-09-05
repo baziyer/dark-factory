@@ -34,6 +34,12 @@ type Daemon struct {
 	topologyMu sync.Mutex
 	topologies map[kernel.ProjectID]topologySnapshot
 
+	// providerDefaultCache holds the last read of each provider account's own
+	// configured model for a short window, on the same terms as topologies:
+	// a cost guard over a file read, never state.
+	providerDefaultMu    sync.Mutex
+	providerDefaultCache map[providerAccount]providerDefault
+
 	// operationMu is the single linearization gate for live-attempt operations
 	// that combine durable state with an owner-side action. It is deliberately
 	// concrete and global: the local operator has no throughput requirement,

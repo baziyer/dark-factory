@@ -658,6 +658,7 @@
 .dfConsoleSidebar__config { display: grid; gap: 0.5rem; }
 .dfConsoleSidebar__config label { color: var(--df-console-muted); font-size: 0.8rem; letter-spacing: 0.08em; }
 .dfConsoleSidebar__config button { justify-self: start; margin-top: 0.5rem; }
+.dfConsoleSidebar__inherit { color: var(--df-console-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 
 .dfConsoleSidebar__toggle {
   display: flex;

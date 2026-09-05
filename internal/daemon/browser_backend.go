@@ -171,7 +171,7 @@ func (backend *browserBackend) StateSnapshot(ctx context.Context, rawClient [bro
 	if err != nil {
 		return browserprotocol.StateSnapshot{}, mapBrowserError(err)
 	}
-	return projectPublicSnapshot(snapshot)
+	return projectPublicSnapshot(snapshot, backend.owner.providerAccountDefaults)
 }
 
 func (backend *browserBackend) HumanRequestDetail(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.HumanRequestDetailGet) (browserprotocol.HumanRequestDetail, error) {
@@ -640,7 +640,7 @@ func projectBrowserAuthentication(client kernel.BrowserClient) (browser.Authenti
 
 // projectPublicSnapshot is the one positive-allowlist conversion from the
 // kernel public snapshot to the wire. Nothing private is reachable from here.
-func projectPublicSnapshot(snapshot kernel.PublicSnapshot) (browserprotocol.StateSnapshot, error) {
+func projectPublicSnapshot(snapshot kernel.PublicSnapshot, providerDefaults func(string) (string, string, string)) (browserprotocol.StateSnapshot, error) {
 	result := browserprotocol.StateSnapshot{
 		Head:          decimalSequence(snapshot.Head),
 		Factory:       projectFactory(snapshot.Factory),
@@ -653,7 +653,7 @@ func projectPublicSnapshot(snapshot kernel.PublicSnapshot) (browserprotocol.Stat
 		result.Projects = append(result.Projects, projectProject(item))
 	}
 	for _, item := range snapshot.Agents {
-		result.Agents = append(result.Agents, projectAgent(item))
+		result.Agents = append(result.Agents, projectAgent(item, providerDefaults))
 	}
 	for _, item := range snapshot.Tasks {
 		result.Tasks = append(result.Tasks, projectTask(item))
@@ -676,8 +676,23 @@ func projectProject(item kernel.ProjectSummary) browserprotocol.ProjectItem {
 	return browserprotocol.ProjectItem{ID: item.ID.String(), Name: item.Name, Revision: decimalRevision(item.Revision)}
 }
 
-func projectAgent(item kernel.AgentSummary) browserprotocol.AgentItem {
-	return browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, Revision: decimalRevision(item.Revision)}
+// projectAgent resolves what the agent will actually run with. An agent that
+// names no model is launched without one and the provider CLI picks its own,
+// so the console is served that CLI's configured default and the file it came
+// from rather than a blank the operator cannot interpret.
+func projectAgent(item kernel.AgentSummary, providerDefaults func(string) (string, string, string)) browserprotocol.AgentItem {
+	defaultModel, defaultEffort, source := providerDefaults(item.Provider)
+	effectiveModel, effectiveEffort := item.Model, item.ReasoningEffort
+	if effectiveModel == "" {
+		effectiveModel = defaultModel
+	}
+	if effectiveEffort == "" {
+		effectiveEffort = defaultEffort
+	}
+	if item.Model != "" {
+		source = "agent"
+	}
+	return browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision)}
 }
 
 func projectTask(item kernel.TaskSummary) browserprotocol.TaskItem {

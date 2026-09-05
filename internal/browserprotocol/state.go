@@ -16,10 +16,13 @@ const (
 	MaxSnapshotEntities = 4096
 	// MaxSnapshotBytes bounds one encoded STATE_SNAPSHOT. Every other frame,
 	// in both directions, stays at MaxControlBytes.
-	MaxSnapshotBytes             = 1 << 20
-	MaxProjectNameBytes          = 128
-	MaxAgentNameBytes            = 128
-	MaxAgentModelBytes           = 128
+	MaxSnapshotBytes    = 1 << 20
+	MaxProjectNameBytes = 128
+	MaxAgentNameBytes   = 128
+	MaxAgentModelBytes  = 128
+	// MaxModelSourceBytes bounds the configuration path an effective model was
+	// read from. It is a local filesystem path, not free text.
+	MaxModelSourceBytes          = 1024
 	MaxTaskTitleBytes            = 1024
 	MaxHumanQuestionBytes        = 8192
 	MaxHumanReplyBytes           = 8192
@@ -121,9 +124,18 @@ type AgentItem struct {
 	Paused   Bool   `json:"paused"`
 	// Model and ReasoningEffort are the operator-editable launch controls the
 	// console displays and AGENT_UPDATE edits. Empty means unset.
-	Model           string  `json:"model"`
-	ReasoningEffort string  `json:"reasoning_effort"`
-	Revision        Decimal `json:"revision"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort"`
+	// EffectiveModel and EffectiveReasoningEffort are what the run will
+	// actually use: the agent's own value when set, otherwise the provider
+	// CLI's own configured default. ModelSource says where the model came
+	// from: "agent" when the agent names one, the provider configuration path
+	// the default was read from, or "" when the CLI keeps a default the
+	// factory cannot see.
+	EffectiveModel           string  `json:"effective_model"`
+	EffectiveReasoningEffort string  `json:"effective_reasoning_effort"`
+	ModelSource              string  `json:"model_source"`
+	Revision                 Decimal `json:"revision"`
 }
 
 type TaskItem struct {
@@ -236,6 +248,9 @@ func validateAgentItem(value AgentItem) error {
 	}
 	if validateBoundedText(value.Model, 0, MaxAgentModelBytes) != nil || validateBoundedText(value.ReasoningEffort, 0, MaxAgentModelBytes) != nil {
 		return fmt.Errorf("%w: agent launch controls", ErrMalformed)
+	}
+	if validateBoundedText(value.EffectiveModel, 0, MaxAgentModelBytes) != nil || validateBoundedText(value.EffectiveReasoningEffort, 0, MaxAgentModelBytes) != nil || validateBoundedText(value.ModelSource, 0, MaxModelSourceBytes) != nil {
+		return fmt.Errorf("%w: agent effective model", ErrMalformed)
 	}
 	return nil
 }

@@ -489,6 +489,7 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 			MaxTerminalRows              int    `json:"max_terminal_rows"`
 			MaxTerminalCols              int    `json:"max_terminal_cols"`
 			MaxAgentModelBytes           int    `json:"max_agent_model_bytes"`
+			MaxModelSourceBytes          int    `json:"max_model_source_bytes"`
 			MaxRemoteInviteLinkBytes     int    `json:"max_remote_invite_link_bytes"`
 			MaxRemoteInviteSVGBytes      int    `json:"max_remote_invite_svg_bytes"`
 		} `json:"bounds"`
@@ -543,8 +544,8 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 		MaxTaskPriority                                                                                               int64
 		MaxSQLiteInteger                                                                                              string
 		MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, MaxTerminalRows, MaxTerminalCols int
-		MaxAgentModelBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes                                         int
-	}{MaxControlBytes, MaxJSONDepth, MaxJSONArray, MaxJSONObject, MaxSnapshotBytes, MaxSnapshotEntities, MaxProjectNameBytes, MaxAgentNameBytes, MaxTaskTitleBytes, MaxHumanQuestionBytes, MaxHumanReplyBytes, MaxTaskInstructionBytes, MaxFactoryCapacity, MaxTaskPriority, fmt.Sprint(MaxSQLiteInteger), MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, int(MaxTerminalRows), int(MaxTerminalCols), MaxAgentModelBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes}
+		MaxAgentModelBytes, MaxModelSourceBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes                    int
+	}{MaxControlBytes, MaxJSONDepth, MaxJSONArray, MaxJSONObject, MaxSnapshotBytes, MaxSnapshotEntities, MaxProjectNameBytes, MaxAgentNameBytes, MaxTaskTitleBytes, MaxHumanQuestionBytes, MaxHumanReplyBytes, MaxTaskInstructionBytes, MaxFactoryCapacity, MaxTaskPriority, fmt.Sprint(MaxSQLiteInteger), MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, int(MaxTerminalRows), int(MaxTerminalCols), MaxAgentModelBytes, MaxModelSourceBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes}
 	if fmt.Sprint(manifest.Bounds) != fmt.Sprint(wantBounds) {
 		t.Fatalf("bounds drift: got %+v want %+v", manifest.Bounds, wantBounds)
 	}
