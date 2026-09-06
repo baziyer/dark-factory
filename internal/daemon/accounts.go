@@ -74,24 +74,12 @@ func (daemon *Daemon) discoverAccounts(home string) []browserprotocol.Discovered
 	return result
 }
 
-// claudeIdentityPath is the file that carries one Claude login's OAuth
-// account. The default directory's is beside it in $HOME, because that
-// directory holds only local flags; a directory made by running the CLI with
-// CLAUDE_CONFIG_DIR set carries its own. There is deliberately no fallback
-// between them: a sibling login that reads $HOME's account would report the
-// default login's identity under its own directory.
-func claudeIdentityPath(home, directory string) string {
-	if directory == providerConfigHome(kernel.ProviderClaudeCode.String(), home) {
-		return filepath.Join(home, ".claude.json")
-	}
-	return filepath.Join(directory, ".claude.json")
-}
-
 func (daemon *Daemon) describeAccount(kind kernel.Provider, home, directory, name string) (browserprotocol.DiscoveredAccount, bool) {
 	account := browserprotocol.DiscoveredAccount{Provider: kind.String(), Home: directory, Label: boundedLabel(name)}
 	switch kind {
 	case kernel.ProviderClaudeCode:
-		identity := claudeIdentityPath(home, directory)
+		// The OAuth account lives in the file provider.ClaudeConfigFile names, beside the default directory or inside a sibling one.
+		identity := provider.ClaudeConfigFile(home, directory)
 		if _, err := os.Stat(identity); err != nil {
 			return browserprotocol.DiscoveredAccount{}, false
 		}

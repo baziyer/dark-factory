@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dark-factory-build/dark-factory/internal/install"
@@ -488,6 +490,136 @@ func TestLaunchFormattingDoesNotRevealRuntimeOrExecutable(t *testing.T) {
 			if strings.Contains(formatted, secret) {
 				t.Fatalf("formatting exposed %q in %q", secret, formatted)
 			}
+		}
+	}
+}
+
+// The Change is a path Claude Code has never seen, so the account's own trust
+// record is written for it before launch, and nothing else in that file moves:
+// other projects, the login, and a number JSON would otherwise round.
+func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
+	accountHome := t.TempDir()
+	runtime := runtimeFixture(t, "/usr/bin:/bin", accountHome)
+	path := filepath.Join(accountHome, ".claude.json")
+	original := `{"oauthAccount":{"emailAddress":"login@example.invalid"},"numStartups":9007199254740993,"lastPrompt":"a<b&c","projects":{"/other":{"hasTrustDialogAccepted":true,"lastCost":0.25}}}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(written, &config); err != nil {
+		t.Fatal(err)
+	}
+	projects := config["projects"].(map[string]any)
+	if projects["/private/change"].(map[string]any)["hasTrustDialogAccepted"] != true {
+		t.Fatalf("working directory is not trusted: %s", written)
+	}
+	other := projects["/other"].(map[string]any)
+	if other["hasTrustDialogAccepted"] != true || other["lastCost"] != 0.25 || config["oauthAccount"].(map[string]any)["emailAddress"] != "login@example.invalid" || !bytes.Contains(written, []byte("9007199254740993")) || !bytes.Contains(written, []byte(`"a<b&c"`)) {
+		t.Fatalf("other values moved: %s", written)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %v, %v", info, err)
+	}
+	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := os.ReadFile(path); err != nil || !bytes.Equal(again, written) {
+		t.Fatalf("second record rewrote the file: %v", err)
+	}
+	// No file yet is a fresh login-less home; the record is still written.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, err := os.ReadFile(path); err != nil || !bytes.Contains(fresh, []byte(`"/private/change":{"hasTrustDialogAccepted":true}`)) {
+		t.Fatalf("fresh record = %s, %v", fresh, err)
+	}
+	// A linked account keeps its configuration, and so its trust, in its own directory.
+	accountConfig := filepath.Join(t.TempDir(), "claude-dogfood")
+	if err := os.Mkdir(accountConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linked, err := NewRuntimePaths(runtime.home, runtime.temp, runtime.socket, runtime.token, runtime.factoryctl, runtime.gitCeiling, runtime.toolPath, accountHome, accountConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(linked, "/private/change"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(accountConfig, ".claude.json")); err != nil {
+		t.Fatalf("linked account record: %v", err)
+	}
+	// The default login discovered as an account names the default directory;
+	// its record still lives beside that directory, in the home's own file.
+	discovered, err := NewRuntimePaths(runtime.home, runtime.temp, runtime.socket, runtime.token, runtime.factoryctl, runtime.gitCeiling, runtime.toolPath, accountHome, ConfigHome(kernel.ProviderClaudeCode, accountHome))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(discovered, "/private/discovered"); err != nil {
+		t.Fatal(err)
+	}
+	if home, err := os.ReadFile(path); err != nil || !bytes.Contains(home, []byte(`"/private/discovered":{"hasTrustDialogAccepted":true}`)) {
+		t.Fatalf("default login record = %s, %v", home, err)
+	}
+	if _, err := os.Stat(filepath.Join(ConfigHome(kernel.ProviderClaudeCode, accountHome), ".claude.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default login record landed inside the flags directory: %v", err)
+	}
+	// Concurrent workers on one account never publish a torn file: each
+	// writes its own temporary name and renames whole.
+	var group sync.WaitGroup
+	for index := range 8 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if err := TrustClaudeDirectory(runtime, fmt.Sprintf("/private/concurrent-%d", index)); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	group.Wait()
+	final, err := os.ReadFile(path)
+	if err != nil || !json.Valid(final) || !bytes.Contains(final, []byte("/private/concurrent-")) {
+		t.Fatalf("concurrent records left %s, %v", final, err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(accountHome, ".claude.json.*")); len(leftovers) != 0 {
+		t.Fatalf("temporary files remain: %v", leftovers)
+	}
+	if err := TrustClaudeDirectory(runtime, "relative/change"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("relative working directory = %v, want ErrInvalid", err)
+	}
+	// An empty or whitespace-only file is a home with no login yet, like a
+	// missing one, and gets the record.
+	for name, content := range map[string]string{"empty": "", "whitespace": " \n\t\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+			t.Fatalf("%s file: %v", name, err)
+		}
+		if recorded, err := os.ReadFile(path); err != nil || !bytes.Contains(recorded, []byte(`"/private/change":{"hasTrustDialogAccepted":true}`)) {
+			t.Fatalf("%s file record = %s, %v", name, recorded, err)
+		}
+	}
+	// A file that is not JSON, or whose projects are not the CLI's shape, is
+	// refused without its path in the error rather than rewritten.
+	for name, content := range map[string]string{"not JSON": "{", "null": "null", "projects not an object": `{"projects":[]}`, "project not an object": `{"projects":{"/private/change":true}}`} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := TrustClaudeDirectory(runtime, "/private/change"); !errors.Is(err, errClaudeConfiguration) || strings.Contains(err.Error(), accountHome) {
+			t.Fatalf("%s = %v", name, err)
+		}
+		if kept, err := os.ReadFile(path); err != nil || string(kept) != content {
+			t.Fatalf("%s was rewritten: %s, %v", name, kept, err)
 		}
 	}
 }

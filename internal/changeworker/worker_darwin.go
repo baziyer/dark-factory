@@ -170,6 +170,16 @@ func runProvider(ctx context.Context) (resultErr error) {
 		_ = cwd.Close()
 		return fmt.Errorf("runtime authority verification: %w", err)
 	}
+	// The one effect outside the runtime, so it is the last thing this
+	// process does before handing over to exec. The runner's own pre-exec
+	// checks can still refuse; a record left for a Change that never ran
+	// names a directory only the daemon makes, and costs nothing else.
+	if config.Provider == kernel.ProviderClaudeCode {
+		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
+			_ = cwd.Close()
+			return err
+		}
+	}
 	taskOpen = false
 	return control.ExecProvider(spec, cwd, task)
 }
