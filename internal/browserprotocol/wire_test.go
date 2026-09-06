@@ -524,6 +524,8 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 			MaxModelSourceBytes          int    `json:"max_model_source_bytes"`
 			MaxRemoteInviteLinkBytes     int    `json:"max_remote_invite_link_bytes"`
 			MaxRemoteInviteSVGBytes      int    `json:"max_remote_invite_svg_bytes"`
+			MaxIdleAfterSeconds          int    `json:"max_idle_after_seconds"`
+			MaxIdleRunBudget             int    `json:"max_idle_run_budget"`
 		} `json:"bounds"`
 		Control []struct {
 			Type      string `json:"type"`
@@ -577,7 +579,8 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 		MaxSQLiteInteger                                                                                              string
 		MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, MaxTerminalRows, MaxTerminalCols int
 		MaxAgentModelBytes, MaxModelSourceBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes                    int
-	}{MaxControlBytes, MaxJSONDepth, MaxJSONArray, MaxJSONObject, MaxSnapshotBytes, MaxSnapshotEntities, MaxProjectNameBytes, MaxAgentNameBytes, MaxTaskTitleBytes, MaxHumanQuestionBytes, MaxHumanReplyBytes, MaxTaskInstructionBytes, MaxFactoryCapacity, MaxTaskPriority, fmt.Sprint(MaxSQLiteInteger), MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, int(MaxTerminalRows), int(MaxTerminalCols), MaxAgentModelBytes, MaxModelSourceBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes}
+		MaxIdleAfterSeconds, MaxIdleRunBudget                                                                         int
+	}{MaxControlBytes, MaxJSONDepth, MaxJSONArray, MaxJSONObject, MaxSnapshotBytes, MaxSnapshotEntities, MaxProjectNameBytes, MaxAgentNameBytes, MaxTaskTitleBytes, MaxHumanQuestionBytes, MaxHumanReplyBytes, MaxTaskInstructionBytes, MaxFactoryCapacity, MaxTaskPriority, fmt.Sprint(MaxSQLiteInteger), MaxTerminalUnackedBytes, TerminalAckTimeoutMS, TerminalLeaseRenewIntervalMS, int(MaxTerminalRows), int(MaxTerminalCols), MaxAgentModelBytes, MaxModelSourceBytes, MaxRemoteInviteLinkBytes, MaxRemoteInviteSVGBytes, MaxIdleAfterSeconds, MaxIdleRunBudget}
 	if fmt.Sprint(manifest.Bounds) != fmt.Sprint(wantBounds) {
 		t.Fatalf("bounds drift: got %+v want %+v", manifest.Bounds, wantBounds)
 	}

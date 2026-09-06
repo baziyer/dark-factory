@@ -12,6 +12,7 @@ import {
   ProtocolError,
   SessionError,
   decodeClientControl,
+  decodeServerControl,
   encodeHello,
   encodePairResult,
   encodeServerError,
@@ -1719,6 +1720,26 @@ test("a verb the daemon does not know refuses that request alone", async () => {
   socket.reply(encodeServerControl({ type: "ERROR", id: ask.id, body: { code: "unsupported", retryable: false } }));
   await assert.rejects(pending, (error) => error instanceof SessionError && error.code === "unsupported" && !error.retryable);
   assert.equal(session.status, "ready");
+  session.close();
+});
+
+test("an agent's idle rule travels on AGENT_UPDATE and comes back on the snapshot", async () => {
+  const { session, socket } = await openHumanSession();
+  const agentId = "7c".repeat(16);
+  const pending = session.updateAgent({ agentId, expectedRevision: 3n, idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
+  const frame = decodeClientControl(socket.sent.at(-1));
+  assert.deepEqual(frame.body, { agent_id: agentId, expected_revision: 3n, idle_policy: "standing_instruction", idle_after_seconds: 600, idle_instruction: "Look for follow-up work.", idle_run_budget: 3 });
+  socket.reply(encodeServerControl({ type: "AGENT_UPDATE_RESULT", id: frame.id, body: { agent_id: agentId, revision: 4n } }));
+  await pending;
+  // Out-of-bounds rules never leave the client.
+  const sent = socket.sent.length;
+  for (const bad of [{ idleAfterSeconds: 604801 }, { idleAfterSeconds: -1 }, { idleRunBudget: 1000001 }, { idleInstruction: "x".repeat(32769) }]) {
+    await assert.rejects(session.updateAgent({ agentId, expectedRevision: 4n, ...bad }), (error) => error instanceof SessionError && error.code === "invalid_request");
+  }
+  assert.equal(socket.sent.length, sent);
+  // A snapshot from before idle rules describes an agent that waits.
+  const legacy = decodeServerControl(JSON.stringify({ type: "STATE_SNAPSHOT", id: "s", body: { head: "1", factory: { dispatch_enabled: true, capacity: 1, active_runs: 0, revision: "1" }, projects: [], agents: [{ id: agentId, project_id: "0a".repeat(16), name: "old", role: "worker", provider: "shell", paused: false, revision: "1" }], tasks: [], human_requests: [] } }));
+  assert.deepEqual([legacy.body.agents[0].idle_policy, legacy.body.agents[0].idle_after_seconds, legacy.body.agents[0].idle_instruction, legacy.body.agents[0].idle_run_budget, legacy.body.agents[0].idle_runs_used], ["wait", 0, "", 0, 0]);
   session.close();
 });
 

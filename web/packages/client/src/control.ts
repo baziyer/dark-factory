@@ -4,6 +4,8 @@ import {
   CONTROL_TYPES,
   ERROR_CODES,
   MAX_AGENT_MODEL_BYTES,
+  MAX_IDLE_AFTER_SECONDS,
+  MAX_IDLE_RUN_BUDGET,
   MAX_AGENT_NAME_BYTES,
   MAX_MODEL_SOURCE_BYTES,
   MAX_ARRAY_ITEMS,
@@ -48,7 +50,8 @@ export type ProjectItem = { id: string; name: string; revision: bigint };
  * CLI keeps a default nobody can see. `account_id` is the linked provider
  * login it launches under; empty means that provider's default directory.
  */
-export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string };
+export type IdlePolicy = "wait" | "standing_instruction";
+export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string; idle_policy: IdlePolicy; idle_after_seconds: number; idle_instruction: string; idle_run_budget: number; idle_runs_used: number };
 export type AccountItem = { id: string; provider: "claude_code" | "codex"; home: string; label: string; revision: bigint };
 export type TaskItem = { id: string; project_id: string; assigned_agent_id: string; title: string; status: "queued" | "running" | "blocked" | "succeeded" | "failed" | "cancelled"; priority: number; revision: bigint };
 export type HumanRequestItem = {
@@ -80,7 +83,7 @@ export type HumanRequestCancelRunBody = { request_id: string; expected_request_r
 export type HumanRequestCancelRunResultBody = { run_id: string; run_revision: bigint; request_id: string; request_revision: bigint };
 export type TaskEnqueueBody = { task_id: string; incarnation_id: string; agent_id: string; expected_agent_revision: bigint; instruction: string };
 export type TaskEnqueueResultBody = { task_id: string; revision: bigint; agent_revision: bigint };
-export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean };
+export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean; idle_policy?: IdlePolicy; idle_after_seconds?: number; idle_instruction?: string; idle_run_budget?: number };
 export type AgentUpdateResultBody = { agent_id: string; revision: bigint };
 export type TaskUpdateBody = { task_id: string; expected_revision: bigint; title?: string; priority?: number; assigned_agent_id?: string; status?: "cancelled" };
 export type TaskUpdateResultBody = { task_id: string; revision: bigint };
@@ -314,7 +317,7 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "HUMAN_REQUEST_CANCEL_RUN_RESULT": requireKeys(body, ["run_id", "run_revision", "request_id", "request_revision"], wire); return { run_id: dynamicID(body.run_id), run_revision: decimal(body.run_revision, wire, true), request_id: dynamicID(body.request_id), request_revision: decimal(body.request_revision, wire, true) };
     case "TASK_ENQUEUE": requireKeys(body, ["task_id", "incarnation_id", "agent_id", "expected_agent_revision", "instruction"], wire); return { task_id: dynamicID(body.task_id), incarnation_id: dynamicID(body.incarnation_id), agent_id: dynamicID(body.agent_id), expected_agent_revision: decimal(body.expected_agent_revision, wire, true), instruction: boundedText(body.instruction, 1, MAX_TASK_INSTRUCTION_BYTES) };
     case "TASK_ENQUEUE_RESULT": requireKeys(body, ["task_id", "revision", "agent_revision"], wire); return { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true), agent_revision: decimal(body.agent_revision, wire, true) };
-    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "account_id", "paused"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } return result; }
+    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } if (present(body, "idle_policy")) result.idle_policy = idlePolicy(body.idle_policy); if (present(body, "idle_after_seconds")) result.idle_after_seconds = integer(body.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS); if (present(body, "idle_instruction")) result.idle_instruction = boundedText(body.idle_instruction, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "idle_run_budget")) result.idle_run_budget = integer(body.idle_run_budget, 0, MAX_IDLE_RUN_BUDGET); return result; }
     case "AGENT_UPDATE_RESULT": requireKeys(body, ["agent_id", "revision"], wire); return { agent_id: dynamicID(body.agent_id), revision: decimal(body.revision, wire, true) };
     case "TASK_UPDATE": requireKeys(body, ["task_id", "expected_revision"], wire, ["title", "priority", "assigned_agent_id", "status"]); { const result: TaskUpdateBody = { task_id: dynamicID(body.task_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "title")) result.title = boundedText(body.title, 1, MAX_TASK_TITLE_BYTES); if (present(body, "priority")) result.priority = integer(body.priority, -MAX_TASK_PRIORITY, MAX_TASK_PRIORITY); if (present(body, "assigned_agent_id")) result.assigned_agent_id = dynamicID(body.assigned_agent_id); if (present(body, "status")) { if (body.status !== "cancelled") malformed(); result.status = body.status; } return result; }
     case "TASK_UPDATE_RESULT": requireKeys(body, ["task_id", "revision"], wire); return { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true) };
@@ -384,7 +387,13 @@ function agentItem(value: unknown, wire: boolean): AgentItem {
   // An older daemon does not send the launch controls, the resolved model or
   // the account; they read as unset, which the console shows as an unknowable
   // CLI default under that provider's own directory.
-  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id"]);
+  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget", "idle_runs_used"]);
+  // An older daemon serves no idle rule; every agent then waits.
+  const idle_policy = present(value, "idle_policy") ? idlePolicy(value.idle_policy) : "wait";
+  const idle_after_seconds = present(value, "idle_after_seconds") ? integer(value.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS) : 0;
+  const idle_instruction = present(value, "idle_instruction") ? boundedText(value.idle_instruction, 0, MAX_TASK_INSTRUCTION_BYTES) : "";
+  const idle_run_budget = present(value, "idle_run_budget") ? integer(value.idle_run_budget, 0, MAX_IDLE_RUN_BUDGET) : 0;
+  const idle_runs_used = present(value, "idle_runs_used") ? integer(value.idle_runs_used, 0, idle_run_budget) : 0;
   if (value.role !== "orchestrator" && value.role !== "worker" || typeof value.paused !== "boolean") malformed();
   if (value.provider !== "claude_code" && value.provider !== "codex" && value.provider !== "shell") malformed();
   const model = present(value, "model") ? boundedText(value.model, 0, MAX_AGENT_MODEL_BYTES) : "";
@@ -394,7 +403,7 @@ function agentItem(value: unknown, wire: boolean): AgentItem {
   const model_source = present(value, "model_source") ? boundedText(value.model_source, 0, MAX_MODEL_SOURCE_BYTES) : "";
   const account_id = present(value, "account_id") && value.account_id !== "" ? dynamicID(value.account_id) : "";
   if (account_id !== "" && value.provider === "shell") malformed();
-  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id };
+  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used };
 }
 function accountProvider(value: unknown): "claude_code" | "codex" { if (value !== "claude_code" && value !== "codex") malformed(); return value; }
 /** One absolute configuration directory, bounded exactly as the daemon does. */
@@ -508,3 +517,5 @@ function rejectDuplicateKeys(text: string, arrayLimit: number): void {
   value(0); whitespace(); if (index !== text.length) malformed();
 }
 function validateJSONNumber(value: string): void { if (!/^-?(0|[1-9][0-9]*)$/.test(value) || value === "-0") malformed(); let parsed: bigint; try { parsed = BigInt(value); } catch { malformed(); } if (parsed < -9_007_199_254_740_991n || parsed > 9_007_199_254_740_991n) malformed(); }
+
+function idlePolicy(value: unknown): IdlePolicy { if (value !== "wait" && value !== "standing_instruction") malformed(); return value; }

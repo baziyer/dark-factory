@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 3
+	userVersion   = 4
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -61,12 +61,18 @@ var schemaStatements = []string{
     reasoning_effort TEXT CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')),
     account_id BLOB CHECK (account_id IS NULL OR length(account_id) = 16) REFERENCES accounts(id),
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    idle_policy TEXT NOT NULL CHECK (idle_policy IN ('wait', 'standing_instruction')),
+    idle_after_seconds INTEGER NOT NULL CHECK (idle_after_seconds BETWEEN 0 AND 604800),
+    idle_instruction TEXT NOT NULL CHECK (length(CAST(idle_instruction AS BLOB)) <= 32768),
+    idle_run_budget INTEGER NOT NULL CHECK (idle_run_budget BETWEEN 0 AND 1000000),
+    idle_runs_used INTEGER NOT NULL CHECK (idle_runs_used >= 0 AND idle_runs_used <= idle_run_budget),
     tool_budget_limit INTEGER NOT NULL CHECK (tool_budget_limit BETWEEN 1 AND 1000000000),
     tool_calls_used INTEGER NOT NULL CHECK (tool_calls_used >= 0 AND tool_calls_used <= tool_budget_limit),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
-    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL))
+    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL)),
+    CHECK (idle_policy <> 'standing_instruction' OR (idle_after_seconds >= 1 AND idle_instruction <> '' AND idle_run_budget >= 1))
 ) STRICT, WITHOUT ROWID`,
 	`CREATE UNIQUE INDEX agents_id_project_unique ON agents(id, project_id)`,
 	`CREATE TABLE tasks (

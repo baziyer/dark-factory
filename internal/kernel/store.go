@@ -97,8 +97,9 @@ func (store *Store) CreateAgent(ctx context.Context, spec NewAgent, at UnixMilli
 	}
 	if _, err := tx.connection.ExecContext(ctx, `INSERT INTO agents(
 		id, project_id, name, role, provider, model, reasoning_effort, account_id,
-		paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 1, ?, ?)`,
+		paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms,
+		idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 1, ?, ?, 'wait', 0, '', 0, 0)`,
 		spec.ID.Bytes(), spec.ProjectID.Bytes(), spec.Name, spec.Role.String(), spec.Provider.String(), nullableString(spec.Model), nullableString(spec.ReasoningEffort), nullableID(spec.AccountID), int64(spec.ToolBudgetLimit), at.Int64(), at.Int64()); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}

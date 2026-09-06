@@ -381,7 +381,7 @@ export class FactoryAppController {
    * the controls the caller changed are sent; an omitted one is left alone,
    * and an empty change is not a write at all.
    */
-  async updateAgentConfig(config: { model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean }): Promise<void> {
+  async updateAgentConfig(config: { model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: "wait" | "standing_instruction"; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }): Promise<void> {
     const selected = this.#selectedAgent;
     const session = this.#client?.session;
     if (this.#closed || this.#status !== "ready" || selected === undefined || session === undefined || this.#edit?.pending === true) return;

@@ -342,6 +342,11 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 		paused := bool(*request.Paused)
 		patch.Paused = &paused
 	}
+	if request.IdlePolicy != nil {
+		policy := kernel.IdlePolicy(*request.IdlePolicy)
+		patch.IdlePolicy = &policy
+	}
+	patch.IdleAfterSeconds, patch.IdleInstruction, patch.IdleRunBudget = request.IdleAfterSeconds, request.IdleInstruction, request.IdleRunBudget
 	agent, err := backend.store.UpdateAgent(ctx, agentID, expected, patch, at)
 	if err != nil {
 		return browserprotocol.AgentUpdateResult{}, consoleUpdateError(err)
@@ -810,7 +815,8 @@ func projectAgent(item kernel.AgentSummary, configHome string, providerDefaults 
 	if item.Model != "" {
 		source = "agent"
 	}
-	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision)}
+	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision),
+		IdlePolicy: string(item.Idle.Policy), IdleAfterSeconds: item.Idle.AfterSeconds, IdleInstruction: item.Idle.Instruction, IdleRunBudget: item.Idle.RunBudget, IdleRunsUsed: item.Idle.RunsUsed}
 	if (item.AccountID != kernel.AccountID{}) {
 		projected.AccountID = item.AccountID.String()
 	}

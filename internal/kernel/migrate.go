@@ -20,9 +20,13 @@ import (
 //
 // v2 bounded the browser capability mask at four bits. v3 adds administration
 // (bit 4) and widens the two CHECKs; nothing else about those tables moved.
+//
+// v3 had no idle rule on agents. v4 adds the five idle_* columns, every
+// existing agent keeping the rule that was always true: wait.
 const (
 	legacyUserVersion   = 1
 	previousUserVersion = 2
+	priorUserVersion    = 3
 
 	legacyAgents = `CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -76,18 +80,54 @@ const (
 
 	previousPairingChallengeColumns = `secret_digest, boot_id, intended_origin, capability_mask, created_at_ms, expires_at_ms, redeemed_at_ms`
 	previousBrowserClientColumns    = `id, public_key, fingerprint, capability_mask, revision, created_at_ms, updated_at_ms, revoked_at_ms`
+
+	priorAgents = `CREATE TABLE agents (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16) REFERENCES projects(id),
+    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
+    role TEXT NOT NULL CHECK (role IN ('orchestrator', 'worker')),
+    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex', 'shell')),
+    model TEXT CHECK (model IS NULL OR length(CAST(model AS BLOB)) BETWEEN 1 AND 128),
+    reasoning_effort TEXT CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')),
+    account_id BLOB CHECK (account_id IS NULL OR length(account_id) = 16) REFERENCES accounts(id),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    tool_budget_limit INTEGER NOT NULL CHECK (tool_budget_limit BETWEEN 1 AND 1000000000),
+    tool_calls_used INTEGER NOT NULL CHECK (tool_calls_used >= 0 AND tool_calls_used <= tool_budget_limit),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL))
+) STRICT, WITHOUT ROWID`
+
+	priorAgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
+	idleColumns       = `idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used`
+	idleDefaults      = `'wait', 0, '', 0, 0`
 )
 
-// previousSchemaStatements is the exact v2 schema: the current one with the
-// two frozen browser definitions substituted. Every other statement is read
-// live from schemaStatements, so editing any of them silently changes what
-// this claims v2 was and stops recognising real v2 homes. The next schema
-// change has to freeze the text it replaces here and extend the migration, in
-// the same change; TestSchemaDigestsArePinned pins every set and fails until
-// it does.
-func previousSchemaStatements() []string {
+// priorSchemaStatements is the exact v3 schema: the current one with the
+// frozen agents definition substituted. Every other statement is read live
+// from schemaStatements, so editing any of them silently changes what this
+// claims v3 was and stops recognising real v3 homes. The next schema change
+// has to freeze the text it replaces here and extend the migration, in the
+// same change; TestSchemaDigestsArePinned pins every set and fails until it
+// does.
+func priorSchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
 	for _, statement := range schemaStatements {
+		if _, name := schemaObjectIdentity(statement); name == "agents" {
+			statement = priorAgents
+		}
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// previousSchemaStatements is the exact v2 schema: v3 with the two frozen
+// browser definitions substituted.
+func previousSchemaStatements() []string {
+	prior := priorSchemaStatements()
+	statements := make([]string, 0, len(prior))
+	for _, statement := range prior {
 		switch _, name := schemaObjectIdentity(statement); name {
 		case "browser_pairing_challenges":
 			statement = previousPairingChallenges
@@ -142,34 +182,56 @@ func migratableSchema(version int) ([]string, bool) {
 		return legacySchemaStatements(), true
 	case previousUserVersion:
 		return previousSchemaStatements(), true
+	case priorUserVersion:
+		return priorSchemaStatements(), true
 	}
 	return nil, false
 }
 
-// migrateLegacy upgrades an exact earlier home to the current schema, one
-// transaction per version step, or leaves the database byte-untouched and
-// refuses. Open calls it before the store is published, so it is the only
-// writer. One case is neither: if restoring foreign key enforcement fails after
-// a commit, the home is migrated that far and this open is still refused,
-// because a connection that cannot enforce foreign keys must not serve the
-// daemon. The next open then finds the later version and continues from there.
-// Each step is one way -- a build from before it refuses the newer
-// user_version -- so the rollback plan for an operator home is the operator's
-// pre-upgrade copy of factory.sqlite3, which docs/install.md tells them to
-// take; nothing here makes one.
+// migrateLegacy upgrades an exact earlier home to the current schema, every
+// version step it needs in one transaction, or leaves the database
+// byte-untouched and refuses. Open calls it before the store is published, so
+// it is the only writer. One case is neither: if restoring foreign key
+// enforcement fails after the commit, the home is migrated and this open is
+// still refused, because a connection that cannot enforce foreign keys must
+// not serve the daemon. The next open then finds a current home and nothing
+// to migrate. The migration is one way -- a build from before it refuses the
+// newer user_version -- so the rollback plan for an operator home is the
+// operator's pre-upgrade copy of factory.sqlite3, which docs/install.md tells
+// them to take; nothing here makes one.
 func (store *Store) migrateLegacy(ctx context.Context) error {
 	connection, err := store.writerConnection(ctx)
 	if err != nil {
 		return err
 	}
 	_, version, err := inspectIdentity(ctx, connection)
-	if err == nil && version == legacyUserVersion {
-		err = migrateWithoutForeignKeys(ctx, connection, migrateLegacyTransaction)
-		version = previousUserVersion
+	if err != nil {
+		releaseUncertainConnection(connection)
+		return err
 	}
-	if err == nil && version == previousUserVersion {
-		err = migrateWithoutForeignKeys(ctx, connection, migratePreviousTransaction)
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction}
+	var steps []func(context.Context, *sql.Conn) error
+	switch version {
+	case legacyUserVersion:
+		steps = all
+	case previousUserVersion:
+		steps = all[1:]
+	case priorUserVersion:
+		steps = all[2:]
+	default:
+		return connection.Close()
 	}
+	err = migrateWithoutForeignKeys(ctx, connection, func(ctx context.Context, connection *sql.Conn) error {
+		for _, step := range steps {
+			if err := step(ctx, connection); err != nil {
+				return err
+			}
+		}
+		// The durable-control pass belongs at the end: it reads columns only
+		// the current schema has, and a home it rejects keeps every original
+		// byte because nothing has been committed yet.
+		return validateDurableControls(ctx, connection)
+	})
 	if err != nil {
 		releaseUncertainConnection(connection)
 		return err
@@ -223,23 +285,18 @@ func migrateLegacyTransaction(ctx context.Context, connection *sql.Conn) error {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
 	}
-	if err := rebuildTable(ctx, connection, target, "agents", legacyAgentColumns, "agents_id_project_unique"); err != nil {
+	if err := rebuildTable(ctx, connection, target, "agents", legacyAgentColumns, "agents_id_project_unique", "", ""); err != nil {
 		return err
 	}
-	if err := rebuildTable(ctx, connection, target, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique"); err != nil {
+	if err := rebuildTable(ctx, connection, target, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 		return err
 	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", previousUserVersion)); err != nil {
 		return fmt.Errorf("set sqlite user version: %w", err)
 	}
 	// The rewritten text must be byte-identical to the v2 statements, with
-	// foreign_key_check, all before the commit. The durable-control pass
-	// belongs here too: it is the one Open cannot run on a v1 snapshot, and a
-	// home it rejects must keep its original bytes.
-	if err := validateSchemaVersion(ctx, connection, previousUserVersion, previousSchemaStatements()); err != nil {
-		return err
-	}
-	return validateDurableControls(ctx, connection)
+	// foreign_key_check, before the next step or the commit.
+	return validateSchemaVersion(ctx, connection, previousUserVersion, previousSchemaStatements())
 }
 
 // migratePreviousTransaction takes an exact v2 home to v3: the browser
@@ -250,11 +307,11 @@ func migratePreviousTransaction(ctx context.Context, connection *sql.Conn) error
 	if err := validateSchemaVersion(ctx, connection, previousUserVersion, previousSchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
-	if err := rebuildTable(ctx, connection, target, "browser_pairing_challenges", previousPairingChallengeColumns, ""); err != nil {
+	target := expectedSchemaOf(priorSchemaStatements())
+	if err := rebuildTable(ctx, connection, target, "browser_pairing_challenges", previousPairingChallengeColumns, "", "", ""); err != nil {
 		return err
 	}
-	if err := rebuildTable(ctx, connection, target, "browser_clients", previousBrowserClientColumns, ""); err != nil {
+	if err := rebuildTable(ctx, connection, target, "browser_clients", previousBrowserClientColumns, "", "", ""); err != nil {
 		return err
 	}
 	for _, table := range []string{"browser_pairing_challenges", "browser_clients"} {
@@ -263,13 +320,26 @@ func migratePreviousTransaction(ctx context.Context, connection *sql.Conn) error
 			return fmt.Errorf("grant administration in %s: %w", table, err)
 		}
 	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", priorUserVersion)); err != nil {
+		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, priorUserVersion, priorSchemaStatements())
+}
+
+// migratePriorTransaction takes an exact v3 home to v4: every agent gains the
+// idle rule columns, holding the rule that was always in force, wait.
+func migratePriorTransaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, priorUserVersion, priorSchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	if err := rebuildTable(ctx, connection, target, "agents", priorAgentColumns, "agents_id_project_unique", idleColumns, idleDefaults); err != nil {
+		return err
+	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
 		return fmt.Errorf("set sqlite user version: %w", err)
 	}
-	if err := validateExactSchema(ctx, connection); err != nil {
-		return err
-	}
-	return validateDurableControls(ctx, connection)
+	return validateExactSchema(ctx, connection)
 }
 
 // rebuildTable replaces one table with its target definition, preserving every
@@ -277,14 +347,20 @@ func migratePreviousTransaction(ctx context.Context, connection *sql.Conn) error
 // table keeps its old text, while the exact-schema check compares that text
 // byte for byte. So the target statement is executed verbatim under the real
 // name and the rows wait in a scratch table for the moment the real one is
-// absent. index names the table's separate index statement, if it has one.
-func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns, index string) error {
+// absent. index names the table's separate index statement, if it has one;
+// added and values name columns the target has and the rows do not, with the
+// constant each row gets.
+func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns, index, added, values string) error {
 	scratch := table + "_pre_migration"
+	into, from := columns, columns
+	if added != "" {
+		into, from = columns+", "+added, columns+", "+values
+	}
 	statements := []string{
 		"CREATE TABLE " + scratch + " AS SELECT " + columns + " FROM " + table,
 		"DROP TABLE " + table,
 		target[table].sql,
-		"INSERT INTO " + table + "(" + columns + ") SELECT " + columns + " FROM " + scratch,
+		"INSERT INTO " + table + "(" + into + ") SELECT " + from + " FROM " + scratch,
 		"DROP TABLE " + scratch,
 	}
 	if index != "" {

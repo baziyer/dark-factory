@@ -1113,7 +1113,7 @@ func rejectNullMembers(kind MessageType, body []byte) error {
 	case TypeTerminalExit:
 		fields = []string{"session_id", "exit_code", "exit_signal", "aborted"}
 	case TypeAgentUpdate:
-		fields = []string{"model", "reasoning_effort", "account_id", "paused"}
+		fields = []string{"model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"}
 	case TypeTaskUpdate:
 		fields = []string{"title", "priority", "assigned_agent_id", "status"}
 	default:

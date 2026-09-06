@@ -140,6 +140,13 @@ type AgentItem struct {
 	// means the provider's own default configuration directory, and so the
 	// default EffectiveModel above was read from.
 	AccountID string `json:"account_id"`
+	// The idle rule, as CONFIG shows and edits it. IdleRunsUsed counts only
+	// the runs the rule enqueued itself.
+	IdlePolicy       string `json:"idle_policy"`
+	IdleAfterSeconds uint32 `json:"idle_after_seconds"`
+	IdleInstruction  string `json:"idle_instruction"`
+	IdleRunBudget    uint32 `json:"idle_run_budget"`
+	IdleRunsUsed     uint32 `json:"idle_runs_used"`
 }
 
 // AccountItem is one linked provider login. Only which login it is and where
@@ -269,6 +276,12 @@ func validateAgentItem(value AgentItem) error {
 	}
 	if value.AccountID != "" && (validateDynamicID(value.AccountID) != nil || value.Provider == "shell") {
 		return fmt.Errorf("%w: agent account", ErrMalformed)
+	}
+	// No policy at all is a snapshot from before idle rules: the agent waits.
+	if value.IdlePolicy != "" && !validIdlePolicy(value.IdlePolicy) || value.IdleAfterSeconds > MaxIdleAfterSeconds || validateBoundedText(value.IdleInstruction, 0, MaxTaskInstructionBytes) != nil ||
+		value.IdleRunBudget > MaxIdleRunBudget || value.IdleRunsUsed > value.IdleRunBudget ||
+		value.IdlePolicy == "standing_instruction" && (value.IdleAfterSeconds == 0 || value.IdleInstruction == "" || value.IdleRunBudget == 0) {
+		return fmt.Errorf("%w: agent idle rule", ErrMalformed)
 	}
 	return nil
 }

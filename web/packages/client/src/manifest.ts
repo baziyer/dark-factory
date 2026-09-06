@@ -31,6 +31,8 @@ export const MAX_AGENT_MODEL_BYTES = 128;
 export const MAX_MODEL_SOURCE_BYTES = 1024;
 export const MAX_REMOTE_INVITE_LINK_BYTES = 8192;
 export const MAX_REMOTE_INVITE_SVG_BYTES = 32768;
+export const MAX_IDLE_AFTER_SECONDS = 604800;
+export const MAX_IDLE_RUN_BUDGET = 1000000;
 
 export const CAPABILITIES = {
   observe: 1,
@@ -142,6 +144,8 @@ export const BROWSER_MANIFEST = {
     maxModelSourceBytes: MAX_MODEL_SOURCE_BYTES,
     maxRemoteInviteLinkBytes: MAX_REMOTE_INVITE_LINK_BYTES,
     maxRemoteInviteSvgBytes: MAX_REMOTE_INVITE_SVG_BYTES,
+    maxIdleAfterSeconds: MAX_IDLE_AFTER_SECONDS,
+    maxIdleRunBudget: MAX_IDLE_RUN_BUDGET,
   },
   control: CONTROL_MANIFEST,
   terminal: {

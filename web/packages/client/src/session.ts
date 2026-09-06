@@ -14,6 +14,7 @@ import {
   type AccountLinkResultBody,
   type AccountsBody,
   type AgentUpdateBody,
+  type IdlePolicy,
   type AuthResultFrame,
   type ErrorFrame,
   type HelloBody,
@@ -30,7 +31,9 @@ import {
   type TopologyBody,
 } from "./control.js";
 import { ProtocolError, type ProtocolErrorCode } from "./errors.js";
-import { CAPABILITIES, MAX_AGENT_MODEL_BYTES, MAX_ARRAY_ITEMS, MAX_HUMAN_REPLY_BYTES, MAX_SQLITE_INTEGER, MAX_TASK_INSTRUCTION_BYTES, MAX_TASK_PRIORITY, MAX_TASK_TITLE_BYTES, type CapabilityMask, type ErrorCode } from "./manifest.js";
+import { CAPABILITIES, MAX_AGENT_MODEL_BYTES,
+  MAX_IDLE_AFTER_SECONDS,
+  MAX_IDLE_RUN_BUDGET, MAX_ARRAY_ITEMS, MAX_HUMAN_REPLY_BYTES, MAX_SQLITE_INTEGER, MAX_TASK_INSTRUCTION_BYTES, MAX_TASK_PRIORITY, MAX_TASK_TITLE_BYTES, type CapabilityMask, type ErrorCode } from "./manifest.js";
 import { snapshotView, type StateView } from "./state.js";
 import { createTerminalHandle, terminalControlFrame, type InternalTerminalHandle, type TerminalHandle, type TerminalOptions } from "./terminal_session.js";
 import { decodeTerminalServer } from "./terminal_session.js";
@@ -265,13 +268,19 @@ export class BrowserSession {
   }
 
   /** Edit one agent's configuration. An omitted member is left alone. */
-  updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean }): Promise<AgentUpdateResult> {
+  updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: IdlePolicy; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }): Promise<AgentUpdateResult> {
     const body: AgentUpdateBody = { agent_id: request.agentId, expected_revision: request.expectedRevision };
     if (request.model !== undefined) body.model = request.model;
     if (request.reasoningEffort !== undefined) body.reasoning_effort = request.reasoningEffort;
     if (request.accountId !== undefined) body.account_id = request.accountId;
     if (request.paused !== undefined) body.paused = request.paused;
-    if (bounded(request.model, MAX_AGENT_MODEL_BYTES) || bounded(request.reasoningEffort, MAX_AGENT_MODEL_BYTES)) return Promise.reject(new SessionError("invalid_request"));
+    if (request.idlePolicy !== undefined) body.idle_policy = request.idlePolicy;
+    if (request.idleAfterSeconds !== undefined) body.idle_after_seconds = request.idleAfterSeconds;
+    if (request.idleInstruction !== undefined) body.idle_instruction = request.idleInstruction;
+    if (request.idleRunBudget !== undefined) body.idle_run_budget = request.idleRunBudget;
+    if (bounded(request.model, MAX_AGENT_MODEL_BYTES) || bounded(request.reasoningEffort, MAX_AGENT_MODEL_BYTES) || bounded(request.idleInstruction, MAX_TASK_INSTRUCTION_BYTES)) return Promise.reject(new SessionError("invalid_request"));
+    if (request.idleAfterSeconds !== undefined && !(Number.isSafeInteger(request.idleAfterSeconds) && request.idleAfterSeconds >= 0 && request.idleAfterSeconds <= MAX_IDLE_AFTER_SECONDS)) return Promise.reject(new SessionError("invalid_request"));
+    if (request.idleRunBudget !== undefined && !(Number.isSafeInteger(request.idleRunBudget) && request.idleRunBudget >= 0 && request.idleRunBudget <= MAX_IDLE_RUN_BUDGET)) return Promise.reject(new SessionError("invalid_request"));
     // Which login an agent runs as is administration, like the logins themselves.
     if (request.accountId !== undefined && (this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
     return this.#consoleRequest("AGENT_UPDATE_RESULT", request.agentId, request.expectedRevision, "agent-update", (id) => encodeClientControl({ type: "AGENT_UPDATE", id, body }));

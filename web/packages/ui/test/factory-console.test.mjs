@@ -972,3 +972,24 @@ test("settings asks the daemon for logins on open and links the one the operator
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
   }
 });
+
+test("the RULES block saves an idle rule and sends only what changed", async () => {
+  const edits = [];
+  const props = { status: "ready", state: baseState(), selectedAgent: agentSelection(), onSaveAgentConfig: (config) => edits.push(config) };
+  let renderer;
+  await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+  const field = (id) => renderer.root.findAll((node) => node.props.id === id)[0];
+  const form = () => renderer.root.findAllByType("form")[0];
+  // Waiting agents show no instruction controls; choosing the rule reveals them.
+  assert.equal(field(`df-idle-instruction-${ids.agent}`), undefined);
+  await act(async () => { field(`df-idle-${ids.agent}`).props.onChange({ currentTarget: { value: "standing_instruction" } }); });
+  await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "10" } }); });
+  await act(async () => { field(`df-idle-instruction-${ids.agent}`).props.onChange({ currentTarget: { value: "Look for follow-up work." } }); });
+  await act(async () => { field(`df-idle-budget-${ids.agent}`).props.onChange({ currentTarget: { value: "3" } }); });
+  await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
+  assert.deepEqual(edits.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
+  // Minutes are what the operator types; seconds are what the daemon keeps.
+  await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "0" } }); });
+  await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
+  assert.equal(edits.at(-1).idleAfterSeconds, undefined);
+});

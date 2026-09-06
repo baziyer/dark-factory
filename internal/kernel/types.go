@@ -520,6 +520,33 @@ type Project struct {
 	UpdatedAt          UnixMillis
 }
 
+// IdlePolicy is what an agent does with no run: wait for work, or enqueue a
+// standing instruction to itself after a quiet spell, within a run budget.
+type IdlePolicy string
+
+const (
+	IdleWait                IdlePolicy = "wait"
+	IdleStandingInstruction IdlePolicy = "standing_instruction"
+)
+
+func ParseIdlePolicy(value string) (IdlePolicy, error) {
+	switch IdlePolicy(value) {
+	case IdleWait, IdleStandingInstruction:
+		return IdlePolicy(value), nil
+	}
+	return "", fmt.Errorf("%w: idle policy %q", ErrInvalidValue, value)
+}
+
+// IdleRule is an agent's idle rule. IdleRunsUsed counts only the runs the
+// rule enqueued itself; a new budget starts the count again.
+type IdleRule struct {
+	Policy       IdlePolicy
+	AfterSeconds uint32
+	Instruction  string
+	RunBudget    uint32
+	RunsUsed     uint32
+}
+
 type Agent struct {
 	ID              AgentID
 	ProjectID       ProjectID
@@ -530,6 +557,7 @@ type Agent struct {
 	ReasoningEffort string
 	AccountID       AccountID
 	Paused          bool
+	Idle            IdleRule
 	ToolBudgetLimit uint64
 	ToolCallsUsed   uint64
 	Revision        Revision
@@ -582,6 +610,7 @@ type AgentSummary struct {
 	// AccountID is the linked provider login this agent launches with; the
 	// zero identity means the provider default.
 	AccountID AccountID
+	Idle      IdleRule
 	Revision  Revision
 }
 
