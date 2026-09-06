@@ -11,7 +11,7 @@ import {
   encodeStateSnapshot,
 } from "../dist/src/index.js";
 
-export const ALL_CAPABILITIES = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+export const ALL_CAPABILITIES = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input | CAPABILITIES.administration;
 export const RELAY_ORIGIN = "wss://relay.example";
 export const PWA_ORIGIN = "https://app.darkfactory.build";
 

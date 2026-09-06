@@ -744,7 +744,7 @@ func validDigest(value string) bool {
 }
 
 func validWebClient(client WebClient) bool {
-	if !validID(client.ID) || client.CapabilityMask == 0 || client.CapabilityMask&1 == 0 || client.CapabilityMask&^15 != 0 || client.Revision == 0 || client.UpdatedAtMs < client.CreatedAtMs {
+	if !validID(client.ID) || client.CapabilityMask == 0 || client.CapabilityMask&1 == 0 || client.CapabilityMask&^31 != 0 || client.Revision == 0 || client.UpdatedAtMs < client.CreatedAtMs {
 		return false
 	}
 	return client.RevokedAtMs == nil || *client.RevokedAtMs >= client.CreatedAtMs && *client.RevokedAtMs <= client.UpdatedAtMs

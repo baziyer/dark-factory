@@ -382,11 +382,43 @@ func accountHomeFixture(t *testing.T, fixture *consoleFixture) string {
 	return home
 }
 
+// The operator's logins are administration. A pairing without that bit -- a
+// relay-paired phone carries observe, private detail and human actions --
+// cannot list them, link them, or choose one for an agent, while its other
+// human actions still work.
+func TestBrowserAccountsNeedAdministration(t *testing.T) {
+	// Every other bit, terminal_input included: only administration opens these.
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityKnownMask&^kernel.BrowserCapabilityAdministration, consoleRoot(t))
+	home := accountHomeFixture(t, fixture)
+	ctx := context.Background()
+	client := rawBrowserClient(fixture.client.ID)
+	if _, err := fixture.backend.DiscoverAccounts(ctx, client); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("discovery without administration = %v", err)
+	}
+	if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: filepath.Join(home, ".codex"), Label: "dogfood"}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("link without administration = %v", err)
+	}
+	if accounts, err := fixture.store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
+		t.Fatalf("refused link left %d accounts, err=%v", len(accounts), err)
+	}
+	cleared, paused := "", browserprotocol.Bool(true)
+	if _, err := fixture.backend.UpdateAgent(ctx, client, browserprotocol.AgentUpdate{
+		AgentID: fixture.agent.ID.String(), ExpectedRevision: decimalRevision(fixture.agent.Revision), AccountID: &cleared,
+	}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("account assignment without administration = %v", err)
+	}
+	if result, err := fixture.backend.UpdateAgent(ctx, client, browserprotocol.AgentUpdate{
+		AgentID: fixture.agent.ID.String(), ExpectedRevision: decimalRevision(fixture.agent.Revision), Paused: &paused,
+	}); err != nil || result.Revision != decimalRevision(fixture.agent.Revision)+1 {
+		t.Fatalf("pause without administration = %+v, %v", result, err)
+	}
+}
+
 // Linking names a login discovery found, never an arbitrary directory: the
 // browser may say which of this machine's logins to use, not where a provider
 // should go looking for credentials.
 func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
-	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions, consoleRoot(t))
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions|kernel.BrowserCapabilityAdministration, consoleRoot(t))
 	home := accountHomeFixture(t, fixture)
 	ctx := context.Background()
 	client := rawBrowserClient(fixture.client.ID)
@@ -419,6 +451,20 @@ func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
 
 	// The one it did find links, and the next discovery says so.
 	result, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: login.Home, Label: "dogfood"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Administration alone, without terminal_input, is what assigns the
+	// linked login to an agent.
+	assigned, err := fixture.backend.UpdateAgent(ctx, client, browserprotocol.AgentUpdate{
+		AgentID: fixture.agent.ID.String(), ExpectedRevision: decimalRevision(fixture.agent.Revision), AccountID: &result.AccountID,
+	})
+	if err != nil || assigned.Revision != decimalRevision(fixture.agent.Revision)+1 {
+		t.Fatalf("account assignment with administration = %+v, %v", assigned, err)
+	}
+	if stored, found, err := fixture.store.Agent(ctx, fixture.agent.ID); err != nil || !found || stored.AccountID.String() != result.AccountID {
+		t.Fatalf("stored agent account = %+v, found=%v, err=%v", stored, found, err)
+	}
 	if err != nil || result.Revision != 1 {
 		t.Fatalf("link = %+v, %v", result, err)
 	}
@@ -438,24 +484,5 @@ func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
 	accounts, err := fixture.store.ListAccounts(ctx)
 	if err != nil || len(accounts) != 1 {
 		t.Fatalf("accounts after relink = %d, err=%v", len(accounts), err)
-	}
-}
-
-// Seeing which logins exist is observation; linking one is a human action.
-func TestBrowserAccountsGateLinkingOnHumanActions(t *testing.T) {
-	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve, consoleRoot(t))
-	home := accountHomeFixture(t, fixture)
-	ctx := context.Background()
-	client := rawBrowserClient(fixture.client.ID)
-
-	discovered, err := fixture.backend.DiscoverAccounts(ctx, client)
-	if err != nil || len(discovered.Accounts) != 1 {
-		t.Fatalf("observe-only discovery = %+v, %v", discovered.Accounts, err)
-	}
-	if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: filepath.Join(home, ".codex"), Label: "dogfood"}); !errors.Is(err, browser.ErrUnauthorized) {
-		t.Fatalf("observe-only link = %v", err)
-	}
-	if accounts, err := fixture.store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
-		t.Fatalf("refused link left %d accounts, err=%v", len(accounts), err)
 	}
 }

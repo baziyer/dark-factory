@@ -17,7 +17,7 @@ import (
 )
 
 func TestProductionBrowserPairingUsesExactlyImplementedCapabilities(t *testing.T) {
-	want := kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityPrivateHumanRequestDetail | kernel.BrowserCapabilityHumanActions | kernel.BrowserCapabilityTerminalInput
+	want := kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityPrivateHumanRequestDetail | kernel.BrowserCapabilityHumanActions | kernel.BrowserCapabilityTerminalInput | kernel.BrowserCapabilityAdministration
 	if webCapabilities != want || webCapabilities&^kernel.BrowserCapabilityKnownMask != 0 {
 		t.Fatalf("production browser capabilities = %#x, want exactly %#x", webCapabilities, want)
 	}

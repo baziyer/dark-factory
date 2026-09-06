@@ -364,7 +364,7 @@ func TestBrowserChallengeBoundsBootOriginExpiryAndPruning(t *testing.T) {
 	}{
 		{"zero boot", BootID{}, "https://app.example", BrowserCapabilityObserve, 10, 20},
 		{"empty origin", boot, "", BrowserCapabilityObserve, 10, 20},
-		{"unknown capability", boot, "https://app.example", BrowserCapabilityObserve | 16, 10, 20},
+		{"unknown capability", boot, "https://app.example", BrowserCapabilityObserve | (BrowserCapabilityKnownMask + 1), 10, 20},
 		{"observe required", boot, "https://app.example", BrowserCapabilityTerminalInput, 10, 20},
 		{"zero capability", boot, "https://app.example", 0, 10, 20},
 		{"zero ttl", boot, "https://app.example", BrowserCapabilityObserve, 10, 10},
@@ -799,7 +799,7 @@ func TestBrowserAuthorityRawCorruptionFailsClosed(t *testing.T) {
 				digest := mintBrowserChallenge(t, store, 103, boot, 10, 100, BrowserCapabilityObserve)
 				id := browserTestID(t, 103)
 				pairBrowserClient(t, store, digest, boot, id, browserKey(t), 11)
-				corruptSQL(t, store, `UPDATE browser_clients SET capability_mask = 17`)
+				corruptSQL(t, store, fmt.Sprintf(`UPDATE browser_clients SET capability_mask = %d`, BrowserCapabilityKnownMask+2))
 				if _, _, err := store.BrowserClient(context.Background(), id); !errors.Is(err, ErrCorruptState) {
 					t.Fatalf("corrupt mask read error = %v", err)
 				}

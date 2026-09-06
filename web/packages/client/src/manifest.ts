@@ -37,6 +37,7 @@ export const CAPABILITIES = {
   private_human_request_detail: 2,
   human_actions: 4,
   terminal_input: 8,
+  administration: 16,
 } as const;
 
 export type CapabilityName = keyof typeof CAPABILITIES;

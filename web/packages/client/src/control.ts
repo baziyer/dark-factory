@@ -462,7 +462,7 @@ function hasLoneSurrogate(value: string): boolean {
 function integer(value: unknown, minimum: number, maximum: number): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) malformed(); return value; }
 function validTerminalInputResult(status: string, acceptedBytes: bigint): boolean { return status === "accepted" || status === "partial" ? acceptedBytes >= 1n && acceptedBytes <= BigInt(MAX_TERMINAL_PAYLOAD) : status === "rejected" || status === "uncertain" ? acceptedBytes === 0n : false; }
 function fixedHex(value: unknown, bytes: number, requireUncompressed = false): string { if (typeof value !== "string" || value.length !== bytes * 2 || !/^[0-9a-f]+$/.test(value)) malformed(); if (requireUncompressed && !value.startsWith("04")) malformed(); return value; }
-function capabilities(value: unknown): number { const result = integer(value, 0, 15); if ((result & CAPABILITIES.observe) === 0) malformed(); return result; }
+function capabilities(value: unknown): number { const result = integer(value, 0, 31); if ((result & CAPABILITIES.observe) === 0) malformed(); return result; }
 function validID(value: string): boolean { return value.length > 0 && value.length <= 64 && [...value].every((character) => character.charCodeAt(0) >= 0x21 && character.charCodeAt(0) <= 0x7e); }
 function isControlType(value: unknown): value is ControlType { return typeof value === "string" && (CONTROL_TYPES as readonly string[]).includes(value); }
 function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }

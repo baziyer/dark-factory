@@ -121,6 +121,9 @@ func (fixture *adapterFixture) pair(t *testing.T) *websocket.Conn {
 	if client.CapabilityMask.Has(kernel.BrowserCapabilityTerminalInput) {
 		want |= browserprotocol.CapabilityTerminalInput
 	}
+	if client.CapabilityMask.Has(kernel.BrowserCapabilityAdministration) {
+		want |= browserprotocol.CapabilityAdministration
+	}
 	if result.Capabilities != want {
 		t.Fatalf("advertised capabilities = %d, want implemented %d", result.Capabilities, want)
 	}

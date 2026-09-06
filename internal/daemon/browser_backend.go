@@ -305,11 +305,15 @@ func (backend *browserBackend) EnqueueTask(ctx context.Context, rawClient [brows
 var _ browser.ConsoleBackend = (*browserBackend)(nil)
 
 func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.AgentUpdate) (browserprotocol.AgentUpdateResult, error) {
-	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
+	_, release, client, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
 	if err != nil {
 		return browserprotocol.AgentUpdateResult{}, err
 	}
 	defer release()
+	// Which login an agent runs as is administration, like the logins themselves.
+	if request.AccountID != nil && !client.CapabilityMask.Has(kernel.BrowserCapabilityAdministration) {
+		return browserprotocol.AgentUpdateResult{}, browser.ErrUnauthorized
+	}
 	agentID, err := browserID(request.AgentID, kernel.AgentIDFromBytes)
 	if err != nil {
 		return browserprotocol.AgentUpdateResult{}, browser.ErrStale
@@ -556,7 +560,7 @@ func (backend *browserBackend) RunPaths(ctx context.Context, rawClient [browserp
 // operator's home, marked with the account row each one is linked to. It reads
 // the login directories' own identity files and never a token value.
 func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
-	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityObserve)
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
 	if err != nil {
 		return browserprotocol.Accounts{}, err
 	}
@@ -589,7 +593,7 @@ func (backend *browserBackend) DiscoverAccounts(ctx context.Context, rawClient [
 // directory discovery actually found may be linked: the browser names a login,
 // it does not name an arbitrary directory for a provider to read.
 func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error) {
-	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
 	if err != nil {
 		return browserprotocol.AccountLinkResult{}, err
 	}
@@ -730,6 +734,9 @@ func projectBrowserAuthentication(client kernel.BrowserClient) (browser.Authenti
 	}
 	if client.CapabilityMask.Has(kernel.BrowserCapabilityTerminalInput) {
 		capabilities |= browserprotocol.CapabilityTerminalInput
+	}
+	if client.CapabilityMask.Has(kernel.BrowserCapabilityAdministration) {
+		capabilities |= browserprotocol.CapabilityAdministration
 	}
 	var principal browser.Principal
 	copy(principal.ClientID[:], client.ID.Bytes())

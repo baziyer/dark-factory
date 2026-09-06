@@ -31,15 +31,16 @@ import (
 // removed silently breaks every paired browser, so the set is asserted.
 var remoteInvitationMembers = []string{"df_remote", "node", "daemon", "challenge", "ticket", "expires"}
 
-func TestRemotePairingGrantsEveryHumanCapabilityExceptTerminalInput(t *testing.T) {
+func TestRemotePairingGrantsEveryHumanCapabilityExceptTerminalInputAndAdministration(t *testing.T) {
 	want := kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityPrivateHumanRequestDetail | kernel.BrowserCapabilityHumanActions
-	if remoteCapabilities != want || remoteCapabilities&kernel.BrowserCapabilityTerminalInput != 0 || remoteCapabilities&^kernel.BrowserCapabilityKnownMask != 0 {
+	if remoteCapabilities != want || remoteCapabilities&^kernel.BrowserCapabilityKnownMask != 0 {
 		t.Fatalf("remote capabilities = %#x, want exactly %#x", remoteCapabilities, want)
 	}
 	// The remote grant is strictly weaker than the local web grant: a relayed
-	// controller must never be able to type into a provider PTY.
-	if webCapabilities&^kernel.BrowserCapabilityTerminalInput != remoteCapabilities {
-		t.Fatalf("remote capabilities are not the web grant minus terminal input: %#x vs %#x", remoteCapabilities, webCapabilities)
+	// controller must never be able to type into a provider PTY, nor see or
+	// assign the operator's provider logins.
+	if operator := kernel.BrowserCapabilityTerminalInput | kernel.BrowserCapabilityAdministration; webCapabilities&^operator != remoteCapabilities {
+		t.Fatalf("remote capabilities are not the web grant minus the operator bits: %#x vs %#x", remoteCapabilities, webCapabilities)
 	}
 }
 

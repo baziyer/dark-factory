@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -161,7 +162,7 @@ func TestOpenRejectsForeignPathsWithoutModification(t *testing.T) {
 func TestOpenRejectsUnknownVersionAndPartialIdentity(t *testing.T) {
 	for name, mutate := range map[string]func(*testing.T, *sql.DB){
 		"unknown version": func(t *testing.T, raw *sql.DB) {
-			if _, err := raw.Exec(`PRAGMA user_version = 3`); err != nil {
+			if _, err := raw.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, userVersion+1)); err != nil {
 				t.Fatal(err)
 			}
 		},

@@ -150,6 +150,9 @@ may mint the one concrete cancellation descriptor containing exact request and
 run revisions. Delivering, delivery-unknown, finalizing, terminal, missing, and
 non-active origins expose no reply or cancellation authority; corrupt active
 relationships fail closed rather than resembling unavailability.
+`administration` is the operator's own bit: discovering and linking this
+machine's provider logins and choosing which one an agent runs as. A pairing
+minted on loopback carries it; a relay pairing does not.
 
 A reply contains only request ID, expected request revision, and bounded text.
 The Store derives the originating run and commits a unique delivery receipt
