@@ -21,7 +21,7 @@ type consoleDispatchBackend struct {
 	account  browserprotocol.AccountLinkResult
 	err      error
 	calls    int
-	walking  chan struct{} // when set, Topology and RunPaths block until it is closed
+	walking  chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
 }
 
 func newConsoleDispatchBackend() *consoleDispatchBackend {
@@ -86,19 +86,20 @@ func (backend *consoleDispatchBackend) RunPaths(ctx context.Context, client [bro
 	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
 }
 
-func (backend *consoleDispatchBackend) walk(ctx context.Context) error {
+func (backend *consoleDispatchBackend) walk(context.Context) error {
 	backend.mu.Lock()
 	walking := backend.walking
 	backend.mu.Unlock()
-	if walking == nil {
-		return nil
+	if walking != nil {
+		<-walking
 	}
-	select {
-	case <-walking:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return nil
+}
+
+func (backend *consoleDispatchBackend) setWalking(walking chan struct{}) {
+	backend.mu.Lock()
+	backend.walking = walking
+	backend.mu.Unlock()
 }
 
 func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
@@ -259,10 +260,8 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 	if !got[browserprotocol.TypeTopology] || !got[browserprotocol.TypeRunPaths] {
 		t.Fatalf("walk answers = %v", got)
 	}
-	// A walk still running when the client leaves is joined, not leaked: the
-	// connection count test proves the goroutines; here the backend refusal
-	// path still ends the connection as dispatch would.
-	backend.walking = nil
+	// The backend refusal path still ends the connection as dispatch would.
+	backend.setWalking(nil)
 	backend.err = ErrUnauthorized
 	writeClientFrame(t, connection, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeTopologyGet), "console-topology", "console-topology-2", 1)))
 	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorUnauthorized)
@@ -270,6 +269,43 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 	defer cancel()
 	if _, _, err := connection.Read(ctx); err == nil || ctx.Err() != nil {
 		t.Fatalf("unauthorized walk left the connection open: err=%v ctx=%v", err, ctx.Err())
+	}
+
+	// A walk still running when the server closes is joined, not leaked:
+	// Close cannot finish while the walk holds the connection's cleanup.
+	backend.err = nil
+	backend.setWalking(make(chan struct{}))
+	held, _ := dialServer(t, server, testOrigin)
+	authenticate(t, held)
+	calls, _ := backend.observed()
+	writeClientFrame(t, held, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
+	// The walk is in flight once the backend has been asked.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if now, _ := backend.observed(); now > calls {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the walk never started")
+		}
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("server close did not wait for the walk in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	backend.mu.Lock()
+	walking := backend.walking
+	backend.mu.Unlock()
+	close(walking)
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server close did not finish once the walk ended")
 	}
 }
 

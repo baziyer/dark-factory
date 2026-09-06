@@ -64,6 +64,7 @@ type Server struct {
 	origins            map[string]struct{}
 	terminalAckTimeout time.Duration
 	http               *http.Server
+	now                func() time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -103,6 +104,7 @@ func Listen(config Config) (*Server, error) {
 func start(backend Backend, origins map[string]struct{}, listener net.Listener) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
+		now:                time.Now,
 		backend:            backend,
 		terminalBackend:    func() TerminalBackend { value, _ := backend.(TerminalBackend); return value }(),
 		taskBackend:        func() TaskBackend { value, _ := backend.(TaskBackend); return value }(),

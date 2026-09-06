@@ -79,7 +79,7 @@ type request struct {
 // admit spends one slot of the sliding window on id, forgetting ids older
 // than the window first. Only the serve goroutine calls it.
 func (current *connection) admit(id string) error {
-	now := time.Now()
+	now := current.server.now()
 	for len(current.recent) > 0 && now.Sub(current.recent[0].at) >= requestWindow {
 		delete(current.seen, current.recent[0].id)
 		current.recent = current.recent[1:]

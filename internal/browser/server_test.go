@@ -882,11 +882,12 @@ func TestDuplicateRequestIDAndConnectionLimit(t *testing.T) {
 }
 
 func TestRequestBudgetIsASlidingWindow(t *testing.T) {
-	window := requestWindow
-	requestWindow = 300 * time.Millisecond
-	t.Cleanup(func() { requestWindow = window })
 	backend := newFakeBackend()
 	server := startServer(t, backend)
+	// The window is measured on the server's clock, held still here so the
+	// fill cannot age out under a slow gate and moved by hand afterwards.
+	clock := time.Unix(1_700_000_000, 0)
+	server.now = func() time.Time { return clock }
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
 	// Authentication consumes one ID of the window. Exactly maxRequests-1
@@ -915,7 +916,7 @@ func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 	// The refusal spent nothing and closed nothing. Once the window has
 	// passed the same connection has budget again, and the id it refused is
 	// admitted like any other.
-	time.Sleep(requestWindow)
+	clock = clock.Add(requestWindow)
 	request, _ = browserprotocol.EncodeStateGet("over-budget", browserprotocol.StateGet{})
 	writeClientFrame(t, connection, request)
 	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot || frame.ID != "over-budget" {
