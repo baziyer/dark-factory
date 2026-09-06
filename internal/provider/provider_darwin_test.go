@@ -95,17 +95,27 @@ func TestBuildOrchestratorClaudeIsGivenTheMaintainerBridge(t *testing.T) {
 	if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("orchestrator without the bridge = %v, want ErrUnavailable", err)
 	}
+	// The installed bridge is a script, which the CLI commitment would refuse;
+	// it needs only to be a regular executable nobody but its owner can write.
 	bridge := filepath.Join(filepath.Dir(locator), maintainerBridge)
-	if err := os.Symlink("/usr/bin/true", bridge); err != nil {
+	if err := os.WriteFile(bridge, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	launch, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{"maintainer":{"command":"/usr/bin/true"}}}`}
+	want := []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{"maintainer":{"command":"` + bridge + `"}}}`}
 	if !reflect.DeepEqual(launch.Argv(), want) {
 		t.Fatalf("orchestrator argv = %q, want %q", launch.Argv(), want)
+	}
+	for name, mode := range map[string]os.FileMode{"not executable": 0o644, "group writable": 0o775} {
+		if err := os.Chmod(bridge, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("%s bridge = %v, want ErrUnavailable", name, err)
+		}
 	}
 	if _, err := NewRequest(kernel.ProviderClaudeCode, installation, "", "", runtime, "/private/change", kernel.AgentRole(0)); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("request without a role = %v, want ErrInvalid", err)

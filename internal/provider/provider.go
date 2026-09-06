@@ -75,6 +75,31 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 	return Installation{provider: kind, executable: executable}, nil
 }
 
+// resolveBridge finds the Maintainer bridge on the fixed tool path. It is
+// not committed like a CLI: Claude spawns it much later and it may be a
+// script, which the executable commitment refuses. It must be a regular
+// executable file that nobody but its owner can write.
+func resolveBridge(toolPath string) (string, error) {
+	for _, directory := range filepath.SplitList(toolPath) {
+		candidate := filepath.Join(directory, maintainerBridge)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return "", ErrUnavailable
+		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil || !validAbsolute(resolved, maxPathBytes) {
+			return "", ErrUnavailable
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
+			return "", ErrUnavailable
+		}
+		return resolved, nil
+	}
+	return "", ErrUnavailable
+}
+
 // resolveTool commits the first tool of that name on the fixed tool path.
 func resolveTool(toolPath, tool string) (runner.ExecutableCommitment, error) {
 	for _, directory := range filepath.SplitList(toolPath) {
@@ -241,11 +266,11 @@ func Build(request Request) (Launch, error) {
 		// blind.
 		argv = append(argv, "--strict-mcp-config")
 		if request.role == kernel.RoleOrchestrator {
-			bridge, err := resolveTool(request.runtime.toolPath, maintainerBridge)
+			bridge, err := resolveBridge(request.runtime.toolPath)
 			if err != nil {
 				return Launch{}, errors.Join(ErrUnavailable, fmt.Errorf("%s: %s", maintainerBridge, request.runtime.toolPath))
 			}
-			config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"maintainer": map[string]string{"command": bridge.Path()}}})
+			config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"maintainer": map[string]string{"command": bridge}}})
 			if err != nil || len(config) > runner.MaxArgumentBytes {
 				return Launch{}, ErrInvalid
 			}
