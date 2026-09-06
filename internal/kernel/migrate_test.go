@@ -213,7 +213,7 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, extra ...string) (string, 
 			t.Fatalf("prepare legacy home: %v", err)
 		}
 	}
-	if err := rebuildTable(ctx, connection, legacy, "agents", legacyAgentColumns, "agents_id_project_unique"); err != nil {
+	if err := rebuildTable(ctx, connection, legacy, "agents", testAgentColumns, "agents_id_project_unique"); err != nil {
 		t.Fatal(err)
 	}
 	if err := rebuildTable(ctx, connection, legacy, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique"); err != nil {
@@ -271,10 +271,12 @@ func openRawDatabase(t *testing.T, path string, persistWAL bool) (*sql.DB, *sql.
 	return pool, connection
 }
 
-// snapshotRowsAgentColumns is the v1 agents column list spelled out, so the
-// proof reads every column whether or not the migration copies it: sharing
-// legacyAgentColumns would hide a column dropped from that constant.
-const snapshotRowsAgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
+// testAgentColumns is the v1 agents column list spelled out, used to build the
+// fixture and to read it back. Both have to stay independent of
+// legacyAgentColumns: sharing that constant would drop a column from the
+// fixture and from the comparison at the same time, hiding a column the
+// migration stopped copying.
+const testAgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 
 // snapshotRows reads every v1 table, agents through the list above because the
 // added account_id makes SELECT * differ either side of the migration.
@@ -287,7 +289,7 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 		}
 		columns := "*"
 		if name == "agents" {
-			columns = snapshotRowsAgentColumns
+			columns = testAgentColumns
 		}
 		rows, err := connection.QueryContext(ctx, "SELECT "+columns+" FROM "+name+" ORDER BY 1")
 		if err != nil {
