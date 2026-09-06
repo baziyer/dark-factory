@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,8 @@ type consoleDispatchBackend struct {
 	account  browserprotocol.AccountLinkResult
 	err      error
 	calls    int
+	walking  chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
+	budgets  []time.Time   // each walk's context deadline, in the order the walks started
 }
 
 func newConsoleDispatchBackend() *consoleDispatchBackend {
@@ -65,18 +68,49 @@ func (backend *consoleDispatchBackend) UpdateTask(_ context.Context, client [bro
 	return backend.task, nil
 }
 
-func (backend *consoleDispatchBackend) Topology(_ context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.TopologyGet) (browserprotocol.Topology, error) {
+func (backend *consoleDispatchBackend) Topology(ctx context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.TopologyGet) (browserprotocol.Topology, error) {
 	if err := backend.record(client); err != nil {
+		return browserprotocol.Topology{}, err
+	}
+	if err := backend.walk(ctx); err != nil {
 		return browserprotocol.Topology{}, err
 	}
 	return backend.topology, nil
 }
 
-func (backend *consoleDispatchBackend) RunPaths(_ context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
+func (backend *consoleDispatchBackend) RunPaths(ctx context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
 	if err := backend.record(client); err != nil {
 		return browserprotocol.RunPaths{}, err
 	}
+	if err := backend.walk(ctx); err != nil {
+		return browserprotocol.RunPaths{}, err
+	}
 	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
+}
+
+func (backend *consoleDispatchBackend) walk(ctx context.Context) error {
+	backend.mu.Lock()
+	walking := backend.walking
+	deadline, _ := ctx.Deadline()
+	backend.budgets = append(backend.budgets, deadline)
+	backend.mu.Unlock()
+	if walking != nil {
+		<-walking
+	}
+	return nil
+}
+
+func (backend *consoleDispatchBackend) setWalking(walking chan struct{}) {
+	backend.mu.Lock()
+	backend.walking = walking
+	backend.mu.Unlock()
+}
+
+// setErr is for a backend a live connection may be reading right now.
+func (backend *consoleDispatchBackend) setErr(err error) {
+	backend.mu.Lock()
+	backend.err = err
+	backend.mu.Unlock()
 }
 
 func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
@@ -209,6 +243,130 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 	}
 	t.Fatalf("no console frame for %s", kind)
 	return ""
+}
+
+// TOPOLOGY_GET and RUN_PATHS_GET may walk a tree under the call budget. The
+// connection keeps serving while they do, and a refusal from that path still
+// ends it the way dispatch would.
+func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
+	backend := newConsoleDispatchBackend()
+	first := make(chan struct{})
+	backend.walking = first
+	server, clock := startHeldClockServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeRunPathsGet)))
+	// The first walk is blocked and the second waits behind it; a state read
+	// on the same connection is answered anyway.
+	state, _ := browserprotocol.EncodeStateGet("state-during-walk", browserprotocol.StateGet{})
+	writeClientFrame(t, connection, state)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot {
+		t.Fatalf("state during walks = %+v", frame)
+	}
+	// Each walk's budget starts with its work, not when its frame arrived:
+	// the first walk is held for a spell, and the second, released on its
+	// own, carries a deadline at least that much later. A budget taken at
+	// dispatch would put the two deadlines a frame apart.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if now, _ := backend.observed(); now >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first walk never started")
+		}
+	}
+	const hold = 50 * time.Millisecond
+	second := make(chan struct{})
+	backend.setWalking(second)
+	time.Sleep(hold)
+	close(first)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTopology {
+		t.Fatalf("first walk answer = %+v", frame)
+	}
+	close(second)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeRunPaths {
+		t.Fatalf("second walk answer = %+v", frame)
+	}
+	backend.mu.Lock()
+	budgets := append([]time.Time(nil), backend.budgets...)
+	backend.mu.Unlock()
+	if len(budgets) != 2 || budgets[1].Sub(budgets[0]) < hold {
+		t.Fatalf("walk budgets = %v; the second should start at least %v after the first", budgets, hold)
+	}
+	// The backend refusal path still ends the connection as dispatch would.
+	backend.setWalking(nil)
+	backend.setErr(ErrUnauthorized)
+	writeClientFrame(t, connection, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeTopologyGet), "console-topology", "console-topology-2", 1)))
+	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorUnauthorized)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := connection.Read(ctx); err == nil || ctx.Err() != nil {
+		t.Fatalf("unauthorized walk left the connection open: err=%v ctx=%v", err, ctx.Err())
+	}
+
+	// Walks are answered one at a time in arrival order and the rest wait:
+	// a window's worth may queue, so a normal round is never refused. Past
+	// that, a walk the window would admit is refused as retryable without
+	// reaching the backend, and the one in flight still holds.
+	backend.setErr(nil)
+	walking := make(chan struct{})
+	backend.setWalking(walking)
+	// A failure below must not leave the walk blocked for the cleanup's join.
+	var released sync.Once
+	release := func() { released.Do(func() { close(walking) }) }
+	t.Cleanup(release)
+	held, _ := dialServer(t, server, testOrigin)
+	authenticate(t, held)
+	calls, _ := backend.observed()
+	walkFrame := func(id string) []byte {
+		return []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeRunPathsGet), "console-rooms", id, 1))
+	}
+	// Authentication spent one id of the window; the rest all go to walks.
+	for index := range maxRequests - 1 {
+		writeClientFrame(t, held, walkFrame(fmt.Sprintf("console-rooms-%d", index)))
+	}
+	// The first walk is in flight once the backend has been asked once.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if now, _ := backend.observed(); now >= calls+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the walk never started")
+		}
+	}
+	// Two slots remain behind it. The window slides, so the next three are
+	// admitted; the third finds the queue full.
+	clock.Add(int64(requestWindow))
+	writeClientFrame(t, held, walkFrame("console-rooms-fill-1"))
+	writeClientFrame(t, held, walkFrame("console-rooms-fill-2"))
+	writeClientFrame(t, held, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
+	over := readServerFrame(t, held)
+	assertError(t, over, browserprotocol.ErrorRateLimited)
+	if over.ID != "console-topology" || !bool(over.Body.(browserprotocol.Error).Retryable) {
+		t.Fatalf("walk past the queue = %+v", over)
+	}
+	if now, _ := backend.observed(); now != calls+1 {
+		t.Fatalf("queued walks reached the backend: calls=%d", now-calls)
+	}
+	// A walk still running when the server closes is joined, not leaked:
+	// Close cannot finish while the walker holds the connection's cleanup.
+	closed := make(chan struct{})
+	go func() {
+		_ = server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("server close did not wait for the walk in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server close did not finish once the walk ended")
+	}
 }
 
 // A verb this build does not know is refused by its id and nothing else

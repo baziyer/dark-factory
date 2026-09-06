@@ -485,7 +485,7 @@ func (failingListener) Addr() net.Addr {
 
 func TestUnexpectedServeFailureIsObservable(t *testing.T) {
 	sentinel := errors.New("serve-SENTINEL")
-	server := start(newFakeBackend(), map[string]struct{}{testOrigin: {}}, failingListener{err: sentinel})
+	server := start(newFakeBackend(), map[string]struct{}{testOrigin: {}}, failingListener{err: sentinel}, time.Now)
 	select {
 	case <-server.ServeDone():
 	case <-time.After(time.Second):

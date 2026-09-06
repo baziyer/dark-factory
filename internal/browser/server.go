@@ -28,9 +28,9 @@ const (
 	maxOrigins     = 8
 	maxConnections = 32
 	// One coherent snapshot is one request, and a notification burst
-	// collapses into at most one trailing refresh. 1,024 retains every
-	// request ID for the whole connection while leaving ample room for
-	// refreshes, detail reads, terminal control and task enqueue.
+	// collapses into at most one trailing refresh. 1,024 per requestWindow
+	// leaves ample room for refreshes, detail reads, terminal control, task
+	// enqueue and the floor's run-path and topology polling.
 	maxRequests         = 1024
 	readQueueSize       = 8
 	maxHeaderBytes      = 8 << 10
@@ -64,6 +64,7 @@ type Server struct {
 	origins            map[string]struct{}
 	terminalAckTimeout time.Duration
 	http               *http.Server
+	now                func() time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -97,12 +98,13 @@ func Listen(config Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("browser: listen: %w", err)
 	}
-	return start(config.Backend, origins, listener), nil
+	return start(config.Backend, origins, listener, time.Now), nil
 }
 
-func start(backend Backend, origins map[string]struct{}, listener net.Listener) *Server {
+func start(backend Backend, origins map[string]struct{}, listener net.Listener, clock func() time.Time) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
+		now:                clock,
 		backend:            backend,
 		terminalBackend:    func() TerminalBackend { value, _ := backend.(TerminalBackend); return value }(),
 		taskBackend:        func() TaskBackend { value, _ := backend.(TaskBackend); return value }(),

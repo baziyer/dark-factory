@@ -881,13 +881,37 @@ func TestDuplicateRequestIDAndConnectionLimit(t *testing.T) {
 	})
 }
 
-func TestLifetimeRequestBudgetRemainsFinite(t *testing.T) {
+// startHeldClockServer starts a server whose request window is measured on
+// a clock held still until the test moves it; the serve goroutine reads it
+// through the atomic.
+func startHeldClockServer(t *testing.T, backend Backend) (*Server, *atomic.Int64) {
+	t.Helper()
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := start(backend, map[string]struct{}{testOrigin: {}, devOrigin: {}}, listener, func() time.Time { return time.Unix(0, clock.Load()) })
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return server, &clock
+}
+
+func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 	backend := newFakeBackend()
-	server := startServer(t, backend)
+	// The window is measured on the server's clock, given before the server
+	// starts and held still so the fill cannot age out under a slow gate,
+	// then moved by hand; the serve goroutine reads it through the atomic.
+	server, clock := startHeldClockServer(t, backend)
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
-	// Authentication consumes one retained ID. Exactly maxRequests-1 distinct
-	// operations may then complete; the next is rejected without backend work.
+	// Authentication consumes one ID of the window. Exactly maxRequests-1
+	// distinct operations may then complete; the next is rejected without
+	// backend work.
 	for index := 0; index < maxRequests-1; index++ {
 		request, _ := browserprotocol.EncodeStateGet(fmt.Sprintf("request-%d", index), browserprotocol.StateGet{})
 		writeClientFrame(t, connection, request)
@@ -907,6 +931,15 @@ func TestLifetimeRequestBudgetRemainsFinite(t *testing.T) {
 	backend.mu.Unlock()
 	if calls != maxRequests-1 {
 		t.Fatalf("over-budget request reached backend: calls=%d", calls)
+	}
+	// The refusal spent nothing and closed nothing. Once the window has
+	// passed the same connection has budget again, and the id it refused is
+	// admitted like any other.
+	clock.Add(int64(requestWindow))
+	request, _ = browserprotocol.EncodeStateGet("over-budget", browserprotocol.StateGet{})
+	writeClientFrame(t, connection, request)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot || frame.ID != "over-budget" {
+		t.Fatalf("request after the window = %+v", frame)
 	}
 }
 
