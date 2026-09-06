@@ -39,7 +39,8 @@ head=$(git -C "$source" rev-parse HEAD)
 # its base must still diff from the branch point.
 git -C "$source" checkout -q -b advance "$base"
 printf 'later\n' >"$source/LATER.md"
-git -C "$source" add LATER.md
+printf 'later rules\n' >"$source/AGENTS.md"
+git -C "$source" add LATER.md AGENTS.md
 git -C "$source" commit -q -m later
 moved=$(git -C "$source" rev-parse HEAD)
 git clone -q --bare "$source" "$remote/owner/repo"
@@ -136,9 +137,17 @@ review owner/repo 7 "$head" "$(printf '%s' "$base" | cut -c1-39)" "$body" || sta
 status=0
 review owner/repo 7 "$head" "$(printf '%040d' 0)" "$body" || status=$?
 [ "$status" -eq 2 ] || fail "unknown base exited $status, want 2"
+for name in 'owner/repo/extra' 'repo' '../repo' 'owner/.repo'; do
+    status=0
+    review "$name" 7 "$head" "$base" "$body" || status=$?
+    [ "$status" -eq 2 ] || fail "repository name $name exited $status, want 2"
+done
+# A base that already contains the head leaves nothing to review.
+: >"$args"
 status=0
-review 'owner/repo/extra' 7 "$head" "$base" "$body" || status=$?
-[ "$status" -eq 2 ] || fail "bad repository name exited $status, want 2"
+review owner/repo 7 "$head" "$head" "$body" || status=$?
+[ "$status" -eq 2 ] || fail "a base at the head exited $status, want 2"
+[ ! -s "$args" ] || fail "a base at the head still started a session"
 status=0
 (cd "$run" && TMPDIR="$scratch" DARK_FACTORY_REVIEW_REMOTE="file://$temporary/nowhere" DARK_FACTORY_FAKE_CLAUDE_ARGS="$args" DARK_FACTORY_FAKE_CLAUDE_REPLY="$reply" \
     PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?

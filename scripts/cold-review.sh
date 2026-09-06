@@ -43,7 +43,9 @@ repository=$1 pr=$2 head=$3 base=$4 body=$5
 shift 5
 focus="$*"
 case "$repository" in
-    */*/* | '' | /* | */ | *[!A-Za-z0-9._/-]*) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+    */*/* | '' | /* | */ | .* | */.* | *[!A-Za-z0-9._/-]*) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+    */*) ;;
+    *) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
 esac
 case "$pr" in
     '' | *[!0-9]*) echo "not a pull request number: $pr" >&2; exit 2 ;;
@@ -56,8 +58,9 @@ for sha in "$head" "$base"; do
 done
 [ -f "$body" ] || { echo "no body file: $body" >&2; exit 2; }
 bridge=$(command -v dark-factory-maintainer-mcp-bridge) || { echo "maintainer bridge is not on PATH" >&2; exit 2; }
-command -v claude >/dev/null || { echo "claude is not on PATH" >&2; exit 2; }
-command -v git >/dev/null || { echo "git is not on PATH" >&2; exit 2; }
+for tool in claude git uuidgen; do
+    command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 2; }
+done
 remote=${DARK_FACTORY_REVIEW_REMOTE:-https://github.com}
 work=$(mktemp -d "${TMPDIR:-/tmp}/cold-review.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -73,16 +76,21 @@ if ! git -C "$work/repo" cat-file -e "$base^{commit}" 2>/dev/null; then
     exit 2
 fi
 merge_base=$(git -C "$work/repo" merge-base "$base" "$head") || exit 5
+if [ "$merge_base" = "$head" ]; then
+    echo "base $base already contains the head: nothing to review" >&2
+    exit 2
+fi
 git -C "$work/repo" checkout -q "$head" || exit 5
 # Deepest first, so a CLAUDE.md inside a .claude directory is renamed before
 # the directory that holds it; the listing is taken whole before any rename.
-find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -name CLAUDE.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
+find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
 while IFS= read -r instruction; do
     mv "$instruction" "$instruction.under-review" || exit 5
 done <"$work/instructions"
 # Presence is read from the merge base's tree, which the clone holds; the
 # blob may need fetching, and a fetch that fails must not pass as absence.
-if [ -n "$(git -C "$work/repo" ls-tree "$merge_base" -- AGENTS.md)" ]; then
+rules_entry=$(git -C "$work/repo" ls-tree "$merge_base" -- AGENTS.md) || exit 5
+if [ -n "$rules_entry" ]; then
     git -C "$work/repo" show "$merge_base:AGENTS.md" >"$work/rules.md" || exit 5
 else
     printf 'The repository has no AGENTS.md at the merge base.\n' >"$work/rules.md"
