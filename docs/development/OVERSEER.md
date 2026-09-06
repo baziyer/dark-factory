@@ -44,7 +44,7 @@ The daemon home is two directories above `$DARK_FACTORY_SOCKET`. Its store is
 home=$(dirname "$(dirname "$DARK_FACTORY_SOCKET")")
 sqlite3 -readonly -json "file:$home/factory.sqlite3?mode=ro" "
 SELECT lower(hex(c.id)) AS change_id, lower(hex(c.base_commit)) AS base_commit,
-       c.object_format, p.name AS project, p.root, t.title, t.body,
+       p.name AS project, p.root, t.title, t.body,
        r.terminal_result AS result, a.name AS agent
 FROM changes c
 JOIN runs r ON r.id = c.settled_run_id
@@ -57,10 +57,11 @@ ORDER BY r.terminal_at_ms"
 
 Handle only rows whose `project` is yours. The retained tree of a change is
 `$home/changes/<change_id>`. A change is finished when its `enqueue`
-operation (step 5) is `completed` in the App journal; anything short of that
-is resumed at the first step whose operation is not completed, as section 2
-says, and a change whose pull request exists but was blocked waits for a new
-retained change (section 5 says how to tell).
+operation (step 5) is `completed` in the App journal and the merge was
+observed; anything short of that is resumed at the first step whose
+operation is not completed, as section 2 says, and a change whose pull
+request exists but was blocked waits for a new retained change (section 5
+says how to tell).
 
 ## 2. Derive one operation id per step, and check the journal first
 
@@ -69,8 +70,11 @@ step so a retry is a replay, never a second publication:
 
 ```sh
 opid() { python3 -c "import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, 'dark-factory:' + sys.argv[1] + ':' + sys.argv[2]))" "$1" "$2"; }
-# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, enqueue
+# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, review-HEAD8, enqueue
 ```
+
+`review-HEAD8` takes the first eight hex digits of the pull request head it
+reviews, so a fix pushed later gets a review of its own.
 
 One id per App write: a change that needs several commits (step 3) uses
 `publish-1`, `publish-2` and so on, one per commit, and the same request under
@@ -124,12 +128,15 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 
 `create_pull_request` needs an issue. `create_issue` with `opid issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
-text plus the change id; it returns the issue number. Then
-`create_pull_request` with `opid pr`, `issue_number` from that result,
-`head = branch`, `head_sha` = the last published commit, `base = main`,
-`base_sha = main_head` from step 3 (the App verifies the base branch is at
-that commit now; `base_commit` is wrong whenever main moved), `draft =
-false`, the same title, and a body in this repository's shape. An operation
+text plus the change id; it returns the issue number. Then read
+`observe_ref` for `main` again, immediately before the call, and use that
+answer: `create_pull_request` with `opid pr`, `issue_number` from that
+result, `head = branch`, `head_sha` = the last published commit, `base =
+main`, `base_sha` = main's head as just read (the App verifies the base
+branch is at that commit at that moment; `base_commit` is wrong whenever
+main moved, and a stale read is wrong whenever main moves between the read
+and the call), `draft = false`, the same title, and a body in this
+repository's shape. An operation
 id belongs to the exact request it was first sent with, so a request the App
 refuses for its content cannot be corrected under the same id: that is a
 human request, not a retry.
@@ -146,18 +153,25 @@ Write that body to a file; the review needs it.
 ## 5. Get the cold review, then merge
 
 ```sh
-repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA BASE_SHA body.md "first review"
+DARK_FACTORY_REVIEW_OPERATION_ID=$(opid "$change_id" "review-$(printf '%s' "$HEAD_SHA" | cut -c1-8)") \
+    repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA BASE_SHA body.md "first review"
 ```
 
-It exits 0 for ALLOW, 1 for REQUEST_CHANGES and 3 when the session reported
-no verdict, and leaves `review-PR-HEAD8.log` in the current directory.
+The verdict is recorded under that operation id, so `observe_operation`
+with it answers `completed` with the verdict (`allow` or `block`) once a
+review exists, and nothing until then. The script exits 0 for ALLOW, 1 for
+REQUEST_CHANGES, 3 when the session reported no verdict, 4 when the pull
+request is no longer at that head, and 2 for an argument it refuses, and
+leaves `review-PR-HEAD8.log` in the current directory.
 
 - Exit 3: run it once more; a second 3 is a human request with the log's
   last lines.
 - ALLOW: `enqueue_pull_request` with `opid enqueue`, the PR number, the head
   and `base = main`. Then `observe_pull_request_merge`, with the PR number,
   the head and the enqueue operation id, every 60 s for up to 30 minutes;
-  never faster. Merged: done. No longer queued and not merged:
+  never faster. Merged: done. Still queued after 30 minutes: the change is
+  not finished; raise a human request naming the PR and stop, and the next
+  run observes it again. No longer queued and not merged:
   the queue's run failed or dropped the entry, and the App cannot read a
   queue run's log or rerun it (`read_pull_request_job_log` and
   `rerun_failed_pull_request_jobs` bind to the pull request's own runs), so
@@ -172,9 +186,11 @@ no verdict, and leaves `review-PR-HEAD8.log` in the current directory.
   only a person can have done; raise a human request.
 
 On a resumed run, a change whose `pr` is completed but whose `enqueue` is not
-needs no second review if one was recorded: `observe_pull_request_checks` at
-the head shows the `review` check passed (enqueue), failed (blocked: wait for
-a new retained change), or absent (run the review).
+needs no second review if one was recorded: `observe_operation` with `opid
+review-HEAD8` for the pull request head answers `completed` with verdict
+`allow` (enqueue), `block` (blocked: wait for a new retained change), or
+nothing (run the review). The `review` check itself runs only in the merge
+queue, so it is never the signal here.
 
 ## 6. Hand off and finish
 
