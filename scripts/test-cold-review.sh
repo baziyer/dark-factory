@@ -35,9 +35,16 @@ printf '{}\n' >"$source/sub/.claude/settings.json"
 git -C "$source" add -A
 git -C "$source" commit -q -m change
 head=$(git -C "$source" rev-parse HEAD)
+# main moves on after the branch point, so a review given main's head as
+# its base must still diff from the branch point.
+git -C "$source" checkout -q -b advance "$base"
+printf 'later\n' >"$source/LATER.md"
+git -C "$source" add LATER.md
+git -C "$source" commit -q -m later
+moved=$(git -C "$source" rev-parse HEAD)
 git clone -q --bare "$source" "$remote/owner/repo"
 git -C "$remote/owner/repo" update-ref refs/pull/7/head "$head"
-git -C "$remote/owner/repo" update-ref refs/heads/main "$base"
+git -C "$remote/owner/repo" update-ref refs/heads/main "$moved"
 
 # The session is a fake claude that records what it was allowed and answers
 # with whatever verdict the test asks for; the bridge only has to exist.
@@ -100,6 +107,12 @@ case "$(sed -n 's/^cwd=//p' "$args")" in
     */repo | */repo/*) fail "session runs inside the change under review" ;;
 esac
 grep -q 'Bash(git -C ' "$args" || fail "git is not scoped to the checkout"
+# Given main's moved head as the base, the diff still runs from the branch
+# point, and so do the rules.
+: >"$args"
+review owner/repo 7 "$head" "$moved" "$body" || fail "review against the moved base did not exit 0"
+grep -q "diff $base $head" "$args" || fail "with a moved base the diff does not run from the branch point"
+[ "$(sed -n 's/^rules=//p' "$args")" = "base rules" ] || fail "with a moved base the rules are not the branch point's"
 
 printf 'Findings.\nVERDICT: REQUEST_CHANGES\n' >"$reply"
 status=0
@@ -130,10 +143,17 @@ status=0
 (cd "$run" && TMPDIR="$scratch" DARK_FACTORY_REVIEW_REMOTE="file://$temporary/nowhere" DARK_FACTORY_FAKE_CLAUDE_ARGS="$args" DARK_FACTORY_FAKE_CLAUDE_REPLY="$reply" \
     PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?
 [ "$status" -eq 5 ] || fail "failed clone exited $status, want 5"
+# The bridge alone on PATH: claude is missing, and that is refused before
+# any session could be swallowed as a verdict.
+bridge_only=$temporary/bridge-only
+mkdir -p "$bridge_only"
+cp "$tools/dark-factory-maintainer-mcp-bridge" "$bridge_only/"
+: >"$args"
 status=0
 (cd "$run" && TMPDIR="$scratch" DARK_FACTORY_REVIEW_REMOTE="file://$remote" DARK_FACTORY_FAKE_CLAUDE_ARGS="$args" DARK_FACTORY_FAKE_CLAUDE_REPLY="$reply" \
-    PATH="$temporary/no-tools:/usr/bin:/bin" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?
-[ "$status" -eq 2 ] || fail "missing tools exited $status, want 2"
+    PATH="$bridge_only:/usr/bin:/bin" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?
+[ "$status" -eq 2 ] || fail "missing claude exited $status, want 2"
+[ ! -s "$args" ] || fail "a missing claude still started a session"
 status=0
 review owner/repo 7x "$head" "$base" "$body" || status=$?
 [ "$status" -eq 2 ] || fail "non-numeric pull request exited $status, want 2"

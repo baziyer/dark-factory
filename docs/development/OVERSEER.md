@@ -107,8 +107,9 @@ Build the `changes` array for `publish_commit`: added and modified paths carry
 `content_base64` and the `mode` the staged entry shows (`100644` or
 `100755`); deleted paths carry only `path`. The App takes at most 50 entries
 per commit and 1,000,000 base64 characters per file (about 732 KiB of
-content), and refuses `.github/workflows`, the CODEOWNERS locations and the
-dependabot config. More than 50 files means several commits on the same
+content), and refuses the `.github` directory itself, `.github/workflows`,
+the CODEOWNERS locations and the dependabot config (other `.github` paths
+are publishable). More than 50 files means several commits on the same
 branch, each bound to the head the previous one returned. A file over that
 bound, a symlink (staged mode `120000`), or a refused path is a human request,
 not a workaround.
@@ -166,8 +167,9 @@ The verdict is recorded under that operation id, so `observe_operation`
 with it answers `completed` with the verdict (`allow` or `block`) once a
 review exists, and nothing until then. The script exits 0 for ALLOW, 1 for
 REQUEST_CHANGES, 3 when the session reported no verdict, 4 when the pull
-request is no longer at that head, and 2 for an argument it refuses, and
-leaves `review-PR-HEAD8.log` in the current directory.
+request is no longer at that head, 2 for an argument or a tool it refuses,
+and 5 when it could not prepare the checkout, and leaves
+`review-PR-HEAD8.log` in the current directory.
 
 - Exit 3: run it once more; a second 3 is a human request with the log's
   last lines.

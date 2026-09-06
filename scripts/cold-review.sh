@@ -76,11 +76,13 @@ merge_base=$(git -C "$work/repo" merge-base "$base" "$head") || exit 5
 git -C "$work/repo" checkout -q "$head" || exit 5
 # Deepest first, so a CLAUDE.md inside a .claude directory is renamed before
 # the directory that holds it; the listing is taken whole before any rename.
-find "$work/repo" -depth -path "$work/repo/.git" -prune -o \( -name CLAUDE.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
+find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -name CLAUDE.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
 while IFS= read -r instruction; do
     mv "$instruction" "$instruction.under-review" || exit 5
 done <"$work/instructions"
-if git -C "$work/repo" cat-file -e "$merge_base:AGENTS.md" 2>/dev/null; then
+# Presence is read from the merge base's tree, which the clone holds; the
+# blob may need fetching, and a fetch that fails must not pass as absence.
+if [ -n "$(git -C "$work/repo" ls-tree "$merge_base" -- AGENTS.md)" ]; then
     git -C "$work/repo" show "$merge_base:AGENTS.md" >"$work/rules.md" || exit 5
 else
     printf 'The repository has no AGENTS.md at the merge base.\n' >"$work/rules.md"
