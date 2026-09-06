@@ -217,7 +217,7 @@ func TestUnknownControlTypeIsRefusedByIDAndKeepsTheConnection(t *testing.T) {
 	server := startTaskServer(t, newConsoleDispatchBackend())
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
-	writeClientFrame(t, connection, []byte(`{"type":"ACCOUNTS_USAGE_GET","id":"console-future","body":{"account_id":"x"}}`))
+	writeClientFrame(t, connection, []byte(`{"type":"FUTURE_VERB","id":"console-future","body":{"account_id":"x"}}`))
 	reply := readServerFrame(t, connection)
 	assertError(t, reply, browserprotocol.ErrorUnsupported)
 	if reply.ID != "console-future" || reply.Body.(browserprotocol.Error).Retryable {
@@ -229,7 +229,7 @@ func TestUnknownControlTypeIsRefusedByIDAndKeepsTheConnection(t *testing.T) {
 		t.Fatalf("known request after unsupported = %+v", reply)
 	}
 	// The refusal spent the id: repeating it is the transport's invalid_request.
-	writeClientFrame(t, connection, []byte(`{"type":"ACCOUNTS_USAGE_GET","id":"console-future","body":{}}`))
+	writeClientFrame(t, connection, []byte(`{"type":"FUTURE_VERB","id":"console-future","body":{}}`))
 	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
 }
 

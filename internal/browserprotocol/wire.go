@@ -151,9 +151,10 @@ const (
 	ErrorStale          ErrorCode = "stale"
 	ErrorTooLarge       ErrorCode = "too_large"
 	ErrorInternal       ErrorCode = "internal"
-	// ErrorUnsupported answers a control type this build does not know. The
-	// peer is newer, not wrong, so the refusal names the request and the
-	// connection stays open for everything else.
+	// ErrorUnsupported answers a control type this build does not know: a
+	// verb it never had or one it retired, so the peer is newer or older, not
+	// wrong. The refusal names the request and the connection stays open for
+	// everything else.
 	ErrorUnsupported ErrorCode = "unsupported"
 )
 
@@ -312,11 +313,7 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		return ControlFrame{}, ErrMalformed
 	}
 	if !typeAllowed(role, envelope.Type) {
-		peer := clientRole
-		if role == clientRole {
-			peer = serverRole
-		}
-		if envelope.Type == "" || typeAllowed(peer, envelope.Type) {
+		if envelope.Type == "" || typeAllowed(clientRole, envelope.Type) || typeAllowed(serverRole, envelope.Type) {
 			return ControlFrame{}, ErrMalformed
 		}
 		// A type neither direction knows is one this build never had or no

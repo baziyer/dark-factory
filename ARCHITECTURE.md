@@ -116,8 +116,11 @@ both read the same frame the same way.
 Tolerance is additive only. Every size, count, depth and member bound still
 binds, and an unknown member counts toward them: an array or a nesting depth
 inside a tolerated member is measured exactly as one inside a known member. A
-missing required member, a member of the wrong type, an unknown frame type and
-a frame arriving in the wrong direction all remain finite refusals.
+missing required member, a member of the wrong type and a frame arriving in the
+wrong direction remain finite refusals that end the connection. A frame type
+this build does not know, whether the peer is newer or still sends a retired
+verb, is answered by its request id with `ERROR` code `unsupported` and the
+connection stays open, so one side can add a verb before the other learns it.
 
 ## Browser HumanRequest authority
 
