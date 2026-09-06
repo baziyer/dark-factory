@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,22 @@ import (
 )
 
 var runnerTestWorkerConfig = []byte(`{"kind":"runner-test"}`)
+
+// runnerTestWorkerConfigOverride, when set, is what the fixture hands the
+// outer runner as the worker config instead of runnerTestWorkerConfig.
+var runnerTestWorkerConfigOverride []byte
+
+// runnerTestConfigKind is what the test worker checks: any JSON object of
+// kind runner-test, so a test may pad the config to any size.
+func runnerTestConfigKind(config []byte) string {
+	var decoded struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(config, &decoded); err != nil {
+		return ""
+	}
+	return decoded.Kind
+}
 
 func TestInheritedWorkerConfigIsExactBoundedAndUnlinked(t *testing.T) {
 	directory, err := os.Open(t.TempDir())
@@ -270,7 +287,7 @@ func runAttemptWorkerHelper(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(config, runnerTestWorkerConfig) {
+	if runnerTestConfigKind(config) != "runner-test" {
 		return fmt.Errorf("attempt worker: config mismatch")
 	}
 	runtimeDirectory, err := control.DuplicateRuntimeDirectory(context.Background())
@@ -603,7 +620,11 @@ func newAttemptFixture(t *testing.T, mode string, target string) *attemptFixture
 	}
 	attemptSpec := AttemptSpec{AttemptID: "attempt-1", Wrapper: wrapper, MarkerName: InnerActivationMarkerName, ResultName: AttemptResultSpoolName, ResultProof: testResultProof()}
 	diagnostic := outputFile(t, filepath.Join(root, "runner.output"))
-	outerSpec, err := PrepareExecSpec(ExecSpec{Target: executable, Args: []string{"--attempt-runner"}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: filepath.Join(root, "work"), Stdin: runnerTestWorkerConfig, Stdout: diagnostic, Stderr: diagnostic, Control: childCap})
+	workerConfig := runnerTestWorkerConfig
+	if runnerTestWorkerConfigOverride != nil {
+		workerConfig = runnerTestWorkerConfigOverride
+	}
+	outerSpec, err := PrepareExecSpec(ExecSpec{Target: executable, Args: []string{"--attempt-runner"}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: filepath.Join(root, "work"), Stdin: workerConfig, Stdout: diagnostic, Stderr: diagnostic, Control: childCap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -971,6 +992,33 @@ func TestAttemptRunnerReportsAProviderThatDiesBeforeItsPrompt(t *testing.T) {
 	}
 	record := f.finishAndAck()
 	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 3 {
+		t.Fatalf("terminal=%+v", record.Terminal)
+	}
+}
+
+// A worker config larger than a Unix socket buffer still reaches the worker:
+// the daemon's prepared prompt rides in that config, and a real task is
+// larger than the eight kilobytes Darwin gives a stream socket by default.
+func TestAttemptRunnerCarriesAWorkerConfigLargerThanTheSocketBuffer(t *testing.T) {
+	runnerTestWorkerConfigOverride = []byte(`{"kind":"runner-test","pad":"` + strings.Repeat("x", 24<<10) + `"}`)
+	t.Cleanup(func() { runnerTestWorkerConfigOverride = nil })
+	f := newAttemptFixture(t, "shell", "")
+	inner := f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if ready := f.nextTerminal(TerminalReady, 0); ready.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v", ready)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "continue"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := f.finishAndAck()
+	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 0 {
 		t.Fatalf("terminal=%+v", record.Terminal)
 	}
 }

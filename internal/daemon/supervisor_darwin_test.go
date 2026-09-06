@@ -38,6 +38,13 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if filepath.Base(os.Args[0]) == "claude" {
+		if err := runSupervisorClaudeFixture(); err != nil {
+			fmt.Fprintln(os.Stderr, "supervisor Claude fixture failed:", err)
+			os.Exit(70)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 {
 		var err error
 		switch os.Args[1] {
@@ -192,6 +199,73 @@ func TestSupervisorRunsOrchestratorInItsPrivateHomeWithoutAChange(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(fixture.runtimeParentPath, run.ID.String())); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("runtime remains: %v", err)
 	}
+}
+
+// runSupervisorClaudeFixture stands in for the Claude CLI: it takes its
+// terminal out of canonical mode as the CLI does, reads the prompt the
+// runner types until the keystroke that submits it, and reports how many
+// bytes arrived.
+func runSupervisorClaudeFixture() error {
+	termios, err := unix.IoctlGetTermios(0, unix.TIOCGETA)
+	if err != nil {
+		return err
+	}
+	termios.Lflag &^= unix.ICANON | unix.ECHO
+	termios.Cc[unix.VMIN], termios.Cc[unix.VTIME] = 1, 0
+	if err := unix.IoctlSetTermios(0, unix.TIOCSETA, termios); err != nil {
+		return err
+	}
+	var line []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			return err
+		}
+		line = append(line, buf[:n]...)
+		if end := bytes.IndexAny(line, "\r\n"); end >= 0 {
+			line = line[:end]
+			break
+		}
+	}
+	client, err := api.NewAttemptClientFromEnvironment(os.Getenv("DARK_FACTORY_SOCKET"))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = client.Succeed(ctx, fmt.Sprintf("received=%d", len(line)))
+	return err
+}
+
+// A Claude task longer than a terminal line or a socket buffer reaches the
+// CLI whole, through the real runner, worker and PTY.
+func TestSupervisorClaudeReceivesALongTaskThroughTheTerminal(t *testing.T) {
+	task := strings.Repeat("Codify the operator scripts and the deploy order. ", 128)
+	fixture := newSupervisorFixture(t, "unused shell task")
+	if err := replaceSupervisorAgentLaunchControls(fixture.storePath, fixture.agentID, kernel.ProviderClaudeCode, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	execSupervisorSQL(t, fixture.storePath, `UPDATE tasks SET title = ?, body = ? WHERE id = ?`, "long task", task, fixture.taskID.Bytes())
+	tools := filepath.Join(fixture.root, "tools")
+	if err := os.Mkdir(tools, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copySupervisorExecutable(t, supervisorTestExecutable(t), filepath.Join(tools, "claude"))
+	fixture.spec.ToolPath = tools + ":" + fixture.spec.ToolPath
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
+	var received int
+	if run.Proposal == nil || len(run.Proposal.Result()) == 0 {
+		t.Fatalf("Claude receipt = %+v", run.Proposal)
+	}
+	if _, err := fmt.Sscanf(run.Proposal.Result(), "received=%d", &received); err != nil || received < len(task) {
+		t.Fatalf("Claude receipt = %q (task is %d bytes), err=%v", run.Proposal.Result(), len(task), err)
+	}
+	fixture.assertReleased(t, run)
 }
 
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
