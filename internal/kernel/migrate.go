@@ -178,19 +178,16 @@ func migrateLegacyTransaction(ctx context.Context, connection *sql.Conn) (result
 // table keeps its old text, while validateExactSchema compares that text byte
 // for byte. So the current statement is executed verbatim under the real name
 // and the rows wait in a scratch table for the moment the real one is absent.
-func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns string, indexes ...string) error {
+func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns, index string) error {
 	scratch := table + "_pre_migration"
-	statements := []string{
+	for _, statement := range []string{
 		"CREATE TABLE " + scratch + " AS SELECT " + columns + " FROM " + table,
 		"DROP TABLE " + table,
 		target[table].sql,
 		"INSERT INTO " + table + "(" + columns + ") SELECT " + columns + " FROM " + scratch,
 		"DROP TABLE " + scratch,
-	}
-	for _, index := range indexes {
-		statements = append(statements, target[index].sql)
-	}
-	for _, statement := range statements {
+		target[index].sql,
+	} {
 		if _, err := connection.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("rebuild %s: %w", table, err)
 		}
