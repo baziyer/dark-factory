@@ -12,8 +12,9 @@ import (
 // settleRun commits the terminal outcome of a finalizing run through the
 // reviewed finalize edges. An unpublished candidate change settles abandoned;
 // a published change settles retained after the published tree is re-read and
-// verified against the durable selection. Every state the kernel edges refuse
-// is returned unchanged with the refusal — settlement never invents evidence.
+// verified against its recorded identity, base and format. Every state the
+// kernel edges refuse is returned unchanged with the refusal — settlement
+// never invents evidence.
 func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel.Run, error) {
 	if daemon == nil || daemon.store == nil || runID == (kernel.RunID{}) {
 		return kernel.Run{}, fmt.Errorf("%w: invalid run settlement", kernel.ErrInvalidValue)
@@ -69,9 +70,12 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 }
 
 // retainedSettlement re-reads the published tree the durable change row names
-// and verifies the observed facts against the stored selection before any
-// settlement authority exists. The published tree is evidence; the durable
-// row is the expectation; a mismatch is a conflict, never a repair.
+// and verifies it against the recorded identity, base and format before any
+// settlement authority exists, the evidence the supervisor's own finalize
+// takes. The selection on an available change is the tree as the daemon
+// made it before the worker ran, so the tree's contents settle as found;
+// the inspection refuses a tree that is not the recorded one, and nothing
+// here repairs anything.
 func retainedSettlement(ctx context.Context, changeParent string, changeState kernel.Change) (kernel.ChangeSettlement, error) {
 	if changeParent == "" || changeState.Selection == nil || changeState.TreeIdentity == nil {
 		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published change lacks retained evidence", kernel.ErrConflict)
@@ -87,11 +91,6 @@ func retainedSettlement(ctx context.Context, changeParent string, changeState ke
 	availability, err := kernelAvailability(facts)
 	if err != nil {
 		return kernel.ChangeSettlement{}, err
-	}
-	stored := *changeState.Selection
-	if availability.Commitment() != stored.Commitment() || availability.EntryCount() != stored.EntryCount() ||
-		availability.TotalBytes() != stored.TotalBytes() || availability.TreeIdentity() != *changeState.TreeIdentity {
-		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published tree disagrees with the durable selection", kernel.ErrConflict)
 	}
 	return kernel.NewRetainedChangeSettlement(changeState.Revision, availability)
 }
