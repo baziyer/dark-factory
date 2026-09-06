@@ -683,3 +683,68 @@ test("closing the controller stops the run-paths timer", async (t) => {
   await settle();
   assert.equal(asked.length, before);
 });
+
+test("a structure arriving during a run-paths round is asked as soon as the round answers, and only while shown", async (t) => {
+  mock.timers.enable({ apis: ["setInterval"] });
+  t.after(() => mock.timers.reset());
+  const [firstProject, secondProject] = [...fixtureState.projects.keys()];
+  const secondAgent = [...fixtureState.agents.values()].find((agent) => agent.project_id === secondProject).id;
+  const state = { ...fixtureState, tasks: new Map([...fixtureState.tasks,
+    ["0b".repeat(16), { id: "0b".repeat(16), project_id: secondProject, assigned_agent_id: secondAgent, title: "Second", status: "running", priority: 1, revision: 1n }]]) };
+  const asked = [];
+  const firstAnswer = deferred();
+  const secondStructure = deferred();
+  const context = harness({
+    getRunPaths: (agentId) => { asked.push(agentId); return agentId === runningAgentID && asked.length === 1 ? firstAnswer.promise : Promise.resolve({ agentId, runId: "0a".repeat(16), paths: [] }); },
+    getTopology: async (id) => {
+      if (id === secondProject) await secondStructure.promise;
+      return { projectId: id, digest: (id === firstProject ? "ab" : "cd").repeat(32), sourceRevision: "", nodes: [] };
+    },
+  });
+  context.controller.start();
+  context.emitState(state);
+  context.emitStatus("ready");
+  context.controller.loadTopology();
+  context.controller.watchRunPaths(true);
+  await settle();
+  await settle();
+  // The first structure fired a round that is still in flight.
+  assert.deepEqual(asked, [runningAgentID]);
+  // The second structure lands meanwhile: nothing is asked until the round
+  // answers, then both served projects' agents are asked without a tick.
+  secondStructure.resolve();
+  await settle();
+  await settle();
+  assert.deepEqual(asked, [runningAgentID]);
+  firstAnswer.resolve({ agentId: runningAgentID, runId: "0a".repeat(16), paths: [] });
+  await settle();
+  await settle();
+  assert.deepEqual(asked.slice(1).sort(), [runningAgentID, secondAgent].sort());
+
+  // The same arrival while the floor is being hidden owes nothing.
+  const late = deferred();
+  const hidden = [];
+  const lateStructure = deferred();
+  const other = harness({
+    getRunPaths: (agentId) => { hidden.push(agentId); return hidden.length === 1 ? late.promise : Promise.resolve({ agentId, runId: "0a".repeat(16), paths: [] }); },
+    getTopology: async (id) => {
+      if (id === secondProject) await lateStructure.promise;
+      return { projectId: id, digest: (id === firstProject ? "ab" : "cd").repeat(32), sourceRevision: "", nodes: [] };
+    },
+  });
+  other.controller.start();
+  other.emitState(state);
+  other.emitStatus("ready");
+  other.controller.loadTopology();
+  other.controller.watchRunPaths(true);
+  await settle();
+  await settle();
+  lateStructure.resolve();
+  await settle();
+  await settle();
+  other.controller.watchRunPaths(false);
+  late.resolve({ agentId: runningAgentID, runId: "0a".repeat(16), paths: [] });
+  await settle();
+  await settle();
+  assert.deepEqual(hidden, [runningAgentID]);
+});

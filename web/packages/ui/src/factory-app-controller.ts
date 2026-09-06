@@ -344,6 +344,7 @@ export class FactoryAppController {
     if (!active || this.#closed || this.#status !== "ready") {
       if (this.#runPathsTimer !== undefined) clearInterval(this.#runPathsTimer);
       this.#runPathsTimer = undefined;
+      this.#runPathsDue = false;
       return;
     }
     if (this.#runPathsTimer !== undefined) return;
@@ -386,11 +387,12 @@ export class FactoryAppController {
       () => [agentId, this.#runPaths.get(agentId) ?? []] as const,
     ))).then((answers) => {
       this.#runPathsPending = false;
+      // A round owed to a structure that arrived meanwhile is asked now, and
+      // only while the floor is still shown; an abandoned round owes nothing.
+      const due = this.#runPathsDue;
+      this.#runPathsDue = false;
       if (!this.#current(generation)) return;
-      if (this.#runPathsDue) {
-        this.#runPathsDue = false;
-        this.#pollRunPaths();
-      }
+      if (due && this.#runPathsTimer !== undefined) this.#pollRunPaths();
       // An agent that stopped running loses its entry; an unchanged round is
       // not a new snapshot, so the floor does not re-render on a heartbeat.
       if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;
