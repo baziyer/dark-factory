@@ -209,17 +209,17 @@ test("rooms group under their project's heading and stay on the tile grid", () =
   const grouped = {
     digest: "fixture-2",
     nodes: [
-      { id: "b-root", parentId: "", path: ".", label: "Beta", kind: "repository", project: "Beta" },
-      { id: "a-web", parentId: "a-root", path: "web", label: "web", kind: "package", project: "Alpha" },
-      { id: "b-src", parentId: "b-root", path: "src", label: "src", kind: "directory", project: "Beta" },
-      { id: "a-root", parentId: "", path: ".", label: "Alpha", kind: "repository", project: "Alpha" },
-      { id: "a-cmd", parentId: "a-root", path: "cmd", label: "cmd", kind: "directory", project: "Alpha" },
+      { id: "b-root", parentId: "", path: ".", label: "Beta", kind: "repository", project: { id: "p-b", name: "Beta Works" } },
+      { id: "a-web", parentId: "a-root", path: "web", label: "web", kind: "package", project: { id: "p-a", name: "Alpha Works" } },
+      { id: "b-src", parentId: "b-root", path: "src", label: "src", kind: "directory", project: { id: "p-b", name: "Beta Works" } },
+      { id: "a-root", parentId: "", path: ".", label: "Alpha", kind: "repository", project: { id: "p-a", name: "Alpha Works" } },
+      { id: "a-cmd", parentId: "a-root", path: "cmd", label: "cmd", kind: "directory", project: { id: "p-a", name: "Alpha Works" } },
     ],
   };
   const layout = layoutScene(grouped);
   assert.deepEqual(layout, layoutScene({ ...grouped, nodes: [...grouped.nodes].reverse() }));
   assert.deepEqual(layout.rooms.map((room) => room.id), ["a-root", "a-cmd", "a-web", "b-root", "b-src"]);
-  assert.deepEqual(layout.headings.map((heading) => heading.label), ["Alpha", "Beta"]);
+  assert.deepEqual(layout.headings.map((heading) => heading.label), ["Alpha Works", "Beta Works"]);
   const [alpha, beta] = layout.headings;
   for (const room of layout.rooms.slice(0, 3)) assert.ok(room.y > alpha.y && room.y < beta.y, `${room.id} outside Alpha`);
   for (const room of layout.rooms.slice(3)) assert.ok(room.y > beta.y, `${room.id} outside Beta`);
@@ -227,9 +227,19 @@ test("rooms group under their project's heading and stay on the tile grid", () =
     assert.equal(room.x % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
     assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
   }
+  // Two projects with one name are still two blocks under two headings.
+  const twins = layoutScene({ ...grouped, nodes: grouped.nodes.map((node) => ({ ...node, project: { id: node.project.id, name: "Twin" } })) });
+  assert.deepEqual(twins.headings.map((heading) => heading.label), ["Twin", "Twin"]);
+  assert.deepEqual(twins.rooms.map((room) => room.id), layout.rooms.map((room) => room.id));
+  // The heading is its own element at the row the layout gave it, and every
+  // door sits on the tile grid like the room it opens.
   const markup = renderToStaticMarkup(createElement(FactoryScene, { topology: grouped, workers: [], workItems: [] }));
-  assert.match(markup, />Alpha<\/text>/);
-  assert.match(markup, />Beta<\/text>/);
+  for (const heading of layout.headings) {
+    assert.match(markup, new RegExp(`<text data-floor-heading="${heading.label}" x="${heading.x}" y="${heading.y + 11}"[^>]*>${heading.label}</text>`));
+  }
+  const doors = [...markup.matchAll(/href="#df-frame-tile\.door" x="([0-9.]+)"/g)].map((match) => Number(match[1]));
+  assert.equal(doors.length, layout.rooms.length);
+  for (const x of doors) assert.equal(x % spriteAtlas.frame, 0, `door at ${x} off the tile grid`);
   // Rooms without a project stand under no heading, as before.
   assert.deepEqual(layoutScene(topology).headings, []);
 });

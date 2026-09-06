@@ -95,7 +95,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
       </text>
 
       {layout.headings.map((heading) => (
-        <text key={`${heading.y}:${heading.label}`} x={heading.x} y={heading.y + 11} fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="9" fontWeight="700">
+        <text key={heading.y} data-floor-heading={heading.label} x={heading.x} y={heading.y + 11} fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="9" fontWeight="700">
           {shortLabel(heading.label)}
         </text>
       ))}
@@ -108,7 +108,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
             <title>{node.path}</title>
             <rect x={room.x} y={room.y} width={room.width} height={room.height} rx="3" fill="url(#df-floor)" stroke="#638095" />
             <rect x={room.x} y={room.y} width={room.width} height={FRAME} fill="url(#df-wall)" />
-            <Frame name="tile.door" x={room.x + room.width / 2 - FRAME / 2} y={room.y + room.height - FRAME} />
+            <Frame name="tile.door" x={room.x + Math.floor(room.width / 2 / FRAME) * FRAME} y={room.y + room.height - FRAME} />
             <text x={room.x + 8} y={room.y + 18} fill="#f2f6f8" fontFamily="ui-monospace, monospace" fontSize="11" fontWeight="700">
               {shortLabel(node.label)}
             </text>

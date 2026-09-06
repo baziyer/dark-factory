@@ -186,7 +186,7 @@ const SIZE_BUCKETS = ["large", "medium", "small", "tiny", "empty"];
 function projectBlock(project: { id: string; name: string }, topology: TopologyView | undefined): readonly SceneNode[] {
   const root = topology?.nodes.find((node) => node.parent_id === "");
   if (topology === undefined || root === undefined) {
-    return [{ id: project.id, path: project.name, label: project.name, kind: "repository", project: project.name }];
+    return [{ id: project.id, path: project.name, label: project.name, kind: "repository", project: { id: project.id, name: project.name } }];
   }
   const roots = new Set(topology.nodes.filter((node) => node.path === ".").map((node) => node.id));
   roots.add(root.id);
@@ -205,6 +205,6 @@ function projectBlock(project: { id: string; name: string }, topology: TopologyV
     label: node.path === "." ? project.name : node.label,
     kind: node.kind,
     sizeBucket: node.size_bucket,
-    project: project.name,
+    project: { id: project.id, name: project.name },
   }));
 }

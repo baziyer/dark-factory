@@ -199,6 +199,7 @@ export class FactoryAppController {
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
   #runPathsTicks = 0;
   #runPathsPending = false;
+  #runPathsDue = false;
   #edit: FactoryEditView | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
   #remoteInviteError: string | undefined;
@@ -320,8 +321,11 @@ export class FactoryAppController {
           if (!this.#current(generation) || this.#topologies.get(projectId)?.digest === topology.digest) return;
           this.#topologies = new Map(this.#topologies).set(projectId, topology);
           this.#publish();
-          // A project just served has rooms its running agents can stand in.
-          if (this.#runPathsTimer !== undefined) this.#pollRunPaths();
+          // A project just served has rooms its running agents can stand in:
+          // ask now, or as soon as the round in flight is answered.
+          if (this.#runPathsTimer === undefined) return;
+          if (this.#runPathsPending) this.#runPathsDue = true;
+          else this.#pollRunPaths();
         },
         // A refused answer keeps the structure last served for that project
         // rather than emptying its block of rooms for one cycle.
@@ -383,6 +387,10 @@ export class FactoryAppController {
     ))).then((answers) => {
       this.#runPathsPending = false;
       if (!this.#current(generation)) return;
+      if (this.#runPathsDue) {
+        this.#runPathsDue = false;
+        this.#pollRunPaths();
+      }
       // An agent that stopped running loses its entry; an unchanged round is
       // not a new snapshot, so the floor does not re-render on a heartbeat.
       if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;

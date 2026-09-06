@@ -12,8 +12,8 @@ export type SceneNode = Readonly<{
   kind: "repository" | "module" | "package" | "directory";
   /** Absent when the room stands for a project rather than a served node. */
   sizeBucket?: "empty" | "tiny" | "small" | "medium" | "large";
-  /** The heading this room stands under; rooms sharing one are laid out together. */
-  project?: string;
+  /** The project this room belongs to: rooms sharing an id are laid out together under its name. */
+  project?: Readonly<{ id: string; name: string }>;
 }>;
 
 export type SceneWorker = Readonly<{
@@ -78,20 +78,22 @@ function centeredSlot(index: number) {
   return index % 2 === 0 ? -distance : distance;
 }
 
-/** Rooms sit under their project's heading, projects in name order. */
+/** Rooms sit under their project's heading, projects in name order, then id. */
 export function layoutScene(topology: SceneTopology): SceneLayout {
   const nodes = [...topology.nodes].sort((left, right) =>
-    compareText(left.project ?? "", right.project ?? "") || compareText(left.path, right.path) || compareText(left.id, right.id));
+    compareText(left.project?.name ?? "", right.project?.name ?? "") || compareText(left.project?.id ?? "", right.project?.id ?? "")
+    || compareText(left.path, right.path) || compareText(left.id, right.id));
   const columns = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(nodes.length))));
   const width = PADDING * 2 + columns * ROOM_WIDTH + (columns - 1) * ROOM_GAP;
   const groups = new Map<string, SceneNode[]>();
-  for (const node of nodes) groups.set(node.project ?? "", [...(groups.get(node.project ?? "") ?? []), node]);
+  for (const node of nodes) groups.set(node.project?.id ?? "", [...(groups.get(node.project?.id ?? "") ?? []), node]);
   const rooms: SceneRoomLayout[] = [];
   const headings: SceneHeading[] = [];
   let top = FLOOR_TOP;
-  for (const [project, members] of groups) {
-    if (project !== "") {
-      headings.push({ label: project, x: PADDING, y: top });
+  for (const members of groups.values()) {
+    const project = members[0]!.project;
+    if (project !== undefined) {
+      headings.push({ label: project.name, x: PADDING, y: top });
       top += HEADING;
     }
     members.forEach((node, index) => {
