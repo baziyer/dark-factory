@@ -318,7 +318,7 @@ func TestProjectTopologyKeepsARootModuleAheadOfItsRepository(t *testing.T) {
 	root := t.TempDir()
 	writeTopologyFixture(t, root, "go.mod", "module example.com/console\n")
 	writeTopologyFixture(t, root, "one/one.go", "package one\n")
-	snapshot, err := topology.Build(context.Background(), root, nil)
+	snapshot, err := topology.Build(context.Background(), root, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

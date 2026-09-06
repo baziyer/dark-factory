@@ -546,15 +546,27 @@ test("run paths are polled for running agents only while the floor is shown", as
   t.after(() => mock.timers.reset());
   const asked = [];
   let answer = async (agentId) => ({ agentId, runId: "0a".repeat(16), paths: ["web/packages/ui"] });
-  const context = harness({ getRunPaths: (agentId) => { asked.push(agentId); return answer(agentId); } });
+  // Only the first project's structure is served; the second project has a
+  // running agent too, and nobody asks where it is standing.
+  const [servedProject, otherProject] = [...fixtureState.projects.keys()];
+  const otherAgent = [...fixtureState.agents.values()].find((agent) => agent.project_id === otherProject).id;
+  const state = { ...fixtureState, tasks: new Map([...fixtureState.tasks,
+    ["0b".repeat(16), { id: "0b".repeat(16), project_id: otherProject, assigned_agent_id: otherAgent, title: "Unserved", status: "running", priority: 1, revision: 1n }]]) };
+  const context = harness({
+    getRunPaths: (agentId) => { asked.push(agentId); return answer(agentId); },
+    getTopology: async (id) => { if (id !== servedProject) throw new SessionError("not_found"); return { projectId: id, digest: "ab".repeat(32), sourceRevision: "", nodes: [] }; },
+  });
   context.controller.start();
-  context.emitState(fixtureState);
+  context.emitState(state);
   context.emitStatus("ready");
 
   // One timer however many times the floor asks, and only the agents that are
-  // on a running task are asked at all.
+  // on a running task in a served project are asked at all: the first round
+  // has no structure yet, and the one the structure's arrival triggers does.
+  context.controller.loadTopology();
   context.controller.watchRunPaths(true);
   context.controller.watchRunPaths(true);
+  await settle();
   await settle();
   assert.deepEqual(asked, [runningAgentID]);
   assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
@@ -574,7 +586,7 @@ test("run paths are polled for running agents only while the floor is shown", as
   assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
 
   // An agent that is no longer running loses its entry.
-  context.emitState({ ...fixtureState, tasks: new Map() });
+  context.emitState({ ...state, tasks: new Map() });
   mock.timers.tick(10_000);
   await settle();
   assert.equal(asked.length, 3);
@@ -582,7 +594,7 @@ test("run paths are polled for running agents only while the floor is shown", as
 
   // A hidden floor stops the timer, and so does leaving ready.
   context.controller.watchRunPaths(false);
-  context.emitState(fixtureState);
+  context.emitState(state);
   mock.timers.tick(10_000);
   await settle();
   assert.equal(asked.length, 3);

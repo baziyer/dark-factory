@@ -21,7 +21,7 @@ func TestBuildDoesNotOpenSpecialGitOrCacheFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCompletes(t, func() error {
-		snapshot, err := Build(context.Background(), root, nil)
+		snapshot, err := Build(context.Background(), root, "", nil)
 		if err == nil && snapshot.SourceRevision != "" {
 			t.Errorf("source revision = %q, want empty", snapshot.SourceRevision)
 		}
@@ -36,7 +36,7 @@ func TestBuildDoesNotOpenSpecialGitOrCacheFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCompletes(t, func() error {
-		_, err := BuildCached(context.Background(), root, cache)
+		_, err := BuildCached(context.Background(), root, "", cache)
 		return err
 	})
 }

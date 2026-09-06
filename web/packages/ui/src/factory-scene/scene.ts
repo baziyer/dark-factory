@@ -12,6 +12,8 @@ export type SceneNode = Readonly<{
   kind: "repository" | "module" | "package" | "directory";
   /** Absent when the room stands for a project rather than a served node. */
   sizeBucket?: "empty" | "tiny" | "small" | "medium" | "large";
+  /** The heading this room stands under; rooms sharing one are laid out together. */
+  project?: string;
 }>;
 
 export type SceneWorker = Readonly<{
@@ -39,10 +41,13 @@ export type SceneRoomLayout = Readonly<{
   anchor: ScenePoint;
 }>;
 
+export type SceneHeading = Readonly<{ label: string; x: number; y: number }>;
+
 export type SceneLayout = Readonly<{
   width: number;
   height: number;
   rooms: readonly SceneRoomLayout[];
+  headings: readonly SceneHeading[];
 }>;
 
 export type SceneWorkerPlacement = Readonly<{
@@ -52,13 +57,14 @@ export type SceneWorkerPlacement = Readonly<{
   y: number;
 }>;
 
-const ROOM_WIDTH = 152;
+// The floor and wall patterns are anchored at the SVG origin, so a room shows
+// whole tiles only while its edges and both pitches stay multiples of the frame.
+const ROOM_WIDTH = 160;
 const ROOM_HEIGHT = 96;
 const ROOM_GAP = 16;
-const PADDING = 12;
-// The floor and wall patterns are anchored at the SVG origin, so a room shows
-// whole tiles only while its top and the row pitch stay multiples of the frame.
+export const PADDING = 16;
 const FLOOR_TOP = 48;
+const HEADING = 16;
 const WORKER_GAP = 18;
 
 /** Ordering for the floor: byte order over paths and ids, never a locale. */
@@ -72,26 +78,30 @@ function centeredSlot(index: number) {
   return index % 2 === 0 ? -distance : distance;
 }
 
+/** Rooms sit under their project's heading, projects in name order. */
 export function layoutScene(topology: SceneTopology): SceneLayout {
   const nodes = [...topology.nodes].sort((left, right) =>
-    compareText(left.path, right.path) || compareText(left.id, right.id));
+    compareText(left.project ?? "", right.project ?? "") || compareText(left.path, right.path) || compareText(left.id, right.id));
   const columns = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(nodes.length))));
-  const rows = Math.ceil(nodes.length / columns);
   const width = PADDING * 2 + columns * ROOM_WIDTH + (columns - 1) * ROOM_GAP;
-  const roomsHeight = rows === 0 ? 30 : rows * ROOM_HEIGHT + (rows - 1) * ROOM_GAP;
-  const rooms = nodes.map((node, index) => {
-    const x = PADDING + (index % columns) * (ROOM_WIDTH + ROOM_GAP);
-    const y = FLOOR_TOP + Math.floor(index / columns) * (ROOM_HEIGHT + ROOM_GAP);
-    return {
-      id: node.id,
-      x,
-      y,
-      width: ROOM_WIDTH,
-      height: ROOM_HEIGHT,
-      anchor: { x: x + ROOM_WIDTH / 2, y: y + ROOM_HEIGHT / 2 },
-    };
-  });
-  return { width, height: FLOOR_TOP + roomsHeight + PADDING, rooms };
+  const groups = new Map<string, SceneNode[]>();
+  for (const node of nodes) groups.set(node.project ?? "", [...(groups.get(node.project ?? "") ?? []), node]);
+  const rooms: SceneRoomLayout[] = [];
+  const headings: SceneHeading[] = [];
+  let top = FLOOR_TOP;
+  for (const [project, members] of groups) {
+    if (project !== "") {
+      headings.push({ label: project, x: PADDING, y: top });
+      top += HEADING;
+    }
+    members.forEach((node, index) => {
+      const x = PADDING + (index % columns) * (ROOM_WIDTH + ROOM_GAP);
+      const y = top + Math.floor(index / columns) * (ROOM_HEIGHT + ROOM_GAP);
+      rooms.push({ id: node.id, x, y, width: ROOM_WIDTH, height: ROOM_HEIGHT, anchor: { x: x + ROOM_WIDTH / 2, y: y + ROOM_HEIGHT / 2 } });
+    });
+    top += Math.ceil(members.length / columns) * (ROOM_HEIGHT + ROOM_GAP);
+  }
+  return { width, height: rooms.length === 0 ? FLOOR_TOP + 30 + PADDING : top - ROOM_GAP + PADDING, rooms, headings };
 }
 
 export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[]): readonly SceneWorkerPlacement[] {

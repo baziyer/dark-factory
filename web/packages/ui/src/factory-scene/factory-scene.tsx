@@ -1,4 +1,5 @@
 import {
+  PADDING,
   alternateFrame,
   layoutScene,
   placeWorkers,
@@ -10,6 +11,7 @@ import {
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "./sprites/sprites.generated.js";
 
 export type {
+  SceneHeading,
   SceneLayout,
   SceneNode,
   SceneRoomLayout,
@@ -27,7 +29,6 @@ export type FactorySceneProps = Readonly<{
   onSelectWorker?: (workerId: string) => void;
 }>;
 
-const PADDING = 12;
 const SERVICE_HEIGHT = 52;
 const FRAME = spriteAtlas.frame;
 
@@ -92,6 +93,12 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
       <text x={PADDING} y="20" fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="10" fontWeight="700">
         FACTORY FLOOR · {layout.rooms.length} SPACES
       </text>
+
+      {layout.headings.map((heading) => (
+        <text key={`${heading.y}:${heading.label}`} x={heading.x} y={heading.y + 11} fill="#b9cad5" fontFamily="ui-monospace, monospace" fontSize="9" fontWeight="700">
+          {shortLabel(heading.label)}
+        </text>
+      ))}
 
       {layout.rooms.map((room) => {
         const node = nodes.get(room.id);

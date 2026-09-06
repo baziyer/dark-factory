@@ -77,7 +77,10 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     y: layout.rooms[0].y + layout.rooms[0].height / 2,
   });
 
-  for (const room of layout.rooms) assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  for (const room of layout.rooms) {
+    assert.equal(room.x % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+    assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  }
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
@@ -162,7 +165,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     assert.ok(placement.y - 8 >= srcRoom.y && placement.y + 8 <= srcRoom.y + srcRoom.height);
   }
   const denseSvg = render({ workers: denseWorkers });
-  assert.match(denseSvg, /WORKER OVERFLOW · 72/);
+  assert.match(denseSvg, /WORKER OVERFLOW · 68/);
   const denseHeight = Number(denseSvg.match(/viewBox="0 0 [^ ]+ ([^"]+)"/)[1]);
   assert.ok(denseHeight > Math.max(...densePlacements.map(({ y }) => y + 8)));
 
@@ -200,6 +203,35 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   // An empty floor in a wide column stays a panel, not a poster.
   assert.match(emptySvg, new RegExp(`max-width:${emptyLayout.width * 3}px`));
   assert.match(emptySvg, /aria-label="20 unassigned workers"/);
+});
+
+test("rooms group under their project's heading and stay on the tile grid", () => {
+  const grouped = {
+    digest: "fixture-2",
+    nodes: [
+      { id: "b-root", parentId: "", path: ".", label: "Beta", kind: "repository", project: "Beta" },
+      { id: "a-web", parentId: "a-root", path: "web", label: "web", kind: "package", project: "Alpha" },
+      { id: "b-src", parentId: "b-root", path: "src", label: "src", kind: "directory", project: "Beta" },
+      { id: "a-root", parentId: "", path: ".", label: "Alpha", kind: "repository", project: "Alpha" },
+      { id: "a-cmd", parentId: "a-root", path: "cmd", label: "cmd", kind: "directory", project: "Alpha" },
+    ],
+  };
+  const layout = layoutScene(grouped);
+  assert.deepEqual(layout, layoutScene({ ...grouped, nodes: [...grouped.nodes].reverse() }));
+  assert.deepEqual(layout.rooms.map((room) => room.id), ["a-root", "a-cmd", "a-web", "b-root", "b-src"]);
+  assert.deepEqual(layout.headings.map((heading) => heading.label), ["Alpha", "Beta"]);
+  const [alpha, beta] = layout.headings;
+  for (const room of layout.rooms.slice(0, 3)) assert.ok(room.y > alpha.y && room.y < beta.y, `${room.id} outside Alpha`);
+  for (const room of layout.rooms.slice(3)) assert.ok(room.y > beta.y, `${room.id} outside Beta`);
+  for (const room of layout.rooms) {
+    assert.equal(room.x % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+    assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  }
+  const markup = renderToStaticMarkup(createElement(FactoryScene, { topology: grouped, workers: [], workItems: [] }));
+  assert.match(markup, />Alpha<\/text>/);
+  assert.match(markup, />Beta<\/text>/);
+  // Rooms without a project stand under no heading, as before.
+  assert.deepEqual(layoutScene(topology).headings, []);
 });
 
 test("worker identity is stable while operational state changes", () => {
