@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +41,7 @@ func TestMain(m *testing.M) {
 	}
 	if filepath.Base(os.Args[0]) == "claude" {
 		if err := runSupervisorClaudeFixture(); err != nil {
-			fmt.Fprintln(os.Stderr, "supervisor Claude fixture failed:", err)
+			fmt.Fprintln(os.Stderr, "supervisor Claude fixture failed")
 			os.Exit(70)
 		}
 		os.Exit(0)
@@ -203,8 +204,8 @@ func TestSupervisorRunsOrchestratorInItsPrivateHomeWithoutAChange(t *testing.T) 
 
 // runSupervisorClaudeFixture stands in for the Claude CLI: it takes its
 // terminal out of canonical mode as the CLI does, reads the prompt the
-// runner types until the keystroke that submits it, and reports how many
-// bytes arrived.
+// runner types until the keystroke that submits it, and reports whether the
+// task quoted at the prompt's end is exactly the task the attempt holds.
 func runSupervisorClaudeFixture() error {
 	termios, err := unix.IoctlGetTermios(0, unix.TIOCGETA)
 	if err != nil {
@@ -234,7 +235,20 @@ func runSupervisorClaudeFixture() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err = client.Succeed(ctx, fmt.Sprintf("received=%d", len(line)))
+	task, err := client.Task(ctx)
+	if err != nil {
+		return err
+	}
+	var typed string
+	if quote := bytes.IndexByte(line, '"'); quote < 0 {
+		return fmt.Errorf("no quoted task in %d typed bytes", len(line))
+	} else if err := json.Unmarshal(line[quote:], &typed); err != nil {
+		return fmt.Errorf("quoted task in %d typed bytes: %w", len(line), err)
+	}
+	if typed != task.Task {
+		return fmt.Errorf("typed task is %d bytes, the attempt's is %d", len(typed), len(task.Task))
+	}
+	_, err = client.Succeed(ctx, "exact")
 	return err
 }
 
@@ -258,12 +272,8 @@ func TestSupervisorClaudeReceivesALongTaskThroughTheTerminal(t *testing.T) {
 		t.Fatalf("RunNext: %v", err)
 	}
 	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
-	var received int
-	if run.Proposal == nil || len(run.Proposal.Result()) == 0 {
+	if run.Proposal == nil || run.Proposal.Result() != "exact" {
 		t.Fatalf("Claude receipt = %+v", run.Proposal)
-	}
-	if _, err := fmt.Sscanf(run.Proposal.Result(), "received=%d", &received); err != nil || received < len(task) {
-		t.Fatalf("Claude receipt = %q (task is %d bytes), err=%v", run.Proposal.Result(), len(task), err)
 	}
 	fixture.assertReleased(t, run)
 }

@@ -73,13 +73,14 @@ func (c *AttemptController) spend() error {
 
 // controlSocketBytes is each control socket's send and receive buffer. Darwin
 // gives a Unix stream socket eight kilobytes, and the attempt config the
-// daemon writes before the runner is released to read it carries the
-// provider's prompt, so a real task's config did not fit and the write sat
-// against a peer that could not drain it until the control timeout.
+// daemon writes before the runner exists to read it carries the provider's
+// prompt, so a real task's config did not fit and the write sat against a
+// peer that could not drain it until the control timeout. Darwin sets a
+// buffer to exactly the size asked or refuses, so the set is the check.
 const controlSocketBytes = maxConfigBytes + maxFrameBytes
 
 // newControlSocketPair makes one non-blocking Unix stream pair whose buffers
-// hold the largest frame either side writes.
+// hold the largest frame either side writes with no reader at the peer.
 func newControlSocketPair() ([2]int, error) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -92,9 +93,6 @@ func newControlSocketPair() ([2]int, error) {
 		for _, option := range []int{unix.SO_SNDBUF, unix.SO_RCVBUF} {
 			if err == nil {
 				err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, option, controlSocketBytes)
-			}
-			if size, getErr := unix.GetsockoptInt(fd, unix.SOL_SOCKET, option); err == nil && (getErr != nil || size < controlSocketBytes) {
-				err = fmt.Errorf("runner: control socket buffer %d below %d: %w", size, controlSocketBytes, ErrState)
 			}
 		}
 	}
