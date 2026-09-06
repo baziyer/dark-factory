@@ -975,6 +975,25 @@ func TestAttemptRunnerReportsAProviderThatDiesBeforeItsPrompt(t *testing.T) {
 	}
 }
 
+// The daemon writes the attempt config before the runner exists to read it,
+// so a control socket must absorb a whole config with nothing at the peer.
+func TestControlSocketPairAbsorbsAConfigWithoutAReader(t *testing.T) {
+	fds, err := newControlSocketPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	payload := make([]byte, maxConfigBytes)
+	for written := 0; written < len(payload); {
+		n, err := unix.Write(fds[0], payload[written:])
+		if err != nil {
+			t.Fatalf("wrote %d of %d bytes with no reader: %v", written, len(payload), err)
+		}
+		written += n
+	}
+}
+
 func TestAttemptRunnerInjectsNativeStartupOnceBeforeInteractiveInput(t *testing.T) {
 	f := newAttemptFixture(t, "native-input", "")
 	f.spec.StartupInput = []byte("native-startup\n")
