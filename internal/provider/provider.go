@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,33 +293,50 @@ func PrepareTask(kind kernel.Provider, task []byte) (TaskDelivery, []byte, error
 	}
 }
 
+// ClaudeConfigFile is the .claude.json a Claude Code launch reads, and the one
+// place that rule is spelled: the launch environment names CLAUDE_CONFIG_DIR
+// only when this file is not the account home's own, and the daemon's account
+// discovery reads a login's identity from the same file. The default
+// directory's file is beside it in the home, because that directory holds
+// only local flags; a directory made with CLAUDE_CONFIG_DIR set carries its
+// own.
+func ClaudeConfigFile(accountHome, accountConfig string) string {
+	if accountConfig != "" && accountConfig != ConfigHome(kernel.ProviderClaudeCode, accountHome) {
+		return filepath.Join(accountConfig, ".claude.json")
+	}
+	return filepath.Join(accountHome, ".claude.json")
+}
+
+// errClaudeConfiguration names a failure around the account's own file
+// without carrying its path into a run's durable failure detail.
+var errClaudeConfiguration = errors.New("provider: claude configuration")
+
+const maxClaudeConfigBytes = 16 << 20
+
 // TrustClaudeDirectory records cwd as trusted in the account's Claude Code
 // configuration, which is what answering the CLI's folder-trust dialog does.
 // Every Change is a path the CLI has never seen, so without this record the
 // interactive session stops at that dialog and the startup task is typed into
-// it. Only this one key is added; every other byte of the file is kept.
+// it. Only this one key is added; every other value in the file is kept, with
+// numbers as their own digits and strings unescaped.
 // ponytail: a read-modify-write like the CLI's own sessions do on the same
-// file; the window is milliseconds. Take a lock file if a lost update is
-// ever observed.
+// file, published by rename so a reader never sees a torn file; a concurrent
+// writer's key can still be lost in the millisecond between read and rename.
+// Take a lock file if a lost update is ever observed.
 func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	if !runtime.valid() || !validAbsolute(cwd, maxPathBytes) {
 		return ErrInvalid
 	}
-	dir := runtime.accountHome
-	if runtime.accountConfig != "" && runtime.accountConfig != ConfigHome(kernel.ProviderClaudeCode, runtime.accountHome) {
-		dir = runtime.accountConfig
-	}
-	path := filepath.Join(dir, ".claude.json")
+	path := ClaudeConfigFile(runtime.accountHome, runtime.accountConfig)
 	config := map[string]any{}
-	raw, err := os.ReadFile(path)
-	if err == nil {
+	if raw, err := readClaudeConfig(path); err != nil {
+		return err
+	} else if raw != nil {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.UseNumber()
 		if err := decoder.Decode(&config); err != nil {
-			return fmt.Errorf("%s: %w", path, err)
+			return errClaudeConfiguration
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 	projects, _ := config["projects"].(map[string]any)
 	if projects == nil {
@@ -334,19 +352,40 @@ func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	project["hasTrustDialogAccepted"] = true
 	projects[cwd] = project
 	config["projects"] = projects
-	encoded, err := json.Marshal(config)
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(config); err != nil {
+		return errClaudeConfiguration
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".claude.json.*")
 	if err != nil {
-		return err
+		return errClaudeConfiguration
 	}
-	temp := path + ".dark-factory"
-	if err := os.WriteFile(temp, encoded, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return err
+	_, writeErr := temp.Write(encoded.Bytes())
+	if err := errors.Join(writeErr, temp.Close()); err != nil || os.Rename(temp.Name(), path) != nil {
+		_ = os.Remove(temp.Name())
+		return errClaudeConfiguration
 	}
 	return nil
+}
+
+// readClaudeConfig returns the file's bytes, nil when there is no file yet,
+// and refuses one past the bound rather than decoding it.
+func readClaudeConfig(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errClaudeConfiguration
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxClaudeConfigBytes+1))
+	if err != nil || len(raw) > maxClaudeConfigBytes {
+		return nil, errClaudeConfiguration
+	}
+	return raw, nil
 }
 
 func unavailable(kind kernel.Provider) error {
@@ -425,8 +464,8 @@ func (runtime RuntimePaths) environment(kind kernel.Provider) []string {
 		// lives in $HOME/.claude.json rather than inside it, so naming it
 		// would point the CLI at the flags-only file it does contain and
 		// launch the run with no login at all.
-		if runtime.accountConfig != "" && runtime.accountConfig != ConfigHome(kind, runtime.accountHome) {
-			environment = append(environment, "CLAUDE_CONFIG_DIR="+runtime.accountConfig)
+		if configDir := filepath.Dir(ClaudeConfigFile(runtime.accountHome, runtime.accountConfig)); configDir != runtime.accountHome {
+			environment = append(environment, "CLAUDE_CONFIG_DIR="+configDir)
 		}
 	}
 	return append(environment,

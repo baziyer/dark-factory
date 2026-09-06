@@ -127,12 +127,6 @@ func runProvider(ctx context.Context) (resultErr error) {
 		_ = cwd.Close()
 		return err
 	}
-	if config.Provider == kernel.ProviderClaudeCode {
-		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
-			_ = cwd.Close()
-			return err
-		}
-	}
 	delivery, program, err := prepareProviderTask(config.Provider, config.ProviderTask)
 	if err != nil {
 		_ = cwd.Close()
@@ -158,6 +152,14 @@ func runProvider(ctx context.Context) (resultErr error) {
 	if err := launch.Executable().Verify(); err != nil {
 		_ = cwd.Close()
 		return err
+	}
+	// The one effect outside the runtime before exec, so it runs last: after
+	// every verification that could still refuse the launch.
+	if config.Provider == kernel.ProviderClaudeCode {
+		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
+			_ = cwd.Close()
+			return err
+		}
 	}
 	var task *os.File
 	if delivery == provider.TaskDeliveryFD11 {

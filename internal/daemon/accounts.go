@@ -81,10 +81,7 @@ func (daemon *Daemon) discoverAccounts(home string) []browserprotocol.Discovered
 // between them: a sibling login that reads $HOME's account would report the
 // default login's identity under its own directory.
 func claudeIdentityPath(home, directory string) string {
-	if directory == providerConfigHome(kernel.ProviderClaudeCode.String(), home) {
-		return filepath.Join(home, ".claude.json")
-	}
-	return filepath.Join(directory, ".claude.json")
+	return provider.ClaudeConfigFile(home, directory)
 }
 
 func (daemon *Daemon) describeAccount(kind kernel.Provider, home, directory, name string) (browserprotocol.DiscoveredAccount, bool) {

@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dark-factory-build/dark-factory/internal/install"
@@ -439,7 +441,7 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 	accountHome := t.TempDir()
 	runtime := runtimeFixture(t, "/usr/bin:/bin", accountHome)
 	path := filepath.Join(accountHome, ".claude.json")
-	original := `{"oauthAccount":{"emailAddress":"login@example.invalid"},"numStartups":9007199254740993,"projects":{"/other":{"hasTrustDialogAccepted":true,"lastCost":0.25}}}`
+	original := `{"oauthAccount":{"emailAddress":"login@example.invalid"},"numStartups":9007199254740993,"lastPrompt":"a<b&c","projects":{"/other":{"hasTrustDialogAccepted":true,"lastCost":0.25}}}`
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -459,8 +461,8 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 		t.Fatalf("working directory is not trusted: %s", written)
 	}
 	other := projects["/other"].(map[string]any)
-	if other["hasTrustDialogAccepted"] != true || other["lastCost"] != 0.25 || config["oauthAccount"].(map[string]any)["emailAddress"] != "login@example.invalid" || !bytes.Contains(written, []byte("9007199254740993")) {
-		t.Fatalf("other keys moved: %s", written)
+	if other["hasTrustDialogAccepted"] != true || other["lastCost"] != 0.25 || config["oauthAccount"].(map[string]any)["emailAddress"] != "login@example.invalid" || !bytes.Contains(written, []byte("9007199254740993")) || !bytes.Contains(written, []byte(`"a<b&c"`)) {
+		t.Fatalf("other values moved: %s", written)
 	}
 	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, %v", info, err)
@@ -496,7 +498,50 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(accountConfig, ".claude.json")); err != nil {
 		t.Fatalf("linked account record: %v", err)
 	}
+	// The default login discovered as an account names the default directory;
+	// its record still lives beside that directory, in the home's own file.
+	discovered, err := NewRuntimePaths(runtime.home, runtime.temp, runtime.socket, runtime.token, runtime.factoryctl, runtime.gitCeiling, runtime.toolPath, accountHome, ConfigHome(kernel.ProviderClaudeCode, accountHome))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(discovered, "/private/discovered"); err != nil {
+		t.Fatal(err)
+	}
+	if home, err := os.ReadFile(path); err != nil || !bytes.Contains(home, []byte(`"/private/discovered":{"hasTrustDialogAccepted":true}`)) {
+		t.Fatalf("default login record = %s, %v", home, err)
+	}
+	if _, err := os.Stat(filepath.Join(ConfigHome(kernel.ProviderClaudeCode, accountHome), ".claude.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default login record landed inside the flags directory: %v", err)
+	}
+	// Concurrent workers on one account never publish a torn file: each
+	// writes its own temporary name and renames whole.
+	var group sync.WaitGroup
+	for index := range 8 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if err := TrustClaudeDirectory(runtime, fmt.Sprintf("/private/concurrent-%d", index)); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	group.Wait()
+	final, err := os.ReadFile(path)
+	if err != nil || !json.Valid(final) || !bytes.Contains(final, []byte("/private/concurrent-")) {
+		t.Fatalf("concurrent records left %s, %v", final, err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(accountHome, ".claude.json.*")); len(leftovers) != 0 {
+		t.Fatalf("temporary files remain: %v", leftovers)
+	}
 	if err := TrustClaudeDirectory(runtime, "relative/change"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("relative working directory = %v, want ErrInvalid", err)
+	}
+	// A file past the bound, or one that is not JSON, is refused without its
+	// path in the error.
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(runtime, "/private/change"); !errors.Is(err, errClaudeConfiguration) || strings.Contains(err.Error(), accountHome) {
+		t.Fatalf("broken file = %v", err)
 	}
 }
