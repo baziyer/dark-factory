@@ -153,14 +153,6 @@ func runProvider(ctx context.Context) (resultErr error) {
 		_ = cwd.Close()
 		return err
 	}
-	// The one effect outside the runtime before exec, so it runs last: after
-	// every verification that could still refuse the launch.
-	if config.Provider == kernel.ProviderClaudeCode {
-		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
-			_ = cwd.Close()
-			return err
-		}
-	}
 	var task *os.File
 	if delivery == provider.TaskDeliveryFD11 {
 		task, err = authority.sealProviderTask(config.Provider, program)
@@ -187,6 +179,15 @@ func runProvider(ctx context.Context) (resultErr error) {
 	if err := authority.verify(ctx); err != nil {
 		_ = cwd.Close()
 		return fmt.Errorf("runtime authority verification: %w", err)
+	}
+	// The one effect outside the runtime before exec, so it is the last thing
+	// before it: nothing after this can refuse the launch and leave a record
+	// for a Change that never ran.
+	if config.Provider == kernel.ProviderClaudeCode {
+		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
+			_ = cwd.Close()
+			return err
+		}
 	}
 	taskOpen = false
 	return control.ExecProvider(spec, cwd, task)

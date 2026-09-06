@@ -536,8 +536,14 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 	if err := TrustClaudeDirectory(runtime, "relative/change"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("relative working directory = %v, want ErrInvalid", err)
 	}
-	// A file past the bound, or one that is not JSON, is refused without its
-	// path in the error.
+	// An empty file is a home with no login yet, like a missing one.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+		t.Fatalf("empty file: %v", err)
+	}
+	// A file that is not JSON is refused without its path in the error.
 	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}

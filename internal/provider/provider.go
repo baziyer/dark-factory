@@ -331,7 +331,7 @@ func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	config := map[string]any{}
 	if raw, err := readClaudeConfig(path); err != nil {
 		return err
-	} else if raw != nil {
+	} else if len(raw) > 0 {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.UseNumber()
 		if err := decoder.Decode(&config); err != nil {
@@ -363,15 +363,15 @@ func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 		return errClaudeConfiguration
 	}
 	_, writeErr := temp.Write(encoded.Bytes())
-	if err := errors.Join(writeErr, temp.Close()); err != nil || os.Rename(temp.Name(), path) != nil {
+	if err := errors.Join(writeErr, temp.Sync(), temp.Close()); err != nil || os.Rename(temp.Name(), path) != nil {
 		_ = os.Remove(temp.Name())
 		return errClaudeConfiguration
 	}
 	return nil
 }
 
-// readClaudeConfig returns the file's bytes, nil when there is no file yet,
-// and refuses one past the bound rather than decoding it.
+// readClaudeConfig returns the file's bytes, none when there is no file yet
+// or an empty one, and refuses one past the bound rather than decoding it.
 func readClaudeConfig(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
