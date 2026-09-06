@@ -41,11 +41,17 @@ func runReleasedProvider(child *OwnedChild, daemon, worker *os.File, reads *atte
 	// PTY is now registered. Claude receives its frozen prompt once. Shell reads
 	// its program from fd 11, and Codex reads its task through the attempt API;
 	// neither has startup PTY bytes.
-	// A prompt ending in CR is submitted by that CR as a keystroke of its own,
-	// once the provider has drawn its prompt: an interactive provider reads one
-	// chunk that carries text and a newline as a paste, and a paste does not
-	// submit. The text goes now; the CR follows from serve.
+	// The prompt is typed only once the provider has taken the terminal out
+	// of canonical mode, or at a ceiling: until then the line discipline
+	// echoes every byte back as output and keeps at most a kilobyte of a
+	// line, so a long prompt typed into a provider still starting would be
+	// cut short and its echo would flood the daemon. A prompt ending in CR is
+	// then submitted by that CR as a keystroke of its own, once the provider
+	// has drawn its prompt: an interactive provider reads one chunk that
+	// carries text and a newline as a paste, and a paste does not submit. The
+	// text goes now; the CR follows from serve.
 	if len(startup) > 0 {
+		loop.child.awaitRawMode(startupRawCeiling)
 		text := startup
 		if text[len(text)-1] == '\r' {
 			text = text[:len(text)-1]
@@ -99,6 +105,7 @@ type terminalOwner struct {
 }
 
 const (
+	startupRawCeiling   = 2 * time.Second
 	startupEnterFloor   = time.Second
 	startupEnterQuiet   = 500 * time.Millisecond
 	startupEnterCeiling = 5 * time.Second
