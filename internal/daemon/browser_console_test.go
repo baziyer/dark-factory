@@ -387,7 +387,8 @@ func accountHomeFixture(t *testing.T, fixture *consoleFixture) string {
 // cannot list them, link them, or choose one for an agent, while its other
 // human actions still work.
 func TestBrowserAccountsNeedAdministration(t *testing.T) {
-	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail|kernel.BrowserCapabilityHumanActions, consoleRoot(t))
+	// Every other bit, terminal_input included: only administration opens these.
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityKnownMask&^kernel.BrowserCapabilityAdministration, consoleRoot(t))
 	home := accountHomeFixture(t, fixture)
 	ctx := context.Background()
 	client := rawBrowserClient(fixture.client.ID)
@@ -450,6 +451,20 @@ func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
 
 	// The one it did find links, and the next discovery says so.
 	result, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: login.Home, Label: "dogfood"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Administration alone, without terminal_input, is what assigns the
+	// linked login to an agent.
+	assigned, err := fixture.backend.UpdateAgent(ctx, client, browserprotocol.AgentUpdate{
+		AgentID: fixture.agent.ID.String(), ExpectedRevision: decimalRevision(fixture.agent.Revision), AccountID: &result.AccountID,
+	})
+	if err != nil || assigned.Revision != decimalRevision(fixture.agent.Revision)+1 {
+		t.Fatalf("account assignment with administration = %+v, %v", assigned, err)
+	}
+	if stored, found, err := fixture.store.Agent(ctx, fixture.agent.ID); err != nil || !found || stored.AccountID.String() != result.AccountID {
+		t.Fatalf("stored agent account = %+v, found=%v, err=%v", stored, found, err)
+	}
 	if err != nil || result.Revision != 1 {
 		t.Fatalf("link = %+v, %v", result, err)
 	}

@@ -2,9 +2,6 @@ package kernel
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -30,79 +27,75 @@ func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
 }
 
 func testLegacyHomeMigratesAndKeepsEveryRow(t *testing.T, version int, persistWAL bool) {
-	{
-		{
-			ctx := context.Background()
-			path, before := newLegacyDatabase(t, persistWAL, version)
+	ctx := context.Background()
+	path, before := newLegacyDatabase(t, persistWAL, version)
 
-			store, err := Open(ctx, path)
-			if err != nil {
-				t.Fatalf("Open legacy home: %v", err)
-			}
-			defer store.Close()
-			connection, err := store.readerConnection(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer connection.Close()
-			if _, version, err := inspectIdentity(ctx, connection); err != nil || version != userVersion {
-				t.Fatalf("user_version = %d, %v, want %d", version, err, userVersion)
-			}
-			if err := validateExactSchema(ctx, connection); err != nil {
-				t.Fatalf("validateExactSchema after migration: %v", err)
-			}
-			if after := snapshotRows(t, ctx, connection); !reflect.DeepEqual(before, after) {
-				for table := range before {
-					if !reflect.DeepEqual(before[table], after[table]) {
-						t.Errorf("%s changed:\nbefore %v\nafter  %v", table, before[table], after[table])
-					}
-				}
-				t.Fatal("migration did not preserve every row")
-			}
-			var accounts, adopted int
-			if err := connection.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM accounts), (SELECT COUNT(*) FROM agents WHERE account_id IS NOT NULL)`).Scan(&accounts, &adopted); err != nil {
-				t.Fatal(err)
-			}
-			if accounts != 0 || adopted != 0 {
-				t.Fatalf("migration invented %d accounts and %d agent links", accounts, adopted)
-			}
-			// Loopback pairings (the ones with terminal_input) gained
-			// administration; the relay pairing did not. Every pending
-			// challenge is treated the same way.
-			for _, table := range []string{"browser_clients", "browser_pairing_challenges"} {
-				var loopback, relay int
-				if err := connection.QueryRowContext(ctx, `SELECT MIN(capability_mask), MAX(capability_mask) FROM `+table).Scan(&relay, &loopback); err != nil {
-					t.Fatal(err)
-				}
-				if want := int(BrowserCapabilityKnownMask); loopback != want || relay != int(testRelayMask) {
-					t.Fatalf("%s masks after migration: loopback=%d relay=%d, want %d and %d", table, loopback, relay, want, testRelayMask)
-				}
-			}
-			if err := connection.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := store.Close(); err != nil {
-				t.Fatalf("Close: %v", err)
-			}
-
-			// A second open must find nothing to migrate.
-			reopened, err := Open(ctx, path)
-			if err != nil {
-				t.Fatalf("reopen migrated home: %v", err)
-			}
-			defer reopened.Close()
-			again, err := reopened.readerConnection(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer again.Close()
-			if _, version, err := inspectIdentity(ctx, again); err != nil || version != userVersion {
-				t.Fatalf("reopened user_version = %d, %v, want %d", version, err, userVersion)
-			}
-			if after := snapshotRows(t, ctx, again); !reflect.DeepEqual(before, after) {
-				t.Fatal("reopening a migrated home changed rows")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open legacy home: %v", err)
+	}
+	defer store.Close()
+	connection, err := store.readerConnection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, got, err := inspectIdentity(ctx, connection); err != nil || got != userVersion {
+		t.Fatalf("user_version = %d, %v, want %d", got, err, userVersion)
+	}
+	if err := validateExactSchema(ctx, connection); err != nil {
+		t.Fatalf("validateExactSchema after migration: %v", err)
+	}
+	if after := snapshotRows(t, ctx, connection); !reflect.DeepEqual(before, after) {
+		for table := range before {
+			if !reflect.DeepEqual(before[table], after[table]) {
+				t.Errorf("%s changed:\nbefore %v\nafter  %v", table, before[table], after[table])
 			}
 		}
+		t.Fatal("migration did not preserve every row")
+	}
+	var accounts, adopted int
+	if err := connection.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM accounts), (SELECT COUNT(*) FROM agents WHERE account_id IS NOT NULL)`).Scan(&accounts, &adopted); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 0 || adopted != 0 {
+		t.Fatalf("migration invented %d accounts and %d agent links", accounts, adopted)
+	}
+	// Loopback pairings (the ones with terminal_input) gained
+	// administration; the relay pairing did not. Every pending
+	// challenge is treated the same way.
+	for _, table := range []string{"browser_clients", "browser_pairing_challenges"} {
+		var loopback, relay int
+		if err := connection.QueryRowContext(ctx, `SELECT MIN(capability_mask), MAX(capability_mask) FROM `+table).Scan(&relay, &loopback); err != nil {
+			t.Fatal(err)
+		}
+		if want := int(BrowserCapabilityKnownMask); loopback != want || relay != int(testRelayMask) {
+			t.Fatalf("%s masks after migration: loopback=%d relay=%d, want %d and %d", table, loopback, relay, want, testRelayMask)
+		}
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A second open must find nothing to migrate.
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen migrated home: %v", err)
+	}
+	defer reopened.Close()
+	again, err := reopened.readerConnection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if _, got, err := inspectIdentity(ctx, again); err != nil || got != userVersion {
+		t.Fatalf("reopened user_version = %d, %v, want %d", got, err, userVersion)
+	}
+	if after := snapshotRows(t, ctx, again); !reflect.DeepEqual(before, after) {
+		t.Fatal("reopening a migrated home changed rows")
 	}
 }
 
@@ -183,16 +176,13 @@ func requireUnmigrated(t *testing.T, path string, wantVersion int) {
 		(SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('accounts', 'accounts_provider_home_unique'))`).Scan(&stale, &accounts); err != nil {
 		t.Fatal(err)
 	}
-	if stale != 2 || (wantVersion == legacyUserVersion) != (accounts == 0) {
-		t.Fatalf("refused open rewrote objects: pre-v3 browser tables=%d accounts objects=%d for v%d", stale, accounts, wantVersion)
+	wantAccounts := 2 // the table and its unique index, absent from a v1 home
+	if wantVersion == legacyUserVersion {
+		wantAccounts = 0
 	}
-}
-
-func must[T any](value T, ok bool) T {
-	if !ok {
-		panic("no migratable schema for that version")
+	if stale != 2 || accounts != wantAccounts {
+		t.Fatalf("refused open rewrote objects: pre-v3 browser tables=%d accounts objects=%d for v%d, want 2 and %d", stale, accounts, wantVersion, wantAccounts)
 	}
-	return value
 }
 
 // The relay pairing mask: every bit but terminal_input and administration.
@@ -214,10 +204,6 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	loopback := BrowserCapabilityObserve | BrowserCapabilityPrivateHumanRequestDetail | BrowserCapabilityHumanActions | BrowserCapabilityTerminalInput
 	boot := browserTestBoot(t, 1)
 	for index, mask := range []BrowserCapabilityMask{loopback, testRelayMask} {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
 		redeemed := HashBrowserChallenge([]byte(fmt.Sprintf("redeemed %d", index)))
 		pending := HashBrowserChallenge([]byte(fmt.Sprintf("pending %d", index)))
 		for _, digest := range []BrowserChallengeDigest{redeemed, pending} {
@@ -225,8 +211,7 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 				t.Fatalf("mint pairing challenge: %v", err)
 			}
 		}
-		publicKey := elliptic.Marshal(elliptic.P256(), key.X, key.Y)
-		if _, err := store.RedeemBrowserPairingChallenge(ctx, redeemed, boot, "https://app.example", browserTestID(t, byte(10+index)), publicKey, mustTime(t, 1)); err != nil {
+		if _, err := store.RedeemBrowserPairingChallenge(ctx, redeemed, boot, "https://app.example", browserTestID(t, byte(10+index)), browserKey(t), mustTime(t, 1)); err != nil {
 			t.Fatalf("redeem pairing challenge: %v", err)
 		}
 	}
@@ -266,7 +251,10 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	if err := setForeignKeys(ctx, connection, false); err != nil {
 		t.Fatal(err)
 	}
-	wantStatements := must(migratableSchema(version))
+	wantStatements, migrates := migratableSchema(version)
+	if !migrates {
+		t.Fatalf("no migratable schema for v%d", version)
+	}
 	legacy := expectedSchemaOf(wantStatements)
 	statements := []string{"BEGIN IMMEDIATE"}
 	statements = append(statements, extra...)

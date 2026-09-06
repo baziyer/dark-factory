@@ -1719,6 +1719,32 @@ test("a verb the daemon does not know refuses that request alone", async () => {
   socket.reply(encodeServerControl({ type: "ERROR", id: ask.id, body: { code: "unsupported", retryable: false } }));
   await assert.rejects(pending, (error) => error instanceof SessionError && error.code === "unsupported" && !error.retryable);
   assert.equal(session.status, "ready");
+test("without administration the account verbs are refused before anything is sent", async () => {
+  const grant = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+  let socket;
+  const session = new BrowserSession({
+    url: "ws://127.0.0.1:43123/browser", host: "127.0.0.1:43123", origin: "https://preview.example", challenge, keyStore: new MemoryKeys(),
+    socketFactory: () => {
+      socket = new Socket((current, frame) => {
+        if (frame.type === "PAIR_PROVE") current.reply(encodePairResult(frame.id, { client_id: clientID, capabilities: grant }));
+        if (frame.type === "AUTH_PROVE") current.reply(encodeAuthResult(frame.id, { client_id: clientID, capabilities: grant }));
+        if (frame.type === "STATE_GET") replySnapshot(current, frame, 1n);
+      });
+      return socket;
+    },
+  });
+  await session.connect();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(session.status, "ready");
+  const sent = socket.sent.length;
+  const agentId = "7c".repeat(16);
+  for (const refused of [session.discoverAccounts(), session.linkAccount({ provider: "codex", home: "/x", label: "x" }), session.updateAgent({ agentId, expectedRevision: 3n, accountId: "" })]) {
+    await assert.rejects(refused, (error) => error instanceof SessionError && error.code === "unauthorized");
+  }
+  assert.equal(socket.sent.length, sent);
+  // The same session still edits what human_actions covers.
+  void session.updateAgent({ agentId, expectedRevision: 3n, paused: true }).catch(() => undefined);
+  assert.equal(decodeClientControl(socket.sent.at(-1)).type, "AGENT_UPDATE");
   session.close();
 });
 

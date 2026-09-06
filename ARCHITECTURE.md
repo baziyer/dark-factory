@@ -145,14 +145,14 @@ target, the same snapshot validates the canonical task assignment, resource
 topology and identities, run/resource/session chronology, and requires the
 validated terminal session to equal the selected active session.
 `human_actions` is checked independently: without it, detail may contain that
-target but cannot advertise reply or cancellation. `administration` is the
-operator's own bit: discovering and linking this machine's provider logins
-and choosing which one an agent runs as. A pairing minted on loopback carries
-it; a relay pairing does not. With it, the same snapshot
+target but cannot advertise reply or cancellation. With it, the same snapshot
 may mint the one concrete cancellation descriptor containing exact request and
 run revisions. Delivering, delivery-unknown, finalizing, terminal, missing, and
 non-active origins expose no reply or cancellation authority; corrupt active
 relationships fail closed rather than resembling unavailability.
+`administration` is the operator's own bit: discovering and linking this
+machine's provider logins and choosing which one an agent runs as. A pairing
+minted on loopback carries it; a relay pairing does not.
 
 A reply contains only request ID, expected request revision, and bounded text.
 The Store derives the originating run and commits a unique delivery receipt

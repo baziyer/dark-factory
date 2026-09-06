@@ -36,7 +36,7 @@ func TestProjectBrowserAuthenticationProjectsExactDurableEffectCapabilities(t *t
 			}
 		})
 	}
-	for _, mask := range []kernel.BrowserCapabilityMask{0, kernel.BrowserCapabilityHumanActions, kernel.BrowserCapabilityObserve | (1 << 5)} {
+	for _, mask := range []kernel.BrowserCapabilityMask{0, kernel.BrowserCapabilityHumanActions, kernel.BrowserCapabilityObserve | (kernel.BrowserCapabilityKnownMask + 1)} {
 		if _, err := projectBrowserAuthentication(kernel.BrowserClient{ID: clientID, CapabilityMask: mask}); err == nil {
 			t.Fatalf("accepted invalid durable capability mask %d", mask)
 		}
