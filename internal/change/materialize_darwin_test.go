@@ -715,13 +715,48 @@ func TestInspectPublishedDetectsIdentityBaseBytesModesAndRootAuthority(t *testin
 	if tampered.Commitment().Equal(fixture.manifest.Commitment()) {
 		t.Fatal("same-size byte tamper trusted stored commitment")
 	}
+	// A provider under the service umask leaves 0600 files and 0700
+	// directories, and one that runs chmod may leave 0755 of either; none of
+	// those changes what is published. Group or other write and special bits
+	// are refused, and the owner's execute bit is what the entry records.
 	if err := unix.Chmod(file, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
-		t.Fatal("file mode tamper accepted")
+	private, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base)
+	if err != nil || !private.Commitment().Equal(tampered.Commitment()) {
+		t.Fatalf("private file mode: %v, commitment changed=%v", err, err == nil && !private.Commitment().Equal(tampered.Commitment()))
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err != nil {
+		t.Fatalf("shared directory mode: %v", err)
+	}
+	if err := unix.Chmod(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base)
+	if err != nil || executable.Commitment().Equal(tampered.Commitment()) {
+		t.Fatalf("owner-executable file: %v, commitment unchanged=%v", err, err == nil && executable.Commitment().Equal(tampered.Commitment()))
+	}
+	for _, refused := range []uint32{0o666, 0o664, 0o4755, 0o1644, 0o400} {
+		if err := unix.Chmod(file, refused); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
+			t.Fatalf("file mode %o accepted", refused)
+		}
 	}
 	if err := unix.Chmod(file, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
+		t.Fatal("group-writable directory accepted")
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Chmod(filepath.Join(parent, "change"), 0o777); err != nil {

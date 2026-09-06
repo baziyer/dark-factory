@@ -1003,7 +1003,10 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 		}
 		switch before.Mode & unix.S_IFMT {
 		case unix.S_IFDIR:
-			if before.Mode&0o7777 != directoryMode {
+			// The daemon makes directories 0700; a provider's mkdir leaves
+			// what its umask allows. Either way the owner has everything,
+			// nobody else may write, and no special bit is set.
+			if before.Mode&0o7022 != 0 || before.Mode&0o700 != 0o700 {
 				return &ValidationError{Reason: "prepared directory mode or special bits differ"}
 			}
 			childFD, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0)
@@ -1024,8 +1027,11 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 				return err
 			}
 		case unix.S_IFREG:
+			// A file the provider made carries what its umask left, 0600
+			// under the service's 077; the entry records only whether the
+			// owner may execute it, as git does.
 			permissions := before.Mode & 0o7777
-			if before.Nlink != 1 || (permissions != 0o644 && permissions != 0o755) {
+			if before.Nlink != 1 || permissions&0o7022 != 0 || permissions&0o600 != 0o600 {
 				return &ValidationError{Reason: "prepared file link, mode or special bits differ"}
 			}
 			if before.Size < 0 || uint64(before.Size) > MaxBlobBytes || *total > MaxTotalBlobBytes-uint64(before.Size) {
@@ -1049,7 +1055,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 				return err
 			}
 			mode := "100644"
-			if permissions == 0o755 {
+			if permissions&0o100 != 0 {
 				mode = "100755"
 			}
 			entry, err := NewEntry([]byte(path), mode, uint64(opened.Size), oid)
