@@ -45,6 +45,8 @@ type Config struct {
 	Address        string
 	AllowedOrigins []string
 	Backend        Backend
+	// Clock is the server's time source; nil means time.Now. A test holds it still.
+	Clock func() time.Time
 }
 
 type clientLifecycle struct {
@@ -98,13 +100,17 @@ func Listen(config Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("browser: listen: %w", err)
 	}
-	return start(config.Backend, origins, listener), nil
+	clock := config.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	return start(config.Backend, origins, listener, clock), nil
 }
 
-func start(backend Backend, origins map[string]struct{}, listener net.Listener) *Server {
+func start(backend Backend, origins map[string]struct{}, listener net.Listener, clock func() time.Time) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
-		now:                time.Now,
+		now:                clock,
 		backend:            backend,
 		terminalBackend:    func() TerminalBackend { value, _ := backend.(TerminalBackend); return value }(),
 		taskBackend:        func() TaskBackend { value, _ := backend.(TaskBackend); return value }(),

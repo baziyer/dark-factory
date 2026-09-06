@@ -102,6 +102,13 @@ func (backend *consoleDispatchBackend) setWalking(walking chan struct{}) {
 	backend.mu.Unlock()
 }
 
+// setErr is for a backend a live connection may be reading right now.
+func (backend *consoleDispatchBackend) setErr(err error) {
+	backend.mu.Lock()
+	backend.err = err
+	backend.mu.Unlock()
+}
+
 func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
 	if err := backend.record(client); err != nil {
 		return browserprotocol.Accounts{}, err
@@ -262,7 +269,7 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 	}
 	// The backend refusal path still ends the connection as dispatch would.
 	backend.setWalking(nil)
-	backend.err = ErrUnauthorized
+	backend.setErr(ErrUnauthorized)
 	writeClientFrame(t, connection, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeTopologyGet), "console-topology", "console-topology-2", 1)))
 	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorUnauthorized)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -273,7 +280,7 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 
 	// A walk still running when the server closes is joined, not leaked:
 	// Close cannot finish while the walk holds the connection's cleanup.
-	backend.err = nil
+	backend.setErr(nil)
 	backend.setWalking(make(chan struct{}))
 	held, _ := dialServer(t, server, testOrigin)
 	authenticate(t, held)

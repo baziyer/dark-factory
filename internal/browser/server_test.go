@@ -883,11 +883,20 @@ func TestDuplicateRequestIDAndConnectionLimit(t *testing.T) {
 
 func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 	backend := newFakeBackend()
-	server := startServer(t, backend)
-	// The window is measured on the server's clock, held still here so the
-	// fill cannot age out under a slow gate and moved by hand afterwards.
-	clock := time.Unix(1_700_000_000, 0)
-	server.now = func() time.Time { return clock }
+	// The window is measured on the server's clock, given before the server
+	// starts and held still so the fill cannot age out under a slow gate,
+	// then moved by hand; the serve goroutine reads it through the atomic.
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
+	server, err := Listen(Config{Address: "127.0.0.1:0", AllowedOrigins: []string{testOrigin, devOrigin}, Backend: backend, Clock: func() time.Time { return time.Unix(0, clock.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
 	// Authentication consumes one ID of the window. Exactly maxRequests-1
@@ -916,7 +925,7 @@ func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 	// The refusal spent nothing and closed nothing. Once the window has
 	// passed the same connection has budget again, and the id it refused is
 	// admitted like any other.
-	clock = clock.Add(requestWindow)
+	clock.Add(int64(requestWindow))
 	request, _ = browserprotocol.EncodeStateGet("over-budget", browserprotocol.StateGet{})
 	writeClientFrame(t, connection, request)
 	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot || frame.ID != "over-budget" {
