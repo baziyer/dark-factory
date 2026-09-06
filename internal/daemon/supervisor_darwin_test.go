@@ -278,6 +278,29 @@ func TestSupervisorClaudeReceivesALongTaskThroughTheTerminal(t *testing.T) {
 	fixture.assertReleased(t, run)
 }
 
+// The provider inherits the daemon's umask. The service runs under 077, so
+// a file it makes is 0600 and a directory 0700; a run whose worker made any
+// file must still settle, with those modes kept, not repaired.
+func TestSupervisorWorkerFilesSettleUnderThePrivateServiceUmask(t *testing.T) {
+	previous := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(previous) })
+	program := "set -eu\nprintf made > made.txt\nmkdir made\nprintf inner > made/inner.txt\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
+	retained := filepath.Join(fixture.changeParent, fixture.changeName(t, run))
+	if info, err := os.Stat(filepath.Join(retained, "made.txt")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("retained file = %v, %v", info, err)
+	}
+	if info, err := os.Stat(filepath.Join(retained, "made")); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("retained directory = %v, %v", info, err)
+	}
+	fixture.assertReleased(t, run)
+}
+
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
 	const privateTask = "exact private Codex task"
 	fixture := newSupervisorFixture(t, "unused shell task")
