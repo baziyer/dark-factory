@@ -51,7 +51,9 @@ func runReleasedProvider(child *OwnedChild, daemon, worker *os.File, reads *atte
 	// carries text and a newline as a paste, and a paste does not submit. The
 	// text goes now; the CR follows from serve.
 	if len(startup) > 0 {
-		loop.child.awaitRawMode(startupRawCeiling)
+		if err := loop.awaitRawMode(stagePTY, startupRawCeiling); err != nil {
+			return loop.daemonOpen, err
+		}
 		text := startup
 		if text[len(text)-1] == '\r' {
 			text = text[:len(text)-1]
@@ -64,7 +66,7 @@ func runReleasedProvider(child *OwnedChild, daemon, worker *os.File, reads *atte
 			if status != TerminalResultOK {
 				clear(startup)
 				stopErr := loop.stop()
-				return loop.daemonOpen, errors.Join(fmt.Errorf("runner: provider startup input %s after %d bytes", status, count), stopErr)
+				return loop.daemonOpen, errors.Join(fmt.Errorf("runner: provider startup input %s after %d bytes: %w", status, count, err), stopErr)
 			}
 		}
 		clear(startup)
@@ -112,10 +114,33 @@ const (
 	startupEnterTick    = 100 * time.Millisecond
 )
 
+// awaitRawMode waits, up to the ceiling, for the provider to clear canonical
+// input on its terminal, draining what it prints meanwhile so a provider that
+// greets with more than the terminal's output buffer is not stuck before it
+// can. The master reflects the slave's line discipline on Darwin.
+func (o *terminalOwner) awaitRawMode(stagePTY *ptyStageSink, ceiling time.Duration) error {
+	deadline := time.Now().Add(ceiling)
+	for {
+		if err := stagePTY.drain(); err != nil {
+			return err
+		}
+		termios, err := unix.IoctlGetTermios(int(o.child.ptyMaster.Fd()), unix.TIOCGETA)
+		if err != nil || termios.Lflag&unix.ICANON == 0 || !time.Now().Before(deadline) {
+			return nil
+		}
+		time.Sleep(startupEnterTick)
+	}
+}
+
 // submitStartup writes the owed CR once the provider's output has been quiet
-// for a spell after the floor, or at the ceiling regardless.
+// for a spell after the floor, or at the ceiling regardless. A provider that
+// has exited or closed its terminal is owed nothing.
 func (o *terminalOwner) submitStartup() error {
 	if o.enterBy.IsZero() {
+		return nil
+	}
+	if o.stopRequested || o.ptyEOF || !o.ptyOpen || o.child.exitObserved {
+		o.enterAfter, o.enterBy = time.Time{}, time.Time{}
 		return nil
 	}
 	now := time.Now()
@@ -123,7 +148,7 @@ func (o *terminalOwner) submitStartup() error {
 		return nil
 	}
 	o.enterAfter, o.enterBy = time.Time{}, time.Time{}
-	n, err := o.child.writePTYOwned([]byte{'\r'}, attemptControlTimeout)
+	n, err := o.child.writePTYOwned([]byte{'\r'}, 250*time.Millisecond)
 	if _, status := terminalPayloadResult(n, 1, err); status != TerminalResultOK {
 		return fmt.Errorf("runner: provider startup submit %s", status)
 	}
@@ -196,12 +221,11 @@ func (o *terminalOwner) serve() (bool, error) {
 		if err != nil {
 			return o.daemonOpen, err
 		}
-		if err := o.submitStartup(); err != nil {
-			return o.daemonOpen, err
-		}
 		switch ev.source {
 		case sourceTick:
-			continue
+			if err := o.submitStartup(); err != nil {
+				return o.daemonOpen, err
+			}
 		case sourceChild:
 			// First converge the exact process group and perform the sole Wait;
 			// only then is PTY tail output drained. PTY EOF is emitted exclusively
@@ -216,6 +240,9 @@ func (o *terminalOwner) serve() (bool, error) {
 		case sourcePTY:
 			o.lastOutput = time.Now()
 			if err := o.consumePTY(ev.bytes, ev.err); err != nil {
+				return o.daemonOpen, err
+			}
+			if err := o.submitStartup(); err != nil {
 				return o.daemonOpen, err
 			}
 		case sourceDaemon:
@@ -262,7 +289,8 @@ func (o *terminalOwner) nextEvent() (terminalReady, error) {
 		// is noticed without any event arriving.
 		var timeout *unix.Timespec
 		if !o.enterBy.IsZero() {
-			timeout = &unix.Timespec{Nsec: int64(startupEnterTick)}
+			tick := unix.NsecToTimespec(int64(startupEnterTick))
+			timeout = &tick
 		}
 		n, err := unix.Kevent(o.child.kq, nil, events, timeout)
 		if errors.Is(err, unix.EINTR) {

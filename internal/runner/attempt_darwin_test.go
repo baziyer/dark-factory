@@ -328,8 +328,15 @@ func runAttemptWorkerHelper(args []string) error {
 	var provider ExecSpec
 	var providerTask []byte
 	switch mode {
-	case "native-input":
-		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; IFS= read -r startup || exit 98; printf '%%s' \"$startup\" > %q || exit 99; IFS= read -r interactive || exit 100; printf '%%s' \"$interactive\" > %q || exit 101; while test ! -f %q; do sleep 0.01; done", filepath.Join(root, "provider.startup"), filepath.Join(root, "provider.stdin"), filepath.Join(root, "finish"))
+	case "native-input", "native-raw":
+		// native-raw greets with more than the terminal's output buffer and
+		// only then takes the terminal out of canonical mode, as an
+		// interactive CLI does while it starts.
+		greeting := ""
+		if mode == "native-raw" {
+			greeting = "head -c 2048 /dev/zero | tr '\\0' x; sleep 0.3; stty -icanon || exit 96; "
+		}
+		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; %sIFS= read -r startup || exit 98; printf '%%s' \"$startup\" > %q || exit 99; IFS= read -r interactive || exit 100; printf '%%s' \"$interactive\" > %q || exit 101; while test ! -f %q; do sleep 0.01; done", greeting, filepath.Join(root, "provider.startup"), filepath.Join(root, "provider.stdin"), filepath.Join(root, "finish"))
 		provider = ExecSpec{Target: "/bin/sh", Args: []string{"-c", script}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: providerCwd}
 	case "shell", "shell-input", "term", "leader", "tail", "reply", "loud-adoption":
 		providerWitness := shellPIDWitness("$$", filepath.Join(root, "provider.pid"))
@@ -469,7 +476,7 @@ func runAttemptWorkerHelper(args []string) error {
 		}
 	}
 	var task *os.File
-	if mode != "native-input" {
+	if mode != "native-input" && mode != "native-raw" {
 		if len(providerTask) == 0 {
 			providerTask = []byte("test-provider-task\n")
 		}
@@ -842,6 +849,52 @@ func TestAttemptRunnerSubmitsStartupCarriageReturnAfterThePromptIsQuiet(t *testi
 	waitFile(t, stdin)
 	if body, err := os.ReadFile(stdin); err != nil || string(body) != "interactive-after-ready" {
 		t.Fatalf("provider.stdin=%q err=%v", body, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := f.finishAndAck()
+	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 0 {
+		t.Fatalf("terminal=%+v", record.Terminal)
+	}
+}
+
+// A prompt longer than the line discipline keeps is typed only once the
+// provider has left canonical mode, and a provider that greets with more
+// than the terminal's output buffer is drained meanwhile so it gets there:
+// the whole prompt arrives, and ready comes before the ceiling.
+func TestAttemptRunnerTypesTheStartupPromptOnlyOnceTheProviderIsRaw(t *testing.T) {
+	f := newAttemptFixture(t, "native-raw", "")
+	prompt := strings.Repeat("p", 3000)
+	f.spec.StartupInput = []byte(prompt + "\n")
+	inner := f.activateOuter()
+	f.advanceToProvider()
+	released := time.Now()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if ready := f.nextTerminal(TerminalReady, 0); ready.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v", ready)
+	}
+	if elapsed := time.Since(released); elapsed >= startupRawCeiling {
+		t.Fatalf("ready %v after release: the raw-mode gate ran to its %v ceiling", elapsed, startupRawCeiling)
+	}
+	startup := filepath.Join(f.root, "provider.startup")
+	waitFile(t, startup)
+	if body, err := os.ReadFile(startup); err != nil || string(body) != prompt {
+		t.Fatalf("provider.startup has %d bytes, err=%v, want the %d-byte prompt", len(body), err, len(prompt))
+	}
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalGenerationInstall, Correlation: 1, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalGenerationResult, 1); result.Status != TerminalResultOK {
+		t.Fatalf("generation install=%+v", result)
+	}
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalInput, Correlation: 2, Generation: 1, Sequence: 1, Payload: []byte("interactive-after-ready\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalInputResult, 2); result.Status != TerminalResultOK {
+		t.Fatalf("terminal input=%+v", result)
 	}
 	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
 		t.Fatal(err)

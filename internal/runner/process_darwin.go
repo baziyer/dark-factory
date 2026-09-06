@@ -195,23 +195,6 @@ func (c *OwnedChild) WritePTY(input []byte) (int, error) {
 // the child's EVFILT_PROC event. Calling refreshExit from that loop could
 // consume a readiness event belonging to the loop and lose the only exit
 // notification.
-// awaitRawMode returns once the provider has cleared canonical input on its
-// terminal, read through the master, or after the ceiling. The master
-// reflects the slave's line discipline on Darwin.
-func (c *OwnedChild) awaitRawMode(ceiling time.Duration) {
-	if c == nil || c.ptyMaster == nil {
-		return
-	}
-	deadline := time.Now().Add(ceiling)
-	for {
-		termios, err := unix.IoctlGetTermios(int(c.ptyMaster.Fd()), unix.TIOCGETA)
-		if err != nil || termios.Lflag&unix.ICANON == 0 || !time.Now().Before(deadline) {
-			return
-		}
-		time.Sleep(startupEnterTick)
-	}
-}
-
 func (c *OwnedChild) writePTYOwned(input []byte, timeout time.Duration) (int, error) {
 	if c == nil || c.ptyMaster == nil || c.state != stateActivated || c.exitObserved {
 		return 0, ErrState
