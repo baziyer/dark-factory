@@ -77,4 +77,16 @@ func TestStandingInstructionEnqueuesItselfWithinItsBudget(t *testing.T) {
 	if reset.Idle.RunsUsed != 0 || reset.Idle.RunBudget != budget {
 		t.Fatalf("new budget did not restart the count: %+v", reset.Idle)
 	}
+	// An agent admission would not take (its tool budget is spent) draws
+	// nothing either, unpaused or not.
+	unpaused := false
+	if _, err := store.UpdateAgent(ctx, agent.ID, reset.Revision, AgentPatch{Paused: &unpaused}, mustTime(t, 100_001+20_000_001)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`UPDATE agents SET tool_calls_used = tool_budget_limit WHERE id = ?`, agent.ID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 100_001+30_000_000)); err != nil || len(tasks) != 0 {
+		t.Fatalf("agent past its tool budget enqueued %d tasks, err=%v", len(tasks), err)
+	}
 }
