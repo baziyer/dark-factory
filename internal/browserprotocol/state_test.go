@@ -179,6 +179,16 @@ func TestSnapshotEntityCountBoundFailsClosed(t *testing.T) {
 	if _, err := EncodeStateSnapshot("state", spread); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("spread overflow accepted: %v", err)
 	}
+	// Accounts count toward the same bound as everything else.
+	accounts := StateSnapshot{Head: 1, Factory: factoryItem(), Projects: spread.Projects, Agents: []AgentItem{}, Tasks: []TaskItem{}, HumanRequests: []HumanRequestItem{}}
+	for index := 1; index <= MaxSnapshotEntities/2; index++ {
+		item := accountItem()
+		item.ID = hexIdentity(0xa4, index)
+		accounts.Accounts = append(accounts.Accounts, item)
+	}
+	if _, err := EncodeStateSnapshot("state", accounts); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("account overflow accepted: %v", err)
+	}
 }
 
 // One encoded snapshot may reach 1 MiB and not a byte more. Oversize is a
