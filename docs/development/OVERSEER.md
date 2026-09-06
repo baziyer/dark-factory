@@ -5,13 +5,17 @@ takes what a worker finished and gets it merged, through the Maintainer App,
 and asks a human only when it cannot decide alone. It never writes code.
 
 The overseer's standing instruction (CONFIG → RULES → WHEN IDLE → run a
-standing instruction) is short, because the daemon caps task text at 8 KiB:
+standing instruction) is short, because a Claude launch delivers the task
+through the terminal and that prepared prompt is capped at 8 KiB:
 
-> You are the overseer of the project named PROJECT. Clone
-> https://github.com/OWNER/REPO with `git clone --filter=blob:none`, read
-> docs/development/OVERSEER.md in that clone, and follow it exactly. Before
-> exiting, report the durable outcome with `$DARK_FACTORY_FACTORYCTL attempt
-> succeed --result` (one line per change you handled, or "nothing to publish").
+> You are the overseer of the project named PROJECT. Run
+> `git clone --filter=blob:none https://github.com/OWNER/REPO repo`, read
+> repo/docs/development/OVERSEER.md, and follow it exactly. Before exiting,
+> report the durable outcome with `$DARK_FACTORY_FACTORYCTL attempt succeed
+> --result` (one line per change you handled, or "nothing to publish").
+
+Every command below runs from the directory the session starts in, its
+private runtime home, with the clone at `repo` inside it.
 
 Everything below assumes that session: `--dangerously-skip-permissions`, the
 operator's own home and login, a private `TMPDIR`, no `gh` credential, git
@@ -57,17 +61,23 @@ Handle only rows whose `project` is yours. The retained tree of a change is
 
 ## 2. Derive one operation id per step, and check the journal first
 
-Every App write takes an `operation_id`. Derive it from the change so a retry
-is a replay, never a second publication:
+Every App write takes an `operation_id`. Derive it from the change and the
+step so a retry is a replay, never a second publication:
 
 ```sh
 opid() { python3 -c "import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, 'dark-factory:' + sys.argv[1] + ':' + sys.argv[2]))" "$1" "$2"; }
-# opid CHANGE_ID issue | publish | pr | enqueue
+# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, enqueue
 ```
 
-Before each step call `observe_operation` with that id. `completed` means the
-step already happened: reuse its result and move on. `executing` or
-`indeterminate` means stop and raise a human request with the id.
+One id per App write: a change that needs several commits (step 3) uses
+`publish-1`, `publish-2` and so on, one per commit, and the same request under
+the same id is a replay while a different request under it is refused. Before
+each write call `observe_operation` with its id. `completed` means that write
+already happened: take its result (for a commit, the head it returned) and go
+on to the next step, which for a multi-commit publication is the next commit,
+not the pull request. Never received or `planned` means it has not happened.
+`executing` or `indeterminate` means stop and raise a human request with the
+id.
 
 ## 3. Publish the change as a branch
 
@@ -89,27 +99,32 @@ unset GIT_DIR GIT_WORK_TREE
 Build the `changes` array for `publish_commit`: added and modified paths carry
 `content_base64` and the `mode` the staged entry shows (`100644` or
 `100755`); deleted paths carry only `path`. The App takes at most 50 entries
-per commit and 1 MB per file, and refuses `.github` and CODEOWNERS paths; more
-than 50 files means several commits on the same branch, each bound to the
-head the previous one returned. A file over 1 MB or a refused path is a human
-request, not a workaround.
+per commit and 1,000,000 base64 characters per file (about 732 KiB of
+content), and refuses `.github/workflows`, the CODEOWNERS locations and the
+dependabot config. More than 50 files means several commits on the same
+branch, each bound to the head the previous one returned. A file over that
+bound, a symlink (staged mode `120000`), or a refused path is a human request,
+not a workaround.
 
 Then, with `branch = factory/<first 12 hex of change_id>`:
 
 1. `observe_ref` for `main`. If it is not `base_commit`, main moved since the
    worker started; publish anyway from `base_commit` and let the queue merge
    it, but say so in the body.
-2. `publish_commit` with `operation_id = opid publish`, `branch`,
+2. `publish_commit` with `operation_id = opid publish-1`, `branch`,
    `expected_head_sha = base_commit`, a one-line message from the task title,
-   and the `changes` array. It returns the new head commit.
+   and the first (or only) 50 entries. It returns the new head commit; a
+   second commit uses `opid publish-2` and that head, and so on. The last
+   returned head is the pull request head.
 
 ## 4. Open the issue and the pull request
 
 `create_pull_request` needs an issue. `create_issue` with `opid issue`, the
-task title, and a body of the task text plus the change id. Then
-`create_pull_request` with `opid pr`, `head = branch`, `head_sha` = the
-published commit, `base = main`, `base_sha = base_commit`, `draft = false`,
-the task title, and a body in this repository's shape:
+task title (cut to 256 characters, the App's bound), and a body of the task
+text plus the change id. Then `create_pull_request` with `opid pr`,
+`head = branch`, `head_sha` = the last published commit, `base = main`,
+`base_sha = base_commit`, `draft = false`, the same title, and a body in this
+repository's shape:
 
 - What changed and why: from the task and the diff, in prose.
 - Production-line delta: added minus deleted outside tests, docs and fixtures,
@@ -122,20 +137,24 @@ Write that body to a file; the review needs it.
 
 ## 5. Get the cold review, then merge
 
-From the clone directory:
-
 ```sh
-scripts/cold-review.sh OWNER/REPO PR HEAD_SHA BASE_SHA body.md "first review"
+repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA BASE_SHA body.md "first review"
 ```
 
-It prints the verdict last and leaves `review-PR-HEAD8.log`.
+It exits 0 for ALLOW, 1 for REQUEST_CHANGES and 3 when the session reported
+no verdict, and leaves `review-PR-HEAD8.log` in the current directory.
 
+- Exit 3: run it once more; a second 3 is a human request with the log's
+  last lines.
 - ALLOW: `enqueue_pull_request` with `opid enqueue`, the PR number, the head
   and `base = main`. Then `observe_pull_request_merge` every 60 s for up to
-  30 minutes. Merged: done. A failed queue run: `read_pull_request_job_log`;
-  if the failing test does not touch anything in the diff, rerun once with
-  `rerun_failed_pull_request_jobs`; otherwise raise a human request quoting
-  the failure. Never poll GitHub faster than once a minute.
+  30 minutes; never faster. Merged: done. No longer queued and not merged:
+  the queue's run failed or dropped the entry, and the App cannot read a
+  queue run's log or rerun it (`read_pull_request_job_log` and
+  `rerun_failed_pull_request_jobs` bind to the pull request's own runs), so
+  raise a human request with the PR link; never enqueue again on your own.
+  An ALLOW the App did not record shows up the same way: the queue's review
+  check refuses the entry.
 - REQUEST_CHANGES: you do not fix code. Raise a human request with the PR
   link and the findings verbatim; the human enqueues the fix as a task to the
   worker. Stop handling this change until a new retained change for the same
