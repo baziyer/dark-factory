@@ -402,8 +402,9 @@ func (backend *browserBackend) Topology(ctx context.Context, rawClient [browserp
 	}
 	// The walk reads no client state and may take most of its budget, so it
 	// runs outside the client's gate: a state or terminal call from the same
-	// client is not charged the walk's time. The connection's one walker is
-	// what keeps a client to one walk at a time.
+	// client is not charged the walk's time. Each connection's walker keeps
+	// that connection to one walk at a time; a client with several
+	// connections may walk on each of them.
 	release()
 	if backend.owner == nil {
 		return browserprotocol.Topology{}, browser.ErrNotFound
