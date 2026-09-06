@@ -168,7 +168,8 @@ leaves `review-PR-HEAD8.log` in the current directory.
   last lines.
 - ALLOW: `enqueue_pull_request` with `opid enqueue`, the PR number, the head
   and `base = main`. Then `observe_pull_request_merge`, with the PR number,
-  the head and the enqueue operation id, every 60 s for up to 30 minutes;
+  the head, `base = main` and the enqueue operation id, every 60 s for up to
+  30 minutes;
   never faster. Merged: done. Still queued after 30 minutes: the change is
   not finished; raise a human request naming the PR and stop, and the next
   run observes it again. No longer queued and not merged:
@@ -184,13 +185,18 @@ leaves `review-PR-HEAD8.log` in the current directory.
   task appears.
 - Exit 4: the pull request is no longer at the head you published, which
   only a person can have done; raise a human request.
+- Exit 2 or 5: the script refused its arguments or could not prepare the
+  checkout; the log was not written. Check the head and base you passed once,
+  then raise a human request with the script's message.
 
 On a resumed run, a change whose `pr` is completed but whose `enqueue` is not
 needs no second review if one was recorded: `observe_operation` with `opid
 review-HEAD8` for the pull request head answers `completed` with verdict
-`allow` (enqueue), `block` (blocked: wait for a new retained change), or
-nothing (run the review). The `review` check itself runs only in the merge
-queue, so it is never the signal here.
+`allow` (enqueue), `block` (blocked: wait for a new retained change), `note`
+(a comment that decided nothing: run the review again under a fresh id, the
+head's plus `-2`), or nothing (run the review); `executing` or
+`indeterminate` is a human request, as in section 2. The `review` check
+itself runs only in the merge queue, so it is never the signal here.
 
 ## 6. Hand off and finish
 
