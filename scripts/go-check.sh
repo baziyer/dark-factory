@@ -49,7 +49,8 @@ go test -short -timeout=20m \
     ./cmd/cloudflare-admin \
     ./internal/browserprotocol \
     ./internal/cloudflareadmin \
-    ./internal/provider
+    ./internal/provider \
+    ./internal/topology
 
 echo "go-check: TypeScript install, build, typecheck, and tests"
 (
