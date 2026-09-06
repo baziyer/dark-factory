@@ -22,14 +22,6 @@ const (
 // for days keeps its socket; a repeated id inside the window is still refused.
 const requestWindow = time.Minute
 
-// maxWalks bounds the tree walks one connection may have in flight. The
-// floor asks for one topology per project and one run-path set per running
-// agent per round, so a handful covers it; a client past the bound is told
-// to try again, and the daemon's per-client gate serialises them anyway.
-// ponytail: a fixed small count; make it per-kind if a single slow project
-// walk ever starves run-path answers.
-const maxWalks = 8
-
 var (
 	errBackendResult             = errors.New("browser: invalid backend result")
 	errInvalidTerminalAttachment = errors.New("browser: invalid terminal attachment")
@@ -61,8 +53,8 @@ type connection struct {
 	authenticatingID    [browserprotocol.ClientIDSize]byte
 	seen                map[string]struct{}
 	recent              []request
-	background          sync.WaitGroup
-	walks               chan struct{}
+	walks               chan browserprotocol.ControlFrame
+	walked              chan struct{}
 	subscription        StateSubscription
 	updates             <-chan StateUpdate
 	subscriptionID      string
@@ -125,7 +117,9 @@ func (current *connection) run() {
 			current.recordCleanup(err)
 		}
 		current.stop()
-		current.background.Wait()
+		if current.walked != nil {
+			<-current.walked
+		}
 		if readerStarted {
 			<-readerDone
 		}
@@ -473,24 +467,21 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 		payload, err = browserprotocol.EncodeTaskUpdateResult(frame.ID, result)
 	case browserprotocol.TopologyGet, browserprotocol.RunPathsGet:
 		// Both may walk a tree under the call budget. That must not hold up
-		// state and terminal frames, so they answer from their own goroutine;
-		// the websocket permits concurrent writes. Past maxWalks in flight
-		// the request is refused as retryable, not queued.
+		// state and terminal frames, so one walker goroutine answers them in
+		// arrival order, each under its own budget from the moment it starts;
+		// the websocket permits concurrent writes. The queue holds a window's
+		// budget, so only a client the window would refuse anyway finds it
+		// full and is told to try again.
 		if current.walks == nil {
-			current.walks = make(chan struct{}, maxWalks)
+			current.walks = make(chan browserprotocol.ControlFrame, maxRequests)
+			current.walked = make(chan struct{})
+			go current.walk()
 		}
 		select {
-		case current.walks <- struct{}{}:
+		case current.walks <- frame:
 		default:
 			current.sendError(frame.ID, browserprotocol.ErrorRateLimited, true)
-			return true
 		}
-		current.background.Add(1)
-		go func() {
-			defer current.background.Done()
-			defer func() { <-current.walks }()
-			current.observe(frame)
-		}()
 		return true
 	case browserprotocol.AccountsDiscover:
 		if current.server.consoleBackend == nil {
@@ -1019,6 +1010,19 @@ func stopSubscription(subscription StateSubscription) error {
 		return nil
 	case <-timer.C:
 		return ErrSubscriptionUnresolved
+	}
+}
+
+// walk answers queued walks one at a time until the connection ends; the
+// cleanup in run waits for it, so a walk in flight is joined, never leaked.
+func (current *connection) walk() {
+	defer close(current.walked)
+	for current.ctx.Err() == nil {
+		select {
+		case <-current.ctx.Done():
+		case frame := <-current.walks:
+			current.observe(frame)
+		}
 	}
 }
 

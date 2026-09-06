@@ -248,7 +248,7 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 	backend := newConsoleDispatchBackend()
 	backend.walking = make(chan struct{})
-	server := startTaskServer(t, backend)
+	server, clock := startHeldClockServer(t, backend)
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
 	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
@@ -279,36 +279,52 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 		t.Fatalf("unauthorized walk left the connection open: err=%v ctx=%v", err, ctx.Err())
 	}
 
-	// Walks in flight are bounded: the one past maxWalks is refused as
-	// retryable without reaching the backend, while the others still hold.
+	// Walks are answered one at a time in arrival order and the rest wait:
+	// a window's worth may queue, so a normal round is never refused. Past
+	// that, a walk the window would admit is refused as retryable without
+	// reaching the backend, and the one in flight still holds.
 	backend.setErr(nil)
-	backend.setWalking(make(chan struct{}))
+	walking := make(chan struct{})
+	backend.setWalking(walking)
+	// A failure below must not leave the walk blocked for the cleanup's join.
+	var released sync.Once
+	release := func() { released.Do(func() { close(walking) }) }
+	t.Cleanup(release)
 	held, _ := dialServer(t, server, testOrigin)
 	authenticate(t, held)
 	calls, _ := backend.observed()
-	for index := range maxWalks {
-		writeClientFrame(t, held, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeRunPathsGet), "console-rooms", fmt.Sprintf("console-rooms-%d", index), 1)))
+	walkFrame := func(id string) []byte {
+		return []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeRunPathsGet), "console-rooms", id, 1))
 	}
-	// Every walk is in flight once the backend has been asked that often.
+	// Authentication spent one id of the window; the rest all go to walks.
+	for index := range maxRequests - 1 {
+		writeClientFrame(t, held, walkFrame(fmt.Sprintf("console-rooms-%d", index)))
+	}
+	// The first walk is in flight once the backend has been asked once.
 	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		if now, _ := backend.observed(); now >= calls+maxWalks {
+		if now, _ := backend.observed(); now >= calls+1 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the walks never all started")
+			t.Fatal("the walk never started")
 		}
 	}
+	// Two slots remain behind it. The window slides, so the next three are
+	// admitted; the third finds the queue full.
+	clock.Add(int64(requestWindow))
+	writeClientFrame(t, held, walkFrame("console-rooms-fill-1"))
+	writeClientFrame(t, held, walkFrame("console-rooms-fill-2"))
 	writeClientFrame(t, held, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
 	over := readServerFrame(t, held)
 	assertError(t, over, browserprotocol.ErrorRateLimited)
-	if !bool(over.Body.(browserprotocol.Error).Retryable) {
-		t.Fatal("walk past the bound was not retryable")
+	if over.ID != "console-topology" || !bool(over.Body.(browserprotocol.Error).Retryable) {
+		t.Fatalf("walk past the queue = %+v", over)
 	}
-	if now, _ := backend.observed(); now != calls+maxWalks {
-		t.Fatalf("walk past the bound reached the backend: calls=%d", now-calls)
+	if now, _ := backend.observed(); now != calls+1 {
+		t.Fatalf("queued walks reached the backend: calls=%d", now-calls)
 	}
 	// A walk still running when the server closes is joined, not leaked:
-	// Close cannot finish while the walks hold the connection's cleanup.
+	// Close cannot finish while the walker holds the connection's cleanup.
 	closed := make(chan struct{})
 	go func() {
 		_ = server.Close()
@@ -319,10 +335,7 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 		t.Fatal("server close did not wait for the walk in flight")
 	case <-time.After(200 * time.Millisecond):
 	}
-	backend.mu.Lock()
-	walking := backend.walking
-	backend.mu.Unlock()
-	close(walking)
+	release()
 	select {
 	case <-closed:
 	case <-time.After(3 * time.Second):

@@ -881,11 +881,11 @@ func TestDuplicateRequestIDAndConnectionLimit(t *testing.T) {
 	})
 }
 
-func TestRequestBudgetIsASlidingWindow(t *testing.T) {
-	backend := newFakeBackend()
-	// The window is measured on the server's clock, given before the server
-	// starts and held still so the fill cannot age out under a slow gate,
-	// then moved by hand; the serve goroutine reads it through the atomic.
+// startHeldClockServer starts a server whose request window is measured on
+// a clock held still until the test moves it; the serve goroutine reads it
+// through the atomic.
+func startHeldClockServer(t *testing.T, backend Backend) (*Server, *atomic.Int64) {
+	t.Helper()
 	var clock atomic.Int64
 	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -898,6 +898,15 @@ func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 			t.Errorf("close: %v", err)
 		}
 	})
+	return server, &clock
+}
+
+func TestRequestBudgetIsASlidingWindow(t *testing.T) {
+	backend := newFakeBackend()
+	// The window is measured on the server's clock, given before the server
+	// starts and held still so the fill cannot age out under a slow gate,
+	// then moved by hand; the serve goroutine reads it through the atomic.
+	server, clock := startHeldClockServer(t, backend)
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
 	// Authentication consumes one ID of the window. Exactly maxRequests-1
