@@ -13,13 +13,15 @@
 #
 # DARK_FACTORY_REVIEW_OPERATION_ID, when set, is the App operation id the
 # verdict is recorded under, so a caller that derives it can read the verdict
-# back with observe_operation; otherwise the session mints one.
+# back with observe_operation; otherwise uuidgen mints one, so uuidgen is
+# only needed when it is not set.
 #
 # Exit status: 0 when the session reports an ALLOW verdict, 1 for
 # REQUEST_CHANGES, 3 when it reports no verdict at all, 4 when the pull
 # request is no longer at the stated head, 2 for bad arguments, a missing
-# tool or a base commit the repository does not hold, 5 when the clone, the
-# checkout, the renaming below or the rules copy fails. The session's final
+# tool, a base commit the repository does not hold or shares no history
+# with the head, or a base that already contains the head, 5 when the clone,
+# the checkout, the renaming below or the rules copy fails. The session's final
 # message lands in review-PR-HEAD8.log in the current directory. Whether a
 # verdict was really recorded is the merge queue's review check to decide,
 # not this script's.
@@ -42,13 +44,28 @@ fi
 repository=$1 pr=$2 head=$3 base=$4 body=$5
 shift 5
 focus="$*"
+# The App's own shape for a repository name: an owner of 1 to 39 letters,
+# digits and hyphens, a slash, a name of 1 to 100 letters, digits, dots,
+# underscores and hyphens.
+owner=${repository%%/*}
+name=${repository#*/}
 case "$repository" in
-    */*/* | '' | /* | */ | .* | */.* | *[!A-Za-z0-9._/-]*) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+    */*/*) owner= ;;
     */*) ;;
-    *) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+    *) owner= ;;
 esac
+case "$owner" in
+    '' | *[!A-Za-z0-9-]*) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+esac
+case "$name" in
+    '' | *[!A-Za-z0-9._-]*) echo "not an OWNER/REPO name: $repository" >&2; exit 2 ;;
+esac
+if [ "${#owner}" -gt 39 ] || [ "${#name}" -gt 100 ]; then
+    echo "not an OWNER/REPO name: $repository" >&2
+    exit 2
+fi
 case "$pr" in
-    '' | *[!0-9]*) echo "not a pull request number: $pr" >&2; exit 2 ;;
+    '' | 0* | *[!0-9]*) echo "not a pull request number: $pr" >&2; exit 2 ;;
 esac
 for sha in "$head" "$base"; do
     if [ "${#sha}" -ne 40 ] || [ -n "$(printf '%s' "$sha" | tr -d '0-9a-f')" ]; then
@@ -58,9 +75,12 @@ for sha in "$head" "$base"; do
 done
 [ -f "$body" ] || { echo "no body file: $body" >&2; exit 2; }
 bridge=$(command -v dark-factory-maintainer-mcp-bridge) || { echo "maintainer bridge is not on PATH" >&2; exit 2; }
-for tool in claude git uuidgen; do
+for tool in claude git; do
     command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 2; }
 done
+if [ -z "${DARK_FACTORY_REVIEW_OPERATION_ID:-}" ]; then
+    command -v uuidgen >/dev/null || { echo "uuidgen is not on PATH and no operation id was given" >&2; exit 2; }
+fi
 remote=${DARK_FACTORY_REVIEW_REMOTE:-https://github.com}
 work=$(mktemp -d "${TMPDIR:-/tmp}/cold-review.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -75,7 +95,10 @@ if ! git -C "$work/repo" cat-file -e "$base^{commit}" 2>/dev/null; then
     echo "base $base is not a commit of $repository" >&2
     exit 2
 fi
-merge_base=$(git -C "$work/repo" merge-base "$base" "$head") || exit 5
+if ! merge_base=$(git -C "$work/repo" merge-base "$base" "$head"); then
+    echo "base $base shares no history with the head" >&2
+    exit 2
+fi
 if [ "$merge_base" = "$head" ]; then
     echo "base $base already contains the head: nothing to review" >&2
     exit 2
@@ -104,6 +127,7 @@ DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" claude -p "$prompt" --model opus \
     --strict-mcp-config --mcp-config "{\"mcpServers\":{\"maintainer\":{\"command\":\"$bridge\"}}}" \
     --allowedTools "mcp__maintainer__submit_pull_request_review,Bash(git -C $work/repo:*),Read,Grep,Glob" \
     > "$out" 2>&1 || true
+[ -f "$out" ] || exit 5
 tail -60 "$out"
 case "$(grep -E '^VERDICT: (ALLOW|REQUEST_CHANGES)$' "$out" | tail -1)" in
     'VERDICT: ALLOW') exit 0 ;;
