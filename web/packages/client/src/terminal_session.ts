@@ -268,9 +268,14 @@ class TerminalHandleImpl implements InternalTerminalHandle {
     // whether any bytes reached the runner, so the generation must be fenced
     // rather than allowing a different payload to reuse its reservation.
     if (operation.kind === "input") { this.#fatal(error); return true; }
-    if (operation.kind === "renew" || operation.kind === "release" || operation.kind === "detach") { this.#fatal(error); return true; }
+    if (operation.kind === "detach") { this.#fatal(error); return true; }
     this.#operation = undefined;
     if (operation.kind === "acquire") { this.#cancelTimer(); this.#renewDue = false; this.#lease = undefined; }
+    // A refused release or renewal still ends this client's authority:
+    // whatever the daemon's reason (the run ended, the lease lapsed or moved
+    // on), it no longer honours this generation, so it is fenced here and
+    // observation continues. A detach in progress carries on without it.
+    if (operation.kind === "release" || operation.kind === "renew") this.#clearAuthority(operation.generation);
     if (operation.kind === "resize") this.#serviceRenewal();
     operation.reject(error);
     this.#advanceDetach();
@@ -479,7 +484,10 @@ class TerminalHandleImpl implements InternalTerminalHandle {
     if (!this.#detaching || this.#closed || this.#operation !== undefined || this.#outputInFlight) return;
     if (!this.#attached) { this.#closeLocal(); return; }
     try {
-      if (this.#lease !== undefined) void this.#beginRelease(true).catch((error: unknown) => this.#fatal(error as SessionErrorLike));
+      // A release the daemon refused was handled where it was received and
+      // left no lease behind; a rejection that leaves the lease in place is
+      // one that never went out (the generation guard), and that is fatal.
+      if (this.#lease !== undefined) void this.#beginRelease(true).catch((error: unknown) => { if (this.#lease !== undefined) this.#fatal(error as SessionErrorLike); });
       else void this.#beginDetach().catch((error: unknown) => this.#fatal(error as SessionErrorLike));
     } catch (error) {
       this.#fatal(error as SessionErrorLike);

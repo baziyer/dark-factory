@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTerminalHandle } from "../dist/src/terminal_session.js";
+import { ProtocolError } from "../dist/src/errors.js";
+import { SessionErrorLikeError, createTerminalHandle } from "../dist/src/terminal_session.js";
 import {
   decodeClientControl,
   decodeServerControl,
@@ -705,14 +706,23 @@ test("release precedes detach and exact release ambiguity never sends detach", a
   context.handle.receive(serverFrame(encodeTerminalDetached(detach.id, { session_id: sessionId })));
   await detached;
 
-  const failed = makeHandle();
-  await attachedWithLease(failed);
-  const pending = failed.handle.detach();
-  const releaseFrame = lastControl(failed.sent);
-  assert.equal(failed.handle.receiveError(releaseFrame.id, new Error("release unknown")), true);
-  await assert.rejects(pending, /release unknown/);
-  assert.equal(failed.fatals.length, 1);
-  assert.equal(failed.sent.some(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_DETACH"), false);
+  // A release the daemon refuses (the run was cancelled first, the lease
+  // moved on) is not fatal: authority is dropped and fenced, the detach goes
+  // on, and the session keeps observing (#542).
+  const refused = makeHandle();
+  await attachedWithLease(refused);
+  const pending = refused.handle.detach();
+  const releaseFrame = lastControl(refused.sent);
+  assert.equal(refused.handle.receiveError(releaseFrame.id, new SessionErrorLikeError("stale")), true);
+  assert.equal(refused.fatals.length, 0);
+  assert.equal(refused.handle.writable, false);
+  // The authority is gone, not merely parked behind the detach.
+  assert.throws(() => refused.handle.sendInput(new Uint8Array([1])), /terminal lease required/);
+  const detachFrame = lastControl(refused.sent);
+  assert.equal(detachFrame.type, "TERMINAL_DETACH");
+  refused.handle.receive(serverFrame(encodeTerminalDetached(detachFrame.id, { session_id: sessionId })));
+  await pending;
+  assert.equal(refused.fatals.length, 0);
 });
 
 test("detach waits for a pending attach before sending detach", async () => {
@@ -1025,4 +1035,51 @@ test("manual lease renewal and raw identities are absent from the public package
   assert.equal("TerminalHandle" in publicApi, false);
   assert.equal("createTerminalHandle" in publicApi, false);
   assert.equal("TerminalHandleOptions" in publicApi, false);
+});
+
+test("a refused release outside a detach fences its generation and keeps observing", async () => {
+  const context = makeHandle();
+  await attachedWithLease(context);
+  const pending = context.handle.releaseInput();
+  const releaseFrame = lastControl(context.sent);
+  assert.equal(context.handle.receiveError(releaseFrame.id, new SessionErrorLikeError("stale")), true);
+  await assert.rejects(pending, /stale/);
+  assert.equal(context.fatals.length, 0);
+  assert.equal(context.handle.writable, false);
+  assert.throws(() => context.handle.sendInput(new Uint8Array([1])), /terminal lease required/);
+  // The fence: the daemon moves to the next generation when it clears a
+  // lease it refused to release, and this client must never type under that
+  // one either, so a later acquire answered with it is a protocol fault. The
+  // refused generation itself was already floored when it was acquired, so
+  // only the next one tells the fence apart from that floor.
+  void context.handle.acquireInput().catch(() => undefined);
+  const acquireFrame = lastControl(context.sent);
+  assert.equal(acquireFrame.type, "TERMINAL_LEASE_ACQUIRE");
+  assert.throws(() => context.handle.receive(serverFrame(encodeTerminalLeaseResult(acquireFrame.id, {
+    operation: "acquired", run_id: runId, session_id: sessionId, generation: 2n,
+    expires_at_ms: BigInt(context.timer.now + 30_000), last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  }))), ProtocolError);
+});
+
+test("a refused renewal drops authority without ending the session", async () => {
+  const context = makeHandle();
+  await attachedWithLease(context);
+  context.timer.advance(10_000);
+  const renewal = lastControl(context.sent);
+  assert.equal(renewal.type, "TERMINAL_LEASE_RENEW");
+  assert.equal(context.handle.receiveError(renewal.id, new SessionErrorLikeError("stale")), true);
+  assert.equal(context.fatals.length, 0);
+  assert.equal(context.handle.writable, false);
+  assert.throws(() => context.handle.sendInput(new Uint8Array([1])), /terminal lease required/);
+  // Still attached: a fresh lease past the fence (the refused generation and
+  // the one the daemon moves to when it clears it) is accepted.
+  const acquire = context.handle.acquireInput();
+  const acquireFrame = lastControl(context.sent);
+  context.handle.receive(serverFrame(encodeTerminalLeaseResult(acquireFrame.id, {
+    operation: "acquired", run_id: runId, session_id: sessionId, generation: 3n,
+    expires_at_ms: BigInt(context.timer.now + 30_000), last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  })));
+  await acquire;
+  assert.equal(context.handle.writable, true);
+  assert.equal(context.fatals.length, 0);
 });

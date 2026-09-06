@@ -209,6 +209,13 @@ func (daemon *Daemon) terminalLeaseRelease(ctx context.Context, principal browse
 		kind: terminalEffectCheck, client: clientID, connection: principal.ConnectionID, generation: generation,
 	})
 	if err := checked.effectError(-1); err != nil {
+		// A runner that refuses the check does not hold this binding any
+		// more: the provider exited, the generation was fenced, or another
+		// connection holds it. Nothing to give up, so at the browser boundary
+		// this is stale, not an internal fault (#542).
+		if errors.Is(err, ErrTerminalEffectRejected) {
+			err = errors.Join(kernel.ErrRevisionConflict, err)
+		}
 		return kernel.TerminalLease{}, err
 	}
 	at, err := daemon.timestamp()
