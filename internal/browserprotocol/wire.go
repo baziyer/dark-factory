@@ -151,6 +151,11 @@ const (
 	ErrorStale          ErrorCode = "stale"
 	ErrorTooLarge       ErrorCode = "too_large"
 	ErrorInternal       ErrorCode = "internal"
+	// ErrorUnsupported answers a client control type the daemon does not
+	// know: a verb it never had or one it retired. The refusal names the
+	// request and the daemon keeps its side of the connection open; a console
+	// that knows this code degrades that one feature and carries on.
+	ErrorUnsupported ErrorCode = "unsupported"
 )
 
 // ControlFrame is the decoded, closed union. Body is always one of the
@@ -162,8 +167,9 @@ type ControlFrame struct {
 }
 
 var (
-	ErrMalformed = errors.New("browser protocol: malformed control frame")
-	ErrOversized = errors.New("browser protocol: control frame too large")
+	ErrMalformed   = errors.New("browser protocol: malformed control frame")
+	ErrOversized   = errors.New("browser protocol: control frame too large")
+	ErrUnsupported = errors.New("browser protocol: unsupported control type")
 )
 
 // The envelope carries no generation. The contract is unversioned by owner
@@ -307,7 +313,14 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		return ControlFrame{}, ErrMalformed
 	}
 	if !typeAllowed(role, envelope.Type) {
-		return ControlFrame{}, ErrMalformed
+		if envelope.Type == "" || typeAllowed(clientRole, envelope.Type) || typeAllowed(serverRole, envelope.Type) {
+			return ControlFrame{}, ErrMalformed
+		}
+		// A type neither direction knows is one this build never had or no
+		// longer has: the peer is newer, or older and still sending a retired
+		// verb. Either way the frame comes back with its identity so the
+		// caller can refuse exactly that request and keep the connection.
+		return ControlFrame{Type: envelope.Type, ID: id}, ErrUnsupported
 	}
 	var body any
 	switch envelope.Type {
@@ -976,7 +989,7 @@ func validateCapabilities(value Capabilities) error {
 
 func validateError(value Error) error {
 	switch value.Code {
-	case ErrorUnauthorized, ErrorInvalidRequest, ErrorRateLimited, ErrorNotFound, ErrorStale, ErrorTooLarge, ErrorInternal:
+	case ErrorUnauthorized, ErrorInvalidRequest, ErrorRateLimited, ErrorNotFound, ErrorStale, ErrorTooLarge, ErrorInternal, ErrorUnsupported:
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown error code %q", ErrMalformed, value.Code)

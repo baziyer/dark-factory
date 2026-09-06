@@ -214,7 +214,7 @@ func TestControlMalformed(t *testing.T) {
 	valid := string(fixtureBytes(t, "hello.json"))
 	deep := `{"type":"HELLO","body":{"daemon_id":"` + strings.Repeat("00", 16) + `","boot_id":"` + strings.Repeat("11", 16) + `","connection_nonce":"` + strings.Repeat("22", 32) + `","x":[` + strings.Repeat("[", MaxJSONDepth+2) + "0" + strings.Repeat("]", MaxJSONDepth+2) + `]}}`
 	cases := []struct{ name, data string }{
-		{"unknown type", strings.Replace(valid, `"HELLO"`, `"NOPE"`, 1)},
+		{"unknown type without id", strings.Replace(valid, `"HELLO"`, `"NOPE"`, 1)},
 		{"missing body", `{"type":"HELLO"}`},
 		{"missing body member", strings.Replace(valid, `"boot_id"`, `"future_id"`, 1)},
 		{"duplicate envelope", strings.Replace(valid, `{"type"`, `{"type":"HELLO","type"`, 1)},
@@ -245,6 +245,30 @@ func TestControlMalformed(t *testing.T) {
 	}
 	if _, err := DecodeClientControl(bytes.Repeat([]byte{' '}, MaxControlBytes+1)); !errors.Is(err, ErrOversized) {
 		t.Fatalf("client oversize error = %v", err)
+	}
+}
+
+func TestUnknownTypeWithIDIsUnsupportedNotMalformed(t *testing.T) {
+	for _, decode := range []func([]byte) (ControlFrame, error){DecodeClientControl, DecodeServerControl} {
+		frame, err := decode([]byte(`{"type":"FUTURE_VERB","id":"future-1","body":{"x":1}}`))
+		if !errors.Is(err, ErrUnsupported) || frame.Type != "FUTURE_VERB" || frame.ID != "future-1" || frame.Body != nil {
+			t.Fatalf("unknown type = %+v, %v", frame, err)
+		}
+	}
+	// A type the other direction owns is a violation, not evolution, and an
+	// empty type is no type at all.
+	if _, err := DecodeClientControl([]byte(`{"type":"STATE_SNAPSHOT","id":"s","body":{}}`)); err != ErrMalformed {
+		t.Fatalf("server type from client = %v", err)
+	}
+	if _, err := DecodeClientControl([]byte(`{"type":"","id":"s","body":{}}`)); err != ErrMalformed {
+		t.Fatalf("empty type = %v", err)
+	}
+	wire, err := EncodeError("future-1", Error{Code: ErrorUnsupported})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame, err := DecodeServerControl(wire); err != nil || frame.Body.(Error).Code != ErrorUnsupported {
+		t.Fatalf("unsupported error round trip = %+v, %v", frame, err)
 	}
 }
 
@@ -369,12 +393,12 @@ func TestCaseVariantOfAKnownMemberIsRefused(t *testing.T) {
 	assertIgnoredMember(t, valid, tolerated, true)
 }
 
-// An unknown frame type and a frame sent in the wrong direction stay finite
-// refusals; only members are tolerated.
+// An unknown frame type is refused by name and a frame sent in the wrong
+// direction is malformed; only members are tolerated.
 func TestControlRefusesUnknownTypesAndWrongDirection(t *testing.T) {
 	watch := string(fixtureBytes(t, "state_watch.json"))
-	if _, err := DecodeClientControl([]byte(strings.Replace(watch, `"STATE_WATCH"`, `"STATE_FUTURE"`, 1))); err != ErrMalformed {
-		t.Fatalf("unknown type error = %v, want ErrMalformed", err)
+	if _, err := DecodeClientControl([]byte(strings.Replace(watch, `"STATE_WATCH"`, `"STATE_FUTURE"`, 1))); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("unknown type error = %v, want ErrUnsupported", err)
 	}
 	// A known client frame carrying an unknown member still cannot cross into
 	// the server decoder.
@@ -1006,7 +1030,7 @@ func TestHumanRequestAuthorityWireRejectsLegacyAndForgedShapes(t *testing.T) {
 	}
 	legacyResult := strings.Replace(result, `"type":"HUMAN_REQUEST_CANCEL_RUN_RESULT"`, `"type":"HUMAN_REQUEST_ACTION_RESULT"`, 1)
 	legacyResult = strings.Replace(legacyResult, `"body":{`, `"body":{"action":"cancel_run","status":"resolved",`, 1)
-	if _, err := DecodeServerControl([]byte(legacyResult)); err != ErrMalformed {
+	if _, err := DecodeServerControl([]byte(legacyResult)); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("legacy generic result accepted: %v", err)
 	}
 	// Residue from the deleted generic result shape carries no meaning: it is

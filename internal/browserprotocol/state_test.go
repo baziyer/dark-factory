@@ -613,9 +613,10 @@ func TestStateMalformedEnvelopeBodyAndGlobalBounds(t *testing.T) {
 	}
 }
 
-// A retired message type is refused, so the deleted paging contract cannot
-// come back through a frame this build does not implement. The envelope has no
-// generation to refuse: an older client's `v` member is simply ignored.
+// A retired message type is refused as unsupported, so the deleted paging
+// contract cannot come back through a frame this build does not implement. The
+// envelope has no generation to refuse: an older client's `v` member is simply
+// ignored.
 func TestRetiredStateTypesAreRefused(t *testing.T) {
 	legacy := `{"v":1,"type":"STATE_GET","id":"state","body":{"cursor":null}}`
 	frame, err := DecodeClientControl([]byte(legacy))
@@ -627,13 +628,13 @@ func TestRetiredStateTypesAreRefused(t *testing.T) {
 	}
 	for _, kind := range []string{"STATE_SUBSCRIBE", "STATE_ENTITY_GET"} {
 		wire := fmt.Sprintf(`{"type":%q,"id":"x","body":{}}`, kind)
-		if _, err := DecodeClientControl([]byte(wire)); err != ErrMalformed {
+		if _, err := DecodeClientControl([]byte(wire)); !errors.Is(err, ErrUnsupported) {
 			t.Fatalf("retired client type %s accepted: %v", kind, err)
 		}
 	}
 	for _, kind := range []string{"STATE_RESTART", "STATE_EVENT", "STATE_ENTITY"} {
 		wire := fmt.Sprintf(`{"type":%q,"id":"x","body":{}}`, kind)
-		if _, err := DecodeServerControl([]byte(wire)); err != ErrMalformed {
+		if _, err := DecodeServerControl([]byte(wire)); !errors.Is(err, ErrUnsupported) {
 			t.Fatalf("retired server type %s accepted: %v", kind, err)
 		}
 	}
