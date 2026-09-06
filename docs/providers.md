@@ -30,13 +30,17 @@ rejected for `shell`. Claude Code accepts `low`, `medium`, `high`, `xhigh`, or
 `max`; Codex additionally accepts `ultra`.
 
 `--role orchestrator` names an overseer. A worker's run materializes a Change
-of the project and works there; an orchestrator's run binds no Change and works
-in its private runtime home, so it can only read what a worker retained and
-publish through the Maintainer App. A Claude Code orchestrator is launched with
-that App's MCP bridge, `dark-factory-maintainer-mcp-bridge` resolved on the
-fixed tool path, as its one MCP server (`--strict-mcp-config`); a worker is
-launched with none. An orchestrator launch is refused when the bridge is not
-installed. Codex orchestrators receive no MCP configuration yet.
+of the project and works there; an orchestrator's run binds no Change and is
+given its private runtime home as its working directory, from which it reads
+what workers retained and publishes through the Maintainer App. Neither role
+is confined beyond that: both run as the operator with the authority the
+environment section below describes. A Claude Code orchestrator is launched
+with that App's MCP bridge, `dark-factory-maintainer-mcp-bridge` resolved on
+the fixed tool path, as its one MCP server; a Claude Code worker is launched
+with `--strict-mcp-config` and no server, so nothing in its account
+configuration or in a `.mcp.json` inside the Change reaches it. An
+orchestrator launch is refused when the bridge is not installed. Codex
+orchestrators receive no MCP configuration yet.
 
 ## Shell
 
@@ -61,7 +65,7 @@ once and the direct Mach-O target is committed and reverified before exec.
 The native argv templates are:
 
 ```text
-claude --dangerously-skip-permissions [--model MODEL] [--effort EFFORT]
+claude --dangerously-skip-permissions [--model MODEL] [--effort EFFORT] --strict-mcp-config [--mcp-config '{"mcpServers":{"maintainer":{"command":"BRIDGE"}}}']
 codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c check_for_update_on_startup=false -c tool_output_token_limit=32768 -c 'projects={"CHANGE-DIRECTORY"={trust_level="untrusted"}}' [--model MODEL] [-c 'model_reasoning_effort="EFFORT"'] 'FIXED BOOTSTRAP INSTRUCTION'
 ```
 

@@ -89,8 +89,8 @@ func TestBuildOrchestratorClaudeIsGivenTheMaintainerBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.Join(worker.Argv(), " "), "mcp") {
-		t.Fatalf("worker argv names an MCP server: %q", worker.Argv())
+	if !reflect.DeepEqual(worker.Argv(), []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config"}) {
+		t.Fatalf("worker argv = %q, want strict MCP with no server", worker.Argv())
 	}
 	if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("orchestrator without the bridge = %v, want ErrUnavailable", err)
@@ -233,7 +233,7 @@ func TestBuildNativeReturnsExactArgvEnvironmentAndSafeStartupTask(t *testing.T) 
 	}{
 		{
 			kind: kernel.ProviderClaudeCode, model: "claude-model", effort: "max", wantDelivery: TaskDeliveryStartupTerminal,
-			wantArgv: []string{"/usr/bin/true", "--dangerously-skip-permissions", "--model", "claude-model", "--effort", "max"},
+			wantArgv: []string{"/usr/bin/true", "--dangerously-skip-permissions", "--model", "claude-model", "--effort", "max", "--strict-mcp-config"},
 		},
 		{
 			kind: kernel.ProviderCodex, model: "codex-model", effort: "xhigh", wantDelivery: TaskDeliveryAttemptAPI,

@@ -233,10 +233,13 @@ func Build(request Request) (Launch, error) {
 		if request.reasoningEffort != "" {
 			argv = append(argv, "--effort", request.reasoningEffort)
 		}
-		// An orchestrator publishes through the Maintainer App, so its
-		// session is given that one MCP server and no other; a worker gets
-		// none. Without the bridge an orchestrator cannot do its job, so
-		// the launch is refused rather than started blind.
+		// Only the servers named here reach the session: none for a worker,
+		// so neither the account's configuration nor a .mcp.json in the
+		// Change can add one; the Maintainer App alone for an orchestrator,
+		// which publishes through it. Without the bridge an orchestrator
+		// cannot do its job, so the launch is refused rather than started
+		// blind.
+		argv = append(argv, "--strict-mcp-config")
 		if request.role == kernel.RoleOrchestrator {
 			bridge, err := resolveTool(request.runtime.toolPath, maintainerBridge)
 			if err != nil {
@@ -246,7 +249,7 @@ func Build(request Request) (Launch, error) {
 			if err != nil || len(config) > runner.MaxArgumentBytes {
 				return Launch{}, ErrInvalid
 			}
-			argv = append(argv, "--strict-mcp-config", "--mcp-config", string(config))
+			argv = append(argv, "--mcp-config", string(config))
 		}
 		return Launch{
 			executable: request.installation.executable, argv: argv,
