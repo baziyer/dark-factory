@@ -69,9 +69,11 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 }
 
 // retainedSettlement re-reads the published tree the durable change row names
-// and verifies the observed facts against the stored selection before any
-// settlement authority exists. The published tree is evidence; the durable
-// row is the expectation; a mismatch is a conflict, never a repair.
+// and verifies it against the recorded identity, base and format before any
+// settlement authority exists, the evidence the supervisor's own finalize
+// takes. The selection on an available change is the tree as the daemon
+// made it before the worker ran, so the tree's contents settle as found;
+// a tree that is not the recorded one is a conflict, never a repair.
 func retainedSettlement(ctx context.Context, changeParent string, changeState kernel.Change) (kernel.ChangeSettlement, error) {
 	if changeParent == "" || changeState.Selection == nil || changeState.TreeIdentity == nil {
 		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published change lacks retained evidence", kernel.ErrConflict)
@@ -88,10 +90,8 @@ func retainedSettlement(ctx context.Context, changeParent string, changeState ke
 	if err != nil {
 		return kernel.ChangeSettlement{}, err
 	}
-	stored := *changeState.Selection
-	if availability.Commitment() != stored.Commitment() || availability.EntryCount() != stored.EntryCount() ||
-		availability.TotalBytes() != stored.TotalBytes() || availability.TreeIdentity() != *changeState.TreeIdentity {
-		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published tree disagrees with the durable selection", kernel.ErrConflict)
+	if availability.TreeIdentity() != *changeState.TreeIdentity {
+		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published tree is not the recorded tree", kernel.ErrConflict)
 	}
 	return kernel.NewRetainedChangeSettlement(changeState.Revision, availability)
 }
