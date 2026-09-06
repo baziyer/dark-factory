@@ -303,7 +303,7 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	}
 	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
 	if version == legacyUserVersion {
-		if err := rebuildTable(ctx, connection, legacy, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
+		if err := rebuildTable(ctx, connection, legacy, "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 			t.Fatal(err)
 		}
 		downgrade = append([]string{"DROP TABLE accounts"}, downgrade...)
@@ -370,6 +370,10 @@ const testAgentColumns = `id, project_id, name, role, provider, model, reasoning
 // testAgentColumnsV3 is the v2/v3 agent row: v1 plus account_id, before the idle rule.
 const testAgentColumnsV3 = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 
+// testInvalidationColumns is the invalidation row every version has had,
+// spelled here so the fixture cannot lose a column with the migration's list.
+const testInvalidationColumns = `sequence, occurred_at_ms, entity_kind, entity_id, revision, deleted`
+
 var testBrowserColumns = map[string]string{
 	"browser_pairing_challenges": strings.ReplaceAll(previousPairingChallengeColumns, "capability_mask, ", ""),
 	"browser_clients":            strings.ReplaceAll(previousBrowserClientColumns, "capability_mask, ", ""),
@@ -424,18 +428,19 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 // database: every table the migration touches has to carry real rows.
 func requireLegacyPopulation(t *testing.T, ctx context.Context, connection *sql.Conn) {
 	t.Helper()
-	var projects, agents, providers, tasks, runs, kinds, clients, challenges, events int
+	var projects, agents, providers, tasks, runs, kinds, clients, challenges, events, resources, sessions int
 	if err := connection.QueryRowContext(ctx, `SELECT
 		(SELECT COUNT(*) FROM projects), (SELECT COUNT(*) FROM agents), (SELECT COUNT(DISTINCT provider) FROM agents),
 		(SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM runs), (SELECT COUNT(DISTINCT entity_kind) FROM invalidations),
 		(SELECT COUNT(DISTINCT capability_mask) FROM browser_clients), (SELECT COUNT(DISTINCT capability_mask) FROM browser_pairing_challenges),
-		(SELECT COUNT(*) FROM browser_security_events WHERE client_id IS NOT NULL)`).
-		Scan(&projects, &agents, &providers, &tasks, &runs, &kinds, &clients, &challenges, &events); err != nil {
+		(SELECT COUNT(*) FROM browser_security_events WHERE client_id IS NOT NULL),
+		(SELECT COUNT(*) FROM resources), (SELECT COUNT(*) FROM terminal_sessions)`).
+		Scan(&projects, &agents, &providers, &tasks, &runs, &kinds, &clients, &challenges, &events, &resources, &sessions); err != nil {
 		t.Fatal(err)
 	}
-	if projects < 1 || agents < 3 || providers != 3 || tasks < 1 || runs < 1 || kinds != 7 || clients != 2 || challenges != 2 || events < 1 {
-		t.Fatalf("thin fixture: projects=%d agents=%d providers=%d tasks=%d runs=%d invalidation kinds=%d client masks=%d challenge masks=%d client events=%d",
-			projects, agents, providers, tasks, runs, kinds, clients, challenges, events)
+	if projects < 1 || agents < 3 || providers != 3 || tasks < 1 || runs < 1 || kinds != 7 || clients != 2 || challenges != 2 || events < 1 || resources < 1 || sessions < 1 {
+		t.Fatalf("thin fixture: projects=%d agents=%d providers=%d tasks=%d runs=%d invalidation kinds=%d client masks=%d challenge masks=%d client events=%d resources=%d terminal sessions=%d",
+			projects, agents, providers, tasks, runs, kinds, clients, challenges, events, resources, sessions)
 	}
 }
 
