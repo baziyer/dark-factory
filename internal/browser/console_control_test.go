@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -278,23 +279,36 @@ func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 		t.Fatalf("unauthorized walk left the connection open: err=%v ctx=%v", err, ctx.Err())
 	}
 
-	// A walk still running when the server closes is joined, not leaked:
-	// Close cannot finish while the walk holds the connection's cleanup.
+	// Walks in flight are bounded: the one past maxWalks is refused as
+	// retryable without reaching the backend, while the others still hold.
 	backend.setErr(nil)
 	backend.setWalking(make(chan struct{}))
 	held, _ := dialServer(t, server, testOrigin)
 	authenticate(t, held)
 	calls, _ := backend.observed()
-	writeClientFrame(t, held, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
-	// The walk is in flight once the backend has been asked.
+	for index := range maxWalks {
+		writeClientFrame(t, held, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeRunPathsGet), "console-rooms", fmt.Sprintf("console-rooms-%d", index), 1)))
+	}
+	// Every walk is in flight once the backend has been asked that often.
 	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		if now, _ := backend.observed(); now > calls {
+		if now, _ := backend.observed(); now >= calls+maxWalks {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the walk never started")
+			t.Fatal("the walks never all started")
 		}
 	}
+	writeClientFrame(t, held, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
+	over := readServerFrame(t, held)
+	assertError(t, over, browserprotocol.ErrorRateLimited)
+	if !bool(over.Body.(browserprotocol.Error).Retryable) {
+		t.Fatal("walk past the bound was not retryable")
+	}
+	if now, _ := backend.observed(); now != calls+maxWalks {
+		t.Fatalf("walk past the bound reached the backend: calls=%d", now-calls)
+	}
+	// A walk still running when the server closes is joined, not leaked:
+	// Close cannot finish while the walks hold the connection's cleanup.
 	closed := make(chan struct{})
 	go func() {
 		_ = server.Close()

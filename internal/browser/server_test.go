@@ -888,10 +888,11 @@ func TestRequestBudgetIsASlidingWindow(t *testing.T) {
 	// then moved by hand; the serve goroutine reads it through the atomic.
 	var clock atomic.Int64
 	clock.Store(time.Unix(1_700_000_000, 0).UnixNano())
-	server, err := Listen(Config{Address: "127.0.0.1:0", AllowedOrigins: []string{testOrigin, devOrigin}, Backend: backend, Clock: func() time.Time { return time.Unix(0, clock.Load()) }})
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	server := start(backend, map[string]struct{}{testOrigin: {}, devOrigin: {}}, listener, func() time.Time { return time.Unix(0, clock.Load()) })
 	t.Cleanup(func() {
 		if err := server.Close(); err != nil {
 			t.Errorf("close: %v", err)

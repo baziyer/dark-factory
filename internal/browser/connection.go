@@ -20,7 +20,15 @@ const (
 // requestWindow is how long a request id is remembered. The budget is
 // maxRequests per window rather than per connection, so a console left open
 // for days keeps its socket; a repeated id inside the window is still refused.
-var requestWindow = time.Minute
+const requestWindow = time.Minute
+
+// maxWalks bounds the tree walks one connection may have in flight. The
+// floor asks for one topology per project and one run-path set per running
+// agent per round, so a handful covers it; a client past the bound is told
+// to try again, and the daemon's per-client gate serialises them anyway.
+// ponytail: a fixed small count; make it per-kind if a single slow project
+// walk ever starves run-path answers.
+const maxWalks = 8
 
 var (
 	errBackendResult             = errors.New("browser: invalid backend result")
@@ -54,6 +62,7 @@ type connection struct {
 	seen                map[string]struct{}
 	recent              []request
 	background          sync.WaitGroup
+	walks               chan struct{}
 	subscription        StateSubscription
 	updates             <-chan StateUpdate
 	subscriptionID      string
@@ -465,10 +474,21 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 	case browserprotocol.TopologyGet, browserprotocol.RunPathsGet:
 		// Both may walk a tree under the call budget. That must not hold up
 		// state and terminal frames, so they answer from their own goroutine;
-		// the websocket permits concurrent writes.
+		// the websocket permits concurrent writes. Past maxWalks in flight
+		// the request is refused as retryable, not queued.
+		if current.walks == nil {
+			current.walks = make(chan struct{}, maxWalks)
+		}
+		select {
+		case current.walks <- struct{}{}:
+		default:
+			current.sendError(frame.ID, browserprotocol.ErrorRateLimited, true)
+			return true
+		}
 		current.background.Add(1)
 		go func() {
 			defer current.background.Done()
+			defer func() { <-current.walks }()
 			current.observe(frame)
 		}()
 		return true
