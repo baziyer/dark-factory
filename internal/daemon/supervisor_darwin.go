@@ -204,9 +204,10 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		return kernel.Run{}, fmt.Errorf("%w: no admission (%s)", kernel.ErrConflict, admission.Reason.String())
 	}
 	run := *admission.Run
-	if run.Role != kernel.RoleWorker {
-		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSpawn, fmt.Errorf("%w: supervisor supports worker runs only", kernel.ErrInvalidValue))
-	}
+	// A worker runs in a Change prepared from the project; an orchestrator has
+	// none and runs in its private runtime home, so every Change step below
+	// is a worker's alone.
+	worker := run.Role == kernel.RoleWorker
 	project, found, err := daemon.store.Project(ctx, run.ProjectID)
 	if err != nil || !found {
 		if err == nil {
@@ -231,12 +232,16 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if err != nil {
 		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSource, err)
 	}
-	if run.ChangeID == nil || run.AdmittedChangeRevision == nil {
+	if worker != (run.ChangeID != nil && run.AdmittedChangeRevision != nil) {
 		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, kernel.ErrCorruptState)
 	}
-	changeID := *run.ChangeID
-	finalName := changeID.String()
-	stagingName := "." + finalName + ".stage"
+	var changeID kernel.ChangeID
+	var finalName, stagingName string
+	if worker {
+		changeID = *run.ChangeID
+		finalName = changeID.String()
+		stagingName = "." + finalName + ".stage"
+	}
 	task, found, err := daemon.store.Task(ctx, run.TaskID)
 	if err != nil || !found {
 		if err == nil {
@@ -267,22 +272,26 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	default:
 		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSpawn, provider.ErrInvalid)
 	}
-	changeState, found, err := daemon.store.Change(ctx, changeID)
-	if err != nil || !found {
-		if err == nil {
-			err = kernel.ErrCorruptState
-		}
-		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, err)
-	}
+	var changeState kernel.Change
 	var retained *changeworker.Result
-	if changeState.Phase == kernel.ChangeAvailable && changeState.Revision == *run.AdmittedChangeRevision {
-		var retainedRepository change.RepositoryIdentity
-		retained, retainedRepository, err = retainedWorkerCheckpoint(changeState)
-		if err != nil || !retainedRepository.Equal(repositoryIdentity) {
-			return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSource, errors.Join(err, errInvalidContract))
+	if worker {
+		var found bool
+		changeState, found, err = daemon.store.Change(ctx, changeID)
+		if err != nil || !found {
+			if err == nil {
+				err = kernel.ErrCorruptState
+			}
+			return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, err)
 		}
-	} else if changeState.Phase != kernel.ChangeReserved || changeState.Revision != *run.AdmittedChangeRevision {
-		return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, kernel.ErrCorruptState)
+		if changeState.Phase == kernel.ChangeAvailable && changeState.Revision == *run.AdmittedChangeRevision {
+			var retainedRepository change.RepositoryIdentity
+			retained, retainedRepository, err = retainedWorkerCheckpoint(changeState)
+			if err != nil || !retainedRepository.Equal(repositoryIdentity) {
+				return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureSource, errors.Join(err, errInvalidContract))
+			}
+		} else if changeState.Phase != kernel.ChangeReserved || changeState.Revision != *run.AdmittedChangeRevision {
+			return daemon.failRunBeforeRuntime(run, keys.resources.RuntimeRoot, kernel.FailureInternal, kernel.ErrCorruptState)
+		}
 	}
 
 	// From CreateRuntime until the runtime resource is durably active, a
@@ -318,7 +327,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		return daemon.failRun(run, kernel.FailureSpawn, err)
 	}
 	config := changeworker.Config{
-		Provider: run.Provider, Model: run.Model, ReasoningEffort: run.ReasoningEffort,
+		Provider: run.Provider, Role: run.Role, Model: run.Model, ReasoningEffort: run.ReasoningEffort,
 		RuntimePath: gotRuntimePath, RuntimeIdentity: runtimeFileIdentity,
 		GitExecutable: spec.GitExecutable, FactoryctlExecutable: factoryctl.Path(), ToolPath: spec.ToolPath, AccountHome: spec.AccountHome, AccountConfigDir: accountConfigDir, RepositoryRoot: project.Root, RepositoryIdentity: repositoryIdentity,
 		Revision: spec.BaseRevision, ChangeParent: spec.ChangeParent, FinalName: finalName, StagingName: stagingName,
@@ -474,40 +483,46 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if len(selectionEvent.Payload) != 0 {
 		return daemon.failRun(run, kernel.FailureSource, errInvalidContract)
 	}
-	changeState, found, err = daemon.store.Change(ctx, changeID)
-	if err != nil || !found {
-		if err == nil {
-			err = kernel.ErrCorruptState
+	if worker {
+		var found bool
+		changeState, found, err = daemon.store.Change(ctx, changeID)
+		if err != nil || !found {
+			if err == nil {
+				err = kernel.ErrCorruptState
+			}
+			return daemon.failRun(run, kernel.FailureInternal, err)
 		}
-		return daemon.failRun(run, kernel.FailureInternal, err)
 	}
 	preparationEvent, err := releaseCheckpoint(controller, runner.StagePreparation)
 	if err != nil {
 		return daemon.failRun(run, kernel.FailureSource, err)
 	}
-	workerResult, err := changeworker.DecodeResult(preparationEvent.Payload)
-	if err != nil {
-		return daemon.failRun(run, kernel.FailureSource, err)
-	}
-	selection, err := kernelSelectionCheckpoint(workerResult, repositoryIdentity)
-	if err != nil {
-		return daemon.failRun(run, kernel.FailureSource, err)
-	}
-	stage, err := kernelStageIdentity(workerResult.Tree)
-	if err != nil {
-		return daemon.failRun(run, kernel.FailureSource, err)
-	}
-	at, err = daemon.timestamp()
-	if err != nil {
-		return daemon.failRun(run, kernel.FailureInternal, err)
-	}
-	if retained == nil {
-		changeState, err = daemon.store.RecordChangePrepared(ctx, changeID, changeState.Revision, selection, stage, at)
-		if err != nil {
+	var workerResult changeworker.Result
+	var selection kernel.ChangeSelection
+	var stage kernel.FileIdentity
+	if worker {
+		if workerResult, err = changeworker.DecodeResult(preparationEvent.Payload); err != nil {
 			return daemon.failRun(run, kernel.FailureSource, err)
 		}
+		if selection, err = kernelSelectionCheckpoint(workerResult, repositoryIdentity); err != nil {
+			return daemon.failRun(run, kernel.FailureSource, err)
+		}
+		if stage, err = kernelStageIdentity(workerResult.Tree); err != nil {
+			return daemon.failRun(run, kernel.FailureSource, err)
+		}
+		at, err = daemon.timestamp()
+		if err != nil {
+			return daemon.failRun(run, kernel.FailureInternal, err)
+		}
+		if retained == nil {
+			changeState, err = daemon.store.RecordChangePrepared(ctx, changeID, changeState.Revision, selection, stage, at)
+			if err != nil {
+				return daemon.failRun(run, kernel.FailureSource, err)
+			}
+		}
+	} else if len(preparationEvent.Payload) != 0 {
+		return daemon.failRun(run, kernel.FailureSource, errInvalidContract)
 	}
-
 	populationEvent, err := releaseCheckpoint(controller, runner.StagePopulation)
 	if err != nil {
 		return daemon.failRun(run, kernel.FailureSource, err)
@@ -515,25 +530,27 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if len(populationEvent.Payload) != 0 {
 		return daemon.failRun(run, kernel.FailureSource, errInvalidContract)
 	}
-	facts, err := change.InspectPublished(ctx, spec.ChangeParent, finalName, workerResult.Tree, workerResult.Format, workerResult.Base)
-	if err != nil || !resultMatchesFacts(workerResult, facts) {
-		return daemon.failRun(run, kernel.FailureSource, errors.Join(err, errInvalidContract))
-	}
-	availability, err := kernelAvailability(facts)
-	if err != nil {
-		return daemon.failRun(run, kernel.FailureSource, err)
-	}
-	if retained == nil {
-		at, err = daemon.timestamp()
-		if err != nil {
-			return daemon.failRun(run, kernel.FailureInternal, err)
+	if worker {
+		facts, err := change.InspectPublished(ctx, spec.ChangeParent, finalName, workerResult.Tree, workerResult.Format, workerResult.Base)
+		if err != nil || !resultMatchesFacts(workerResult, facts) {
+			return daemon.failRun(run, kernel.FailureSource, errors.Join(err, errInvalidContract))
 		}
-		changeState, err = daemon.store.MarkChangeAvailable(ctx, changeID, changeState.Revision, availability, at)
+		availability, err := kernelAvailability(facts)
 		if err != nil {
 			return daemon.failRun(run, kernel.FailureSource, err)
 		}
-	} else if !retainedWorkerCheckpointsMatch(changeState, selection, stage, availability) {
-		return daemon.failRun(run, kernel.FailureSource, errInvalidContract)
+		if retained == nil {
+			at, err = daemon.timestamp()
+			if err != nil {
+				return daemon.failRun(run, kernel.FailureInternal, err)
+			}
+			changeState, err = daemon.store.MarkChangeAvailable(ctx, changeID, changeState.Revision, availability, at)
+			if err != nil {
+				return daemon.failRun(run, kernel.FailureSource, err)
+			}
+		} else if !retainedWorkerCheckpointsMatch(changeState, selection, stage, availability) {
+			return daemon.failRun(run, kernel.FailureSource, errInvalidContract)
+		}
 	}
 	at, err = daemon.timestamp()
 	if err != nil {
@@ -710,6 +727,10 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	at, err = daemon.timestamp()
 	if err != nil {
 		return run, err
+	}
+	if !worker {
+		final, err := daemon.store.FinalizeRun(context.Background(), run.ID, current.Revision, at)
+		return final, errors.Join(err, ctx.Err())
 	}
 	settledFacts, settleErr := change.InspectPublished(context.Background(), spec.ChangeParent, finalName, workerResult.Tree, workerResult.Format, workerResult.Base)
 	if settleErr != nil {

@@ -29,6 +29,22 @@ factoryctl agent create --project PROJECT_ID --name worker --provider codex --mo
 rejected for `shell`. Claude Code accepts `low`, `medium`, `high`, `xhigh`, or
 `max`; Codex additionally accepts `ultra`.
 
+`--role orchestrator` names an overseer. A worker's run materializes a Change
+of the project and works there; an orchestrator's run binds no Change and is
+given its private runtime home as its working directory, from which it reads
+what workers retained and publishes through the Maintainer App. Neither role
+is confined beyond that: both run as the operator with the authority the
+environment section below describes. A Claude Code orchestrator is launched
+with that App's MCP bridge, `dark-factory-maintainer-mcp-bridge` resolved on
+the fixed tool path, as its one MCP server; a Claude Code worker is launched
+with `--strict-mcp-config` and no server, so nothing in its account
+configuration or in a `.mcp.json` inside the Change reaches it. The bridge
+is found on the same ordered path as a CLI but is not committed like one,
+since Claude spawns it itself much later and it may be a script: it must be
+a regular file, executable by its owner and writable by nobody else, and an
+orchestrator launch is refused, naming which, when it is missing or fails
+that. Codex orchestrators receive no MCP configuration yet.
+
 ## Shell
 
 Shell is fixed to `/bin/sh` with argv `/bin/sh`, `/dev/fd/11`. Its bounded task
@@ -47,12 +63,14 @@ The managed daemon searches this fixed default tool path, never ambient
 An explicit `factoryd --tool-path` replaces the default. Search is
 ordered; an existing candidate that cannot be resolved and committed fails
 closed rather than falling through to another executable. A symlink is resolved
-once and the direct Mach-O target is committed and reverified before exec.
+once and the direct Mach-O target is committed and reverified before exec. The
+Maintainer bridge an orchestrator is given is found on the same path but only
+checked, not committed, as described under agent creation.
 
 The native argv templates are:
 
 ```text
-claude --dangerously-skip-permissions [--model MODEL] [--effort EFFORT]
+claude --dangerously-skip-permissions [--model MODEL] [--effort EFFORT] --strict-mcp-config [--mcp-config '{"mcpServers":{"maintainer":{"command":"BRIDGE"}}}']
 codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c check_for_update_on_startup=false -c tool_output_token_limit=32768 -c 'projects={"CHANGE-DIRECTORY"={trust_level="untrusted"}}' [--model MODEL] [-c 'model_reasoning_effort="EFFORT"'] 'FIXED BOOTSTRAP INSTRUCTION'
 ```
 

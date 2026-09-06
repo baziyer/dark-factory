@@ -60,6 +60,37 @@ func TestRetainedConfigRoundTripPreservesExactPublicationAuthority(t *testing.T)
 	}
 }
 
+// An orchestrator's config names no Change: its names and retained result
+// are empty, and a worker's may not be.
+func TestOrchestratorConfigCarriesNoChange(t *testing.T) {
+	config := configFixture(t)
+	config.Role, config.FinalName, config.StagingName = kernel.RoleOrchestrator, "", ""
+	encoded, err := EncodeConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeConfig(encoded)
+	if err != nil || !reflect.DeepEqual(got, config) {
+		t.Fatalf("orchestrator config round trip = %v", err)
+	}
+	named := config
+	named.FinalName = "published"
+	retained := resultFixture(t)
+	withChange := config
+	withChange.Retained = &retained
+	worker := configFixture(t)
+	worker.FinalName = ""
+	for name, bad := range map[string]Config{"orchestrator with a name": named, "orchestrator with a retained tree": withChange, "worker without a name": worker} {
+		if _, err := EncodeConfig(bad); !errors.Is(err, ErrInvalidContract) {
+			t.Fatalf("%s encoded: %v", name, err)
+		}
+	}
+	noRole := bytes.Replace(encoded, []byte(`"role":"orchestrator"`), []byte(`"role":"overseer"`), 1)
+	if _, err := DecodeConfig(noRole); !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("unknown role decoded: %v", err)
+	}
+}
+
 func TestCodexConfigCarriesNoTaskBytes(t *testing.T) {
 	config := configFixture(t)
 	config.Provider = kernel.ProviderCodex
@@ -229,7 +260,7 @@ func configFixture(t testing.TB) Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return Config{Provider: kernel.ProviderShell, RuntimePath: "/private/runtime", RuntimeIdentity: runner.FileIdentity{Device: 1, Inode: 2}, GitExecutable: "/Library/Developer/CommandLineTools/usr/bin/git", FactoryctlExecutable: "/private/release/factoryctl", ToolPath: "/opt/homebrew/bin:/usr/bin:/bin", AccountHome: "/private/account", RepositoryRoot: "/private/repository", RepositoryIdentity: repository, Revision: "main", ChangeParent: "/private/changes", FinalName: "change", StagingName: ".change.stage", AttemptSocket: "/private/api.sock", ProviderTask: []byte("printf exact")}
+	return Config{Provider: kernel.ProviderShell, Role: kernel.RoleWorker, RuntimePath: "/private/runtime", RuntimeIdentity: runner.FileIdentity{Device: 1, Inode: 2}, GitExecutable: "/Library/Developer/CommandLineTools/usr/bin/git", FactoryctlExecutable: "/private/release/factoryctl", ToolPath: "/opt/homebrew/bin:/usr/bin:/bin", AccountHome: "/private/account", RepositoryRoot: "/private/repository", RepositoryIdentity: repository, Revision: "main", ChangeParent: "/private/changes", FinalName: "change", StagingName: ".change.stage", AttemptSocket: "/private/api.sock", ProviderTask: []byte("printf exact")}
 }
 
 func resultFixture(t testing.TB) Result {

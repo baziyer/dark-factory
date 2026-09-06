@@ -16,8 +16,12 @@ import (
 )
 
 const (
-	shellPath            = "/bin/sh"
-	claudeTool           = "claude"
+	shellPath  = "/bin/sh"
+	claudeTool = "claude"
+	// maintainerBridge is the Maintainer App's MCP bridge. An orchestrator
+	// launch names it to Claude, which is how an overseer publishes: the
+	// daemon itself exposes no repository or publication operation.
+	maintainerBridge     = "dark-factory-maintainer-mcp-bridge"
 	codexTool            = "codex"
 	maxPathBytes         = 4096
 	maxClaudePrompt      = 8 << 10
@@ -64,24 +68,63 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 	default:
 		return Installation{}, ErrInvalid
 	}
+	executable, err := resolveTool(toolPath, tool)
+	if err != nil {
+		return Installation{}, unavailable(kind)
+	}
+	return Installation{provider: kind, executable: executable}, nil
+}
+
+// walkToolPath resolves the first tool of that name on the fixed tool path:
+// the search is ordered, and an existing candidate that cannot be resolved
+// fails closed rather than falling through to another.
+func walkToolPath(toolPath, tool string) (string, error) {
 	for _, directory := range filepath.SplitList(toolPath) {
 		candidate := filepath.Join(directory, tool)
 		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return Installation{}, unavailable(kind)
+			return "", ErrUnavailable
 		}
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil || !validAbsolute(resolved, maxPathBytes) {
-			return Installation{}, unavailable(kind)
+			return "", ErrUnavailable
 		}
-		executable, err := runner.CommitExecutableLocator(resolved)
-		if err != nil {
-			return Installation{}, unavailable(kind)
-		}
-		return Installation{provider: kind, executable: executable}, nil
+		return resolved, nil
 	}
-	return Installation{}, unavailable(kind)
+	return "", ErrUnavailable
+}
+
+// resolveTool commits the first tool of that name on the fixed tool path.
+func resolveTool(toolPath, tool string) (runner.ExecutableCommitment, error) {
+	resolved, err := walkToolPath(toolPath, tool)
+	if err != nil {
+		return runner.ExecutableCommitment{}, err
+	}
+	executable, err := runner.CommitExecutableLocator(resolved)
+	if err != nil {
+		return runner.ExecutableCommitment{}, ErrUnavailable
+	}
+	return executable, nil
+}
+
+// errBridgeUnfit names a bridge that is on the path but not a regular file
+// executable by its owner and writable by nobody else; the commitment a CLI
+// gets is not asked of it, since Claude spawns the bridge itself much later
+// and it may be a script.
+var errBridgeUnfit = errors.New("provider: maintainer bridge is not a regular owner-only executable")
+
+// resolveBridge finds the Maintainer bridge on the fixed tool path.
+func resolveBridge(toolPath string) (string, error) {
+	resolved, err := walkToolPath(toolPath, maintainerBridge)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
+		return "", errors.Join(ErrUnavailable, errBridgeUnfit)
+	}
+	return resolved, nil
 }
 
 // ConfigDirName is the directory a provider CLI keeps its login and
@@ -149,16 +192,17 @@ type Request struct {
 	reasoningEffort  string
 	runtime          RuntimePaths
 	workingDirectory string
+	role             kernel.AgentRole
 }
 
-func NewRequest(kind kernel.Provider, installation Installation, model, reasoningEffort string, runtime RuntimePaths, workingDirectory string) (Request, error) {
-	if kernel.ValidateProviderLaunchControls(kind, model, reasoningEffort) != nil || installation.provider != kind || installation.executable.Path() == "" || !runtime.valid() ||
+func NewRequest(kind kernel.Provider, installation Installation, model, reasoningEffort string, runtime RuntimePaths, workingDirectory string, role kernel.AgentRole) (Request, error) {
+	if kernel.ValidateProviderLaunchControls(kind, model, reasoningEffort) != nil || installation.provider != kind || installation.executable.Path() == "" || !runtime.valid() || role.String() == "" ||
 		kind == kernel.ProviderCodex && (!validAbsolute(workingDirectory, maxPathBytes) || len(codexUntrustedProjectConfig(workingDirectory)) > runner.MaxArgumentBytes) {
 		return Request{}, ErrInvalid
 	}
 	return Request{
 		provider: kind, installation: installation,
-		model: model, reasoningEffort: reasoningEffort, runtime: runtime, workingDirectory: workingDirectory,
+		model: model, reasoningEffort: reasoningEffort, runtime: runtime, workingDirectory: workingDirectory, role: role,
 	}, nil
 }
 
@@ -218,6 +262,24 @@ func Build(request Request) (Launch, error) {
 		}
 		if request.reasoningEffort != "" {
 			argv = append(argv, "--effort", request.reasoningEffort)
+		}
+		// Only the servers named here reach the session: none for a worker,
+		// so neither the account's configuration nor a .mcp.json in the
+		// Change can add one; the Maintainer App alone for an orchestrator,
+		// which publishes through it. Without the bridge an orchestrator
+		// cannot do its job, so the launch is refused rather than started
+		// blind.
+		argv = append(argv, "--strict-mcp-config")
+		if request.role == kernel.RoleOrchestrator {
+			bridge, err := resolveBridge(request.runtime.toolPath)
+			if err != nil {
+				return Launch{}, errors.Join(err, fmt.Errorf("%s on %s", maintainerBridge, request.runtime.toolPath))
+			}
+			config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"maintainer": map[string]string{"command": bridge}}})
+			if err != nil || len(config) > runner.MaxArgumentBytes {
+				return Launch{}, ErrInvalid
+			}
+			argv = append(argv, "--mcp-config", string(config))
 		}
 		return Launch{
 			executable: request.installation.executable, argv: argv,

@@ -66,41 +66,31 @@ func runProvider(ctx context.Context) (resultErr error) {
 		return err
 	}
 
-	var verified *change.VerifiedPublished
+	home := filepath.Join(config.RuntimePath, HomeName)
+	var cwd *os.File
 	publishedPath := filepath.Join(config.ChangeParent, config.FinalName)
-	if config.Retained == nil {
-		verified, err = prepareFreshChange(ctx, control, config)
-	} else {
-		verified, err = openRetainedChange(ctx, control, config)
-	}
-	if err != nil {
-		return err
-	}
-	verifiedOpen := true
-	defer func() {
-		if verifiedOpen {
-			resultErr = errors.Join(resultErr, verified.Close())
+	if config.Role == kernel.RoleOrchestrator {
+		// An orchestrator has no Change. It walks the same checkpoints with
+		// nothing to report, so the daemon's stage grammar is unchanged, and
+		// works in its private runtime home.
+		if control.ReportSelection(nil) != nil || control.AwaitPreparation() != nil || control.ReportPreparation(nil) != nil || control.AwaitPopulation() != nil {
+			return ErrWorker
 		}
-	}()
-	if err := authority.verify(ctx); err != nil {
-		return fmt.Errorf("runtime authority verification: %w", err)
+		if err := reportPopulation(control); err != nil {
+			return err
+		}
+		if err := control.AwaitProvider(); err != nil {
+			return err
+		}
+		publishedPath = home
+		cwd, err = authority.openHome(ctx, runtimeDir)
+	} else {
+		cwd, err = openChangeDirectory(ctx, control, config, authority)
 	}
-	cwd, err := verified.DuplicateDirectory(ctx)
 	if err != nil {
 		return err
-	}
-	if err := verified.Close(); err != nil {
-		verifiedOpen = false
-		_ = cwd.Close()
-		return err
-	}
-	verifiedOpen = false
-	if err := authority.verify(ctx); err != nil {
-		_ = cwd.Close()
-		return fmt.Errorf("runtime authority verification: %w", err)
 	}
 
-	home := filepath.Join(config.RuntimePath, HomeName)
 	temp := filepath.Join(config.RuntimePath, TempName)
 	token := filepath.Join(config.RuntimePath, AttemptTokenName)
 	runtimePaths, err := provider.NewRuntimePaths(
@@ -117,7 +107,7 @@ func runProvider(ctx context.Context) (resultErr error) {
 	}
 	// Keep the one verified publication path as the authority for both Codex's
 	// project policy and the runner's process cwd below.
-	request, err := provider.NewRequest(config.Provider, installation, config.Model, config.ReasoningEffort, runtimePaths, publishedPath)
+	request, err := provider.NewRequest(config.Provider, installation, config.Model, config.ReasoningEffort, runtimePaths, publishedPath, config.Role)
 	if err != nil {
 		_ = cwd.Close()
 		return err
@@ -182,6 +172,62 @@ func runProvider(ctx context.Context) (resultErr error) {
 	}
 	taskOpen = false
 	return control.ExecProvider(spec, cwd, task)
+}
+
+// openChangeDirectory prepares or reopens the run's Change and returns its
+// verified directory, the provider's working directory.
+func openChangeDirectory(ctx context.Context, control *runner.WorkerControl, config Config, authority *runtimeAuthority) (_ *os.File, resultErr error) {
+	var verified *change.VerifiedPublished
+	var err error
+	if config.Retained == nil {
+		verified, err = prepareFreshChange(ctx, control, config)
+	} else {
+		verified, err = openRetainedChange(ctx, control, config)
+	}
+	if err != nil {
+		return nil, err
+	}
+	verifiedOpen := true
+	defer func() {
+		if verifiedOpen {
+			resultErr = errors.Join(resultErr, verified.Close())
+		}
+	}()
+	if err := authority.verify(ctx); err != nil {
+		return nil, fmt.Errorf("runtime authority verification: %w", err)
+	}
+	cwd, err := verified.DuplicateDirectory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := verified.Close(); err != nil {
+		verifiedOpen = false
+		_ = cwd.Close()
+		return nil, err
+	}
+	verifiedOpen = false
+	if err := authority.verify(ctx); err != nil {
+		_ = cwd.Close()
+		return nil, fmt.Errorf("runtime authority verification: %w", err)
+	}
+	return cwd, nil
+}
+
+// openHome returns a fresh descriptor for the private runtime home the
+// authority already holds, checked to be that same directory.
+func (a *runtimeAuthority) openHome(ctx context.Context, runtimeDir *os.File) (*os.File, error) {
+	if err := a.verify(ctx); err != nil {
+		return nil, fmt.Errorf("runtime authority verification: %w", err)
+	}
+	home, homeID, err := openPrivateDirectoryAt(int(runtimeDir.Fd()), HomeName, a.rootID.Device)
+	if err != nil {
+		return nil, err
+	}
+	if homeID != a.homeID {
+		_ = home.Close()
+		return nil, ErrWorker
+	}
+	return home, nil
 }
 
 // sealProviderTask turns the admission-owned bytes into one exact, unlinked,

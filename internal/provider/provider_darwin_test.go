@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -67,11 +68,70 @@ func nativeFixture(t *testing.T, kind kernel.Provider) (Installation, RuntimePat
 
 func requestFor(t *testing.T, kind kernel.Provider, installation Installation, runtime RuntimePaths, model, effort string) Request {
 	t.Helper()
-	request, err := NewRequest(kind, installation, model, effort, runtime, filepath.Join(t.TempDir(), "change"))
+	return roleRequestFor(t, kind, installation, runtime, model, effort, kernel.RoleWorker)
+}
+
+func roleRequestFor(t *testing.T, kind kernel.Provider, installation Installation, runtime RuntimePaths, model, effort string, role kernel.AgentRole) Request {
+	t.Helper()
+	request, err := NewRequest(kind, installation, model, effort, runtime, filepath.Join(t.TempDir(), "change"), role)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return request
+}
+
+// An orchestrator's Claude session is handed the Maintainer bridge as its one
+// MCP server, resolved on the fixed tool path; a worker's is handed none, and
+// an orchestrator without the bridge is not launched at all.
+func TestBuildOrchestratorClaudeIsGivenTheMaintainerBridge(t *testing.T) {
+	installation, runtime, locator := nativeFixture(t, kernel.ProviderClaudeCode)
+	worker, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleWorker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(worker.Argv(), []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config"}) {
+		t.Fatalf("worker argv = %q, want strict MCP with no server", worker.Argv())
+	}
+	if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("orchestrator without the bridge = %v, want ErrUnavailable", err)
+	}
+	// The installed bridge is a script, which the CLI commitment would refuse;
+	// it needs only to be a regular executable nobody but its owner can write.
+	bridge := filepath.Join(filepath.Dir(locator), maintainerBridge)
+	if err := os.WriteFile(bridge, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedBridge, err := filepath.EvalSymlinks(bridge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{"maintainer":{"command":"` + resolvedBridge + `"}}}`}
+	if !reflect.DeepEqual(launch.Argv(), want) {
+		t.Fatalf("orchestrator argv = %q, want %q", launch.Argv(), want)
+	}
+	// A bridge that is present but unfit is refused by name, unlike a
+	// missing one, so the operator learns which of the two it is.
+	for name, mode := range map[string]os.FileMode{"not executable": 0o644, "group writable": 0o775} {
+		if err := os.Chmod(bridge, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) || !errors.Is(err, errBridgeUnfit) {
+			t.Fatalf("%s bridge = %v, want ErrUnavailable and errBridgeUnfit", name, err)
+		}
+	}
+	if err := os.Remove(bridge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) || errors.Is(err, errBridgeUnfit) {
+		t.Fatalf("missing bridge = %v, want ErrUnavailable alone", err)
+	}
+	if _, err := NewRequest(kernel.ProviderClaudeCode, installation, "", "", runtime, "/private/change", kernel.AgentRole(0)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("request without a role = %v, want ErrInvalid", err)
+	}
 }
 
 func TestBuildShellReturnsExactImmutableLaunchAndTask(t *testing.T) {
@@ -195,7 +255,7 @@ func TestBuildNativeReturnsExactArgvEnvironmentAndSafeStartupTask(t *testing.T) 
 	}{
 		{
 			kind: kernel.ProviderClaudeCode, model: "claude-model", effort: "max", wantDelivery: TaskDeliveryStartupTerminal,
-			wantArgv: []string{"/usr/bin/true", "--dangerously-skip-permissions", "--model", "claude-model", "--effort", "max"},
+			wantArgv: []string{"/usr/bin/true", "--dangerously-skip-permissions", "--model", "claude-model", "--effort", "max", "--strict-mcp-config"},
 		},
 		{
 			kind: kernel.ProviderCodex, model: "codex-model", effort: "xhigh", wantDelivery: TaskDeliveryAttemptAPI,
@@ -296,30 +356,30 @@ func TestNewRequestRejectsMismatchedProviderAndControls(t *testing.T) {
 		{effort: "high"},
 		{model: "model-sentinel", effort: "high"},
 	} {
-		if _, err := NewRequest(kernel.ProviderShell, shell, controls.model, controls.effort, shellRuntime, "/private/change"); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRequest(kernel.ProviderShell, shell, controls.model, controls.effort, shellRuntime, "/private/change", kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("Shell controls %+v error=%v, want ErrInvalid", controls, err)
 		}
 	}
-	if _, err := NewRequest(kernel.ProviderCodex, shell, "", "", shellRuntime, "/private/change"); !errors.Is(err, ErrInvalid) {
+	if _, err := NewRequest(kernel.ProviderCodex, shell, "", "", shellRuntime, "/private/change", kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("mismatched installation error=%v, want ErrInvalid", err)
 	}
 	claude, claudeRuntime, _ := nativeFixture(t, kernel.ProviderClaudeCode)
 	for _, effort := range []string{"ultra", "speculative"} {
-		if _, err := NewRequest(kernel.ProviderClaudeCode, claude, "", effort, claudeRuntime, "/private/change"); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRequest(kernel.ProviderClaudeCode, claude, "", effort, claudeRuntime, "/private/change", kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("Claude effort %q error=%v, want ErrInvalid", effort, err)
 		}
 	}
 	codex, codexRuntime, _ := nativeFixture(t, kernel.ProviderCodex)
-	if _, err := NewRequest(kernel.ProviderCodex, codex, "", "ultra", codexRuntime, "/private/change"); err != nil {
+	if _, err := NewRequest(kernel.ProviderCodex, codex, "", "ultra", codexRuntime, "/private/change", kernel.RoleWorker); err != nil {
 		t.Fatalf("Codex durable ultra effort rejected: %v", err)
 	}
 	for _, model := range []string{string([]byte{0xff}), "model\x00suffix"} {
-		if _, err := NewRequest(kernel.ProviderCodex, codex, model, "", codexRuntime, "/private/change"); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRequest(kernel.ProviderCodex, codex, model, "", codexRuntime, "/private/change", kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("model %x error=%v, want ErrInvalid", []byte(model), err)
 		}
 	}
 	for _, workingDirectory := range []string{"", "relative/change", "/", "/private/../change", "/private/change\x00suffix", string([]byte{0xff})} {
-		if _, err := NewRequest(kernel.ProviderCodex, codex, "", "", codexRuntime, workingDirectory); !errors.Is(err, ErrInvalid) {
+		if _, err := NewRequest(kernel.ProviderCodex, codex, "", "", codexRuntime, workingDirectory, kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("working directory %q error=%v, want ErrInvalid", workingDirectory, err)
 		}
 	}
@@ -327,7 +387,7 @@ func TestNewRequestRejectsMismatchedProviderAndControls(t *testing.T) {
 	if len(codexUntrustedProjectConfig(tooLarge)) <= runner.MaxArgumentBytes {
 		t.Fatalf("expanded project config=%d, want larger than argv bound", len(codexUntrustedProjectConfig(tooLarge)))
 	}
-	if _, err := NewRequest(kernel.ProviderCodex, codex, "", "", codexRuntime, tooLarge); !errors.Is(err, ErrInvalid) {
+	if _, err := NewRequest(kernel.ProviderCodex, codex, "", "", codexRuntime, tooLarge, kernel.RoleWorker); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("oversized encoded working directory error=%v, want ErrInvalid", err)
 	}
 }
