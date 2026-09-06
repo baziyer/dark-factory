@@ -99,10 +99,15 @@ Change is a path the CLI has never seen, and without the record the session
 would stop at that dialog with the startup task typed into it.
 
 Native providers do not inherit the shell task descriptor. For Claude, the
-runner writes one fixed instruction plus the terminal-safe JSON-quoted task to
-the PTY after provider exec and before reporting the terminal ready. The
-complete prepared input must fit 8 KiB; a partial or uncertain write fails the
-attempt and is never replayed.
+runner types one fixed instruction plus the terminal-safe JSON-quoted task
+into the PTY after provider exec, once the CLI has taken its terminal out of
+canonical mode or two seconds have passed, and before reporting the terminal
+ready; the carriage return that submits it is the one startup byte sent after
+ready, as a keystroke of its own once the CLI's output has been quiet for half
+a second (after a one-second floor, or at five seconds regardless), because a
+CLI reads text and newline arriving together as a paste, and a paste does not
+submit. The complete prepared input must fit 8 KiB; a partial or uncertain
+write of the text fails the attempt and is never replayed.
 
 Codex starts from a fixed, non-secret positional instruction to run
 `factoryctl attempt task` first. That command authenticates with the attempt's

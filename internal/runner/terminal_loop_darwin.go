@@ -51,25 +51,29 @@ func runReleasedProvider(child *OwnedChild, daemon, worker *os.File, reads *atte
 	// carries text and a newline as a paste, and a paste does not submit. The
 	// text goes now; the CR follows from serve.
 	if len(startup) > 0 {
-		if err := loop.awaitRawMode(stagePTY, startupRawCeiling); err != nil {
+		defer clear(startup)
+		alive, err := loop.awaitRawMode(stagePTY, startupRawCeiling)
+		if err != nil {
 			return loop.daemonOpen, err
 		}
-		text := startup
-		if text[len(text)-1] == '\r' {
-			text = text[:len(text)-1]
-			now := time.Now()
-			loop.enterAfter, loop.enterBy = now.Add(startupEnterFloor), now.Add(startupEnterCeiling)
-		}
-		if len(text) > 0 {
-			n, err := loop.child.writePTYOwned(text, attemptControlTimeout)
-			count, status := terminalPayloadResult(n, len(text), err)
-			if status != TerminalResultOK {
-				clear(startup)
-				stopErr := loop.stop()
-				return loop.daemonOpen, errors.Join(fmt.Errorf("runner: provider startup input %s after %d bytes: %w", status, count, err), stopErr)
+		// A provider that hung up its terminal during the gate is owed no
+		// prompt; serve reports its exit as it would any other.
+		if alive {
+			text := startup
+			if text[len(text)-1] == '\r' {
+				text = text[:len(text)-1]
+				now := time.Now()
+				loop.enterAfter, loop.enterBy = now.Add(startupEnterFloor), now.Add(startupEnterCeiling)
+			}
+			if len(text) > 0 {
+				n, err := loop.child.writePTYOwned(text, attemptControlTimeout)
+				count, status := terminalPayloadResult(n, len(text), err)
+				if status != TerminalResultOK {
+					stopErr := loop.stop()
+					return loop.daemonOpen, errors.Join(fmt.Errorf("runner: provider startup input %s after %d bytes: %w", status, count, err), stopErr)
+				}
 			}
 		}
-		clear(startup)
 	}
 	if err := loop.send(TerminalFrame{Kind: TerminalReady}); err != nil {
 		return false, err
@@ -106,6 +110,12 @@ type terminalOwner struct {
 	enterAfter, enterBy, lastOutput time.Time
 }
 
+// ponytail: the provider's output is opaque to the runner, so its readiness
+// is calibrated, not observed. The gate waits for canonical input to clear
+// and gives up at startupRawCeiling; the submitting CR waits for the output
+// to go quiet for startupEnterQuiet after startupEnterFloor and goes at
+// startupEnterCeiling regardless. Recognise the provider's own prompt if
+// these ever prove wrong for a CLI.
 const (
 	startupRawCeiling   = 2 * time.Second
 	startupEnterFloor   = time.Second
@@ -117,42 +127,56 @@ const (
 // awaitRawMode waits, up to the ceiling, for the provider to clear canonical
 // input on its terminal, draining what it prints meanwhile so a provider that
 // greets with more than the terminal's output buffer is not stuck before it
-// can. The master reflects the slave's line discipline on Darwin.
-func (o *terminalOwner) awaitRawMode(stagePTY *ptyStageSink, ceiling time.Duration) error {
+// can. It answers false once the provider has hung up its terminal, so a
+// provider that dies while starting is reported as an exit, not as a failed
+// prompt. The master reflects the slave's line discipline on Darwin.
+func (o *terminalOwner) awaitRawMode(stagePTY *ptyStageSink, ceiling time.Duration) (bool, error) {
 	deadline := time.Now().Add(ceiling)
+	master := int(o.child.ptyMaster.Fd())
 	for {
+		before := o.ring.Head()
 		if err := stagePTY.drain(); err != nil {
-			return err
+			return false, err
 		}
-		termios, err := unix.IoctlGetTermios(int(o.child.ptyMaster.Fd()), unix.TIOCGETA)
+		if o.ring.Head() != before {
+			o.lastOutput = time.Now()
+		}
+		fds := []unix.PollFd{{Fd: int32(master), Events: unix.POLLIN}}
+		if _, err := unix.Poll(fds, 0); err == nil && fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+			return false, nil
+		}
+		termios, err := unix.IoctlGetTermios(master, unix.TIOCGETA)
 		if err != nil || termios.Lflag&unix.ICANON == 0 || !time.Now().Before(deadline) {
-			return nil
+			return true, nil
 		}
 		time.Sleep(startupEnterTick)
 	}
 }
 
 // submitStartup writes the owed CR once the provider's output has been quiet
-// for a spell after the floor, or at the ceiling regardless. A provider that
-// has exited or closed its terminal is owed nothing.
+// for a spell after the floor (a provider that never wrote is quiet), or at
+// the ceiling regardless. A provider that has exited or closed its terminal
+// is owed nothing.
 func (o *terminalOwner) submitStartup() error {
 	if o.enterBy.IsZero() {
 		return nil
 	}
-	if o.stopRequested || o.ptyEOF || !o.ptyOpen || o.child.exitObserved {
+	if o.child.exitObserved {
 		o.enterAfter, o.enterBy = time.Time{}, time.Time{}
 		return nil
 	}
 	now := time.Now()
-	if now.Before(o.enterAfter) || now.Before(o.enterBy) && (o.lastOutput.IsZero() || now.Sub(o.lastOutput) < startupEnterQuiet) {
+	quiet := o.lastOutput.IsZero() || now.Sub(o.lastOutput) >= startupEnterQuiet
+	if now.Before(o.enterAfter) || now.Before(o.enterBy) && !quiet {
 		return nil
 	}
 	o.enterAfter, o.enterBy = time.Time{}, time.Time{}
-	n, err := o.child.writePTYOwned([]byte{'\r'}, 250*time.Millisecond)
-	if _, status := terminalPayloadResult(n, 1, err); status != TerminalResultOK {
+	switch _, status := o.writeTerminalPayload([]byte{'\r'}); status {
+	case TerminalResultOK, TerminalResultRejected:
+		return nil
+	default:
 		return fmt.Errorf("runner: provider startup submit %s", status)
 	}
-	return nil
 }
 
 type terminalReplay struct {

@@ -328,13 +328,20 @@ func runAttemptWorkerHelper(args []string) error {
 	var provider ExecSpec
 	var providerTask []byte
 	switch mode {
-	case "native-input", "native-raw":
+	case "native-input", "native-raw", "native-chatty", "native-exit":
 		// native-raw greets with more than the terminal's output buffer and
 		// only then takes the terminal out of canonical mode, as an
-		// interactive CLI does while it starts.
+		// interactive CLI does while it starts; native-chatty then keeps
+		// printing for two seconds while it waits for its line; native-exit
+		// dies at once.
 		greeting := ""
-		if mode == "native-raw" {
+		switch mode {
+		case "native-raw":
 			greeting = "head -c 2048 /dev/zero | tr '\\0' x; sleep 0.3; stty -icanon || exit 96; "
+		case "native-chatty":
+			greeting = "stty -icanon || exit 96; (i=0; while [ $i -lt 20 ]; do printf .; sleep 0.1; i=$((i+1)); done) & "
+		case "native-exit":
+			greeting = "exit 3; "
 		}
 		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; %sIFS= read -r startup || exit 98; printf '%%s' \"$startup\" > %q || exit 99; IFS= read -r interactive || exit 100; printf '%%s' \"$interactive\" > %q || exit 101; while test ! -f %q; do sleep 0.01; done", greeting, filepath.Join(root, "provider.startup"), filepath.Join(root, "provider.stdin"), filepath.Join(root, "finish"))
 		provider = ExecSpec{Target: "/bin/sh", Args: []string{"-c", script}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: providerCwd}
@@ -476,7 +483,7 @@ func runAttemptWorkerHelper(args []string) error {
 		}
 	}
 	var task *os.File
-	if mode != "native-input" && mode != "native-raw" {
+	if mode != "native-input" && mode != "native-raw" && mode != "native-chatty" && mode != "native-exit" {
 		if len(providerTask) == 0 {
 			providerTask = []byte("test-provider-task\n")
 		}
@@ -901,6 +908,69 @@ func TestAttemptRunnerTypesTheStartupPromptOnlyOnceTheProviderIsRaw(t *testing.T
 	}
 	record := f.finishAndAck()
 	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 0 {
+		t.Fatalf("terminal=%+v", record.Terminal)
+	}
+}
+
+// The submitting CR waits for the provider's output to go quiet: a provider
+// that keeps printing for two seconds after the prompt is typed gets its
+// line completed after that, well before the five-second ceiling.
+func TestAttemptRunnerSubmitsTheStartupPromptOnlyOnceTheProviderIsQuiet(t *testing.T) {
+	f := newAttemptFixture(t, "native-chatty", "")
+	f.spec.StartupInput = []byte("native-startup\r")
+	inner := f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if ready := f.nextTerminal(TerminalReady, 0); ready.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v", ready)
+	}
+	readyAt := time.Now()
+	startup := filepath.Join(f.root, "provider.startup")
+	waitFile(t, startup)
+	elapsed := time.Since(readyAt)
+	if body, err := os.ReadFile(startup); err != nil || string(body) != "native-startup" {
+		t.Fatalf("provider.startup=%q err=%v", body, err)
+	}
+	// Printing lasts about two seconds from the prompt; the CR follows the
+	// quiet spell after it, and never waits for the ceiling.
+	if elapsed < 2*time.Second || elapsed >= startupEnterCeiling {
+		t.Fatalf("startup line completed %v after ready, want after the chatter's two seconds and before the %v ceiling", elapsed, startupEnterCeiling)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalGenerationInstall, Correlation: 1, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalGenerationResult, 1); result.Status != TerminalResultOK {
+		t.Fatalf("generation install=%+v", result)
+	}
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalInput, Correlation: 2, Generation: 1, Sequence: 1, Payload: []byte("interactive-after-ready\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalInputResult, 2); result.Status != TerminalResultOK {
+		t.Fatalf("terminal input=%+v", result)
+	}
+	record := f.finishAndAck()
+	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 0 {
+		t.Fatalf("terminal=%+v", record.Terminal)
+	}
+}
+
+// A provider that dies while the runner waits for its terminal is reported
+// as the exit it was, not as a prompt that could not be typed.
+func TestAttemptRunnerReportsAProviderThatDiesBeforeItsPrompt(t *testing.T) {
+	f := newAttemptFixture(t, "native-exit", "")
+	f.spec.StartupInput = []byte("native-startup\r")
+	inner := f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	record := f.finishAndAck()
+	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 3 {
 		t.Fatalf("terminal=%+v", record.Terminal)
 	}
 }
