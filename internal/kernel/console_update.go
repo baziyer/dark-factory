@@ -14,6 +14,12 @@ type AgentPatch struct {
 	// selection back to the provider's default configuration directory.
 	AccountID *AccountID
 	Paused    *bool
+	// The idle rule. A new budget starts the used count again; that is the
+	// one explicit operator action that resets it.
+	IdlePolicy       *IdlePolicy
+	IdleAfterSeconds *uint32
+	IdleInstruction  *string
+	IdleRunBudget    *uint32
 }
 
 // TaskPatch is the console's queue edit. A nil member leaves the durable
@@ -63,6 +69,21 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 	if patch.Paused != nil {
 		agent.Paused = *patch.Paused
 	}
+	if patch.IdlePolicy != nil {
+		agent.Idle.Policy = *patch.IdlePolicy
+	}
+	if patch.IdleAfterSeconds != nil {
+		agent.Idle.AfterSeconds = *patch.IdleAfterSeconds
+	}
+	if patch.IdleInstruction != nil {
+		agent.Idle.Instruction = *patch.IdleInstruction
+	}
+	if patch.IdleRunBudget != nil {
+		agent.Idle.RunBudget, agent.Idle.RunsUsed = *patch.IdleRunBudget, 0
+	}
+	if err := validateIdleRule(agent.Idle); err != nil {
+		return Agent{}, tx.Rollback(err)
+	}
 	// Only an edit that touches a launch control is held to the launch rules.
 	// A stored row may legitimately hold a combination new launches refuse
 	// (Claude ultra), and pausing such an agent must not be blocked by it.
@@ -73,8 +94,8 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 	} else if err := validateStoredProviderControls(agent.Provider, agent.Model, agent.ReasoningEffort); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}
-	result, err := tx.connection.ExecContext(ctx, `UPDATE agents SET model = ?, reasoning_effort = ?, account_id = ?, paused = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
-		nullableString(agent.Model), nullableString(agent.ReasoningEffort), nullableID(agent.AccountID), boolInt(agent.Paused), at.Int64(), id.Bytes(), expected.Int64())
+	result, err := tx.connection.ExecContext(ctx, `UPDATE agents SET model = ?, reasoning_effort = ?, account_id = ?, paused = ?, idle_policy = ?, idle_after_seconds = ?, idle_instruction = ?, idle_run_budget = ?, idle_runs_used = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
+		nullableString(agent.Model), nullableString(agent.ReasoningEffort), nullableID(agent.AccountID), boolInt(agent.Paused), string(agent.Idle.Policy), int64(agent.Idle.AfterSeconds), agent.Idle.Instruction, int64(agent.Idle.RunBudget), int64(agent.Idle.RunsUsed), at.Int64(), id.Bytes(), expected.Int64())
 	if err := requireOneRow(result, err); err != nil {
 		return Agent{}, tx.Rollback(err)
 	}

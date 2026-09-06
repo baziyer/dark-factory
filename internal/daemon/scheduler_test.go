@@ -373,3 +373,74 @@ func schedulerOutcomeUnknown(err error) bool {
 	var unknown *kernel.OutcomeUnknownError
 	return errors.As(err, &unknown)
 }
+
+// A poll tick enqueues an idle agent's standing instruction once its quiet
+// spell has passed, and spends one of its idle runs for it; the probe that
+// follows the tick is what admits it.
+func TestSchedulerTickEnqueuesStandingInstructions(t *testing.T) {
+	store, err := createTestStore(context.Background(), filepath.Join(t.TempDir(), "kernel.sqlite"), kernel.FactoryConfig{DispatchEnabled: true, Capacity: 2}, schedulerTime(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var clock atomic.Int64
+	clock.Store(100_000)
+	daemon, err := newDaemon(store, func() time.Time { return time.UnixMilli(clock.Load()) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	projectID, _ := kernel.ProjectIDFromBytes(adapterID(t, 0x31))
+	agentID, _ := kernel.AgentIDFromBytes(adapterID(t, 0x32))
+	project, err := store.CreateProject(ctx, kernel.NewProject{ID: projectID, Name: "idle", Root: t.TempDir()}, adapterTime(t, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: "idle agent", Role: kernel.RoleWorker, Provider: kernel.ProviderShell, ToolBudgetLimit: 4}, adapterTime(t, 11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, budget, instruction := kernel.IdleStandingInstruction, uint32(60), uint32(1), "Tidy up."
+	ruled, err := store.UpdateAgent(ctx, agent.ID, agent.Revision, kernel.AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleInstruction: &instruction, IdleRunBudget: &budget}, adapterTime(t, 12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	polls := make(chan time.Time, 4)
+	spec := SupervisorSpec{
+		schedulerPoll: polls,
+		scheduledAttempt: func(ctx context.Context, _ SupervisorSpec) (kernel.Run, error) {
+			<-ctx.Done()
+			return kernel.Run{}, ctx.Err()
+		},
+	}
+	go func() { done <- daemon.RunScheduler(runCtx, spec) }()
+	// Too soon: the rule was set at 12 ms and waits a minute.
+	clock.Store(30_000)
+	polls <- time.Now()
+	time.Sleep(50 * time.Millisecond)
+	if current, _, _ := store.Agent(ctx, agent.ID); current.Idle.RunsUsed != 0 {
+		t.Fatalf("early tick spent an idle run: %+v", current.Idle)
+	}
+	clock.Store(70_000)
+	polls <- time.Now()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, _, err := store.Agent(ctx, agent.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Idle.RunsUsed == 1 && current.Revision.Int64() == ruled.Revision.Int64()+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("due tick did not enqueue the standing instruction: %+v", current.Idle)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := waitSchedulerDone(t, done); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("scheduler shutdown = %v", err)
+	}
+}

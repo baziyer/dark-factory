@@ -326,6 +326,8 @@ test("manifest bounds and registry are an exact readable mirror", () => {
     maxModelSourceBytes: manifest.bounds.max_model_source_bytes,
     maxRemoteInviteLinkBytes: manifest.bounds.max_remote_invite_link_bytes,
     maxRemoteInviteSvgBytes: manifest.bounds.max_remote_invite_svg_bytes,
+    maxIdleAfterSeconds: manifest.bounds.max_idle_after_seconds,
+    maxIdleRunBudget: manifest.bounds.max_idle_run_budget,
   });
 });
 
@@ -375,7 +377,7 @@ test("linked accounts and agent account selections decode under the closed rules
   for (const wire of [
     // A shell agent can never carry an account.
     valid.replace('"provider":"codex","paused"', '"provider":"shell","paused"'),
-    valid.replace('"account_id":"05050505050505050505050505050505"}]', '"account_id":"05"}]'),
+    valid.replace('"account_id":"05050505050505050505050505050505","idle_policy"', '"account_id":"05","idle_policy"'),
     valid.replace('"provider":"codex","home"', '"provider":"shell","home"'),
     valid.replace('"home":"/Users/operator/.codex"', '"home":"Users/operator/.codex"'),
     valid.replace('"label":"codex","revision":"1"', '"label":"","revision":"1"'),

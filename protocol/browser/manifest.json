@@ -51,7 +51,9 @@
     "max_agent_model_bytes": 128,
     "max_model_source_bytes": 1024,
     "max_remote_invite_link_bytes": 8192,
-    "max_remote_invite_svg_bytes": 32768
+    "max_remote_invite_svg_bytes": 32768,
+    "max_idle_after_seconds": 604800,
+    "max_idle_run_budget": 1000000
   },
   "control": [
     {

@@ -17,6 +17,11 @@ type AgentUpdate struct {
 	// selection back to that provider's default configuration directory.
 	AccountID *string `json:"account_id,omitempty"`
 	Paused    *Bool   `json:"paused,omitempty"`
+	// The idle rule. A new budget starts the used count again.
+	IdlePolicy       *string `json:"idle_policy,omitempty"`
+	IdleAfterSeconds *uint32 `json:"idle_after_seconds,omitempty"`
+	IdleInstruction  *string `json:"idle_instruction,omitempty"`
+	IdleRunBudget    *uint32 `json:"idle_run_budget,omitempty"`
 }
 
 type AgentUpdateResult struct {
@@ -180,7 +185,11 @@ func validConsoleControl(kind MessageType, body any) error {
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
 			value.Model != nil && validateBoundedText(*value.Model, 0, MaxAgentModelBytes) != nil ||
 			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil ||
-			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil {
+			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil ||
+			value.IdlePolicy != nil && !validIdlePolicy(*value.IdlePolicy) ||
+			value.IdleAfterSeconds != nil && *value.IdleAfterSeconds > MaxIdleAfterSeconds ||
+			value.IdleInstruction != nil && validateBoundedText(*value.IdleInstruction, 0, MaxTaskInstructionBytes) != nil ||
+			value.IdleRunBudget != nil && *value.IdleRunBudget > MaxIdleRunBudget {
 			return bad()
 		}
 	case AgentUpdateResult:
@@ -325,4 +334,14 @@ func validTopologyNode(node TopologyNode) bool {
 	return validateBoundedText(node.Path, 1, MaxTaskTitleBytes) == nil &&
 		validateBoundedText(node.Label, 1, MaxAgentNameBytes) == nil &&
 		validateBoundedText(node.Language, 0, MaxAgentNameBytes) == nil
+}
+
+// The idle rule bounds; the kernel enforces the same numbers durably.
+const (
+	MaxIdleAfterSeconds = 604800
+	MaxIdleRunBudget    = 1000000
+)
+
+func validIdlePolicy(value string) bool {
+	return value == "wait" || value == "standing_instruction"
 }

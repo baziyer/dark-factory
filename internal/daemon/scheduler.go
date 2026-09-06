@@ -109,6 +109,14 @@ func (daemon *Daemon) RunScheduler(ctx context.Context, spec SupervisorSpec) err
 				startProbe()
 			}
 		case <-pollEvents:
+			if !stopping && resultErr == nil {
+				// Standing instructions are enqueued on the tick, ahead of the
+				// probe that admits them. A round that fails is retried next
+				// tick; the admission probe is what has to stay exact.
+				if at, err := daemon.timestamp(); err == nil {
+					_, _ = daemon.store.EnqueueIdleInstructions(ownedCtx, at)
+				}
+			}
 			if !stopping && resultErr == nil && probeID == 0 {
 				startProbe()
 			}
