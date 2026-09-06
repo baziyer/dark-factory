@@ -113,13 +113,21 @@ func TestBuildOrchestratorClaudeIsGivenTheMaintainerBridge(t *testing.T) {
 	if !reflect.DeepEqual(launch.Argv(), want) {
 		t.Fatalf("orchestrator argv = %q, want %q", launch.Argv(), want)
 	}
+	// A bridge that is present but unfit is refused by name, unlike a
+	// missing one, so the operator learns which of the two it is.
 	for name, mode := range map[string]os.FileMode{"not executable": 0o644, "group writable": 0o775} {
 		if err := os.Chmod(bridge, mode); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("%s bridge = %v, want ErrUnavailable", name, err)
+		if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) || !errors.Is(err, errBridgeUnfit) {
+			t.Fatalf("%s bridge = %v, want ErrUnavailable and errBridgeUnfit", name, err)
 		}
+	}
+	if err := os.Remove(bridge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator)); !errors.Is(err, ErrUnavailable) || errors.Is(err, errBridgeUnfit) {
+		t.Fatalf("missing bridge = %v, want ErrUnavailable alone", err)
 	}
 	if _, err := NewRequest(kernel.ProviderClaudeCode, installation, "", "", runtime, "/private/change", kernel.AgentRole(0)); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("request without a role = %v, want ErrInvalid", err)

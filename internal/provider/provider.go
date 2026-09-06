@@ -75,13 +75,12 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 	return Installation{provider: kind, executable: executable}, nil
 }
 
-// resolveBridge finds the Maintainer bridge on the fixed tool path. It is
-// not committed like a CLI: Claude spawns it much later and it may be a
-// script, which the executable commitment refuses. It must be a regular
-// executable file that nobody but its owner can write.
-func resolveBridge(toolPath string) (string, error) {
+// walkToolPath resolves the first tool of that name on the fixed tool path:
+// the search is ordered, and an existing candidate that cannot be resolved
+// fails closed rather than falling through to another.
+func walkToolPath(toolPath, tool string) (string, error) {
 	for _, directory := range filepath.SplitList(toolPath) {
-		candidate := filepath.Join(directory, maintainerBridge)
+		candidate := filepath.Join(directory, tool)
 		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
@@ -89,10 +88,6 @@ func resolveBridge(toolPath string) (string, error) {
 		}
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil || !validAbsolute(resolved, maxPathBytes) {
-			return "", ErrUnavailable
-		}
-		info, err := os.Stat(resolved)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
 			return "", ErrUnavailable
 		}
 		return resolved, nil
@@ -102,24 +97,34 @@ func resolveBridge(toolPath string) (string, error) {
 
 // resolveTool commits the first tool of that name on the fixed tool path.
 func resolveTool(toolPath, tool string) (runner.ExecutableCommitment, error) {
-	for _, directory := range filepath.SplitList(toolPath) {
-		candidate := filepath.Join(directory, tool)
-		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
-			continue
-		} else if err != nil {
-			return runner.ExecutableCommitment{}, ErrUnavailable
-		}
-		resolved, err := filepath.EvalSymlinks(candidate)
-		if err != nil || !validAbsolute(resolved, maxPathBytes) {
-			return runner.ExecutableCommitment{}, ErrUnavailable
-		}
-		executable, err := runner.CommitExecutableLocator(resolved)
-		if err != nil {
-			return runner.ExecutableCommitment{}, ErrUnavailable
-		}
-		return executable, nil
+	resolved, err := walkToolPath(toolPath, tool)
+	if err != nil {
+		return runner.ExecutableCommitment{}, err
 	}
-	return runner.ExecutableCommitment{}, ErrUnavailable
+	executable, err := runner.CommitExecutableLocator(resolved)
+	if err != nil {
+		return runner.ExecutableCommitment{}, ErrUnavailable
+	}
+	return executable, nil
+}
+
+// errBridgeUnfit names a bridge that is on the path but not a regular file
+// executable by its owner and writable by nobody else; the commitment a CLI
+// gets is not asked of it, since Claude spawns the bridge itself much later
+// and it may be a script.
+var errBridgeUnfit = errors.New("provider: maintainer bridge is not a regular owner-only executable")
+
+// resolveBridge finds the Maintainer bridge on the fixed tool path.
+func resolveBridge(toolPath string) (string, error) {
+	resolved, err := walkToolPath(toolPath, maintainerBridge)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
+		return "", errors.Join(ErrUnavailable, errBridgeUnfit)
+	}
+	return resolved, nil
 }
 
 // ConfigDirName is the directory a provider CLI keeps its login and
@@ -268,7 +273,7 @@ func Build(request Request) (Launch, error) {
 		if request.role == kernel.RoleOrchestrator {
 			bridge, err := resolveBridge(request.runtime.toolPath)
 			if err != nil {
-				return Launch{}, errors.Join(ErrUnavailable, fmt.Errorf("%s: %s", maintainerBridge, request.runtime.toolPath))
+				return Launch{}, errors.Join(err, fmt.Errorf("%s on %s", maintainerBridge, request.runtime.toolPath))
 			}
 			config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"maintainer": map[string]string{"command": bridge}}})
 			if err != nil || len(config) > runner.MaxArgumentBytes {

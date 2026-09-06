@@ -38,9 +38,12 @@ environment section below describes. A Claude Code orchestrator is launched
 with that App's MCP bridge, `dark-factory-maintainer-mcp-bridge` resolved on
 the fixed tool path, as its one MCP server; a Claude Code worker is launched
 with `--strict-mcp-config` and no server, so nothing in its account
-configuration or in a `.mcp.json` inside the Change reaches it. An
-orchestrator launch is refused when the bridge is not installed. Codex
-orchestrators receive no MCP configuration yet.
+configuration or in a `.mcp.json` inside the Change reaches it. The bridge
+is found on the same ordered path as a CLI but is not committed like one,
+since Claude spawns it itself much later and it may be a script: it must be
+a regular file, executable by its owner and writable by nobody else, and an
+orchestrator launch is refused, naming which, when it is missing or fails
+that. Codex orchestrators receive no MCP configuration yet.
 
 ## Shell
 
@@ -60,7 +63,9 @@ The managed daemon searches this fixed default tool path, never ambient
 An explicit `factoryd --tool-path` replaces the default. Search is
 ordered; an existing candidate that cannot be resolved and committed fails
 closed rather than falling through to another executable. A symlink is resolved
-once and the direct Mach-O target is committed and reverified before exec.
+once and the direct Mach-O target is committed and reverified before exec. The
+Maintainer bridge an orchestrator is given is found on the same path but only
+checked, not committed, as described under agent creation.
 
 The native argv templates are:
 
