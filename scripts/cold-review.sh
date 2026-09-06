@@ -18,10 +18,13 @@
 #
 # Exit status: 0 when the session reports an ALLOW verdict, 1 for
 # REQUEST_CHANGES, 3 when it reports no verdict at all, 4 when the pull
-# request is no longer at the stated head, 2 for bad arguments, a missing
-# tool, a base commit the repository does not hold or shares no history
-# with the head, or a base that already contains the head, 5 when the clone,
-# the checkout, the renaming below or the rules copy fails. The session's final
+# request is no longer at the stated head, 2 for bad arguments, a malformed
+# operation id, a missing tool, a base commit the repository does not hold
+# or shares no history with the head, or a base that already contains the
+# head, 5 when the clone, the checkout, the renaming below (including a
+# change that already holds a path the rename would take, since mv into an
+# existing directory succeeds and leaves the instruction live), the rules
+# copy or the session log fails. The session's final
 # message lands in review-PR-HEAD8.log in the current directory. Whether a
 # verdict was really recorded is the merge queue's review check to decide,
 # not this script's.
@@ -80,6 +83,9 @@ for tool in claude git; do
 done
 if [ -z "${DARK_FACTORY_REVIEW_OPERATION_ID:-}" ]; then
     command -v uuidgen >/dev/null || { echo "uuidgen is not on PATH and no operation id was given" >&2; exit 2; }
+elif ! printf '%s\n' "$DARK_FACTORY_REVIEW_OPERATION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    echo "not an operation id: $DARK_FACTORY_REVIEW_OPERATION_ID" >&2
+    exit 2
 fi
 remote=${DARK_FACTORY_REVIEW_REMOTE:-https://github.com}
 work=$(mktemp -d "${TMPDIR:-/tmp}/cold-review.XXXXXX")
@@ -108,6 +114,10 @@ git -C "$work/repo" checkout -q "$head" || exit 5
 # the directory that holds it; the listing is taken whole before any rename.
 find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
 while IFS= read -r instruction; do
+    if [ -e "$instruction.under-review" ]; then
+        echo "the change already holds $instruction.under-review" >&2
+        exit 5
+    fi
     mv "$instruction" "$instruction.under-review" || exit 5
 done <"$work/instructions"
 # Presence is read from the merge base's tree, which the clone holds; the

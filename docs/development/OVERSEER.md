@@ -119,19 +119,19 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 1. `observe_ref` for `main` and keep the answer as `main_head`. If it is not
    `base_commit`, main moved since the worker started; publish anyway from
    `base_commit` and let the queue merge it, but say so in the body.
-2. `publish_commit` with `operation_id = opid publish-1`, `branch`,
+2. `publish_commit` with `operation_id = opid "$change_id" publish-1`, `branch`,
    `expected_head_sha = base_commit`, a one-line message from the task title,
    and the first (or only) 50 entries. It returns the new head commit; a
-   second commit uses `opid publish-2` and that head, and so on. The last
+   second commit uses `opid "$change_id" publish-2` and that head, and so on. The last
    returned head is the pull request head.
 
 ## 4. Open the issue and the pull request
 
-`create_pull_request` needs an issue. `create_issue` with `opid issue`, the
+`create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
 text plus the change id; it returns the issue number. Then read
 `observe_ref` for `main` again, immediately before the call, and use that
-answer: `create_pull_request` with `opid pr`, `issue_number` from that
+answer: `create_pull_request` with `opid "$change_id" pr`, `issue_number` from that
 result, `head = branch`, `head_sha` = the last published commit, `base =
 main`, `base_sha` = main's head as just read (the App verifies the base
 branch is at that commit at that moment; `base_commit` is wrong whenever
@@ -173,7 +173,7 @@ and 5 when it could not prepare the checkout, and leaves
 
 - Exit 3: run it once more; a second 3 is a human request with the log's
   last lines.
-- ALLOW: `enqueue_pull_request` with `opid enqueue`, the PR number, the head
+- ALLOW: `enqueue_pull_request` with `opid "$change_id" enqueue`, the PR number, the head
   and `base = main`. Then `observe_pull_request_merge`, with the PR number,
   the head, `base = main` and the enqueue operation id, every 60 s for up to
   30 minutes;
@@ -197,7 +197,7 @@ and 5 when it could not prepare the checkout, and leaves
   then raise a human request with the script's message.
 
 On a resumed run, a change whose `pr` is completed but whose `enqueue` is not
-needs no second review if one was recorded: `observe_operation` with `opid
+needs no second review if one was recorded: `observe_operation` with `opid "$change_id"
 review-HEAD8` for the pull request head answers `completed` with verdict
 `allow` (enqueue), `block` (blocked: wait for a new retained change), `note`
 (a comment that decided nothing: run the review again under a fresh id, the
