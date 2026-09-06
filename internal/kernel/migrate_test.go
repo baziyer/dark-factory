@@ -327,17 +327,28 @@ func requireLegacyPopulation(t *testing.T, ctx context.Context, connection *sql.
 	}
 }
 
-// TestLegacySchemaIsPinned trips on any schema edit, because
-// legacySchemaStatements derives every unchanged statement from
-// schemaStatements: a new statement there would rewrite what v1 is claimed to
-// have been, and real v1 homes would stop opening. Re-pinning this digest
-// without freezing the replaced text and extending the migration ships the
-// outage this migration exists to fix.
-func TestLegacySchemaIsPinned(t *testing.T) {
-	const pinned = "63a444a2fe57a994b712bfe5b56764d684b2cb3ed73d7324465d894107f96f33"
-	digest := sha256.Sum256([]byte(strings.Join(legacySchemaStatements(), "\n")))
-	if got := hex.EncodeToString(digest[:]); got != pinned {
-		t.Fatalf("v1 schema digest = %s, want %s", got, pinned)
+// TestSchemaDigestsArePinned trips on any schema edit. Both sets need a pin:
+// legacySchemaStatements derives every unchanged statement live from
+// schemaStatements, so an edit there rewrites what v1 is claimed to have been
+// and real v1 homes stop opening, while an edit to an object the v1 derivation
+// drops or replaces (accounts, agents, invalidations) moves the target without
+// touching the v1 digest and every migrated home is refused on the next start.
+// A schema change re-pins both, and re-pinning without freezing the replaced
+// text and extending the migration ships the outage this migration exists to
+// fix.
+func TestSchemaDigestsArePinned(t *testing.T) {
+	for _, pin := range []struct {
+		name       string
+		statements []string
+		digest     string
+	}{
+		{"current", schemaStatements, "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
+		{"v1", legacySchemaStatements(), "63a444a2fe57a994b712bfe5b56764d684b2cb3ed73d7324465d894107f96f33"},
+	} {
+		sum := sha256.Sum256([]byte(strings.Join(pin.statements, "\n")))
+		if got := hex.EncodeToString(sum[:]); got != pin.digest {
+			t.Errorf("%s schema digest = %s, want %s", pin.name, got, pin.digest)
+		}
 	}
 }
 

@@ -35,7 +35,11 @@ uninstall --home "$HOME/.dark-factory"` with the new `factoryctl`, then
 `factoryctl service install --home "$HOME/.dark-factory"`. Only the service's
 binaries, plist, and receipt are replaced; the data home is untouched. An
 installation that used `--relay-origin` must repeat that flag on the install
-after the uninstall, or the new job comes back loopback-only.
+after the uninstall, or the new job comes back loopback-only. Before upgrading
+across a schema change, copy the database first — `sqlite3
+"$HOME/.dark-factory/factory.sqlite3" ".backup <copy>"` — because the new build
+migrates the home on its first start, the migration is one way, and an older
+build refuses the migrated home.
 
 To reach the factory from the hosted PWA rather than only from this machine's
 loopback, install with `factoryctl service install --home "$HOME/.dark-factory"

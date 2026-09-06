@@ -51,7 +51,8 @@ const (
 // statement is read live from schemaStatements, so editing any of them silently
 // changes what this claims v1 was and stops recognising real v1 homes. The next
 // schema change has to freeze the text it replaces here and extend the
-// migration, in the same change; TestLegacySchemaIsPinned fails until it does.
+// migration, in the same change; TestSchemaDigestsArePinned pins both this set
+// and schemaStatements and fails until it does.
 func legacySchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
 	for _, statement := range schemaStatements {
@@ -92,7 +93,8 @@ func validateOpenableSnapshot(ctx context.Context, connection *sql.Conn) error {
 // enforce foreign keys must not serve the daemon. The next open then finds a v2
 // home and nothing to migrate. The migration is one way -- a build from before
 // it refuses user_version 2 -- so the rollback plan for an operator home is the
-// .backup copy taken before the upgrade.
+// operator's pre-upgrade copy of factory.sqlite3, which docs/install.md tells
+// them to take; nothing here makes one.
 func (store *Store) migrateLegacy(ctx context.Context) error {
 	connection, err := store.writerConnection(ctx)
 	if err != nil {
