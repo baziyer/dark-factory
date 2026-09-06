@@ -543,11 +543,17 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
 		t.Fatalf("empty file: %v", err)
 	}
-	// A file that is not JSON is refused without its path in the error.
-	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := TrustClaudeDirectory(runtime, "/private/change"); !errors.Is(err, errClaudeConfiguration) || strings.Contains(err.Error(), accountHome) {
-		t.Fatalf("broken file = %v", err)
+	// A file that is not JSON, or whose projects are not the CLI's shape, is
+	// refused without its path in the error rather than rewritten.
+	for name, content := range map[string]string{"not JSON": "{", "projects not an object": `{"projects":[]}`, "project not an object": `{"projects":{"/private/change":true}}`} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := TrustClaudeDirectory(runtime, "/private/change"); !errors.Is(err, errClaudeConfiguration) || strings.Contains(err.Error(), accountHome) {
+			t.Fatalf("%s = %v", name, err)
+		}
+		if kept, err := os.ReadFile(path); err != nil || string(kept) != content {
+			t.Fatalf("%s was rewritten: %s, %v", name, kept, err)
+		}
 	}
 }

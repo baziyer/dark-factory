@@ -318,11 +318,14 @@ const maxClaudeConfigBytes = 16 << 20
 // Every Change is a path the CLI has never seen, so without this record the
 // interactive session stops at that dialog and the startup task is typed into
 // it. Only this one key is added; every other value in the file is kept, with
-// numbers as their own digits and strings unescaped.
+// numbers as their own digits and strings unescaped, and a file whose shape
+// is not the CLI's is refused rather than rewritten.
 // ponytail: a read-modify-write like the CLI's own sessions do on the same
 // file, published by rename so a reader never sees a torn file; a concurrent
-// writer's key can still be lost in the millisecond between read and rename.
-// Take a lock file if a lost update is ever observed.
+// writer's key can still be lost between read and rename. Take a lock file
+// if a lost update is ever observed. Every Change adds one entry that nothing
+// removes; past maxClaudeConfigBytes every Claude launch on the account is
+// refused. Prune entries whose directory is gone if that ceiling nears.
 func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	if !runtime.valid() || !validAbsolute(cwd, maxPathBytes) {
 		return ErrInvalid
@@ -331,19 +334,25 @@ func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	config := map[string]any{}
 	if raw, err := readClaudeConfig(path); err != nil {
 		return err
-	} else if len(raw) > 0 {
+	} else if len(bytes.TrimSpace(raw)) > 0 {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.UseNumber()
 		if err := decoder.Decode(&config); err != nil {
 			return errClaudeConfiguration
 		}
 	}
-	projects, _ := config["projects"].(map[string]any)
-	if projects == nil {
+	projects, ok := config["projects"].(map[string]any)
+	if !ok {
+		if _, present := config["projects"]; present {
+			return errClaudeConfiguration
+		}
 		projects = map[string]any{}
 	}
-	project, _ := projects[cwd].(map[string]any)
-	if project == nil {
+	project, ok := projects[cwd].(map[string]any)
+	if !ok {
+		if _, present := projects[cwd]; present {
+			return errClaudeConfiguration
+		}
 		project = map[string]any{}
 	}
 	if project["hasTrustDialogAccepted"] == true {
