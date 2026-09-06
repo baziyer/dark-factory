@@ -83,7 +83,7 @@ for tool in claude git; do
 done
 if [ -z "${DARK_FACTORY_REVIEW_OPERATION_ID:-}" ]; then
     command -v uuidgen >/dev/null || { echo "uuidgen is not on PATH and no operation id was given" >&2; exit 2; }
-elif ! printf '%s\n' "$DARK_FACTORY_REVIEW_OPERATION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+elif [ "${#DARK_FACTORY_REVIEW_OPERATION_ID}" -ne 36 ] || ! printf '%s\n' "$DARK_FACTORY_REVIEW_OPERATION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     echo "not an operation id: $DARK_FACTORY_REVIEW_OPERATION_ID" >&2
     exit 2
 fi
@@ -112,7 +112,9 @@ fi
 git -C "$work/repo" checkout -q "$head" || exit 5
 # Deepest first, so a CLAUDE.md inside a .claude directory is renamed before
 # the directory that holds it; the listing is taken whole before any rename.
-find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -name .claude \) -print >"$work/instructions" || exit 5
+# Names match in any case: on a case-insensitive filesystem a committed
+# claude.md is what opening CLAUDE.md finds.
+find "$work/repo" -depth ! -path "$work/repo/.git" ! -path "$work/repo/.git/*" \( -iname CLAUDE.md -o -iname CLAUDE.local.md -o -iname AGENTS.md -o -iname .claude \) -print >"$work/instructions" || exit 5
 while IFS= read -r instruction; do
     if [ -e "$instruction.under-review" ]; then
         echo "the change already holds $instruction.under-review" >&2
