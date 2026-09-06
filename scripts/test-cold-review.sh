@@ -34,7 +34,7 @@ tools=$temporary/tools
 mkdir -p "$tools"
 cat >"$tools/claude" <<'FAKE'
 #!/bin/sh
-printf '%s\n' "$@" >"$DARK_FACTORY_FAKE_CLAUDE_ARGS"
+{ printf 'cwd=%s\n' "$PWD"; printf '%s\n' "$@"; } >"$DARK_FACTORY_FAKE_CLAUDE_ARGS"
 cat "$DARK_FACTORY_FAKE_CLAUDE_REPLY"
 FAKE
 printf '#!/bin/sh\nexit 0\n' >"$tools/dark-factory-maintainer-mcp-bridge"
@@ -54,7 +54,7 @@ review() {
 }
 
 printf 'Findings.\nVERDICT: ALLOW\n' >"$reply"
-review owner/repo 7 "$head" "$base" "$body" "focus" || fail "ALLOW did not exit 0"
+review owner/repo 7 "$head" "$base" "$body" "the focus sentinel" || fail "ALLOW did not exit 0"
 [ -f "$run/review-7-$(printf '%s' "$head" | cut -c1-8).log" ] || fail "no log for the review"
 grep -q -- '--strict-mcp-config' "$args" || fail "session is not strict about MCP servers"
 grep -q 'mcp__maintainer__submit_pull_request_review' "$args" || fail "verdict tool is not allowed"
@@ -63,7 +63,13 @@ if grep -E 'mcp__maintainer,|mcp__maintainer"|mcp__maintainer$' "$args" >/dev/nu
 fi
 grep -q "$head" "$args" || fail "prompt does not name the head"
 grep -q "$base" "$args" || fail "prompt does not name the base"
-grep -q 'focus' "$args" || fail "prompt does not carry the focus"
+grep -q 'the focus sentinel' "$args" || fail "prompt does not carry the focus"
+# The session must not run inside the checkout, whose CLAUDE.md, AGENTS.md
+# or .claude directory would otherwise become its own instructions.
+case "$(sed -n 's/^cwd=//p' "$args")" in
+    */repo | */repo/*) fail "session runs inside the change under review" ;;
+esac
+grep -q 'Bash(git -C ' "$args" || fail "git is not scoped to the checkout"
 
 printf 'Findings.\nVERDICT: REQUEST_CHANGES\n' >"$reply"
 status=0
@@ -79,7 +85,7 @@ printf 'VERDICT: ALLOW\n' >"$reply"
 : >"$args"
 status=0
 review owner/repo 7 "$base" "$base" "$body" || status=$?
-[ "$status" -eq 1 ] || fail "head mismatch exited $status, want 1"
+[ "$status" -eq 4 ] || fail "head mismatch exited $status, want 4"
 [ ! -s "$args" ] || fail "head mismatch still started a session"
 status=0
 review owner/repo 7 "$head" "$(printf '%s' "$base" | cut -c1-39)" "$body" || status=$?

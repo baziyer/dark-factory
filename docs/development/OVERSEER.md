@@ -56,8 +56,11 @@ ORDER BY r.terminal_at_ms"
 ```
 
 Handle only rows whose `project` is yours. The retained tree of a change is
-`$home/changes/<change_id>`. A change you already handled has a completed
-`publish` operation in the App journal (step 3); skip it.
+`$home/changes/<change_id>`. A change is finished when its `enqueue`
+operation (step 5) is `completed` in the App journal; anything short of that
+is resumed at the first step whose operation is not completed, as section 2
+says, and a change whose pull request exists but was blocked waits for a new
+retained change (section 5 says how to tell).
 
 ## 2. Derive one operation id per step, and check the journal first
 
@@ -87,13 +90,13 @@ the work tree. `git add -A` respects the tree's own `.gitignore`, so build
 output the worker left behind is not published.
 
 ```sh
-export GIT_DIR=$PWD/repo/.git GIT_WORK_TREE=$home/changes/$change_id
+export GIT_DIR=$PWD/repo/.git GIT_WORK_TREE=$home/changes/$change_id GIT_INDEX_FILE=$PWD/change.index
 git fetch -q origin "$base_commit"
 git read-tree "$base_commit" && git add -A
 git diff --cached --name-status "$base_commit"   # A / M / D per path
 git diff --cached --numstat "$base_commit"       # for the delta paragraph
 git ls-files --stage                             # mode and blob per path
-unset GIT_DIR GIT_WORK_TREE
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ```
 
 Build the `changes` array for `publish_commit`: added and modified paths carry
@@ -108,9 +111,9 @@ not a workaround.
 
 Then, with `branch = factory/<first 12 hex of change_id>`:
 
-1. `observe_ref` for `main`. If it is not `base_commit`, main moved since the
-   worker started; publish anyway from `base_commit` and let the queue merge
-   it, but say so in the body.
+1. `observe_ref` for `main` and keep the answer as `main_head`. If it is not
+   `base_commit`, main moved since the worker started; publish anyway from
+   `base_commit` and let the queue merge it, but say so in the body.
 2. `publish_commit` with `operation_id = opid publish-1`, `branch`,
    `expected_head_sha = base_commit`, a one-line message from the task title,
    and the first (or only) 50 entries. It returns the new head commit; a
@@ -121,10 +124,15 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 
 `create_pull_request` needs an issue. `create_issue` with `opid issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
-text plus the change id. Then `create_pull_request` with `opid pr`,
+text plus the change id; it returns the issue number. Then
+`create_pull_request` with `opid pr`, `issue_number` from that result,
 `head = branch`, `head_sha` = the last published commit, `base = main`,
-`base_sha = base_commit`, `draft = false`, the same title, and a body in this
-repository's shape:
+`base_sha = main_head` from step 3 (the App verifies the base branch is at
+that commit now; `base_commit` is wrong whenever main moved), `draft =
+false`, the same title, and a body in this repository's shape. An operation
+id belongs to the exact request it was first sent with, so a request the App
+refuses for its content cannot be corrected under the same id: that is a
+human request, not a retry.
 
 - What changed and why: from the task and the diff, in prose.
 - Production-line delta: added minus deleted outside tests, docs and fixtures,
@@ -147,8 +155,9 @@ no verdict, and leaves `review-PR-HEAD8.log` in the current directory.
 - Exit 3: run it once more; a second 3 is a human request with the log's
   last lines.
 - ALLOW: `enqueue_pull_request` with `opid enqueue`, the PR number, the head
-  and `base = main`. Then `observe_pull_request_merge` every 60 s for up to
-  30 minutes; never faster. Merged: done. No longer queued and not merged:
+  and `base = main`. Then `observe_pull_request_merge`, with the PR number,
+  the head and the enqueue operation id, every 60 s for up to 30 minutes;
+  never faster. Merged: done. No longer queued and not merged:
   the queue's run failed or dropped the entry, and the App cannot read a
   queue run's log or rerun it (`read_pull_request_job_log` and
   `rerun_failed_pull_request_jobs` bind to the pull request's own runs), so
@@ -159,6 +168,13 @@ no verdict, and leaves `review-PR-HEAD8.log` in the current directory.
   link and the findings verbatim; the human enqueues the fix as a task to the
   worker. Stop handling this change until a new retained change for the same
   task appears.
+- Exit 4: the pull request is no longer at the head you published, which
+  only a person can have done; raise a human request.
+
+On a resumed run, a change whose `pr` is completed but whose `enqueue` is not
+needs no second review if one was recorded: `observe_pull_request_checks` at
+the head shows the `review` check passed (enqueue), failed (blocked: wait for
+a new retained change), or absent (run the review).
 
 ## 6. Hand off and finish
 
