@@ -41,10 +41,11 @@ func idleRuleFromRow(policy string, after int64, instruction string, budget, use
 // EnqueueIdleInstructions enqueues each idle agent's standing instruction to
 // itself once its quiet spell has passed, and spends one of its idle runs
 // for it, in one transaction. Idle means the agent itself could take work
-// (not paused, tool budget left, no non-terminal run; the factory's dispatch
-// switch and capacity stay admission's to apply once the task is queued)
-// and has no queued or running task, so the rule never stacks on work. The
-// quiet spell starts at the later of the agent's last edit and its
+// (not paused, tool budget left; the factory's dispatch switch and capacity
+// stay admission's to apply once the task is queued) and has no queued or
+// running task, so the rule never stacks on work; a run in flight is a
+// running task, which the durable checks enforce. The quiet spell starts at
+// the later of the agent's last edit and its
 // last run's end, so editing the rule restarts the clock. An agent with any
 // queued or running task is left alone, and so is a paused one; a budget
 // already spent is never touched again until the operator sets a new one.
@@ -59,7 +60,6 @@ func (store *Store) EnqueueIdleInstructions(ctx context.Context, at UnixMillis) 
 	rows, err := tx.connection.QueryContext(ctx, `SELECT `+agentColumns+` FROM agents
 		WHERE idle_policy = 'standing_instruction' AND paused = 0 AND idle_runs_used < idle_run_budget AND tool_calls_used < tool_budget_limit
 		  AND NOT EXISTS (SELECT 1 FROM tasks WHERE assigned_agent_id = agents.id AND status IN ('queued', 'running'))
-		  AND NOT EXISTS (SELECT 1 FROM runs WHERE agent_id = agents.id AND phase <> 'terminal')
 		  AND MAX(updated_at_ms, COALESCE((SELECT MAX(terminal_at_ms) FROM runs WHERE agent_id = agents.id), 0)) + idle_after_seconds * 1000 <= ?
 		ORDER BY id`, at.Int64())
 	if err != nil {

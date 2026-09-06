@@ -90,3 +90,35 @@ func TestStandingInstructionEnqueuesItselfWithinItsBudget(t *testing.T) {
 		t.Fatalf("agent past its tool budget enqueued %d tasks, err=%v", len(tasks), err)
 	}
 }
+
+// A run keeps the rule quiet while it lasts, and the quiet spell restarts at
+// the run's end rather than at the rule's edit, so a long run is never
+// followed by a back-to-back fire.
+func TestStandingInstructionWaitsForTheRunAndThenItsQuietSpell(t *testing.T) {
+	ctx := context.Background()
+	proposal, _ := NewSuccessProposal("done")
+	store, finalizing := finalizingReleasedRun(t, RoleOrchestrator, VerificationNone, proposal)
+	defer store.Close()
+	agent, _, err := store.Agent(ctx, finalizing.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, budget, instruction := IdleStandingInstruction, uint32(60), uint32(2), "Look for something useful to do."
+	if _, err := store.UpdateAgent(ctx, agent.ID, agent.Revision, AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleInstruction: &instruction, IdleRunBudget: &budget}, mustTime(t, 100)); err != nil {
+		t.Fatal(err)
+	}
+	// The run still in flight keeps the rule quiet long past the wait.
+	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 100+600_000)); err != nil || len(tasks) != 0 {
+		t.Fatalf("round during a run enqueued %d tasks, err=%v", len(tasks), err)
+	}
+	if _, err := store.FinalizeRun(ctx, finalizing.ID, finalizing.Revision, mustTime(t, 1_000_000)); err != nil {
+		t.Fatal(err)
+	}
+	// The clock starts at the run's end: 59 s after it is too soon, 60 s is due.
+	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 1_000_000+59_000)); err != nil || len(tasks) != 0 {
+		t.Fatalf("round just after the run enqueued %d tasks, err=%v", len(tasks), err)
+	}
+	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 1_000_000+60_000)); err != nil || len(tasks) != 1 || tasks[0].AssignedAgentID != agent.ID {
+		t.Fatalf("round after the quiet spell = %+v, %v", tasks, err)
+	}
+}
