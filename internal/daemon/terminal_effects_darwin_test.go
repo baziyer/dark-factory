@@ -1068,6 +1068,50 @@ func TestCancelHumanRequestSurfacesControllerFailureAfterCommit(t *testing.T) {
 	}
 }
 
+// The #542 timeline: a run cancelled from a decision card revokes the runner
+// binding before the console's terminal lets go of its lease, with the
+// provider result still pending. The release's check is then a plain
+// rejection, and the browser boundary answers stale, not internal.
+func TestReleaseAfterCancelIsStaleNotInternal(t *testing.T) {
+	fixture := newTerminalEffectFixture(t)
+	lease := fixture.acquire(t, fixture.principal)
+	var key [kernel.IDBytes]byte
+	copy(key[:], adapterID(t, 225))
+	request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{IdempotencyKey: key, QuestionText: "cancel then release"}, adapterTime(t, 2_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRun, found, err := fixture.adapter.store.Run(context.Background(), fixture.run.ID)
+	if err != nil || !found {
+		t.Fatalf("current run = %+v, found=%v, err=%v", currentRun, found, err)
+	}
+	cancelled := make(chan error, 1)
+	go func() {
+		_, _, err := fixture.adapter.daemon.cancelHumanRequestRun(context.Background(), fixture.adapter.client.ID, request.ID, request.Revision, currentRun.Revision, adapterTime(t, 2_001))
+		cancelled <- err
+	}()
+	revoke := readTerminalEffectWire(t, fixture.peer)
+	replyTerminalEffect(t, fixture.peer, revoke, runner.TerminalResultOK, 0)
+	if err := <-cancelled; err != nil {
+		t.Fatalf("cancel with a live binding = %v", err)
+	}
+	if terminate := readTerminalEffectWire(t, fixture.peer); terminate.Kind != "terminate" {
+		t.Fatalf("post-cancel lifecycle command = %+v", terminate)
+	}
+	// The console still holds the revisions it attached with; the check is
+	// refused before the store would compare them.
+	release := browserprotocol.TerminalLeaseRelease{
+		RunID: fixture.run.ID.String(), SessionID: fixture.session.ID.String(), Generation: browserprotocol.Decimal(lease.Generation),
+		ExpectedRunRevision: decimalRevision(fixture.run.Revision), ExpectedSessionRevision: decimalRevision(fixture.session.Revision),
+	}
+	if _, err := fixture.adapter.daemon.terminalLeaseRelease(context.Background(), fixture.principal, fixture.run.ID, fixture.session.ID, lease.Generation, fixture.run.Revision, fixture.session.Revision); !errors.Is(err, ErrTerminalEffectRejected) || !errors.Is(err, kernel.ErrRevisionConflict) {
+		t.Fatalf("release after cancel = %v, want a rejection carrying a revision conflict", err)
+	}
+	if _, err := fixture.adapter.backend.ReleaseTerminalLease(context.Background(), fixture.principal, release); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("release after cancel at the browser boundary = %v", err)
+	}
+}
+
 func TestBrowserCancelOwnerFenceErrorIsNonRetryable(t *testing.T) {
 	fixture := newTerminalEffectFixture(t)
 	fixture.acquire(t, fixture.principal)
@@ -1353,16 +1397,6 @@ func TestProviderExitAndOwnerDeathFencePrivateBinding(t *testing.T) {
 		}
 		if _, err := fixture.adapter.daemon.terminalInput(context.Background(), fixture.principal, fixture.run.ID, fixture.session.ID, lease.Generation, 1, fixture.run.Revision, fixture.session.Revision, []byte("after exit")); !errors.Is(err, ErrTerminalEffectRejected) {
 			t.Fatalf("input after provider exit = %v", err)
-		}
-		// At the browser boundary a release the runner refuses is stale, not
-		// an internal fault, so a console that cancelled the run and then let
-		// go of its terminal keeps its session (#542).
-		release := browserprotocol.TerminalLeaseRelease{
-			RunID: fixture.run.ID.String(), SessionID: fixture.session.ID.String(), Generation: browserprotocol.Decimal(lease.Generation),
-			ExpectedRunRevision: decimalRevision(fixture.run.Revision), ExpectedSessionRevision: decimalRevision(fixture.session.Revision),
-		}
-		if _, err := fixture.adapter.backend.ReleaseTerminalLease(context.Background(), fixture.principal, release); !errors.Is(err, browser.ErrStale) {
-			t.Fatalf("release after provider exit = %v", err)
 		}
 	})
 
