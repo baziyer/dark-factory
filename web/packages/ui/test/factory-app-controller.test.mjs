@@ -645,3 +645,29 @@ test("one invitation is minted at a time and a dropped connection leaves no stal
   assert.equal(context.latest().remoteInvite, undefined);
   assert.equal(context.latest().remoteInviteAllowed, false);
 });
+
+test("closing the controller stops the run-paths timer", async (t) => {
+  mock.timers.enable({ apis: ["setInterval"] });
+  t.after(() => mock.timers.reset());
+  const asked = [];
+  const [servedProject] = [...fixtureState.projects.keys()];
+  const context = harness({
+    getRunPaths: async (agentId) => { asked.push(agentId); return { agentId, runId: "0a".repeat(16), paths: [] }; },
+    getTopology: async (id) => ({ projectId: id, digest: "ab".repeat(32), sourceRevision: "", nodes: [] }),
+  });
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+  context.controller.loadTopology();
+  context.controller.watchRunPaths(true);
+  await settle();
+  await settle();
+  mock.timers.tick(10_000);
+  await settle();
+  const before = asked.length;
+  assert.ok(before >= 1);
+  context.controller.close();
+  mock.timers.tick(30_000);
+  await settle();
+  assert.equal(asked.length, before);
+});

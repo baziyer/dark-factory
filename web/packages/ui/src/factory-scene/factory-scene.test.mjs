@@ -245,7 +245,8 @@ test("the committed sprite module is exactly what the generator writes", () => {
   const scratch = mkdtempSync(join(tmpdir(), "df-sprites-"));
   try {
     copyFileSync(new URL("gen-sprites.mjs", sprites), join(scratch, "gen-sprites.mjs"));
-    execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "ignore" });
+    // A failing generator reports its own assertion, not just a bad exit.
+    execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "pipe" });
     for (const name of ["sprites.png", "sprites.generated.ts", "preview.html"]) {
       assert.deepEqual(readFileSync(join(scratch, name)), readFileSync(new URL(name, sprites)), name);
     }

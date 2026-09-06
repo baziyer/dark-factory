@@ -71,9 +71,11 @@ func TestProviderDefaultsTreatUnreadableConfigurationAsUnknown(t *testing.T) {
 		{"codex model only under a profile", "codex", ".codex/config.toml", "[profiles.only]\nmodel = \"gpt-4\"\n"},
 		{"codex model too large for the wire", "codex", ".codex/config.toml", "model = \"" + strings.Repeat("m", browserprotocol.MaxAgentModelBytes+1) + "\"\n"},
 		{"codex multi-line string", "codex", ".codex/config.toml", "model = \"\"\"gpt-4\"\"\"\n"},
-		// readBoundedFile answers only for a bounded regular file. Each of
-		// these would otherwise be read whole, on a path a browser request
-		// reaches: "" means the case builds the path itself below.
+		// readBoundedFile answers only for a bounded regular file, on a path
+		// a browser request reaches. An oversized file would otherwise be
+		// read whole and a fifo would block; a directory os.ReadFile refuses
+		// by itself, so that case pins the answer rather than the guard.
+		// "" means the case builds the path itself below.
 		{"claude settings larger than the bound", "claude_code", ".claude/settings.json", `{"model":"gpt-6-astra","pad":"` + strings.Repeat("x", maxProviderConfigBytes) + `"}`},
 		{"codex config that is a directory", "codex", ".codex/config.toml", ""},
 		{"codex config that is a fifo", "codex", ".codex/config.toml", ""},
