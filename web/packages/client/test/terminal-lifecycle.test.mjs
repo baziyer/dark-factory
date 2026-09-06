@@ -1047,13 +1047,16 @@ test("a refused release outside a detach fences its generation and keeps observi
   assert.equal(context.fatals.length, 0);
   assert.equal(context.handle.writable, false);
   assert.throws(() => context.handle.sendInput(new Uint8Array([1])), /terminal lease required/);
-  // The refused generation is fenced: a later acquire answered with it is
-  // not a lease this client will ever type under.
+  // The fence: the daemon moves to the next generation when it clears a
+  // lease it refused to release, and this client must never type under that
+  // one either, so a later acquire answered with it is a protocol fault. The
+  // refused generation itself was already floored when it was acquired, so
+  // only the next one tells the fence apart from that floor.
   void context.handle.acquireInput().catch(() => undefined);
   const acquireFrame = lastControl(context.sent);
   assert.equal(acquireFrame.type, "TERMINAL_LEASE_ACQUIRE");
   assert.throws(() => context.handle.receive(serverFrame(encodeTerminalLeaseResult(acquireFrame.id, {
-    operation: "acquired", run_id: runId, session_id: sessionId, generation: 1n,
+    operation: "acquired", run_id: runId, session_id: sessionId, generation: 2n,
     expires_at_ms: BigInt(context.timer.now + 30_000), last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
   }))), ProtocolError);
 });
