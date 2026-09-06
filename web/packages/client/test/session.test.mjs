@@ -1719,6 +1719,9 @@ test("a verb the daemon does not know refuses that request alone", async () => {
   socket.reply(encodeServerControl({ type: "ERROR", id: ask.id, body: { code: "unsupported", retryable: false } }));
   await assert.rejects(pending, (error) => error instanceof SessionError && error.code === "unsupported" && !error.retryable);
   assert.equal(session.status, "ready");
+  session.close();
+});
+
 test("without administration the account verbs are refused before anything is sent", async () => {
   const grant = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
   let socket;
