@@ -101,11 +101,15 @@ func TestBuildOrchestratorClaudeIsGivenTheMaintainerBridge(t *testing.T) {
 	if err := os.WriteFile(bridge, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	resolvedBridge, err := filepath.EvalSymlinks(bridge)
+	if err != nil {
+		t.Fatal(err)
+	}
 	launch, err := Build(roleRequestFor(t, kernel.ProviderClaudeCode, installation, runtime, "", "", kernel.RoleOrchestrator))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{"maintainer":{"command":"` + bridge + `"}}}`}
+	want := []string{"/usr/bin/true", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{"maintainer":{"command":"` + resolvedBridge + `"}}}`}
 	if !reflect.DeepEqual(launch.Argv(), want) {
 		t.Fatalf("orchestrator argv = %q, want %q", launch.Argv(), want)
 	}
