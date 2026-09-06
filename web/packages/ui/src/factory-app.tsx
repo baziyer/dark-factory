@@ -187,7 +187,7 @@ export function AgentInstruction({
   if (terminal.queued) return <p className="dfFactoryConsole__instructionState">QUEUED</p>;
   const errorCopy = terminal.instructionError === undefined
     ? undefined
-    : ["invalid_request", "unauthorized", "stale", "too_large", "rate_limited", "not_found", "crypto_unavailable"].includes(terminal.instructionError.code)
+    : ["invalid_request", "unauthorized", "stale", "too_large", "rate_limited", "not_found", "crypto_unavailable", "unsupported"].includes(terminal.instructionError.code)
       ? "NOT SENT"
       : "SEND NOT CONFIRMED — CHECK TASKS BEFORE RETRYING";
   return (

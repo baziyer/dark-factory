@@ -151,6 +151,10 @@ const (
 	ErrorStale          ErrorCode = "stale"
 	ErrorTooLarge       ErrorCode = "too_large"
 	ErrorInternal       ErrorCode = "internal"
+	// ErrorUnsupported answers a control type this build does not know. The
+	// peer is newer, not wrong, so the refusal names the request and the
+	// connection stays open for everything else.
+	ErrorUnsupported ErrorCode = "unsupported"
 )
 
 // ControlFrame is the decoded, closed union. Body is always one of the
@@ -162,8 +166,9 @@ type ControlFrame struct {
 }
 
 var (
-	ErrMalformed = errors.New("browser protocol: malformed control frame")
-	ErrOversized = errors.New("browser protocol: control frame too large")
+	ErrMalformed   = errors.New("browser protocol: malformed control frame")
+	ErrOversized   = errors.New("browser protocol: control frame too large")
+	ErrUnsupported = errors.New("browser protocol: unsupported control type")
 )
 
 // The envelope carries no generation. The contract is unversioned by owner
@@ -307,6 +312,12 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		return ControlFrame{}, ErrMalformed
 	}
 	if !typeAllowed(role, envelope.Type) {
+		if !typeAllowed(clientRole, envelope.Type) && !typeAllowed(serverRole, envelope.Type) {
+			// A type neither direction knows is additive evolution on the
+			// other side. The frame comes back with its identity so the
+			// caller can refuse exactly that request.
+			return ControlFrame{Type: envelope.Type, ID: id}, ErrUnsupported
+		}
 		return ControlFrame{}, ErrMalformed
 	}
 	var body any
@@ -976,7 +987,7 @@ func validateCapabilities(value Capabilities) error {
 
 func validateError(value Error) error {
 	switch value.Code {
-	case ErrorUnauthorized, ErrorInvalidRequest, ErrorRateLimited, ErrorNotFound, ErrorStale, ErrorTooLarge, ErrorInternal:
+	case ErrorUnauthorized, ErrorInvalidRequest, ErrorRateLimited, ErrorNotFound, ErrorStale, ErrorTooLarge, ErrorInternal, ErrorUnsupported:
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown error code %q", ErrMalformed, value.Code)

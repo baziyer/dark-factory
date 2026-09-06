@@ -28,6 +28,7 @@ const EDIT_ERRORS = new Map<string, string>([
   ["too_large", "TOO LONG"],
   ["rate_limited", "TOO MANY EDITS AT ONCE"],
   ["unauthorized", "THIS BROWSER MAY NOT EDIT"],
+  ["unsupported", "THE FACTORY DOES NOT SUPPORT THIS YET"],
 ]);
 
 function editErrorCopy(edit: FactoryEditView | undefined): string | undefined {

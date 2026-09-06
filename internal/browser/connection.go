@@ -288,7 +288,7 @@ func (current *connection) serve() {
 				return
 			}
 			frame, err := browserprotocol.DecodeClientControl(message.data)
-			if err != nil {
+			if err != nil && !errors.Is(err, browserprotocol.ErrUnsupported) {
 				current.sendError("", browserprotocol.ErrorInvalidRequest, false)
 				return
 			}
@@ -656,6 +656,11 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 		current.subscriptionID = frame.ID
 		current.subscriptionHead = body.AfterHead
 		current.subscriptionHeadSet = true
+		return true
+	case nil:
+		// An unknown type still spends a request id and the budget, and is
+		// refused by that id; the console degrades that feature alone.
+		current.sendError(frame.ID, browserprotocol.ErrorUnsupported, false)
 		return true
 	default:
 		current.sendError(frame.ID, browserprotocol.ErrorInvalidRequest, false)

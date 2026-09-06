@@ -216,6 +216,26 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 // keeps working; a frame the transport itself refuses ends the connection.
 // Observing only one of them would let the backend route become the harsh one
 // without anything noticing.
+func TestUnknownControlTypeIsRefusedByIDAndKeepsTheConnection(t *testing.T) {
+	server := startTaskServer(t, newConsoleDispatchBackend())
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+	writeClientFrame(t, connection, []byte(`{"type":"ACCOUNTS_USAGE_GET","id":"console-future","body":{"account_id":"x"}}`))
+	reply := readServerFrame(t, connection)
+	assertError(t, reply, browserprotocol.ErrorUnsupported)
+	if reply.ID != "console-future" || reply.Body.(browserprotocol.Error).Retryable {
+		t.Fatalf("unsupported reply = %+v", reply)
+	}
+	// The socket is still open and the verbs this build knows still work.
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeAgentUpdate)))
+	if reply := readServerFrame(t, connection); reply.Type != browserprotocol.TypeAgentUpdateResult {
+		t.Fatalf("known request after unsupported = %+v", reply)
+	}
+	// The refusal spent the id: repeating it is the transport's invalid_request.
+	writeClientFrame(t, connection, []byte(`{"type":"ACCOUNTS_USAGE_GET","id":"console-future","body":{}}`))
+	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
+}
+
 func TestConsoleInvalidRequestKeepsTheConnectionTheTransportWouldClose(t *testing.T) {
 	backend := newConsoleDispatchBackend()
 	backend.err = ErrInvalidRequest

@@ -104,6 +104,7 @@ export const ERROR_CODES = [
   "stale",
   "too_large",
   "internal",
+  "unsupported",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 

@@ -725,20 +725,24 @@ func TestServerServesFramesCarryingUnknownMembers(t *testing.T) {
 	}
 }
 
-// Only members are tolerated. An unknown frame type and a server-direction
-// frame arriving from a client stay finite refusals.
+// Only members are tolerated silently. An unknown frame type is refused by
+// name as unsupported; a server-direction frame arriving from a client is a
+// violation. Neither reaches the backend.
 func TestServerRefusesUnknownTypesAndWrongDirection(t *testing.T) {
-	for name, payload := range map[string]string{
-		"unknown type":    `{"type":"STATE_FUTURE","id":"x","body":{}}`,
-		"wrong direction": `{"type":"STATE_CHANGED","id":"x","body":{"head":"8"}}`,
+	for name, test := range map[string]struct {
+		payload string
+		code    browserprotocol.ErrorCode
+	}{
+		"unknown type":    {`{"type":"STATE_FUTURE","id":"x","body":{}}`, browserprotocol.ErrorUnsupported},
+		"wrong direction": {`{"type":"STATE_CHANGED","id":"x","body":{"head":"8"}}`, browserprotocol.ErrorInvalidRequest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			backend := newFakeBackend()
 			server := startServer(t, backend)
 			connection, _ := dialServer(t, server, testOrigin)
 			authenticate(t, connection)
-			writeClientFrame(t, connection, []byte(payload))
-			assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
+			writeClientFrame(t, connection, []byte(test.payload))
+			assertError(t, readServerFrame(t, connection), test.code)
 			backend.mu.Lock()
 			calls := backend.stateCalls
 			backend.mu.Unlock()

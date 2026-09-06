@@ -68,6 +68,7 @@ const ERROR_LABELS = new Map<string, string>([
   ["stale", "The requested state is stale."],
   ["too_large", "The request was too large."],
   ["internal", "The server could not complete the request."],
+  ["unsupported", "The factory does not support this request yet."],
 ]);
 
 /** One screen: the floor or the agents on the left, what needs you on the right. */

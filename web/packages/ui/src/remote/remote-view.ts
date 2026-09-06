@@ -80,6 +80,7 @@ const REFUSED = new Set([
   "rate_limited",
   "not_found",
   "crypto_unavailable",
+  "unsupported",
 ]);
 
 function errorCode(error: unknown): string | undefined {
