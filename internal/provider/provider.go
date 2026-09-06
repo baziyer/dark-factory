@@ -337,7 +337,7 @@ func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
 	} else if len(bytes.TrimSpace(raw)) > 0 {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.UseNumber()
-		if err := decoder.Decode(&config); err != nil {
+		if err := decoder.Decode(&config); err != nil || config == nil {
 			return errClaudeConfiguration
 		}
 	}

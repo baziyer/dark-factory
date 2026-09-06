@@ -536,16 +536,22 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 	if err := TrustClaudeDirectory(runtime, "relative/change"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("relative working directory = %v, want ErrInvalid", err)
 	}
-	// An empty file is a home with no login yet, like a missing one.
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
-		t.Fatalf("empty file: %v", err)
+	// An empty or whitespace-only file is a home with no login yet, like a
+	// missing one, and gets the record.
+	for name, content := range map[string]string{"empty": "", "whitespace": " \n\t\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := TrustClaudeDirectory(runtime, "/private/change"); err != nil {
+			t.Fatalf("%s file: %v", name, err)
+		}
+		if recorded, err := os.ReadFile(path); err != nil || !bytes.Contains(recorded, []byte(`"/private/change":{"hasTrustDialogAccepted":true}`)) {
+			t.Fatalf("%s file record = %s, %v", name, recorded, err)
+		}
 	}
 	// A file that is not JSON, or whose projects are not the CLI's shape, is
 	// refused without its path in the error rather than rewritten.
-	for name, content := range map[string]string{"not JSON": "{", "projects not an object": `{"projects":[]}`, "project not an object": `{"projects":{"/private/change":true}}`} {
+	for name, content := range map[string]string{"not JSON": "{", "null": "null", "projects not an object": `{"projects":[]}`, "project not an object": `{"projects":{"/private/change":true}}`} {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
