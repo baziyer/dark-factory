@@ -23,6 +23,7 @@ type consoleDispatchBackend struct {
 	err      error
 	calls    int
 	walking  chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
+	budgets  []time.Time   // each walk's context deadline, in the order the walks started
 }
 
 func newConsoleDispatchBackend() *consoleDispatchBackend {
@@ -87,9 +88,11 @@ func (backend *consoleDispatchBackend) RunPaths(ctx context.Context, client [bro
 	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
 }
 
-func (backend *consoleDispatchBackend) walk(context.Context) error {
+func (backend *consoleDispatchBackend) walk(ctx context.Context) error {
 	backend.mu.Lock()
 	walking := backend.walking
+	deadline, _ := ctx.Deadline()
+	backend.budgets = append(backend.budgets, deadline)
 	backend.mu.Unlock()
 	if walking != nil {
 		<-walking
@@ -247,26 +250,49 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 // ends it the way dispatch would.
 func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
 	backend := newConsoleDispatchBackend()
-	backend.walking = make(chan struct{})
+	first := make(chan struct{})
+	backend.walking = first
 	server, clock := startHeldClockServer(t, backend)
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
 	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
 	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeRunPathsGet)))
-	// Both walks are still blocked; a state read on the same connection is
-	// answered anyway.
+	// The first walk is blocked and the second waits behind it; a state read
+	// on the same connection is answered anyway.
 	state, _ := browserprotocol.EncodeStateGet("state-during-walk", browserprotocol.StateGet{})
 	writeClientFrame(t, connection, state)
 	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot {
 		t.Fatalf("state during walks = %+v", frame)
 	}
-	close(backend.walking)
-	got := map[browserprotocol.MessageType]bool{}
-	for range 2 {
-		got[readServerFrame(t, connection).Type] = true
+	// Each walk's budget starts with its work, not when its frame arrived:
+	// the first walk is held for a spell, and the second, released on its
+	// own, carries a deadline at least that much later. A budget taken at
+	// dispatch would put the two deadlines a frame apart.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if now, _ := backend.observed(); now >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first walk never started")
+		}
 	}
-	if !got[browserprotocol.TypeTopology] || !got[browserprotocol.TypeRunPaths] {
-		t.Fatalf("walk answers = %v", got)
+	const hold = 50 * time.Millisecond
+	second := make(chan struct{})
+	backend.setWalking(second)
+	time.Sleep(hold)
+	close(first)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTopology {
+		t.Fatalf("first walk answer = %+v", frame)
+	}
+	close(second)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeRunPaths {
+		t.Fatalf("second walk answer = %+v", frame)
+	}
+	backend.mu.Lock()
+	budgets := append([]time.Time(nil), backend.budgets...)
+	backend.mu.Unlock()
+	if len(budgets) != 2 || budgets[1].Sub(budgets[0]) < hold {
+		t.Fatalf("walk budgets = %v; the second should start at least %v after the first", budgets, hold)
 	}
 	// The backend refusal path still ends the connection as dispatch would.
 	backend.setWalking(nil)
