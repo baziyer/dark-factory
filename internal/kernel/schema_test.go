@@ -161,7 +161,7 @@ func TestOpenRejectsForeignPathsWithoutModification(t *testing.T) {
 func TestOpenRejectsUnknownVersionAndPartialIdentity(t *testing.T) {
 	for name, mutate := range map[string]func(*testing.T, *sql.DB){
 		"unknown version": func(t *testing.T, raw *sql.DB) {
-			if _, err := raw.Exec(`PRAGMA user_version = 2`); err != nil {
+			if _, err := raw.Exec(`PRAGMA user_version = 3`); err != nil {
 				t.Fatal(err)
 			}
 		},

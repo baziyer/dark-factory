@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 1
+	userVersion   = 2
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -329,22 +329,24 @@ type schemaObject struct {
 	sql  string
 }
 
-func expectedSchema() map[string]schemaObject {
-	result := make(map[string]schemaObject, len(schemaStatements))
-	for _, statement := range schemaStatements {
-		fields := strings.Fields(statement)
-		kind := "table"
-		nameAt := 2
-		if fields[1] == "UNIQUE" {
-			kind = "index"
-			nameAt = 3
-		} else if fields[1] == "INDEX" {
-			kind = "index"
-		}
-		name := fields[nameAt]
+func expectedSchemaOf(statements []string) map[string]schemaObject {
+	result := make(map[string]schemaObject, len(statements))
+	for _, statement := range statements {
+		kind, name := schemaObjectIdentity(statement)
 		result[name] = schemaObject{kind: kind, name: name, sql: strings.TrimSpace(statement)}
 	}
 	return result
+}
+
+func schemaObjectIdentity(statement string) (string, string) {
+	fields := strings.Fields(statement)
+	kind, nameAt := "table", 2
+	if fields[1] == "UNIQUE" {
+		kind, nameAt = "index", 3
+	} else if fields[1] == "INDEX" {
+		kind = "index"
+	}
+	return kind, fields[nameAt]
 }
 
 func inspectIdentity(ctx context.Context, connection *sql.Conn) (int, int, error) {
@@ -359,15 +361,19 @@ func inspectIdentity(ctx context.Context, connection *sql.Conn) (int, int, error
 }
 
 func validateExactSchema(ctx context.Context, connection *sql.Conn) error {
+	return validateSchemaVersion(ctx, connection, userVersion, schemaStatements)
+}
+
+func validateSchemaVersion(ctx context.Context, connection *sql.Conn, wantVersion int, statements []string) error {
 	appID, version, err := inspectIdentity(ctx, connection)
 	if err != nil {
 		return err
 	}
-	if appID != applicationID || version != userVersion {
+	if appID != applicationID || version != wantVersion {
 		return fmt.Errorf("%w: application_id=%#x user_version=%d", ErrForeignDatabase, appID, version)
 	}
 
-	expected := expectedSchema()
+	expected := expectedSchemaOf(statements)
 	rows, err := connection.QueryContext(ctx, `SELECT type, name, sql FROM sqlite_schema WHERE NOT (`+internalSchemaNamePredicate+`) ORDER BY type, name`)
 	if err != nil {
 		return fmt.Errorf("read sqlite schema: %w", err)
