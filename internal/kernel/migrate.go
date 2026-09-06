@@ -47,7 +47,11 @@ const (
 )
 
 // legacySchemaStatements is the exact v1 schema: the current one without the
-// accounts objects and with the two frozen definitions substituted.
+// accounts objects and with the two frozen definitions substituted. Every other
+// statement is read live from schemaStatements, so editing any of them silently
+// changes what this claims v1 was and stops recognising real v1 homes. The next
+// schema change has to freeze the text it replaces here and extend the
+// migration, in the same change; TestLegacySchemaIsPinned fails until it does.
 func legacySchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
 	for _, statement := range schemaStatements {
@@ -82,7 +86,13 @@ func validateOpenableSnapshot(ctx context.Context, connection *sql.Conn) error {
 
 // migrateLegacy upgrades an exact v1 home to the current schema in one
 // transaction, or leaves the database byte-untouched and refuses. Open calls it
-// before the store is published, so it is the only writer.
+// before the store is published, so it is the only writer. One case is neither:
+// if restoring foreign key enforcement fails after the commit, the home is
+// migrated and this open is still refused, because a connection that cannot
+// enforce foreign keys must not serve the daemon. The next open then finds a v2
+// home and nothing to migrate. The migration is one way -- a build from before
+// it refuses user_version 2 -- so the rollback plan for an operator home is the
+// .backup copy taken before the upgrade.
 func (store *Store) migrateLegacy(ctx context.Context) error {
 	connection, err := store.writerConnection(ctx)
 	if err != nil {

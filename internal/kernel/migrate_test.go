@@ -2,11 +2,14 @@ package kernel
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ncruces/go-sqlite3"
@@ -321,5 +324,88 @@ func requireLegacyPopulation(t *testing.T, ctx context.Context, connection *sql.
 	}
 	if projects < 1 || agents < 3 || providers != 3 || tasks < 1 || runs < 1 || kinds != 7 {
 		t.Fatalf("thin fixture: projects=%d agents=%d providers=%d tasks=%d runs=%d invalidation kinds=%d", projects, agents, providers, tasks, runs, kinds)
+	}
+}
+
+// TestLegacySchemaIsPinned trips on any schema edit, because
+// legacySchemaStatements derives every unchanged statement from
+// schemaStatements: a new statement there would rewrite what v1 is claimed to
+// have been, and real v1 homes would stop opening. Re-pinning this digest
+// without freezing the replaced text and extending the migration ships the
+// outage this migration exists to fix.
+func TestLegacySchemaIsPinned(t *testing.T) {
+	const pinned = "63a444a2fe57a994b712bfe5b56764d684b2cb3ed73d7324465d894107f96f33"
+	digest := sha256.Sum256([]byte(strings.Join(legacySchemaStatements(), "\n")))
+	if got := hex.EncodeToString(digest[:]); got != pinned {
+		t.Fatalf("v1 schema digest = %s, want %s", got, pinned)
+	}
+}
+
+// TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses is the only refusal
+// that reaches inside the migration transaction: the two above are rejected by
+// the preflight, on its disposable copy, before any pool exists.
+func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
+	ctx := context.Background()
+	// An invalidation head that no longer matches the log passes the exact
+	// schema, the integrity check and foreign_key_check that the preflight
+	// runs, and fails only the durable-control pass inside the transaction.
+	path, before := newLegacyDatabase(t, false, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
+	evidence := captureDatabaseEvidence(t, path)
+	store, err := Open(ctx, path)
+	if store != nil {
+		store.Close()
+	}
+	if !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("Open = %v, want ErrCorruptState", err)
+	}
+	assertDatabaseEvidenceUnchanged(t, path, evidence)
+	requireUnmigrated(t, path)
+
+	// Repaired, the same home migrates and keeps the rows it always had.
+	pool, connection := openRawDatabase(t, path, false)
+	if _, err := connection.ExecContext(ctx, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence - 5 WHERE singleton = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(connection.Close(), pool.Close()); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open repaired home: %v", err)
+	}
+	defer repaired.Close()
+	reader, err := repaired.readerConnection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, version, err := inspectIdentity(ctx, reader); err != nil || version != userVersion {
+		t.Fatalf("repaired user_version = %d, %v, want %d", version, err, userVersion)
+	}
+	after := snapshotRows(t, ctx, reader)
+	before["factory"] = after["factory"] // the repair rewrote the invalidation head
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("migration after repair did not preserve every row")
+	}
+}
+
+// TestRefusedMigrationReturnsTheWriterConnection covers what the rollback is
+// for. Closing the connection would roll the transaction back anyway, but a
+// connection left mid-transaction is destroyed rather than returned, and the
+// operational writer set is sealed at activation and cannot mint a
+// replacement.
+func TestRefusedMigrationReturnsTheWriterConnection(t *testing.T) {
+	ctx := context.Background()
+	path, _ := newLegacyDatabase(t, false, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
+	store, err := openPools(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.migrateLegacy(ctx); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("migrateLegacy = %v, want ErrCorruptState", err)
+	}
+	if stats := store.writer.Stats(); stats.OpenConnections != 1 || stats.Idle != 1 {
+		t.Fatalf("refused migration did not return the writer connection: open=%d idle=%d", stats.OpenConnections, stats.Idle)
 	}
 }
