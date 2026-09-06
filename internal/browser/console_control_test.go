@@ -21,6 +21,7 @@ type consoleDispatchBackend struct {
 	account  browserprotocol.AccountLinkResult
 	err      error
 	calls    int
+	walking  chan struct{} // when set, Topology and RunPaths block until it is closed
 }
 
 func newConsoleDispatchBackend() *consoleDispatchBackend {
@@ -65,18 +66,39 @@ func (backend *consoleDispatchBackend) UpdateTask(_ context.Context, client [bro
 	return backend.task, nil
 }
 
-func (backend *consoleDispatchBackend) Topology(_ context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.TopologyGet) (browserprotocol.Topology, error) {
+func (backend *consoleDispatchBackend) Topology(ctx context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.TopologyGet) (browserprotocol.Topology, error) {
 	if err := backend.record(client); err != nil {
+		return browserprotocol.Topology{}, err
+	}
+	if err := backend.walk(ctx); err != nil {
 		return browserprotocol.Topology{}, err
 	}
 	return backend.topology, nil
 }
 
-func (backend *consoleDispatchBackend) RunPaths(_ context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
+func (backend *consoleDispatchBackend) RunPaths(ctx context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error) {
 	if err := backend.record(client); err != nil {
 		return browserprotocol.RunPaths{}, err
 	}
+	if err := backend.walk(ctx); err != nil {
+		return browserprotocol.RunPaths{}, err
+	}
 	return browserprotocol.RunPaths{AgentID: request.AgentID, Paths: []string{}}, nil
+}
+
+func (backend *consoleDispatchBackend) walk(ctx context.Context) error {
+	backend.mu.Lock()
+	walking := backend.walking
+	backend.mu.Unlock()
+	if walking == nil {
+		return nil
+	}
+	select {
+	case <-walking:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
@@ -209,6 +231,46 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 	}
 	t.Fatalf("no console frame for %s", kind)
 	return ""
+}
+
+// TOPOLOGY_GET and RUN_PATHS_GET may walk a tree under the call budget. The
+// connection keeps serving while they do, and a refusal from that path still
+// ends it the way dispatch would.
+func TestTreeWalksDoNotStallTheConnection(t *testing.T) {
+	backend := newConsoleDispatchBackend()
+	backend.walking = make(chan struct{})
+	server := startTaskServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeTopologyGet)))
+	writeClientFrame(t, connection, []byte(consoleFrame(t, browserprotocol.TypeRunPathsGet)))
+	// Both walks are still blocked; a state read on the same connection is
+	// answered anyway.
+	state, _ := browserprotocol.EncodeStateGet("state-during-walk", browserprotocol.StateGet{})
+	writeClientFrame(t, connection, state)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot {
+		t.Fatalf("state during walks = %+v", frame)
+	}
+	close(backend.walking)
+	got := map[browserprotocol.MessageType]bool{}
+	for range 2 {
+		got[readServerFrame(t, connection).Type] = true
+	}
+	if !got[browserprotocol.TypeTopology] || !got[browserprotocol.TypeRunPaths] {
+		t.Fatalf("walk answers = %v", got)
+	}
+	// A walk still running when the client leaves is joined, not leaked: the
+	// connection count test proves the goroutines; here the backend refusal
+	// path still ends the connection as dispatch would.
+	backend.walking = nil
+	backend.err = ErrUnauthorized
+	writeClientFrame(t, connection, []byte(strings.Replace(consoleFrame(t, browserprotocol.TypeTopologyGet), "console-topology", "console-topology-2", 1)))
+	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorUnauthorized)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := connection.Read(ctx); err == nil || ctx.Err() != nil {
+		t.Fatalf("unauthorized walk left the connection open: err=%v ctx=%v", err, ctx.Err())
+	}
 }
 
 // A verb this build does not know is refused by its id and nothing else

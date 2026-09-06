@@ -17,6 +17,11 @@ const (
 	subscriptionCloseLimit = time.Second
 )
 
+// requestWindow is how long a request id is remembered. The budget is
+// maxRequests per window rather than per connection, so a console left open
+// for days keeps its socket; a repeated id inside the window is still refused.
+var requestWindow = time.Minute
+
 var (
 	errBackendResult             = errors.New("browser: invalid backend result")
 	errInvalidTerminalAttachment = errors.New("browser: invalid terminal attachment")
@@ -47,6 +52,8 @@ type connection struct {
 	authenticating      bool
 	authenticatingID    [browserprotocol.ClientIDSize]byte
 	seen                map[string]struct{}
+	recent              []request
+	background          sync.WaitGroup
 	subscription        StateSubscription
 	updates             <-chan StateUpdate
 	subscriptionID      string
@@ -62,6 +69,30 @@ type connection struct {
 	terminalSent      uint64
 	terminalPending   *TerminalEvent
 	terminalAckTimer  *time.Timer
+}
+
+type request struct {
+	id string
+	at time.Time
+}
+
+// admit spends one slot of the sliding window on id, forgetting ids older
+// than the window first. Only the serve goroutine calls it.
+func (current *connection) admit(id string) error {
+	now := time.Now()
+	for len(current.recent) > 0 && now.Sub(current.recent[0].at) >= requestWindow {
+		delete(current.seen, current.recent[0].id)
+		current.recent = current.recent[1:]
+	}
+	if _, duplicate := current.seen[id]; duplicate {
+		return ErrInvalidRequest
+	}
+	if len(current.recent) >= maxRequests {
+		return ErrRateLimited
+	}
+	current.seen[id] = struct{}{}
+	current.recent = append(current.recent, request{id: id, at: now})
+	return nil
 }
 
 func (current *connection) stop() {
@@ -85,6 +116,7 @@ func (current *connection) run() {
 			current.recordCleanup(err)
 		}
 		current.stop()
+		current.background.Wait()
 		if readerStarted {
 			<-readerDone
 		}
@@ -155,7 +187,8 @@ func (current *connection) authenticate(identity Identity, nonce [browserprotoco
 			current.sendError("", browserprotocol.ErrorUnauthorized, false)
 			return false
 		}
-		current.seen = map[string]struct{}{frame.ID: {}}
+		current.seen = map[string]struct{}{}
+		_ = current.admit(frame.ID) // the first id of an empty window is always admitted
 		result, requested, tracked, err := current.prove(authContext, identity, nonce, frame)
 		accept := err == nil && authContext.Err() == nil && validateAuthentication(result) == nil
 		if accept {
@@ -302,15 +335,16 @@ func (current *connection) serve() {
 				}
 				continue
 			}
-			if _, duplicate := current.seen[frame.ID]; duplicate {
-				current.sendError(frame.ID, browserprotocol.ErrorInvalidRequest, false)
+			if err := current.admit(frame.ID); err != nil {
+				mapped := errorFrame(err)
+				current.sendError(frame.ID, mapped.Code, mapped.Retryable)
+				if errors.Is(err, ErrRateLimited) {
+					// The window admits the client again shortly; only a
+					// repeated id is a violation that ends the connection.
+					continue
+				}
 				return
 			}
-			if len(current.seen) >= maxRequests {
-				current.sendError(frame.ID, browserprotocol.ErrorRateLimited, true)
-				return
-			}
-			current.seen[frame.ID] = struct{}{}
 			if !current.dispatch(frame) {
 				return
 			}
@@ -428,50 +462,16 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeTaskUpdateResult(frame.ID, result)
-	case browserprotocol.TopologyGet:
-		if current.server.consoleBackend == nil {
-			err = ErrUnauthorized
-			break
-		}
-		result, backendErr := current.server.consoleBackend.Topology(ctx, current.principal.ClientID, body)
-		if backendErr != nil {
-			err = backendErr
-			break
-		}
-		if result.ProjectID != body.ProjectID {
-			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
-			return false
-		}
-		encoded, encodeErr := browserprotocol.EncodeTopology(frame.ID, result)
-		if encodeErr != nil {
-			// Topology shares the snapshot byte bound, so an oversized one is
-			// the same finite too_large answer a snapshot gives.
-			if errors.Is(encodeErr, browserprotocol.ErrOversized) {
-				err = ErrTooLarge
-				break
-			}
-			err = encodeErr
-			break
-		}
-		if current.writeSnapshot(encoded) != nil {
-			return false
-		}
+	case browserprotocol.TopologyGet, browserprotocol.RunPathsGet:
+		// Both may walk a tree under the call budget. That must not hold up
+		// state and terminal frames, so they answer from their own goroutine;
+		// the websocket permits concurrent writes.
+		current.background.Add(1)
+		go func() {
+			defer current.background.Done()
+			current.observe(frame)
+		}()
 		return true
-	case browserprotocol.RunPathsGet:
-		if current.server.consoleBackend == nil {
-			err = ErrUnauthorized
-			break
-		}
-		result, backendErr := current.server.consoleBackend.RunPaths(ctx, current.principal.ClientID, body)
-		if backendErr != nil {
-			err = backendErr
-			break
-		}
-		if result.AgentID != body.AgentID {
-			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
-			return false
-		}
-		payload, err = browserprotocol.EncodeRunPaths(frame.ID, result)
 	case browserprotocol.AccountsDiscover:
 		if current.server.consoleBackend == nil {
 			err = ErrUnauthorized
@@ -999,6 +999,64 @@ func stopSubscription(subscription StateSubscription) error {
 		return nil
 	case <-timer.C:
 		return ErrSubscriptionUnresolved
+	}
+}
+
+// observe answers TOPOLOGY_GET and RUN_PATHS_GET off the serve goroutine. It
+// reads only members that are fixed once authenticated, and it ends the
+// connection the same way dispatch would: on an unauthorized refusal, a
+// backend result that does not match the request, or a failed write.
+func (current *connection) observe(frame browserprotocol.ControlFrame) {
+	ctx, cancel := context.WithTimeout(current.ctx, backendCallLimit)
+	defer cancel()
+	var payload []byte
+	var err error
+	write := current.write
+	switch body := frame.Body.(type) {
+	case browserprotocol.TopologyGet:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		var result browserprotocol.Topology
+		if result, err = current.server.consoleBackend.Topology(ctx, current.principal.ClientID, body); err != nil {
+			break
+		}
+		if result.ProjectID != body.ProjectID {
+			err = errBackendResult
+			break
+		}
+		// Topology shares the snapshot byte bound, so an oversized one is the
+		// same finite too_large answer a snapshot gives.
+		write = current.writeSnapshot
+		if payload, err = browserprotocol.EncodeTopology(frame.ID, result); errors.Is(err, browserprotocol.ErrOversized) {
+			err = ErrTooLarge
+		}
+	case browserprotocol.RunPathsGet:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		var result browserprotocol.RunPaths
+		if result, err = current.server.consoleBackend.RunPaths(ctx, current.principal.ClientID, body); err != nil {
+			break
+		}
+		if result.AgentID != body.AgentID {
+			err = errBackendResult
+			break
+		}
+		payload, err = browserprotocol.EncodeRunPaths(frame.ID, result)
+	}
+	if err != nil {
+		mapped := errorFrame(err)
+		current.sendError(frame.ID, mapped.Code, mapped.Retryable)
+		if errors.Is(err, ErrUnauthorized) || errors.Is(err, errBackendResult) {
+			current.stop()
+		}
+		return
+	}
+	if write(payload) != nil {
+		current.stop()
 	}
 }
 

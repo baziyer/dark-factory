@@ -28,9 +28,9 @@ const (
 	maxOrigins     = 8
 	maxConnections = 32
 	// One coherent snapshot is one request, and a notification burst
-	// collapses into at most one trailing refresh. 1,024 retains every
-	// request ID for the whole connection while leaving ample room for
-	// refreshes, detail reads, terminal control and task enqueue.
+	// collapses into at most one trailing refresh. 1,024 per requestWindow
+	// leaves ample room for refreshes, detail reads, terminal control, task
+	// enqueue and the floor's run-path and topology polling.
 	maxRequests         = 1024
 	readQueueSize       = 8
 	maxHeaderBytes      = 8 << 10

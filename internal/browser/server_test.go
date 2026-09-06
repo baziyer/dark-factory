@@ -881,13 +881,17 @@ func TestDuplicateRequestIDAndConnectionLimit(t *testing.T) {
 	})
 }
 
-func TestLifetimeRequestBudgetRemainsFinite(t *testing.T) {
+func TestRequestBudgetIsASlidingWindow(t *testing.T) {
+	window := requestWindow
+	requestWindow = 300 * time.Millisecond
+	t.Cleanup(func() { requestWindow = window })
 	backend := newFakeBackend()
 	server := startServer(t, backend)
 	connection, _ := dialServer(t, server, testOrigin)
 	authenticate(t, connection)
-	// Authentication consumes one retained ID. Exactly maxRequests-1 distinct
-	// operations may then complete; the next is rejected without backend work.
+	// Authentication consumes one ID of the window. Exactly maxRequests-1
+	// distinct operations may then complete; the next is rejected without
+	// backend work.
 	for index := 0; index < maxRequests-1; index++ {
 		request, _ := browserprotocol.EncodeStateGet(fmt.Sprintf("request-%d", index), browserprotocol.StateGet{})
 		writeClientFrame(t, connection, request)
@@ -907,6 +911,15 @@ func TestLifetimeRequestBudgetRemainsFinite(t *testing.T) {
 	backend.mu.Unlock()
 	if calls != maxRequests-1 {
 		t.Fatalf("over-budget request reached backend: calls=%d", calls)
+	}
+	// The refusal spent nothing and closed nothing. Once the window has
+	// passed the same connection has budget again, and the id it refused is
+	// admitted like any other.
+	time.Sleep(requestWindow)
+	request, _ = browserprotocol.EncodeStateGet("over-budget", browserprotocol.StateGet{})
+	writeClientFrame(t, connection, request)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeStateSnapshot || frame.ID != "over-budget" {
+		t.Fatalf("request after the window = %+v", frame)
 	}
 }
 
