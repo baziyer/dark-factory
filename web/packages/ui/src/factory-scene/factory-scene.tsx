@@ -57,7 +57,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
   const staged = workItems.filter((item) => item.stage === "staged").length;
   const ready = workItems.length - staged;
   // A wide column must not blow 16px frames up to poster size: the scene stops
-  // at three device pixels per sheet pixel and centres in whatever is left.
+  // at three CSS pixels per sheet pixel and centres in whatever is left.
   const maxWidth = layout.width * 3;
 
   return (
@@ -133,8 +133,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         const room = placement.roomId === undefined ? undefined : nodes.get(placement.roomId);
         const location = room === undefined ? "unassigned" : room.label;
         const frame = workerFrame(worker);
-        // The second frame sits on top and blinks in; without it, and under
-        // reduced motion, frame zero is all that shows.
+        // Complementary steps replace the whole pose; holes reveal the floor.
         const alternate = alternateFrame(frame);
         return (
           <g
@@ -146,7 +145,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
             {...(onSelectWorker === undefined ? {} : { onClick: () => onSelectWorker(worker.id), style: { cursor: "pointer" } })}
           >
             <title>{worker.name}</title>
-            <Frame name={frame} x={-8} y={-8} />
+            <Frame name={frame} x={-8} y={-8} className={alternate === undefined ? undefined : "dfFactoryScene__primary"} />
             {alternate === undefined ? null : <Frame name={alternate} x={-8} y={-8} className="dfFactoryScene__alternate" />}
           </g>
         );

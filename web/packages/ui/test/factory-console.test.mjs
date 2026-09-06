@@ -49,8 +49,13 @@ test("error banner keeps its centered layout after the paragraph reset", () => {
   // The sidebar is a sibling of the console, so it needs the same reset.
   assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),\s*\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
-  // The floor's sprite flip is CSS so that reduced motion can stop it dead.
-  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?dfFactoryScene__alternate \{ animation: none/);
+  // Each animation toggles visibility of a complete pose; reduced motion keeps
+  // the primary frame visible and never leaves a stale frame underneath.
+  assert.match(css, /\.dfFactoryScene__primary \{ opacity: 1; animation: dfFactorySceneHide 1\.2s steps\(1, end\) infinite; \}/);
+  assert.match(css, /\.dfFactoryScene__alternate \{ opacity: 0; animation: dfFactorySceneFlip 1\.2s steps\(1, end\) infinite; \}/);
+  assert.match(css, /@keyframes dfFactorySceneHide \{ 50% \{ opacity: 0; \} \}/);
+  assert.match(css, /@keyframes dfFactorySceneFlip \{ 50% \{ opacity: 1; \} \}/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.dfFactoryScene__primary,\s*\.dfFactoryScene__alternate \{ animation: none; \}/);
 });
 
 test("one screen shows the floor, the counters, and what needs you at once", () => {

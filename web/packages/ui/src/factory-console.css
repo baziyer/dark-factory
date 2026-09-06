@@ -724,13 +724,15 @@
   .dfConsoleSidebar { position: static; max-height: none; padding: 0 clamp(1rem, 3vw, 3rem) 1.5rem; }
 }
 
-/* The floor's two-frame sprites: the second frame is stacked on the first and
-   shown for half the cycle, so a still floor is the reduced-motion default. */
+/* Exactly one complete pose at a time, including transparent pixels. */
+.dfFactoryScene__primary { opacity: 1; animation: dfFactorySceneHide 1.2s steps(1, end) infinite; }
 .dfFactoryScene__alternate { opacity: 0; animation: dfFactorySceneFlip 1.2s steps(1, end) infinite; }
 
+@keyframes dfFactorySceneHide { 50% { opacity: 0; } }
 @keyframes dfFactorySceneFlip { 50% { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
+  .dfFactoryScene__primary,
   .dfFactoryScene__alternate { animation: none; }
 }
 

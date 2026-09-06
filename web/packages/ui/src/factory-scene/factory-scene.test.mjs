@@ -29,6 +29,41 @@ const workItems = [
   { id: "staged", stage: "staged" },
 ];
 
+// Pinned outputs keep these tests independent of the hash implementation.
+const pinnedIdentities = Object.freeze({
+  "identity-2": 0,
+  "identity-1": 1,
+  "identity-0": 2,
+  "identity-3": 3,
+  "worker-a": 1,
+  "worker-b": 0,
+  "stable-worker": 3,
+  "worker-😀": 3,
+});
+
+function identityFor(id) {
+  const identity = pinnedIdentities[id];
+  assert.notEqual(identity, undefined, `missing pinned identity for ${id}`);
+  return identity;
+}
+
+function idForIdentity(identity) {
+  const id = ["identity-2", "identity-1", "identity-0", "identity-3"][identity];
+  assert.ok(id, `missing pinned id for identity ${identity}`);
+  return id;
+}
+
+function frameIdentity(frame) {
+  return Number(frame.split(".")[2]);
+}
+
+function frameName(worker) {
+  const role = worker.role === "orchestrator" ? "overseer" : "worker";
+  const provider = worker.provider === "claude_code" || worker.provider === "codex" ? worker.provider : "shell";
+  const activity = ["busy", "waiting", "needs-you", "idle"].includes(worker.activity) ? worker.activity : "idle";
+  return `${role}.${provider}.${identityFor(worker.id)}.${activity}.0`;
+}
+
 function render(props = {}) {
   return renderToStaticMarkup(createElement(FactoryScene, { topology, workers, workItems, ...props }));
 }
@@ -46,11 +81,11 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
-  assert.equal(workerFrame(workers[0]), "worker.codex.busy.0");
-  assert.equal(workerFrame(workers[1]), "overseer.shell.needs-you.0");
-  assert.equal(workerFrame({ ...workers[0], provider: "made_up" }), "worker.shell.busy.0");
-  assert.equal(alternateFrame("worker.codex.busy.0"), "worker.codex.busy.1");
-  assert.equal(alternateFrame("overseer.shell.needs-you.0"), undefined);
+  assert.equal(workerFrame(workers[0]), frameName(workers[0]));
+  assert.equal(workerFrame(workers[1]), frameName(workers[1]));
+  assert.equal(workerFrame({ ...workers[0], provider: "made_up" }), frameName({ ...workers[0], provider: "made_up" }));
+  assert.equal(alternateFrame(frameName({ ...workers[0], activity: "busy" })), `${frameName(workers[0]).replace("busy.0", "busy.1")}`);
+  assert.equal(alternateFrame(frameName({ ...workers[1], activity: "needs-you" })), undefined);
 
   const first = render();
   const reordered = render({
@@ -81,10 +116,13 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     const rendered = first.slice(first.indexOf(`data-worker-id="${worker.id}"`));
     const frame = rendered.slice(0, rendered.indexOf("</g>")).match(/href="#df-frame-([^"]+)"/g)
       .map((match) => match.slice('href="#df-frame-'.length, -1));
-    const role = worker.role === "orchestrator" ? "overseer" : "worker";
-    assert.deepEqual(frame, [`${role}.${worker.provider ?? "shell"}.${worker.activity}.0`]
-      .concat(worker.activity === "busy" || worker.activity === "idle" ? [`${role}.${worker.provider ?? "shell"}.${worker.activity}.1`] : []));
+    assert.deepEqual(frame, [frameName(worker)]
+      .concat(worker.activity === "busy" || worker.activity === "idle" ? [`${frameName(worker).replace(`${worker.activity}.0`, `${worker.activity}.1`)}`] : []));
     for (const name of frame) assert.ok(name in spriteAtlas.frames, name);
+    if (frame.length === 2) {
+      assert.match(rendered, /<use[^>]+class="dfFactoryScene__primary"/);
+      assert.match(rendered, /<use[^>]+class="dfFactoryScene__alternate"/);
+    }
   }
   // Only a two-frame activity animates, and it does so in CSS so that the
   // reduced-motion rule can stop it.
@@ -95,9 +133,9 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   // The sheet the renderer reads is every frame it can draw, on a 16px grid,
   // inside the size the generator wrote next to it.
-  assert.equal(Object.keys(spriteAtlas.frames).length, 43);
+  assert.equal(Object.keys(spriteAtlas.frames).length, 151);
   assert.equal(spriteAtlas.frame, 16);
-  assert.deepEqual(spriteSheetSize, { width: 128, height: 96 });
+  assert.deepEqual(spriteSheetSize, { width: 128, height: 304 });
   assert.match(first, new RegExp(`width="${spriteSheetSize.width}" height="${spriteSheetSize.height}"`));
   for (const [name, cell] of Object.entries(spriteAtlas.frames)) {
     assert.ok(cell.x % 16 === 0 && cell.y % 16 === 0, name);
@@ -164,6 +202,43 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.match(emptySvg, /aria-label="20 unassigned workers"/);
 });
 
+test("worker identity is stable while operational state changes", () => {
+  const base = { id: "stable-worker", name: "Builder", role: "worker", provider: "codex", activity: "busy", nodeId: "src" };
+  const stableIdentity = 3;
+  const variants = [
+    { ...base, name: "Renamed", nodeId: "repo" },
+    { ...base, activity: "waiting" },
+    { ...base, provider: "claude_code" },
+    { ...base, role: "orchestrator" },
+    { ...base, provider: "made_up", activity: "unknown" },
+  ];
+  for (const worker of variants) assert.equal(frameIdentity(workerFrame(worker)), stableIdentity);
+  assert.equal(workerFrame({ ...base, id: "worker-😀" }), "worker.codex.3.busy.0");
+});
+
+test("every identity and operational frame is reachable, including fallbacks", () => {
+  const reached = new Set();
+  for (const role of ["worker", "orchestrator"]) {
+    for (const provider of ["claude_code", "codex", "shell"]) {
+      for (const activity of ["busy", "waiting", "needs-you", "idle"]) {
+        for (let identity = 0; identity < 4; identity++) {
+          const worker = { id: idForIdentity(identity), name: "Agent", role, provider, activity };
+          const frame = workerFrame(worker);
+          reached.add(frame);
+          const alternate = alternateFrame(frame);
+          if (alternate !== undefined) reached.add(alternate);
+        }
+      }
+    }
+  }
+  const fallback = { id: idForIdentity(2), name: "Fallback", role: "worker", provider: "unknown", activity: "debugging" };
+  assert.equal(workerFrame(fallback), "worker.shell.2.idle.0");
+  reached.add(workerFrame(fallback));
+  reached.add(alternateFrame(workerFrame({ ...fallback, activity: "busy" })));
+  const personFrames = Object.keys(spriteAtlas.frames).filter((name) => /^(worker|overseer)\./.test(name));
+  assert.deepEqual([...reached].sort(), personFrames.sort());
+});
+
 // Nothing else runs the generator, so the shipped module could drift from it.
 test("the committed sprite module is exactly what the generator writes", () => {
   const sprites = new URL("./sprites/", import.meta.url);
@@ -171,7 +246,9 @@ test("the committed sprite module is exactly what the generator writes", () => {
   try {
     copyFileSync(new URL("gen-sprites.mjs", sprites), join(scratch, "gen-sprites.mjs"));
     execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "ignore" });
-    assert.deepEqual(readFileSync(join(scratch, "sprites.generated.ts")), readFileSync(new URL("sprites.generated.ts", sprites)));
+    for (const name of ["sprites.png", "sprites.generated.ts", "preview.html"]) {
+      assert.deepEqual(readFileSync(join(scratch, name)), readFileSync(new URL(name, sprites)), name);
+    }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

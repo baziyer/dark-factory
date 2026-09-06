@@ -1,180 +1,612 @@
-export const spriteSheet = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAABgCAYAAADVenpJAAAFX0lEQVR42u1drc4VMRBdf58AgcPgSBAkCBIkCZoAhvACKCRPAAqBxyDRmM8TNMFjkBheYEkvmS+9pd3O3+7svT2TNB8/e6bt9LTb3dOdb5oGs/nFk3mCjWsgAAzGscPhMOdlax/W+lt47grg0f+zjX+6+Ofr+ydFM4BaH9b6o/Ee5H/w9eNJ2dRHuvDR3dvzlzdP599X74/A9FPaAK0PLTZdQ9db2u+BtxIwMv7XDggsrdzDhxRLHaTOWttvbbvHAEbG/2gEttzLLD4k2HzW0Wyztt+C9xjA0PiXS9je8SUBottvHcDy/r0ZvhY8r00cx4el/rwObfs9+m8hUG3zJt3EtTaAbB8UBFq+8nurZAes8dHCSbCt0vNB92ot3nMCpcGyxl/to3yEkT7K5DNR4yPfxKUimb05+VJ59vLV9eAlXz0C0LKtxVsJ5BV/mu0qH3TxnXsPjz9TEMrSC4QXnnxIyVPDS4MvxVsJtJf4TwTO/1yWXgO88Ml61+8JbyXgHuI/lY3VLEGj460EjGw/zOk9PgagYpBjB48/CIAJCDun+xj0+AHPQ1j16Gi8R/Dfffh0Urb0Ya3f3P5L0OOtBBz5PMR/b7Wgx493HuJoUj2+nG3Q47c9D1Eu96b2S/XkkgBherZT8Mt76N7xJQHU9Vv06FyF0urZHnq4hUC14Hlt4jg+LPXndajb39KRuVp4a/DIJ0dO1eInxwMVKWBWPV7jo4WTYFtFfB6A9HjJ7M0PI6SSpEcaPIker8VbCTQ56fE04zzOQ3Bnb14PDXqKHw0+V46+CD1eQ6Ba/0c7D3HtBHr8uOchoMcPfp7hYnSMYQMA269BjgUBQACu/fn2eE4lyoe1/mi8y3006v5JnfcYQI0Pa/0tPHcF8Oy/avA99HCLHl8GYEsf1vqj8WYCeejx1gMNyE9gw1sJBD1+8PMQR4MeP3B+Aquebe0A8hME5Sfw0MMtBFr6vJreo2t85O/k16q/l59g7frNBKJ7hUVP9jpQUeYISP/268fnY+G0ofTBxS/lNejhe7kBOPjW5+XS9qsIlN83NHqyB4GmBT0+dZ4j7LTyE0jwtfwEPfxSfgIuvvV5ORdvJZCbHm85kFDT08sOSPV4LT7vP3cGRuGtBDpxtEc9vhzYLfB5/yWHWqLwVgKeOGn9XdsB6VtES/3IT6AnoJuOoO0ADPFfzSDHggAgANegxwfq8dHxhx4fqMdHxx96fKweHx1/6PHBejx+XwD0ePy+gAn5CWLjH/19P/ITBOUnWPq8WqLH1z7N5urh2vp7+QnWrt+DQEtyuiT+NSme3f5ajgCNHp/7kKhhrTz3HDVsKTcAV4/X4j0nUJkjQBP/3IdKDLLo6bV89Vo9Ph8Arh5ffh4u1eO1eCuBvOJfy08gkoOhx9v0eA2B9hJ/6PHBenx0/KGnB+vxyA9w5oYBWLC9ybGtDddWpZY/SFKoH1ocCHA4zDdu3lIVGsTa/+X5gJbwtfxBkpITgIthE2AEPZ4GMAWFM+j5dSUBpD56BOAQpCRAb8VhE2AUPX6tFYCL3yUBRtLjQQBHOfMc9XgQYHA9PpoA1rIaAabofPUb6fF7WgE0K8JqBAjLV++kh3MJBAI46tG9fPVcPd6qh0sIBAIwtGiJHr+UG4Crx2vxGgKNQgDaCLOfAmr56iV6fPl5uFSP1+KlBMIm8EL1eC6B8Bg4uB6PV8GD6/HRK4AWS2VVMWgEPT5aDvbaA2hxMNi/JdKiRUfjYQ4EsGCi8bALIcDz729nTgEBQAAQAAQAAUAAGAgA2xEBymNYrQICgAAgAAgAAoAAIAAIAALgKQCvgvdAAIhBMNiA9hc6zyHxeS9sNQAAAABJRU5ErkJggg==";
-export const spriteSheetSize = {"width":128,"height":96} as const;
+export const spriteSheet = "data:image/png;base64,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";
+export const spriteSheetSize = {"width":128,"height":304} as const;
 export const spriteAtlas = {
   "frame": 16,
   "sheet": "sprites.png",
   "frames": {
-    "worker.claude_code.busy.0": {
+    "worker.claude_code.0.busy.0": {
       "x": 0,
       "y": 0
     },
-    "worker.claude_code.busy.1": {
+    "worker.claude_code.0.busy.1": {
       "x": 16,
       "y": 0
     },
-    "worker.claude_code.waiting.0": {
+    "worker.claude_code.0.waiting.0": {
       "x": 32,
       "y": 0
     },
-    "worker.claude_code.needs-you.0": {
+    "worker.claude_code.0.needs-you.0": {
       "x": 48,
       "y": 0
     },
-    "worker.claude_code.idle.0": {
+    "worker.claude_code.0.idle.0": {
       "x": 64,
       "y": 0
     },
-    "worker.claude_code.idle.1": {
+    "worker.claude_code.0.idle.1": {
       "x": 80,
       "y": 0
     },
-    "worker.codex.busy.0": {
+    "worker.codex.0.busy.0": {
       "x": 96,
       "y": 0
     },
-    "worker.codex.busy.1": {
+    "worker.codex.0.busy.1": {
       "x": 112,
       "y": 0
     },
-    "worker.codex.waiting.0": {
+    "worker.codex.0.waiting.0": {
       "x": 0,
       "y": 16
     },
-    "worker.codex.needs-you.0": {
+    "worker.codex.0.needs-you.0": {
       "x": 16,
       "y": 16
     },
-    "worker.codex.idle.0": {
+    "worker.codex.0.idle.0": {
       "x": 32,
       "y": 16
     },
-    "worker.codex.idle.1": {
+    "worker.codex.0.idle.1": {
       "x": 48,
       "y": 16
     },
-    "worker.shell.busy.0": {
+    "worker.shell.0.busy.0": {
       "x": 64,
       "y": 16
     },
-    "worker.shell.busy.1": {
+    "worker.shell.0.busy.1": {
       "x": 80,
       "y": 16
     },
-    "worker.shell.waiting.0": {
+    "worker.shell.0.waiting.0": {
       "x": 96,
       "y": 16
     },
-    "worker.shell.needs-you.0": {
+    "worker.shell.0.needs-you.0": {
       "x": 112,
       "y": 16
     },
-    "worker.shell.idle.0": {
+    "worker.shell.0.idle.0": {
       "x": 0,
       "y": 32
     },
-    "worker.shell.idle.1": {
+    "worker.shell.0.idle.1": {
       "x": 16,
       "y": 32
     },
-    "overseer.claude_code.busy.0": {
+    "overseer.claude_code.0.busy.0": {
       "x": 32,
       "y": 32
     },
-    "overseer.claude_code.busy.1": {
+    "overseer.claude_code.0.busy.1": {
       "x": 48,
       "y": 32
     },
-    "overseer.claude_code.waiting.0": {
+    "overseer.claude_code.0.waiting.0": {
       "x": 64,
       "y": 32
     },
-    "overseer.claude_code.needs-you.0": {
+    "overseer.claude_code.0.needs-you.0": {
       "x": 80,
       "y": 32
     },
-    "overseer.claude_code.idle.0": {
+    "overseer.claude_code.0.idle.0": {
       "x": 96,
       "y": 32
     },
-    "overseer.claude_code.idle.1": {
+    "overseer.claude_code.0.idle.1": {
       "x": 112,
       "y": 32
     },
-    "overseer.codex.busy.0": {
+    "overseer.codex.0.busy.0": {
       "x": 0,
       "y": 48
     },
-    "overseer.codex.busy.1": {
+    "overseer.codex.0.busy.1": {
       "x": 16,
       "y": 48
     },
-    "overseer.codex.waiting.0": {
+    "overseer.codex.0.waiting.0": {
       "x": 32,
       "y": 48
     },
-    "overseer.codex.needs-you.0": {
+    "overseer.codex.0.needs-you.0": {
       "x": 48,
       "y": 48
     },
-    "overseer.codex.idle.0": {
+    "overseer.codex.0.idle.0": {
       "x": 64,
       "y": 48
     },
-    "overseer.codex.idle.1": {
+    "overseer.codex.0.idle.1": {
       "x": 80,
       "y": 48
     },
-    "overseer.shell.busy.0": {
+    "overseer.shell.0.busy.0": {
       "x": 96,
       "y": 48
     },
-    "overseer.shell.busy.1": {
+    "overseer.shell.0.busy.1": {
       "x": 112,
       "y": 48
     },
-    "overseer.shell.waiting.0": {
+    "overseer.shell.0.waiting.0": {
       "x": 0,
       "y": 64
     },
-    "overseer.shell.needs-you.0": {
+    "overseer.shell.0.needs-you.0": {
       "x": 16,
       "y": 64
     },
-    "overseer.shell.idle.0": {
+    "overseer.shell.0.idle.0": {
       "x": 32,
       "y": 64
     },
-    "overseer.shell.idle.1": {
+    "overseer.shell.0.idle.1": {
       "x": 48,
       "y": 64
+    },
+    "worker.claude_code.1.busy.0": {
+      "x": 64,
+      "y": 64
+    },
+    "worker.claude_code.1.busy.1": {
+      "x": 80,
+      "y": 64
+    },
+    "worker.claude_code.1.waiting.0": {
+      "x": 96,
+      "y": 64
+    },
+    "worker.claude_code.1.needs-you.0": {
+      "x": 112,
+      "y": 64
+    },
+    "worker.claude_code.1.idle.0": {
+      "x": 0,
+      "y": 80
+    },
+    "worker.claude_code.1.idle.1": {
+      "x": 16,
+      "y": 80
+    },
+    "worker.codex.1.busy.0": {
+      "x": 32,
+      "y": 80
+    },
+    "worker.codex.1.busy.1": {
+      "x": 48,
+      "y": 80
+    },
+    "worker.codex.1.waiting.0": {
+      "x": 64,
+      "y": 80
+    },
+    "worker.codex.1.needs-you.0": {
+      "x": 80,
+      "y": 80
+    },
+    "worker.codex.1.idle.0": {
+      "x": 96,
+      "y": 80
+    },
+    "worker.codex.1.idle.1": {
+      "x": 112,
+      "y": 80
+    },
+    "worker.shell.1.busy.0": {
+      "x": 0,
+      "y": 96
+    },
+    "worker.shell.1.busy.1": {
+      "x": 16,
+      "y": 96
+    },
+    "worker.shell.1.waiting.0": {
+      "x": 32,
+      "y": 96
+    },
+    "worker.shell.1.needs-you.0": {
+      "x": 48,
+      "y": 96
+    },
+    "worker.shell.1.idle.0": {
+      "x": 64,
+      "y": 96
+    },
+    "worker.shell.1.idle.1": {
+      "x": 80,
+      "y": 96
+    },
+    "overseer.claude_code.1.busy.0": {
+      "x": 96,
+      "y": 96
+    },
+    "overseer.claude_code.1.busy.1": {
+      "x": 112,
+      "y": 96
+    },
+    "overseer.claude_code.1.waiting.0": {
+      "x": 0,
+      "y": 112
+    },
+    "overseer.claude_code.1.needs-you.0": {
+      "x": 16,
+      "y": 112
+    },
+    "overseer.claude_code.1.idle.0": {
+      "x": 32,
+      "y": 112
+    },
+    "overseer.claude_code.1.idle.1": {
+      "x": 48,
+      "y": 112
+    },
+    "overseer.codex.1.busy.0": {
+      "x": 64,
+      "y": 112
+    },
+    "overseer.codex.1.busy.1": {
+      "x": 80,
+      "y": 112
+    },
+    "overseer.codex.1.waiting.0": {
+      "x": 96,
+      "y": 112
+    },
+    "overseer.codex.1.needs-you.0": {
+      "x": 112,
+      "y": 112
+    },
+    "overseer.codex.1.idle.0": {
+      "x": 0,
+      "y": 128
+    },
+    "overseer.codex.1.idle.1": {
+      "x": 16,
+      "y": 128
+    },
+    "overseer.shell.1.busy.0": {
+      "x": 32,
+      "y": 128
+    },
+    "overseer.shell.1.busy.1": {
+      "x": 48,
+      "y": 128
+    },
+    "overseer.shell.1.waiting.0": {
+      "x": 64,
+      "y": 128
+    },
+    "overseer.shell.1.needs-you.0": {
+      "x": 80,
+      "y": 128
+    },
+    "overseer.shell.1.idle.0": {
+      "x": 96,
+      "y": 128
+    },
+    "overseer.shell.1.idle.1": {
+      "x": 112,
+      "y": 128
+    },
+    "worker.claude_code.2.busy.0": {
+      "x": 0,
+      "y": 144
+    },
+    "worker.claude_code.2.busy.1": {
+      "x": 16,
+      "y": 144
+    },
+    "worker.claude_code.2.waiting.0": {
+      "x": 32,
+      "y": 144
+    },
+    "worker.claude_code.2.needs-you.0": {
+      "x": 48,
+      "y": 144
+    },
+    "worker.claude_code.2.idle.0": {
+      "x": 64,
+      "y": 144
+    },
+    "worker.claude_code.2.idle.1": {
+      "x": 80,
+      "y": 144
+    },
+    "worker.codex.2.busy.0": {
+      "x": 96,
+      "y": 144
+    },
+    "worker.codex.2.busy.1": {
+      "x": 112,
+      "y": 144
+    },
+    "worker.codex.2.waiting.0": {
+      "x": 0,
+      "y": 160
+    },
+    "worker.codex.2.needs-you.0": {
+      "x": 16,
+      "y": 160
+    },
+    "worker.codex.2.idle.0": {
+      "x": 32,
+      "y": 160
+    },
+    "worker.codex.2.idle.1": {
+      "x": 48,
+      "y": 160
+    },
+    "worker.shell.2.busy.0": {
+      "x": 64,
+      "y": 160
+    },
+    "worker.shell.2.busy.1": {
+      "x": 80,
+      "y": 160
+    },
+    "worker.shell.2.waiting.0": {
+      "x": 96,
+      "y": 160
+    },
+    "worker.shell.2.needs-you.0": {
+      "x": 112,
+      "y": 160
+    },
+    "worker.shell.2.idle.0": {
+      "x": 0,
+      "y": 176
+    },
+    "worker.shell.2.idle.1": {
+      "x": 16,
+      "y": 176
+    },
+    "overseer.claude_code.2.busy.0": {
+      "x": 32,
+      "y": 176
+    },
+    "overseer.claude_code.2.busy.1": {
+      "x": 48,
+      "y": 176
+    },
+    "overseer.claude_code.2.waiting.0": {
+      "x": 64,
+      "y": 176
+    },
+    "overseer.claude_code.2.needs-you.0": {
+      "x": 80,
+      "y": 176
+    },
+    "overseer.claude_code.2.idle.0": {
+      "x": 96,
+      "y": 176
+    },
+    "overseer.claude_code.2.idle.1": {
+      "x": 112,
+      "y": 176
+    },
+    "overseer.codex.2.busy.0": {
+      "x": 0,
+      "y": 192
+    },
+    "overseer.codex.2.busy.1": {
+      "x": 16,
+      "y": 192
+    },
+    "overseer.codex.2.waiting.0": {
+      "x": 32,
+      "y": 192
+    },
+    "overseer.codex.2.needs-you.0": {
+      "x": 48,
+      "y": 192
+    },
+    "overseer.codex.2.idle.0": {
+      "x": 64,
+      "y": 192
+    },
+    "overseer.codex.2.idle.1": {
+      "x": 80,
+      "y": 192
+    },
+    "overseer.shell.2.busy.0": {
+      "x": 96,
+      "y": 192
+    },
+    "overseer.shell.2.busy.1": {
+      "x": 112,
+      "y": 192
+    },
+    "overseer.shell.2.waiting.0": {
+      "x": 0,
+      "y": 208
+    },
+    "overseer.shell.2.needs-you.0": {
+      "x": 16,
+      "y": 208
+    },
+    "overseer.shell.2.idle.0": {
+      "x": 32,
+      "y": 208
+    },
+    "overseer.shell.2.idle.1": {
+      "x": 48,
+      "y": 208
+    },
+    "worker.claude_code.3.busy.0": {
+      "x": 64,
+      "y": 208
+    },
+    "worker.claude_code.3.busy.1": {
+      "x": 80,
+      "y": 208
+    },
+    "worker.claude_code.3.waiting.0": {
+      "x": 96,
+      "y": 208
+    },
+    "worker.claude_code.3.needs-you.0": {
+      "x": 112,
+      "y": 208
+    },
+    "worker.claude_code.3.idle.0": {
+      "x": 0,
+      "y": 224
+    },
+    "worker.claude_code.3.idle.1": {
+      "x": 16,
+      "y": 224
+    },
+    "worker.codex.3.busy.0": {
+      "x": 32,
+      "y": 224
+    },
+    "worker.codex.3.busy.1": {
+      "x": 48,
+      "y": 224
+    },
+    "worker.codex.3.waiting.0": {
+      "x": 64,
+      "y": 224
+    },
+    "worker.codex.3.needs-you.0": {
+      "x": 80,
+      "y": 224
+    },
+    "worker.codex.3.idle.0": {
+      "x": 96,
+      "y": 224
+    },
+    "worker.codex.3.idle.1": {
+      "x": 112,
+      "y": 224
+    },
+    "worker.shell.3.busy.0": {
+      "x": 0,
+      "y": 240
+    },
+    "worker.shell.3.busy.1": {
+      "x": 16,
+      "y": 240
+    },
+    "worker.shell.3.waiting.0": {
+      "x": 32,
+      "y": 240
+    },
+    "worker.shell.3.needs-you.0": {
+      "x": 48,
+      "y": 240
+    },
+    "worker.shell.3.idle.0": {
+      "x": 64,
+      "y": 240
+    },
+    "worker.shell.3.idle.1": {
+      "x": 80,
+      "y": 240
+    },
+    "overseer.claude_code.3.busy.0": {
+      "x": 96,
+      "y": 240
+    },
+    "overseer.claude_code.3.busy.1": {
+      "x": 112,
+      "y": 240
+    },
+    "overseer.claude_code.3.waiting.0": {
+      "x": 0,
+      "y": 256
+    },
+    "overseer.claude_code.3.needs-you.0": {
+      "x": 16,
+      "y": 256
+    },
+    "overseer.claude_code.3.idle.0": {
+      "x": 32,
+      "y": 256
+    },
+    "overseer.claude_code.3.idle.1": {
+      "x": 48,
+      "y": 256
+    },
+    "overseer.codex.3.busy.0": {
+      "x": 64,
+      "y": 256
+    },
+    "overseer.codex.3.busy.1": {
+      "x": 80,
+      "y": 256
+    },
+    "overseer.codex.3.waiting.0": {
+      "x": 96,
+      "y": 256
+    },
+    "overseer.codex.3.needs-you.0": {
+      "x": 112,
+      "y": 256
+    },
+    "overseer.codex.3.idle.0": {
+      "x": 0,
+      "y": 272
+    },
+    "overseer.codex.3.idle.1": {
+      "x": 16,
+      "y": 272
+    },
+    "overseer.shell.3.busy.0": {
+      "x": 32,
+      "y": 272
+    },
+    "overseer.shell.3.busy.1": {
+      "x": 48,
+      "y": 272
+    },
+    "overseer.shell.3.waiting.0": {
+      "x": 64,
+      "y": 272
+    },
+    "overseer.shell.3.needs-you.0": {
+      "x": 80,
+      "y": 272
+    },
+    "overseer.shell.3.idle.0": {
+      "x": 96,
+      "y": 272
+    },
+    "overseer.shell.3.idle.1": {
+      "x": 112,
+      "y": 272
     },
     "tile.floor.0": {
-      "x": 64,
-      "y": 64
+      "x": 0,
+      "y": 288
     },
     "tile.floor.1": {
-      "x": 80,
-      "y": 64
+      "x": 16,
+      "y": 288
     },
     "tile.wall": {
-      "x": 96,
-      "y": 64
+      "x": 32,
+      "y": 288
     },
     "tile.door": {
-      "x": 112,
-      "y": 64
+      "x": 48,
+      "y": 288
     },
     "bay.free": {
-      "x": 0,
-      "y": 80
+      "x": 64,
+      "y": 288
     },
     "bay.staged": {
-      "x": 16,
-      "y": 80
+      "x": 80,
+      "y": 288
     },
     "bay.ready": {
-      "x": 32,
-      "y": 80
+      "x": 96,
+      "y": 288
     }
   }
 } as const;
