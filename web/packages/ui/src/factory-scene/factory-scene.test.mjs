@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { inflateSync } from "node:zlib";
 import { join } from "node:path";
 import test from "node:test";
 import { createElement } from "react";
@@ -282,6 +283,35 @@ test("every identity and operational frame is reachable, including fallbacks", (
 });
 
 // Nothing else runs the generator, so the shipped module could drift from it.
+// A PNG's pixels: its IHDR and its inflated scanlines. The deflate bytes
+// themselves depend on the zlib a Node was built with, so two builds of the
+// same image may not share a byte; they must share every pixel.
+function pngPixels(bytes) {
+  assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  const idats = [];
+  let header;
+  for (let offset = 8; offset < bytes.length;) {
+    const length = bytes.readUInt32BE(offset);
+    const type = bytes.toString("latin1", offset + 4, offset + 8);
+    const data = bytes.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") header = Buffer.from(data);
+    if (type === "IDAT") idats.push(data);
+    offset += 12 + length;
+  }
+  return Buffer.concat([header, inflateSync(Buffer.concat(idats))]);
+}
+
+// Text that embeds the sheet as a data URL compares by its text with every
+// embedded PNG replaced, plus those PNGs' pixels in order.
+function withPixels(text) {
+  const pixels = [];
+  const stripped = text.replaceAll(/data:image\/png;base64,([A-Za-z0-9+/=]+)/g, (_, base64) => {
+    pixels.push(pngPixels(Buffer.from(base64, "base64")));
+    return "data:image/png;base64,<pixels>";
+  });
+  return { stripped, pixels };
+}
+
 test("the committed sprite module is exactly what the generator writes", () => {
   const sprites = new URL("./sprites/", import.meta.url);
   const scratch = mkdtempSync(join(tmpdir(), "df-sprites-"));
@@ -289,8 +319,13 @@ test("the committed sprite module is exactly what the generator writes", () => {
     copyFileSync(new URL("gen-sprites.mjs", sprites), join(scratch, "gen-sprites.mjs"));
     // A failing generator reports its own assertion, not just a bad exit.
     execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "pipe" });
-    for (const name of ["sprites.png", "sprites.generated.ts", "preview.html"]) {
-      assert.deepEqual(readFileSync(join(scratch, name)), readFileSync(new URL(name, sprites)), name);
+    assert.deepEqual(pngPixels(readFileSync(join(scratch, "sprites.png"))), pngPixels(readFileSync(new URL("sprites.png", sprites))), "sprites.png");
+    for (const name of ["sprites.generated.ts", "preview.html"]) {
+      const fresh = withPixels(readFileSync(join(scratch, name), "utf8"));
+      const committed = withPixels(readFileSync(new URL(name, sprites), "utf8"));
+      assert.equal(fresh.stripped, committed.stripped, name);
+      assert.deepEqual(fresh.pixels, committed.pixels, `${name} pixels`);
+      assert.ok(fresh.pixels.length >= 1, `${name} embeds the sheet`);
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
