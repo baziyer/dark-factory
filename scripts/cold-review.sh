@@ -31,8 +31,9 @@
 #
 # The diff the reviewer reads runs from the merge base of BASE_SHA and the
 # head, so a base that has moved on since the branch started shows only the
-# change. Every CLAUDE.md, AGENTS.md and .claude directory in the checkout, at
-# any depth, is renamed with an .under-review suffix: Claude Code loads a
+# change. Every CLAUDE.md, CLAUDE.local.md, AGENTS.md and .claude in the
+# checkout, at any depth and in any spelling of case (a case-insensitive
+# filesystem serves them all), is renamed with an .under-review suffix: Claude Code loads a
 # CLAUDE.md as instructions the moment a file under it is read, from any
 # working directory, and the change under review must not become its own
 # reviewer's instructions. The reviewer reads them by their renamed paths as
