@@ -801,6 +801,57 @@ func TestAttemptRunnerOrdersOuterWrapperAndShellProvider(t *testing.T) {
 	}
 }
 
+// A startup prompt ending in CR reaches the provider as its text first and
+// the CR later, as a keystroke of its own once the prompt is quiet: the
+// provider's line completes no earlier than the floor after ready, and
+// interactive input still follows in order.
+func TestAttemptRunnerSubmitsStartupCarriageReturnAfterThePromptIsQuiet(t *testing.T) {
+	f := newAttemptFixture(t, "native-input", "")
+	f.spec.StartupInput = []byte("native-startup\r")
+	inner := f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if ready := f.nextTerminal(TerminalReady, 0); ready.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v", ready)
+	}
+	readyAt := time.Now()
+	startup := filepath.Join(f.root, "provider.startup")
+	waitFile(t, startup)
+	if body, err := os.ReadFile(startup); err != nil || string(body) != "native-startup" {
+		t.Fatalf("provider.startup=%q err=%v", body, err)
+	}
+	if elapsed := time.Since(readyAt); elapsed < startupEnterFloor-50*time.Millisecond {
+		t.Fatalf("startup line completed %v after ready, before the %v floor", elapsed, startupEnterFloor)
+	}
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalGenerationInstall, Correlation: 1, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalGenerationResult, 1); result.Status != TerminalResultOK {
+		t.Fatalf("generation install=%+v", result)
+	}
+	interactive := []byte("interactive-after-ready\n")
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalInput, Correlation: 2, Generation: 1, Sequence: 1, Payload: interactive}); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.nextTerminal(TerminalInputResult, 2); result.Status != TerminalResultOK {
+		t.Fatalf("terminal input=%+v", result)
+	}
+	stdin := filepath.Join(f.root, "provider.stdin")
+	waitFile(t, stdin)
+	if body, err := os.ReadFile(stdin); err != nil || string(body) != "interactive-after-ready" {
+		t.Fatalf("provider.stdin=%q err=%v", body, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := f.finishAndAck()
+	if record.Terminal.Process != inner || record.Terminal.Exit.Code != 0 {
+		t.Fatalf("terminal=%+v", record.Terminal)
+	}
+}
+
 func TestAttemptRunnerInjectsNativeStartupOnceBeforeInteractiveInput(t *testing.T) {
 	f := newAttemptFixture(t, "native-input", "")
 	f.spec.StartupInput = []byte("native-startup\n")
