@@ -51,7 +51,7 @@ func (daemon *Daemon) projectTopology(ctx context.Context, projectID kernel.Proj
 	// ponytail: the walk is serialized only by the caller's per-client gate, so
 	// two clients can walk the same project at once. Add a per-project build
 	// gate if that ever costs more than the duplicated walk.
-	snapshot, err := topology.BuildCached(ctx, project.Root, cacheFile)
+	snapshot, err := topology.BuildCached(ctx, project.Root, projectID.String(), cacheFile)
 	if err != nil {
 		return topology.Snapshot{}, err
 	}

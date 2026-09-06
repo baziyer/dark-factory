@@ -101,6 +101,9 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.deepEqual(scene.topology.nodes.map((node) => node.label), ["North Workshop", "South Workshop", "kernel", "web"]);
   assert.equal(scene.topology.nodes.some((node) => node.label === fixtureTopology.nodes[0].label), false);
   assert.deepEqual(scene.topology.nodes.map((node) => node.sizeBucket), ["large", undefined, "medium", "small"]);
+  // Every room names its project, the heading it stands under on the floor.
+  assert.deepEqual(scene.topology.nodes.map((node) => node.project.name), ["North Workshop", "South Workshop", "North Workshop", "North Workshop"]);
+  assert.deepEqual(scene.topology.nodes.map((node) => node.project.id), [ids.project, ids.secondProject, ids.project, ids.project]);
   assert.equal(scene.topology.digest, fixtureTopology.digest);
   assert.deepEqual(scene, floorScene(fixtureState, new Map([[fixtureTopology.projectId, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }]])));
 

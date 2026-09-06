@@ -49,7 +49,8 @@ go test -short -timeout=20m \
     ./cmd/cloudflare-admin \
     ./internal/browserprotocol \
     ./internal/cloudflareadmin \
-    ./internal/provider
+    ./internal/provider \
+    ./internal/topology
 
 echo "go-check: TypeScript install, build, typecheck, and tests"
 (
@@ -58,7 +59,7 @@ echo "go-check: TypeScript install, build, typecheck, and tests"
     COREPACK_ENABLE_NETWORK=0 CI=true "$DF_CI_NODE" "$DF_CI_COREPACK" pnpm --filter @dark-factory/client build
     COREPACK_ENABLE_NETWORK=0 CI=true "$DF_CI_NODE" "$DF_CI_COREPACK" pnpm --filter @dark-factory/ui build
     COREPACK_ENABLE_NETWORK=0 CI=true "$DF_CI_NODE" "$DF_CI_COREPACK" pnpm --filter dark-factory-dev typecheck
-    "$DF_CI_NODE" --test packages/client/test/*.test.mjs packages/ui/test/*.test.mjs
+    "$DF_CI_NODE" --test packages/client/test/*.test.mjs packages/ui/test/*.test.mjs packages/ui/src/factory-scene/*.test.mjs
 )
 
 echo "go-check: git diff --check"

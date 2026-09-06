@@ -126,8 +126,10 @@ type analysis struct {
 
 // Build scans root without running project commands. A previous snapshot from
 // this package is returned unchanged when its structural fingerprint matches.
-func Build(ctx context.Context, root string, previous *Snapshot) (Snapshot, error) {
-	return build(ctx, root, previous, defaultLimits)
+// project salts every node id, so two projects holding the same path are
+// never served the same id.
+func Build(ctx context.Context, root, project string, previous *Snapshot) (Snapshot, error) {
+	return build(ctx, root, project, previous, defaultLimits)
 }
 
 // NodeForPath returns the deepest topology node containing relativePath.
@@ -150,7 +152,7 @@ func NodeForPath(snapshot Snapshot, relativePath string) (Node, bool) {
 	return best, bestDepth >= 0
 }
 
-func build(ctx context.Context, root string, previous *Snapshot, bounds limits) (Snapshot, error) {
+func build(ctx context.Context, root, project string, previous *Snapshot, bounds limits) (Snapshot, error) {
 	found, err := discover(ctx, root, bounds)
 	if err != nil {
 		return Snapshot{}, err
@@ -161,7 +163,7 @@ func build(ctx context.Context, root string, previous *Snapshot, bounds limits) 
 	}
 	fingerprint := fingerprint(found, analyzed)
 	revision := sourceRevision(root)
-	nodes, edges, err := graph(found, analyzed, bounds.nodes, bounds.edges)
+	nodes, edges, err := graph(found, analyzed, project, bounds.nodes, bounds.edges)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -402,7 +404,7 @@ func analyze(found *discovery, edgeLimit int) (analysis, error) {
 	return result, nil
 }
 
-func graph(found *discovery, analyzed analysis, nodeLimit, edgeLimit int) ([]Node, []Edge, error) {
+func graph(found *discovery, analyzed analysis, project string, nodeLimit, edgeLimit int) ([]Node, []Edge, error) {
 	add := func(nodes *[]Node, node Node) error {
 		if len(*nodes) == nodeLimit {
 			return bound("node count", nodeLimit)
@@ -410,7 +412,7 @@ func graph(found *discovery, analyzed analysis, nodeLimit, edgeLimit int) ([]Nod
 		*nodes = append(*nodes, node)
 		return nil
 	}
-	repository := nodeID(NodeRepository, ".")
+	repository := nodeID(project, NodeRepository, ".")
 	nodes := []Node{{ID: repository, Kind: NodeRepository, RelativePath: ".", Label: "repository", SizeBucket: bucket(found.dirs["."])}}
 	primary := map[string]string{".": repository}
 	dirs := keys(found.dirs)
@@ -425,14 +427,14 @@ func graph(found *discovery, analyzed analysis, nodeLimit, edgeLimit int) ([]Nod
 		moduleName, module := found.modules[dir]
 		pkg, isPackage := analyzed.packages[dir]
 		if module {
-			id := nodeID(NodeModule, dir)
+			id := nodeID(project, NodeModule, dir)
 			if err := add(&nodes, Node{id, parent, NodeModule, dir, label(moduleName, dir, "module"), "go", bucket(found.dirs[dir])}); err != nil {
 				return nil, nil, err
 			}
 			primary[dir], parent = id, id
 		}
 		if isPackage {
-			id := nodeID(NodePackage, dir)
+			id := nodeID(project, NodePackage, dir)
 			if err := add(&nodes, Node{id, parent, NodePackage, dir, pkg.label, language(pkg), bucket(found.dirs[dir])}); err != nil {
 				return nil, nil, err
 			}
@@ -441,7 +443,7 @@ func graph(found *discovery, analyzed analysis, nodeLimit, edgeLimit int) ([]Nod
 			}
 		}
 		if dir != "." && !module && !isPackage {
-			id := nodeID(NodeDirectory, dir)
+			id := nodeID(project, NodeDirectory, dir)
 			if err := add(&nodes, Node{id, parent, NodeDirectory, dir, path.Base(dir), "", bucket(found.dirs[dir])}); err != nil {
 				return nil, nil, err
 			}
@@ -462,7 +464,7 @@ func graph(found *discovery, analyzed analysis, nodeLimit, edgeLimit int) ([]Nod
 		}
 	}
 	for edge, weight := range analyzed.imports {
-		edges = append(edges, Edge{nodeID(NodePackage, edge.from), nodeID(NodePackage, edge.to), EdgeImports, weight})
+		edges = append(edges, Edge{nodeID(project, NodePackage, edge.from), nodeID(project, NodePackage, edge.to), EdgeImports, weight})
 	}
 	sort.Slice(edges, func(i, j int) bool {
 		return edges[i].From < edges[j].From || edges[i].From == edges[j].From && (edges[i].To < edges[j].To || edges[i].To == edges[j].To && edges[i].Kind < edges[j].Kind)
@@ -700,8 +702,8 @@ func bucket(bytes int64) string {
 	}
 }
 
-func nodeID(kind NodeKind, rel string) string {
-	sum := sha256.Sum256([]byte("dark-factory/topology/node/v1\x00" + string(kind) + "\x00" + rel))
+func nodeID(project string, kind NodeKind, rel string) string {
+	sum := sha256.Sum256([]byte("dark-factory/topology/node/v1\x00" + project + "\x00" + string(kind) + "\x00" + rel))
 	return hex.EncodeToString(sum[:])
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { inflateSync } from "node:zlib";
 import { join } from "node:path";
 import test from "node:test";
 import { createElement } from "react";
@@ -77,7 +78,10 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     y: layout.rooms[0].y + layout.rooms[0].height / 2,
   });
 
-  for (const room of layout.rooms) assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  for (const room of layout.rooms) {
+    assert.equal(room.x % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+    assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  }
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
@@ -162,7 +166,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     assert.ok(placement.y - 8 >= srcRoom.y && placement.y + 8 <= srcRoom.y + srcRoom.height);
   }
   const denseSvg = render({ workers: denseWorkers });
-  assert.match(denseSvg, /WORKER OVERFLOW · 72/);
+  assert.match(denseSvg, /WORKER OVERFLOW · 68/);
   const denseHeight = Number(denseSvg.match(/viewBox="0 0 [^ ]+ ([^"]+)"/)[1]);
   assert.ok(denseHeight > Math.max(...densePlacements.map(({ y }) => y + 8)));
 
@@ -200,6 +204,45 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   // An empty floor in a wide column stays a panel, not a poster.
   assert.match(emptySvg, new RegExp(`max-width:${emptyLayout.width * 3}px`));
   assert.match(emptySvg, /aria-label="20 unassigned workers"/);
+});
+
+test("rooms group under their project's heading and stay on the tile grid", () => {
+  const grouped = {
+    digest: "fixture-2",
+    nodes: [
+      { id: "b-root", parentId: "", path: ".", label: "Beta", kind: "repository", project: { id: "p-b", name: "Beta Works" } },
+      { id: "a-web", parentId: "a-root", path: "web", label: "web", kind: "package", project: { id: "p-a", name: "Alpha Works" } },
+      { id: "b-src", parentId: "b-root", path: "src", label: "src", kind: "directory", project: { id: "p-b", name: "Beta Works" } },
+      { id: "a-root", parentId: "", path: ".", label: "Alpha", kind: "repository", project: { id: "p-a", name: "Alpha Works" } },
+      { id: "a-cmd", parentId: "a-root", path: "cmd", label: "cmd", kind: "directory", project: { id: "p-a", name: "Alpha Works" } },
+    ],
+  };
+  const layout = layoutScene(grouped);
+  assert.deepEqual(layout, layoutScene({ ...grouped, nodes: [...grouped.nodes].reverse() }));
+  assert.deepEqual(layout.rooms.map((room) => room.id), ["a-root", "a-cmd", "a-web", "b-root", "b-src"]);
+  assert.deepEqual(layout.headings.map((heading) => heading.label), ["Alpha Works", "Beta Works"]);
+  const [alpha, beta] = layout.headings;
+  for (const room of layout.rooms.slice(0, 3)) assert.ok(room.y > alpha.y && room.y < beta.y, `${room.id} outside Alpha`);
+  for (const room of layout.rooms.slice(3)) assert.ok(room.y > beta.y, `${room.id} outside Beta`);
+  for (const room of layout.rooms) {
+    assert.equal(room.x % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+    assert.equal(room.y % spriteAtlas.frame, 0, `room ${room.id} off the tile grid`);
+  }
+  // Two projects with one name are still two blocks under two headings.
+  const twins = layoutScene({ ...grouped, nodes: grouped.nodes.map((node) => ({ ...node, project: { id: node.project.id, name: "Twin" } })) });
+  assert.deepEqual(twins.headings.map((heading) => heading.label), ["Twin", "Twin"]);
+  assert.deepEqual(twins.rooms.map((room) => room.id), layout.rooms.map((room) => room.id));
+  // The heading is its own element at the row the layout gave it, and every
+  // door sits on the tile grid like the room it opens.
+  const markup = renderToStaticMarkup(createElement(FactoryScene, { topology: grouped, workers: [], workItems: [] }));
+  for (const heading of layout.headings) {
+    assert.match(markup, new RegExp(`<text data-floor-heading="${heading.label}" x="${heading.x}" y="${heading.y + 11}"[^>]*>${heading.label}</text>`));
+  }
+  const doors = [...markup.matchAll(/href="#df-frame-tile\.door" x="([0-9.]+)"/g)].map((match) => Number(match[1]));
+  assert.equal(doors.length, layout.rooms.length);
+  for (const x of doors) assert.equal(x % spriteAtlas.frame, 0, `door at ${x} off the tile grid`);
+  // Rooms without a project stand under no heading, as before.
+  assert.deepEqual(layoutScene(topology).headings, []);
 });
 
 test("worker identity is stable while operational state changes", () => {
@@ -240,6 +283,35 @@ test("every identity and operational frame is reachable, including fallbacks", (
 });
 
 // Nothing else runs the generator, so the shipped module could drift from it.
+// A PNG's pixels: its IHDR and its inflated scanlines. The deflate bytes
+// themselves depend on the zlib a Node was built with, so two builds of the
+// same image may not share a byte; they must share every pixel.
+function pngPixels(bytes) {
+  assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  const idats = [];
+  let header;
+  for (let offset = 8; offset < bytes.length;) {
+    const length = bytes.readUInt32BE(offset);
+    const type = bytes.toString("latin1", offset + 4, offset + 8);
+    const data = bytes.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") header = Buffer.from(data);
+    if (type === "IDAT") idats.push(data);
+    offset += 12 + length;
+  }
+  return Buffer.concat([header, inflateSync(Buffer.concat(idats))]);
+}
+
+// Text that embeds the sheet as a data URL compares by its text with every
+// embedded PNG replaced, plus those PNGs' pixels in order.
+function withPixels(text) {
+  const pixels = [];
+  const stripped = text.replaceAll(/data:image\/png;base64,([A-Za-z0-9+/=]+)/g, (_, base64) => {
+    pixels.push(pngPixels(Buffer.from(base64, "base64")));
+    return "data:image/png;base64,<pixels>";
+  });
+  return { stripped, pixels };
+}
+
 test("the committed sprite module is exactly what the generator writes", () => {
   const sprites = new URL("./sprites/", import.meta.url);
   const scratch = mkdtempSync(join(tmpdir(), "df-sprites-"));
@@ -247,8 +319,13 @@ test("the committed sprite module is exactly what the generator writes", () => {
     copyFileSync(new URL("gen-sprites.mjs", sprites), join(scratch, "gen-sprites.mjs"));
     // A failing generator reports its own assertion, not just a bad exit.
     execFileSync(process.execPath, ["gen-sprites.mjs"], { cwd: scratch, stdio: "pipe" });
-    for (const name of ["sprites.png", "sprites.generated.ts", "preview.html"]) {
-      assert.deepEqual(readFileSync(join(scratch, name)), readFileSync(new URL(name, sprites)), name);
+    assert.deepEqual(pngPixels(readFileSync(join(scratch, "sprites.png"))), pngPixels(readFileSync(new URL("sprites.png", sprites))), "sprites.png");
+    for (const name of ["sprites.generated.ts", "preview.html"]) {
+      const fresh = withPixels(readFileSync(join(scratch, name), "utf8"));
+      const committed = withPixels(readFileSync(new URL(name, sprites), "utf8"));
+      assert.equal(fresh.stripped, committed.stripped, name);
+      assert.deepEqual(fresh.pixels, committed.pixels, `${name} pixels`);
+      assert.ok(fresh.pixels.length >= 1, `${name} embeds the sheet`);
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });

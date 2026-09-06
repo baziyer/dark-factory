@@ -199,6 +199,7 @@ export class FactoryAppController {
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
   #runPathsTicks = 0;
   #runPathsPending = false;
+  #runPathsDue = false;
   #edit: FactoryEditView | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
   #remoteInviteError: string | undefined;
@@ -320,6 +321,11 @@ export class FactoryAppController {
           if (!this.#current(generation) || this.#topologies.get(projectId)?.digest === topology.digest) return;
           this.#topologies = new Map(this.#topologies).set(projectId, topology);
           this.#publish();
+          // A project just served has rooms its running agents can stand in:
+          // ask now, or as soon as the round in flight is answered.
+          if (this.#runPathsTimer === undefined) return;
+          if (this.#runPathsPending) this.#runPathsDue = true;
+          else this.#pollRunPaths();
         },
         // A refused answer keeps the structure last served for that project
         // rather than emptying its block of rooms for one cycle.
@@ -338,6 +344,7 @@ export class FactoryAppController {
     if (!active || this.#closed || this.#status !== "ready") {
       if (this.#runPathsTimer !== undefined) clearInterval(this.#runPathsTimer);
       this.#runPathsTimer = undefined;
+      this.#runPathsDue = false;
       return;
     }
     if (this.#runPathsTimer !== undefined) return;
@@ -350,14 +357,27 @@ export class FactoryAppController {
     this.#pollRunPaths();
   }
 
-  /** One round: every agent on a running task, and nobody else. */
+  /**
+   * One round: every agent on a running task in a project whose structure is
+   * served, and nobody else. Without rooms a path places no one, and every
+   * answer costs the daemon a walk.
+   */
   #pollRunPaths(): void {
     const session = this.#client?.session;
     const state = this.#state;
     if (session === undefined || state === undefined || this.#runPathsPending) return;
     const running = [...new Set([...state.tasks.values()]
-      .filter((task) => task.status === "running" && task.assigned_agent_id !== "")
+      .filter((task) => task.status === "running" && task.assigned_agent_id !== "" && this.#topologies.has(task.project_id))
       .map((task) => task.assigned_agent_id))];
+    if (running.length === 0) {
+      // Nothing to ask leaves no round in flight, so the round a served
+      // structure triggers is not lost behind an empty one.
+      if (this.#runPaths.size !== 0) {
+        this.#runPaths = new Map();
+        this.#publish();
+      }
+      return;
+    }
     this.#runPathsPending = true;
     const generation = this.#generation;
     void Promise.all(running.map((agentId) => session.getRunPaths(agentId).then(
@@ -367,7 +387,12 @@ export class FactoryAppController {
       () => [agentId, this.#runPaths.get(agentId) ?? []] as const,
     ))).then((answers) => {
       this.#runPathsPending = false;
+      // A round owed to a structure that arrived meanwhile is asked now, and
+      // only while the floor is still shown; an abandoned round owes nothing.
+      const due = this.#runPathsDue;
+      this.#runPathsDue = false;
       if (!this.#current(generation)) return;
+      if (due && this.#runPathsTimer !== undefined) this.#pollRunPaths();
       // An agent that stopped running loses its entry; an unchanged round is
       // not a new snapshot, so the floor does not re-render on a heartbeat.
       if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;

@@ -18,12 +18,12 @@ type cacheRecord struct {
 
 // BuildCached lazily builds root and atomically replaces cacheFile only when
 // its structural fingerprint or source revision changed.
-func BuildCached(ctx context.Context, root, cacheFile string) (Snapshot, error) {
+func BuildCached(ctx context.Context, root, project, cacheFile string) (Snapshot, error) {
 	previous, err := readCache(cacheFile)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	result, err := Build(ctx, root, previous)
+	result, err := Build(ctx, root, project, previous)
 	if err != nil {
 		return Snapshot{}, err
 	}
