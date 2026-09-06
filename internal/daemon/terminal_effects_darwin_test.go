@@ -1354,6 +1354,16 @@ func TestProviderExitAndOwnerDeathFencePrivateBinding(t *testing.T) {
 		if _, err := fixture.adapter.daemon.terminalInput(context.Background(), fixture.principal, fixture.run.ID, fixture.session.ID, lease.Generation, 1, fixture.run.Revision, fixture.session.Revision, []byte("after exit")); !errors.Is(err, ErrTerminalEffectRejected) {
 			t.Fatalf("input after provider exit = %v", err)
 		}
+		// At the browser boundary a release the runner refuses is stale, not
+		// an internal fault, so a console that cancelled the run and then let
+		// go of its terminal keeps its session (#542).
+		release := browserprotocol.TerminalLeaseRelease{
+			RunID: fixture.run.ID.String(), SessionID: fixture.session.ID.String(), Generation: browserprotocol.Decimal(lease.Generation),
+			ExpectedRunRevision: decimalRevision(fixture.run.Revision), ExpectedSessionRevision: decimalRevision(fixture.session.Revision),
+		}
+		if _, err := fixture.adapter.backend.ReleaseTerminalLease(context.Background(), fixture.principal, release); !errors.Is(err, browser.ErrStale) {
+			t.Fatalf("release after provider exit = %v", err)
+		}
 	})
 
 	t.Run("owner death", func(t *testing.T) {

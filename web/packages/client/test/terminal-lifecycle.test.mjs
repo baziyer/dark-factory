@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTerminalHandle } from "../dist/src/terminal_session.js";
+import { SessionErrorLikeError, createTerminalHandle } from "../dist/src/terminal_session.js";
 import {
   decodeClientControl,
   decodeServerControl,
@@ -705,14 +705,21 @@ test("release precedes detach and exact release ambiguity never sends detach", a
   context.handle.receive(serverFrame(encodeTerminalDetached(detach.id, { session_id: sessionId })));
   await detached;
 
-  const failed = makeHandle();
-  await attachedWithLease(failed);
-  const pending = failed.handle.detach();
-  const releaseFrame = lastControl(failed.sent);
-  assert.equal(failed.handle.receiveError(releaseFrame.id, new Error("release unknown")), true);
-  await assert.rejects(pending, /release unknown/);
-  assert.equal(failed.fatals.length, 1);
-  assert.equal(failed.sent.some(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_DETACH"), false);
+  // A release the daemon refuses (the run was cancelled first, the lease
+  // moved on) is not fatal: authority is dropped and fenced, the detach goes
+  // on, and the session keeps observing (#542).
+  const refused = makeHandle();
+  await attachedWithLease(refused);
+  const pending = refused.handle.detach();
+  const releaseFrame = lastControl(refused.sent);
+  assert.equal(refused.handle.receiveError(releaseFrame.id, new SessionErrorLikeError("stale")), true);
+  assert.equal(refused.fatals.length, 0);
+  assert.equal(refused.handle.writable, false);
+  const detachFrame = lastControl(refused.sent);
+  assert.equal(detachFrame.type, "TERMINAL_DETACH");
+  refused.handle.receive(serverFrame(encodeTerminalDetached(detachFrame.id, { session_id: sessionId })));
+  await pending;
+  assert.equal(refused.fatals.length, 0);
 });
 
 test("detach waits for a pending attach before sending detach", async () => {
