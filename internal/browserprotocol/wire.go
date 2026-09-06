@@ -151,10 +151,10 @@ const (
 	ErrorStale          ErrorCode = "stale"
 	ErrorTooLarge       ErrorCode = "too_large"
 	ErrorInternal       ErrorCode = "internal"
-	// ErrorUnsupported answers a control type this build does not know: a
-	// verb it never had or one it retired, so the peer is newer or older, not
-	// wrong. The refusal names the request and the connection stays open for
-	// everything else.
+	// ErrorUnsupported answers a client control type the daemon does not
+	// know: a verb it never had or one it retired. The refusal names the
+	// request and the daemon keeps its side of the connection open; a console
+	// that knows this code degrades that one feature and carries on.
 	ErrorUnsupported ErrorCode = "unsupported"
 )
 

@@ -117,10 +117,12 @@ Tolerance is additive only. Every size, count, depth and member bound still
 binds, and an unknown member counts toward them: an array or a nesting depth
 inside a tolerated member is measured exactly as one inside a known member. A
 missing required member, a member of the wrong type and a frame arriving in the
-wrong direction remain finite refusals that end the connection. A frame type
-this build does not know, whether the peer is newer or still sends a retired
-verb, is answered by its request id with `ERROR` code `unsupported` and the
-connection stays open, so one side can add a verb before the other learns it.
+wrong direction remain finite refusals that end the connection. A client
+control type the daemon does not know is answered by its request id with
+`ERROR` code `unsupported` and the daemon keeps its side open, so a console
+that knows that code degrades one feature instead of losing its session. The
+other direction is still closed: the console decoder ends the session on a
+server frame type or an `ERROR` code it does not know (#556).
 
 ## Browser HumanRequest authority
 
