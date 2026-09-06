@@ -312,13 +312,18 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		return ControlFrame{}, ErrMalformed
 	}
 	if !typeAllowed(role, envelope.Type) {
-		if !typeAllowed(clientRole, envelope.Type) && !typeAllowed(serverRole, envelope.Type) {
-			// A type neither direction knows is additive evolution on the
-			// other side. The frame comes back with its identity so the
-			// caller can refuse exactly that request.
-			return ControlFrame{Type: envelope.Type, ID: id}, ErrUnsupported
+		peer := clientRole
+		if role == clientRole {
+			peer = serverRole
 		}
-		return ControlFrame{}, ErrMalformed
+		if envelope.Type == "" || typeAllowed(peer, envelope.Type) {
+			return ControlFrame{}, ErrMalformed
+		}
+		// A type neither direction knows is one this build never had or no
+		// longer has: the peer is newer, or older and still sending a retired
+		// verb. Either way the frame comes back with its identity so the
+		// caller can refuse exactly that request and keep the connection.
+		return ControlFrame{Type: envelope.Type, ID: id}, ErrUnsupported
 	}
 	var body any
 	switch envelope.Type {

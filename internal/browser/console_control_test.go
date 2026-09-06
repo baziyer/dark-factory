@@ -211,11 +211,8 @@ func consoleFrame(t *testing.T, kind browserprotocol.MessageType) string {
 	return ""
 }
 
-// invalid_request reaches a client by two routes that differ in what happens
-// next. A member the backend refuses is one bad answer on a connection that
-// keeps working; a frame the transport itself refuses ends the connection.
-// Observing only one of them would let the backend route become the harsh one
-// without anything noticing.
+// A verb this build does not know is refused by its id and nothing else
+// changes: the socket, the budget and every known verb are as they were.
 func TestUnknownControlTypeIsRefusedByIDAndKeepsTheConnection(t *testing.T) {
 	server := startTaskServer(t, newConsoleDispatchBackend())
 	connection, _ := dialServer(t, server, testOrigin)
@@ -236,6 +233,11 @@ func TestUnknownControlTypeIsRefusedByIDAndKeepsTheConnection(t *testing.T) {
 	assertError(t, readServerFrame(t, connection), browserprotocol.ErrorInvalidRequest)
 }
 
+// invalid_request reaches a client by two routes that differ in what happens
+// next. A member the backend refuses is one bad answer on a connection that
+// keeps working; a frame the transport itself refuses ends the connection.
+// Observing only one of them would let the backend route become the harsh one
+// without anything noticing.
 func TestConsoleInvalidRequestKeepsTheConnectionTheTransportWouldClose(t *testing.T) {
 	backend := newConsoleDispatchBackend()
 	backend.err = ErrInvalidRequest

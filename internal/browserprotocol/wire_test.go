@@ -255,9 +255,13 @@ func TestUnknownTypeWithIDIsUnsupportedNotMalformed(t *testing.T) {
 			t.Fatalf("unknown type = %+v, %v", frame, err)
 		}
 	}
-	// A type the other direction owns is a violation, not evolution.
+	// A type the other direction owns is a violation, not evolution, and an
+	// empty type is no type at all.
 	if _, err := DecodeClientControl([]byte(`{"type":"STATE_SNAPSHOT","id":"s","body":{}}`)); err != ErrMalformed {
 		t.Fatalf("server type from client = %v", err)
+	}
+	if _, err := DecodeClientControl([]byte(`{"type":"","id":"s","body":{}}`)); err != ErrMalformed {
+		t.Fatalf("empty type = %v", err)
 	}
 	wire, err := EncodeError("future-1", Error{Code: ErrorUnsupported})
 	if err != nil {
