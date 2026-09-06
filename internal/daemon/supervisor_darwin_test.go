@@ -170,6 +170,30 @@ func TestSupervisorRunsRegisteredShellWorkerToTypedSuccess(t *testing.T) {
 	}
 }
 
+// An orchestrator has no Change: it runs in its private runtime home, the
+// project tree is never copied for it, and its run reaches the same typed
+// success through the same attempt API.
+func TestSupervisorRunsOrchestratorInItsPrivateHomeWithoutAChange(t *testing.T) {
+	program := "set -eu\n[ \"$PWD\" = \"$HOME\" ]\n[ ! -e payload.txt ]\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorRoleFixture(t, program, kernel.RoleOrchestrator)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
+	if run.Role != kernel.RoleOrchestrator || run.ChangeID != nil || run.Proposal == nil || run.Proposal.Result() != "typed-success" {
+		t.Fatalf("orchestrator run = role %s change %v proposal %+v", run.Role, run.ChangeID, run.Proposal)
+	}
+	fixture.assertOneWitness(t)
+	fixture.assertReleased(t, run)
+	if entries, err := os.ReadDir(fixture.changeParent); err != nil || len(entries) != 0 {
+		t.Fatalf("orchestrator left a Change: %v, %v", entries, err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.runtimeParentPath, run.ID.String())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime remains: %v", err)
+	}
+}
+
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
 	const privateTask = "exact private Codex task"
 	fixture := newSupervisorFixture(t, "unused shell task")
@@ -1470,6 +1494,11 @@ type supervisorFixture struct {
 
 func newSupervisorFixture(t *testing.T, program string) *supervisorFixture {
 	t.Helper()
+	return newSupervisorRoleFixture(t, program, kernel.RoleWorker)
+}
+
+func newSupervisorRoleFixture(t *testing.T, program string, role kernel.AgentRole) *supervisorFixture {
+	t.Helper()
 	baselineFDs := supervisorFDCount(t)
 	root, err := os.MkdirTemp("/private/tmp", "dark-factory-supervisor-")
 	if err != nil {
@@ -1555,7 +1584,7 @@ func newSupervisorFixture(t *testing.T, program string) *supervisorFixture {
 		t.Fatal(err)
 	}
 	if _, err := store.CreateAgent(context.Background(), kernel.NewAgent{
-		ID: agentID, ProjectID: project.ID, Name: "worker", Role: kernel.RoleWorker,
+		ID: agentID, ProjectID: project.ID, Name: role.String(), Role: role,
 		Provider: kernel.ProviderShell, ToolBudgetLimit: 20,
 	}, supervisorTime()); err != nil {
 		t.Fatal(err)
@@ -1873,12 +1902,18 @@ func execSupervisorSQL(t *testing.T, path, statement string, arguments ...any) {
 	}
 }
 
-func supervisorProgram(t *testing.T, waitAfterRequest, noRequest bool) string {
+func supervisorTestExecutable(t *testing.T) string {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
+	return executable
+}
+
+func supervisorProgram(t *testing.T, waitAfterRequest, noRequest bool) string {
+	t.Helper()
+	executable := supervisorTestExecutable(t)
 	request := ""
 	if !noRequest {
 		request = quoteShell(executable) + " --supervisor-attempt-succeed typed-success\n"

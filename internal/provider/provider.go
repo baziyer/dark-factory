@@ -16,8 +16,12 @@ import (
 )
 
 const (
-	shellPath            = "/bin/sh"
-	claudeTool           = "claude"
+	shellPath  = "/bin/sh"
+	claudeTool = "claude"
+	// maintainerBridge is the Maintainer App's MCP bridge. An orchestrator
+	// launch names it to Claude, which is how an overseer publishes: the
+	// daemon itself exposes no repository or publication operation.
+	maintainerBridge     = "dark-factory-maintainer-mcp-bridge"
 	codexTool            = "codex"
 	maxPathBytes         = 4096
 	maxClaudePrompt      = 8 << 10
@@ -64,24 +68,33 @@ func ResolveInstallation(kind kernel.Provider, toolPath string) (Installation, e
 	default:
 		return Installation{}, ErrInvalid
 	}
+	executable, err := resolveTool(toolPath, tool)
+	if err != nil {
+		return Installation{}, unavailable(kind)
+	}
+	return Installation{provider: kind, executable: executable}, nil
+}
+
+// resolveTool commits the first tool of that name on the fixed tool path.
+func resolveTool(toolPath, tool string) (runner.ExecutableCommitment, error) {
 	for _, directory := range filepath.SplitList(toolPath) {
 		candidate := filepath.Join(directory, tool)
 		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return Installation{}, unavailable(kind)
+			return runner.ExecutableCommitment{}, ErrUnavailable
 		}
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil || !validAbsolute(resolved, maxPathBytes) {
-			return Installation{}, unavailable(kind)
+			return runner.ExecutableCommitment{}, ErrUnavailable
 		}
 		executable, err := runner.CommitExecutableLocator(resolved)
 		if err != nil {
-			return Installation{}, unavailable(kind)
+			return runner.ExecutableCommitment{}, ErrUnavailable
 		}
-		return Installation{provider: kind, executable: executable}, nil
+		return executable, nil
 	}
-	return Installation{}, unavailable(kind)
+	return runner.ExecutableCommitment{}, ErrUnavailable
 }
 
 // ConfigDirName is the directory a provider CLI keeps its login and
@@ -149,16 +162,17 @@ type Request struct {
 	reasoningEffort  string
 	runtime          RuntimePaths
 	workingDirectory string
+	role             kernel.AgentRole
 }
 
-func NewRequest(kind kernel.Provider, installation Installation, model, reasoningEffort string, runtime RuntimePaths, workingDirectory string) (Request, error) {
-	if kernel.ValidateProviderLaunchControls(kind, model, reasoningEffort) != nil || installation.provider != kind || installation.executable.Path() == "" || !runtime.valid() ||
+func NewRequest(kind kernel.Provider, installation Installation, model, reasoningEffort string, runtime RuntimePaths, workingDirectory string, role kernel.AgentRole) (Request, error) {
+	if kernel.ValidateProviderLaunchControls(kind, model, reasoningEffort) != nil || installation.provider != kind || installation.executable.Path() == "" || !runtime.valid() || role.String() == "" ||
 		kind == kernel.ProviderCodex && (!validAbsolute(workingDirectory, maxPathBytes) || len(codexUntrustedProjectConfig(workingDirectory)) > runner.MaxArgumentBytes) {
 		return Request{}, ErrInvalid
 	}
 	return Request{
 		provider: kind, installation: installation,
-		model: model, reasoningEffort: reasoningEffort, runtime: runtime, workingDirectory: workingDirectory,
+		model: model, reasoningEffort: reasoningEffort, runtime: runtime, workingDirectory: workingDirectory, role: role,
 	}, nil
 }
 
@@ -218,6 +232,21 @@ func Build(request Request) (Launch, error) {
 		}
 		if request.reasoningEffort != "" {
 			argv = append(argv, "--effort", request.reasoningEffort)
+		}
+		// An orchestrator publishes through the Maintainer App, so its
+		// session is given that one MCP server and no other; a worker gets
+		// none. Without the bridge an orchestrator cannot do its job, so
+		// the launch is refused rather than started blind.
+		if request.role == kernel.RoleOrchestrator {
+			bridge, err := resolveTool(request.runtime.toolPath, maintainerBridge)
+			if err != nil {
+				return Launch{}, errors.Join(ErrUnavailable, fmt.Errorf("%s: %s", maintainerBridge, request.runtime.toolPath))
+			}
+			config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"maintainer": map[string]string{"command": bridge.Path()}}})
+			if err != nil || len(config) > runner.MaxArgumentBytes {
+				return Launch{}, ErrInvalid
+			}
+			argv = append(argv, "--strict-mcp-config", "--mcp-config", string(config))
 		}
 		return Launch{
 			executable: request.installation.executable, argv: argv,

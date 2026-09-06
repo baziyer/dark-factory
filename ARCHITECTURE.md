@@ -237,6 +237,9 @@ Provider output is opaque and never lifecycle authority.
 reserves one daemon-derived path for one task incarnation. A registered wrapper
 materializes one exact committed tree before the provider can execute. The
 provider sees a plain writable directory with no Git administrative locator.
+An orchestrator run binds no Change: it works in its private runtime home, and
+publication of a worker's retained Change is the Maintainer App's, reached
+through the one MCP server an orchestrator's Claude session is given.
 Factoryd exposes no repository status, commit, push, pull-request, or
 publication operation.
 

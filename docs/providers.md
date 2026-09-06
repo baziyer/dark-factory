@@ -29,6 +29,15 @@ factoryctl agent create --project PROJECT_ID --name worker --provider codex --mo
 rejected for `shell`. Claude Code accepts `low`, `medium`, `high`, `xhigh`, or
 `max`; Codex additionally accepts `ultra`.
 
+`--role orchestrator` names an overseer. A worker's run materializes a Change
+of the project and works there; an orchestrator's run binds no Change and works
+in its private runtime home, so it can only read what a worker retained and
+publish through the Maintainer App. A Claude Code orchestrator is launched with
+that App's MCP bridge, `dark-factory-maintainer-mcp-bridge` resolved on the
+fixed tool path, as its one MCP server (`--strict-mcp-config`); a worker is
+launched with none. An orchestrator launch is refused when the bridge is not
+installed. Codex orchestrators receive no MCP configuration yet.
+
 ## Shell
 
 Shell is fixed to `/bin/sh` with argv `/bin/sh`, `/dev/fd/11`. Its bounded task

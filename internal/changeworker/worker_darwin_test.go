@@ -590,7 +590,7 @@ func newWorkerFixtureWithFactoryctlAndInput(t *testing.T, factoryctl string, inp
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := changeworker.Config{Provider: kernel.ProviderShell, RuntimePath: runtimePath, RuntimeIdentity: runtimeID, GitExecutable: git, FactoryctlExecutable: factoryctl, ToolPath: toolPath, AccountHome: filepath.Join(root, "account"), RepositoryRoot: repository, RepositoryIdentity: repositoryID, Revision: "HEAD", ChangeParent: changeParent, FinalName: "published", StagingName: ".stage", AttemptSocket: "/private/tmp/dark-factory-worker-api.sock", ProviderTask: providerTask}
+	config := changeworker.Config{Provider: kernel.ProviderShell, Role: kernel.RoleWorker, RuntimePath: runtimePath, RuntimeIdentity: runtimeID, GitExecutable: git, FactoryctlExecutable: factoryctl, ToolPath: toolPath, AccountHome: filepath.Join(root, "account"), RepositoryRoot: repository, RepositoryIdentity: repositoryID, Revision: "HEAD", ChangeParent: changeParent, FinalName: "published", StagingName: ".stage", AttemptSocket: "/private/tmp/dark-factory-worker-api.sock", ProviderTask: providerTask}
 	workerConfig, err := changeworker.EncodeConfig(config)
 	if err != nil {
 		t.Fatal(err)

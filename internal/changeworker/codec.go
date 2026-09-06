@@ -30,7 +30,12 @@ const (
 var ErrInvalidContract = errors.New("Change worker: invalid private contract")
 
 type Config struct {
-	Provider             kernel.Provider
+	Provider kernel.Provider
+	// Role decides whether the run works in a Change. A worker's Change is
+	// prepared or reopened below; an orchestrator has none and works in its
+	// private runtime home, so its FinalName, StagingName and Retained are
+	// empty.
+	Role                 kernel.AgentRole
 	Model                string
 	ReasoningEffort      string
 	RuntimePath          string
@@ -89,6 +94,7 @@ type resultWire struct {
 
 type configWire struct {
 	Provider             string       `json:"provider"`
+	Role                 string       `json:"role"`
 	Model                string       `json:"model"`
 	ReasoningEffort      string       `json:"reasoning_effort"`
 	RuntimePath          string       `json:"runtime_path"`
@@ -114,7 +120,7 @@ func EncodeConfig(config Config) ([]byte, error) {
 		return nil, err
 	}
 	wire := configWire{
-		Provider: config.Provider.String(), Model: config.Model, ReasoningEffort: config.ReasoningEffort,
+		Provider: config.Provider.String(), Role: config.Role.String(), Model: config.Model, ReasoningEffort: config.ReasoningEffort,
 		RuntimePath: config.RuntimePath, RuntimeIdentity: identityWire{Device: config.RuntimeIdentity.Device, Inode: config.RuntimeIdentity.Inode},
 		GitExecutable: config.GitExecutable, FactoryctlExecutable: config.FactoryctlExecutable, ToolPath: config.ToolPath, AccountHome: config.AccountHome, AccountConfigDir: config.AccountConfigDir,
 		RepositoryRoot: config.RepositoryRoot, RepositoryIdentity: identityWire{Device: config.RepositoryIdentity.Device(), Inode: config.RepositoryIdentity.Inode()}, Revision: config.Revision,
@@ -137,6 +143,10 @@ func DecodeConfig(encoded []byte) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	role, err := roleFromString(wire.Role)
+	if err != nil {
+		return Config{}, err
+	}
 	repositoryIdentity, err := change.NewRepositoryIdentity(wire.RepositoryIdentity.Device, wire.RepositoryIdentity.Inode)
 	if err != nil {
 		return Config{}, invalidContract(err)
@@ -150,7 +160,7 @@ func DecodeConfig(encoded []byte) (Config, error) {
 		retained = &result
 	}
 	config := Config{
-		Provider: providerKind, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort,
+		Provider: providerKind, Role: role, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort,
 		RuntimePath: wire.RuntimePath, RuntimeIdentity: runner.FileIdentity{Device: wire.RuntimeIdentity.Device, Inode: wire.RuntimeIdentity.Inode},
 		GitExecutable: wire.GitExecutable, FactoryctlExecutable: wire.FactoryctlExecutable, ToolPath: wire.ToolPath, AccountHome: wire.AccountHome, AccountConfigDir: wire.AccountConfigDir,
 		RepositoryRoot: wire.RepositoryRoot, RepositoryIdentity: repositoryIdentity, Revision: wire.Revision,
@@ -175,8 +185,14 @@ func validateConfig(config Config) error {
 	}
 	if len(config.AttemptSocket) > install.MaxSocketPathBytes || config.RuntimeIdentity.Device == 0 || config.RuntimeIdentity.Inode == 0 ||
 		kernel.ValidateProviderLaunchControls(config.Provider, config.Model, config.ReasoningEffort) != nil || provider.ValidateToolPath(config.ToolPath) != nil ||
-		!validText(config.Revision, maximumRevisionBytes) || !validChangeName(config.FinalName) || !validChangeName(config.StagingName) ||
-		config.FinalName == config.StagingName {
+		!validText(config.Revision, maximumRevisionBytes) || config.Role.String() == "" {
+		return invalidContract(nil)
+	}
+	if config.Role == kernel.RoleOrchestrator {
+		if config.FinalName != "" || config.StagingName != "" || config.Retained != nil {
+			return invalidContract(nil)
+		}
+	} else if !validChangeName(config.FinalName) || !validChangeName(config.StagingName) || config.FinalName == config.StagingName {
 		return invalidContract(nil)
 	}
 	if _, _, err := prepareProviderTask(config.Provider, config.ProviderTask); err != nil {
@@ -201,6 +217,15 @@ func prepareProviderTask(kind kernel.Provider, task []byte) (provider.TaskDelive
 		return provider.TaskDeliveryAttemptAPI, nil, nil
 	}
 	return provider.PrepareTask(kind, task)
+}
+
+func roleFromString(value string) (kernel.AgentRole, error) {
+	for _, candidate := range []kernel.AgentRole{kernel.RoleWorker, kernel.RoleOrchestrator} {
+		if value == candidate.String() {
+			return candidate, nil
+		}
+	}
+	return 0, invalidContract(nil)
 }
 
 func providerFromString(value string) (kernel.Provider, error) {
