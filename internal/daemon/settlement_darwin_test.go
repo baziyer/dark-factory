@@ -240,7 +240,11 @@ func TestRecoverySettlesThePublishedTreeAsTheWorkerLeftIt(t *testing.T) {
 	if fixture.run, err = fixture.store.ActivateRun(ctx, fixture.run.ID, session.ID, fixture.currentRun(t).Revision, session.Revision, mustKernelTime(t, 460)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fixture.changeParent, changeState.ID.String(), "nested", "b"), []byte("made\n"), 0o644); err != nil {
+	made := filepath.Join(fixture.changeParent, changeState.ID.String(), "nested", "b")
+	if err := os.WriteFile(made, []byte("made\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(made, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	success, err := kernel.NewSuccessProposal("made a file")
@@ -260,8 +264,11 @@ func TestRecoverySettlesThePublishedTreeAsTheWorkerLeftIt(t *testing.T) {
 		t.Fatalf("recovered run = %+v", settled)
 	}
 	retained, found, err := fixture.store.Change(ctx, changeState.ID)
-	if err != nil || !found || retained.Phase != kernel.ChangeRetained || retained.Selection == nil || retained.Selection.EntryCount() != uint32(facts.EntryCount())+1 || retained.Selection.TotalBytes() != facts.BlobBytes()+5 {
-		t.Fatalf("retained change phase=%v entries=%d bytes=%d, found=%v, %v", retained.Phase, retained.Selection.EntryCount(), retained.Selection.TotalBytes(), found, err)
+	if err != nil || !found || retained.Phase != kernel.ChangeRetained || retained.Selection == nil {
+		t.Fatalf("retained change phase=%v selection=%v, found=%v, %v", retained.Phase, retained.Selection != nil, found, err)
+	}
+	if retained.Selection.EntryCount() != uint32(facts.EntryCount())+1 || retained.Selection.TotalBytes() != facts.BlobBytes()+5 {
+		t.Fatalf("retained selection entries=%d bytes=%d, want %d and %d", retained.Selection.EntryCount(), retained.Selection.TotalBytes(), facts.EntryCount()+1, facts.BlobBytes()+5)
 	}
 }
 

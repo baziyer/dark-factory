@@ -12,8 +12,9 @@ import (
 // settleRun commits the terminal outcome of a finalizing run through the
 // reviewed finalize edges. An unpublished candidate change settles abandoned;
 // a published change settles retained after the published tree is re-read and
-// verified against the durable selection. Every state the kernel edges refuse
-// is returned unchanged with the refusal — settlement never invents evidence.
+// verified against its recorded identity, base and format. Every state the
+// kernel edges refuse is returned unchanged with the refusal — settlement
+// never invents evidence.
 func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel.Run, error) {
 	if daemon == nil || daemon.store == nil || runID == (kernel.RunID{}) {
 		return kernel.Run{}, fmt.Errorf("%w: invalid run settlement", kernel.ErrInvalidValue)
@@ -73,7 +74,8 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 // settlement authority exists, the evidence the supervisor's own finalize
 // takes. The selection on an available change is the tree as the daemon
 // made it before the worker ran, so the tree's contents settle as found;
-// a tree that is not the recorded one is a conflict, never a repair.
+// the inspection refuses a tree that is not the recorded one, and nothing
+// here repairs anything.
 func retainedSettlement(ctx context.Context, changeParent string, changeState kernel.Change) (kernel.ChangeSettlement, error) {
 	if changeParent == "" || changeState.Selection == nil || changeState.TreeIdentity == nil {
 		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published change lacks retained evidence", kernel.ErrConflict)
@@ -89,9 +91,6 @@ func retainedSettlement(ctx context.Context, changeParent string, changeState ke
 	availability, err := kernelAvailability(facts)
 	if err != nil {
 		return kernel.ChangeSettlement{}, err
-	}
-	if availability.TreeIdentity() != *changeState.TreeIdentity {
-		return kernel.ChangeSettlement{}, fmt.Errorf("%w: published tree is not the recorded tree", kernel.ErrConflict)
 	}
 	return kernel.NewRetainedChangeSettlement(changeState.Revision, availability)
 }
