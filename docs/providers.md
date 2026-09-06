@@ -74,7 +74,11 @@ CODEX_HOME=<account-home>/.codex
 
 No provider API key is copied into the environment. The native process runs as
 the operator with unrestricted interactive authority and may use that account's
-normal configuration or Keychain access.
+normal configuration or Keychain access. Before a Claude Code launch the Change
+worker records the working directory as trusted in that account's
+`.claude.json`, the record the CLI's own folder-trust dialog writes; every
+Change is a path the CLI has never seen, and without the record the session
+would stop at that dialog with the startup task typed into it.
 
 Native providers do not inherit the shell task descriptor. For Claude, the
 runner writes one fixed instruction plus the terminal-safe JSON-quoted task to

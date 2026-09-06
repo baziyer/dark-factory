@@ -292,6 +292,63 @@ func PrepareTask(kind kernel.Provider, task []byte) (TaskDelivery, []byte, error
 	}
 }
 
+// TrustClaudeDirectory records cwd as trusted in the account's Claude Code
+// configuration, which is what answering the CLI's folder-trust dialog does.
+// Every Change is a path the CLI has never seen, so without this record the
+// interactive session stops at that dialog and the startup task is typed into
+// it. Only this one key is added; every other byte of the file is kept.
+// ponytail: a read-modify-write like the CLI's own sessions do on the same
+// file; the window is milliseconds. Take a lock file if a lost update is
+// ever observed.
+func TrustClaudeDirectory(runtime RuntimePaths, cwd string) error {
+	if !runtime.valid() || !validAbsolute(cwd, maxPathBytes) {
+		return ErrInvalid
+	}
+	dir := runtime.accountHome
+	if runtime.accountConfig != "" && runtime.accountConfig != ConfigHome(kernel.ProviderClaudeCode, runtime.accountHome) {
+		dir = runtime.accountConfig
+	}
+	path := filepath.Join(dir, ".claude.json")
+	config := map[string]any{}
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&config); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	projects, _ := config["projects"].(map[string]any)
+	if projects == nil {
+		projects = map[string]any{}
+	}
+	project, _ := projects[cwd].(map[string]any)
+	if project == nil {
+		project = map[string]any{}
+	}
+	if project["hasTrustDialogAccepted"] == true {
+		return nil
+	}
+	project["hasTrustDialogAccepted"] = true
+	projects[cwd] = project
+	config["projects"] = projects
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	temp := path + ".dark-factory"
+	if err := os.WriteFile(temp, encoded, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temp, path); err != nil {
+		_ = os.Remove(temp)
+		return err
+	}
+	return nil
+}
+
 func unavailable(kind kernel.Provider) error {
 	return fmt.Errorf("%w: %s", ErrUnavailable, kind.String())
 }

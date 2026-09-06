@@ -127,6 +127,12 @@ func runProvider(ctx context.Context) (resultErr error) {
 		_ = cwd.Close()
 		return err
 	}
+	if config.Provider == kernel.ProviderClaudeCode {
+		if err := provider.TrustClaudeDirectory(runtimePaths, publishedPath); err != nil {
+			_ = cwd.Close()
+			return err
+		}
+	}
 	delivery, program, err := prepareProviderTask(config.Provider, config.ProviderTask)
 	if err != nil {
 		_ = cwd.Close()
