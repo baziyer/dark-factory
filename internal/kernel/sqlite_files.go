@@ -117,6 +117,9 @@ func openExistingFiles(ctx context.Context, absolutePath string, files *database
 		}
 		files.shm.minimum = walIndexRegionSize
 	}
+	if err := store.migrateLegacy(ctx); err != nil {
+		return closeRejectedOpen(store, files, err)
+	}
 	if err := files.refreshPinnedInfo(); err != nil {
 		return closeRejectedOpen(store, files, err)
 	}
@@ -936,7 +939,7 @@ func validateWALSnapshotCopy(ctx context.Context, sources *databaseFiles) (snaps
 		err = fmt.Errorf("%w: isolated database did not recover in WAL mode", ErrCorruptState)
 	}
 	if err == nil {
-		err = validateDatabaseSnapshot(ctx, tx.connection)
+		err = validateOpenableSnapshot(ctx, tx.connection)
 	}
 	validationErr := errors.Join(err, tx.Close())
 	return snapshot, validationErr
