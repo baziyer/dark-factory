@@ -997,7 +997,8 @@ test("the RULES block saves an idle rule and sends only what changed", async () 
   await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
   assert.equal(edits.length, before);
   assert.ok(renderer.root.findAllByType("p").some((paragraph) => String(paragraph.props.children).includes("needs at least a minute")));
-  // Retyping the same budget on a spent rule sends it, which restarts the count.
+  // On a spent rule, editing the text leaves the budget out, so the count
+  // stands; retyping the same budget sends it, which restarts the count.
   const spent = { ...fixtureState.agents.get(ids.agent), idle_policy: "standing_instruction", idle_after_seconds: 600, idle_instruction: "Look for follow-up work.", idle_run_budget: 3, idle_runs_used: 3 };
   const spentState = baseState({ agents: new Map([...fixtureState.agents, [spent.id, spent]]) });
   const again = [];
@@ -1005,7 +1006,10 @@ test("the RULES block saves an idle rule and sends only what changed", async () 
   await act(async () => { spentRenderer = create(createElement(FactoryConsole, { status: "ready", state: spentState, selectedAgent: agentSelection(), onSaveAgentConfig: (config) => again.push(config) })); });
   const spentField = (id) => spentRenderer.root.findAll((node) => node.props.id === id)[0];
   assert.match(renderToStaticMarkup(createElement(FactoryConsole, { status: "ready", state: spentState, selectedAgent: agentSelection(), onSaveAgentConfig: () => {} })), /3 of 3 idle runs used/);
+  await act(async () => { spentField(`df-idle-instruction-${ids.agent}`).props.onChange({ currentTarget: { value: "Look for follow-up work, then tidy." } }); });
+  await act(async () => { spentRenderer.root.findAllByType("form")[0].props.onSubmit({ preventDefault() {} }); });
+  assert.deepEqual(again.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work, then tidy." });
   await act(async () => { spentField(`df-idle-budget-${ids.agent}`).props.onChange({ currentTarget: { value: "3" } }); });
   await act(async () => { spentRenderer.root.findAllByType("form")[0].props.onSubmit({ preventDefault() {} }); });
-  assert.deepEqual(again.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
+  assert.deepEqual(again.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work, then tidy.", idleRunBudget: 3 });
 });

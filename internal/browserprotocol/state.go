@@ -277,7 +277,8 @@ func validateAgentItem(value AgentItem) error {
 	if value.AccountID != "" && (validateDynamicID(value.AccountID) != nil || value.Provider == "shell") {
 		return fmt.Errorf("%w: agent account", ErrMalformed)
 	}
-	// No policy at all is a snapshot from before idle rules: the agent waits.
+	// No policy at all is a snapshot from before idle rules; it passes as it
+	// is, and the console reads it as wait.
 	if value.IdlePolicy != "" && !validIdlePolicy(value.IdlePolicy) || value.IdleAfterSeconds > MaxIdleAfterSeconds || validateBoundedText(value.IdleInstruction, 0, MaxTaskInstructionBytes) != nil ||
 		value.IdleRunBudget > MaxIdleRunBudget || value.IdleRunsUsed > value.IdleRunBudget ||
 		value.IdlePolicy == "standing_instruction" && (value.IdleAfterSeconds == 0 || value.IdleInstruction == "" || value.IdleRunBudget == 0) {

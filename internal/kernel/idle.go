@@ -40,9 +40,11 @@ func idleRuleFromRow(policy string, after int64, instruction string, budget, use
 
 // EnqueueIdleInstructions enqueues each idle agent's standing instruction to
 // itself once its quiet spell has passed, and spends one of its idle runs
-// for it, in one transaction. Idle is what admission would admit: not paused,
-// tool budget left, no non-terminal run; plus no queued or running task, so
-// the rule never stacks on work. The quiet spell starts at the later of the agent's last edit and its
+// for it, in one transaction. Idle means the agent itself could take work
+// (not paused, tool budget left, no non-terminal run; the factory's dispatch
+// switch and capacity stay admission's to apply once the task is queued)
+// and has no queued or running task, so the rule never stacks on work. The
+// quiet spell starts at the later of the agent's last edit and its
 // last run's end, so editing the rule restarts the clock. An agent with any
 // queued or running task is left alone, and so is a paused one; a budget
 // already spent is never touched again until the operator sets a new one.

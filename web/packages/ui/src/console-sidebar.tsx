@@ -164,8 +164,9 @@ function AgentConfig({
   // A standing instruction is one rule, not three controls: the daemon
   // refuses a wait, text or budget it cannot run, so the form sends the whole
   // rule whenever any part of it moved, and will not submit one it can see
-  // is incomplete. Typing the budget (even the same number) sends it, which
-  // is what starts the used count again.
+  // is incomplete. The budget travels only when it was typed (even the same
+  // number) or the rule is new, since a budget the daemon receives starts the
+  // used count again; an edit to the wait or the text leaves the count alone.
   const ruleMoved = idlePolicy !== agent.idle_policy || idleAfterSeconds !== agent.idle_after_seconds || idleInstruction !== agent.idle_instruction || idleBudget !== agent.idle_run_budget || budgetTyped;
   const ruleIncomplete = standing && (idleAfterSeconds < 60 || idleInstruction.trim() === "" || idleBudget < 1);
   const submit = (event: FormEvent) => {
@@ -176,7 +177,7 @@ function AgentConfig({
       ...(reasoningEffort === agent.reasoning_effort ? {} : { reasoningEffort }),
       ...(accountId === agent.account_id ? {} : { accountId }),
       ...(paused === agent.paused ? {} : { paused }),
-      ...(!ruleMoved ? {} : standing ? { idlePolicy, idleAfterSeconds, idleInstruction, idleRunBudget: idleBudget } : { idlePolicy }),
+      ...(!ruleMoved ? {} : standing ? { idlePolicy, idleAfterSeconds, idleInstruction, ...(budgetTyped || idlePolicy !== agent.idle_policy ? { idleRunBudget: idleBudget } : {}) } : { idlePolicy }),
     });
   };
   return (
