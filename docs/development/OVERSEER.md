@@ -70,7 +70,7 @@ step so a retry is a replay, never a second publication:
 
 ```sh
 opid() { python3 -c "import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, 'dark-factory:' + sys.argv[1] + ':' + sys.argv[2]))" "$1" "$2"; }
-# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, review-HEAD8, enqueue
+# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, review-HEAD8, review-HEAD8-2, enqueue
 ```
 
 `review-HEAD8` takes the first eight hex digits of the pull request head it
@@ -154,8 +154,13 @@ Write that body to a file; the review needs it.
 
 ```sh
 DARK_FACTORY_REVIEW_OPERATION_ID=$(opid "$change_id" "review-$(printf '%s' "$HEAD_SHA" | cut -c1-8)") \
-    repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA BASE_SHA body.md "first review"
+    repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA "$base_commit" body.md "first review"
 ```
+
+The fourth argument is the change's `base_commit`, the commit the branch was
+published from, never main's live head: the reviewer's diff runs from the
+merge base of that commit and the pull request head, and its rules are that
+commit's `AGENTS.md`.
 
 The verdict is recorded under that operation id, so `observe_operation`
 with it answers `completed` with the verdict (`allow` or `block`) once a
