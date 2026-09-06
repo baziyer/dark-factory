@@ -219,8 +219,8 @@ provider cannot select a source path or lifecycle result.
 
 Shell receives bounded task bytes through a sealed descriptor. Claude Code and
 Codex resolve their named CLI through the daemon's fixed tool path to one exact
-direct executable commitment. Claude receives its task once through the PTY
-before the terminal is exposed. Codex receives only a fixed non-secret startup
+direct executable commitment. Claude receives its task text once through the PTY
+before the terminal is exposed, and the keystroke that submits it just after. Codex receives only a fixed non-secret startup
 instruction in argv, then reads its exact task through the running attempt's
 authenticated local API; task text never enters its argv, environment, or
 Change-worker configuration. Native tools use the operator's existing account:
