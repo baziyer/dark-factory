@@ -21,7 +21,7 @@ const (
 	// All four browser effect paths are now reviewed and implemented:
 	// observation/private HumanRequest detail, HumanRequest actions, and
 	// terminal input. The CLI never selects this mask.
-	webCapabilities = kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityPrivateHumanRequestDetail | kernel.BrowserCapabilityHumanActions | kernel.BrowserCapabilityTerminalInput
+	webCapabilities = kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityPrivateHumanRequestDetail | kernel.BrowserCapabilityHumanActions | kernel.BrowserCapabilityTerminalInput | kernel.BrowserCapabilityAdministration
 )
 
 func (daemon *Daemon) webRuntime() (*BrowserRuntime, bool) {

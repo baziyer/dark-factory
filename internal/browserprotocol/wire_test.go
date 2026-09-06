@@ -480,7 +480,7 @@ func TestControlIDAndBodyValidation(t *testing.T) {
 			t.Fatalf("invalid id %q accepted", id)
 		}
 	}
-	for _, caps := range []Capabilities{0, 16, 0xffffffff} {
+	for _, caps := range []Capabilities{0, 32, 0xffffffff} {
 		if _, err := EncodePairResult("x", PairResult{ClientID: strings.Repeat("60", 16), Capabilities: caps}); err == nil {
 			t.Fatalf("invalid capability %d accepted", caps)
 		}
@@ -558,8 +558,8 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 	if manifest.Name != "dark-factory/browser" || len(manifest.Control) != 49 || len(manifest.Terminal.Opcodes) != 2 {
 		t.Fatalf("manifest registry incomplete: %+v", manifest)
 	}
-	capabilityNames := []string{"observe", "private_human_request_detail", "human_actions", "terminal_input"}
-	capabilityValues := []byte{1, 2, 4, 8}
+	capabilityNames := []string{"observe", "private_human_request_detail", "human_actions", "terminal_input", "administration"}
+	capabilityValues := []byte{1, 2, 4, 8, 16}
 	if len(manifest.Capabilities) != len(capabilityNames) {
 		t.Fatalf("capability registry size = %d", len(manifest.Capabilities))
 	}

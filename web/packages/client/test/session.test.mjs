@@ -62,7 +62,7 @@ class Socket {
 
 function serverFor(socket) {
   const frame = decodeClientControl(socket.sent.at(-1));
-  const capabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+  const capabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input | CAPABILITIES.administration;
   if (frame.type === "PAIR_PROVE") socket.reply(encodePairResult(frame.id, { client_id: clientID, capabilities }));
   if (frame.type === "AUTH_PROVE") socket.reply(encodeAuthResult(frame.id, { client_id: clientID, capabilities }));
   if (frame.type === "STATE_GET") replySnapshot(socket, frame, 1n);
@@ -85,7 +85,7 @@ function lastFrame(socket, type) {
 async function openControlledStateSession(options = {}) {
   let socket;
   let automatic = true;
-  const capabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+  const capabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input | CAPABILITIES.administration;
   const server = (current, frame) => {
     if (frame.type === "PAIR_PROVE") current.reply(encodePairResult(frame.id, { client_id: clientID, capabilities }));
     if (frame.type === "AUTH_PROVE") current.reply(encodeAuthResult(frame.id, { client_id: clientID, capabilities }));

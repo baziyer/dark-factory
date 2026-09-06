@@ -20,6 +20,11 @@
       "name": "terminal_input",
       "bit": 3,
       "value": 8
+    },
+    {
+      "name": "administration",
+      "bit": 4,
+      "value": 16
     }
   ],
   "bounds": {

@@ -24,7 +24,7 @@ func TestProjectBrowserAuthenticationProjectsExactDurableEffectCapabilities(t *t
 		{name: "observe", mask: kernel.BrowserCapabilityObserve, wire: browserprotocol.CapabilityObserve},
 		{name: "human actions", mask: kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityHumanActions, wire: browserprotocol.CapabilityObserve | browserprotocol.CapabilityHumanActions},
 		{name: "terminal input", mask: kernel.BrowserCapabilityObserve | kernel.BrowserCapabilityTerminalInput, wire: browserprotocol.CapabilityObserve | browserprotocol.CapabilityTerminalInput},
-		{name: "all", mask: kernel.BrowserCapabilityKnownMask, wire: browserprotocol.CapabilityObserve | browserprotocol.CapabilityPrivateHumanRequestDetail | browserprotocol.CapabilityHumanActions | browserprotocol.CapabilityTerminalInput},
+		{name: "all", mask: kernel.BrowserCapabilityKnownMask, wire: browserprotocol.CapabilityObserve | browserprotocol.CapabilityPrivateHumanRequestDetail | browserprotocol.CapabilityHumanActions | browserprotocol.CapabilityTerminalInput | browserprotocol.CapabilityAdministration},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			authentication, err := projectBrowserAuthentication(kernel.BrowserClient{ID: clientID, CapabilityMask: test.mask})
@@ -36,7 +36,7 @@ func TestProjectBrowserAuthenticationProjectsExactDurableEffectCapabilities(t *t
 			}
 		})
 	}
-	for _, mask := range []kernel.BrowserCapabilityMask{0, kernel.BrowserCapabilityHumanActions, kernel.BrowserCapabilityObserve | (1 << 4)} {
+	for _, mask := range []kernel.BrowserCapabilityMask{0, kernel.BrowserCapabilityHumanActions, kernel.BrowserCapabilityObserve | (1 << 5)} {
 		if _, err := projectBrowserAuthentication(kernel.BrowserClient{ID: clientID, CapabilityMask: mask}); err == nil {
 			t.Fatalf("accepted invalid durable capability mask %d", mask)
 		}

@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 2
+	userVersion   = 3
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -262,7 +262,7 @@ var schemaStatements = []string{
     secret_digest BLOB PRIMARY KEY CHECK (length(secret_digest) = 32),
     boot_id BLOB NOT NULL CHECK (length(boot_id) = 16 AND boot_id <> zeroblob(16)),
     intended_origin TEXT NOT NULL CHECK (length(CAST(intended_origin AS BLOB)) BETWEEN 1 AND 4096),
-    capability_mask INTEGER NOT NULL CHECK (capability_mask BETWEEN 1 AND 15 AND (capability_mask & 1) = 1),
+    capability_mask INTEGER NOT NULL CHECK (capability_mask BETWEEN 1 AND 31 AND (capability_mask & 1) = 1),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > created_at_ms AND expires_at_ms <= created_at_ms + 300000),
     redeemed_at_ms INTEGER CHECK (redeemed_at_ms IS NULL OR (redeemed_at_ms >= created_at_ms AND redeemed_at_ms < expires_at_ms AND redeemed_at_ms >= 0))
@@ -271,7 +271,7 @@ var schemaStatements = []string{
     id BLOB PRIMARY KEY CHECK (length(id) = 16 AND id <> zeroblob(16)),
     public_key BLOB NOT NULL CHECK (length(public_key) = 65 AND substr(public_key, 1, 1) = X'04'),
     fingerprint BLOB NOT NULL UNIQUE CHECK (length(fingerprint) = 32),
-    capability_mask INTEGER NOT NULL CHECK (capability_mask BETWEEN 1 AND 15 AND (capability_mask & 1) = 1),
+    capability_mask INTEGER NOT NULL CHECK (capability_mask BETWEEN 1 AND 31 AND (capability_mask & 1) = 1),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),

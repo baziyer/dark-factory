@@ -20,9 +20,13 @@ const (
 	BrowserCapabilityPrivateHumanRequestDetail
 	BrowserCapabilityHumanActions
 	BrowserCapabilityTerminalInput
+	// BrowserCapabilityAdministration is operator-level: naming this machine's
+	// provider logins, linking them, and assigning them to agents. A pairing
+	// minted on loopback carries it; a relay pairing does not.
+	BrowserCapabilityAdministration
 )
 
-const BrowserCapabilityKnownMask = BrowserCapabilityObserve | BrowserCapabilityPrivateHumanRequestDetail | BrowserCapabilityHumanActions | BrowserCapabilityTerminalInput
+const BrowserCapabilityKnownMask = BrowserCapabilityObserve | BrowserCapabilityPrivateHumanRequestDetail | BrowserCapabilityHumanActions | BrowserCapabilityTerminalInput | BrowserCapabilityAdministration
 const BrowserTerminalLeaseTTL int64 = 30 * 1000
 
 func (m BrowserCapabilityMask) validPairing() bool {

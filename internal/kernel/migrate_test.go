@@ -2,6 +2,9 @@ package kernel
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -17,10 +20,20 @@ import (
 )
 
 func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
-	for _, persistWAL := range []bool{false, true} {
-		t.Run(fmt.Sprintf("wal=%v", persistWAL), func(t *testing.T) {
+	for _, version := range []int{legacyUserVersion, previousUserVersion} {
+		for _, persistWAL := range []bool{false, true} {
+			t.Run(fmt.Sprintf("v%d/wal=%v", version, persistWAL), func(t *testing.T) {
+				testLegacyHomeMigratesAndKeepsEveryRow(t, version, persistWAL)
+			})
+		}
+	}
+}
+
+func testLegacyHomeMigratesAndKeepsEveryRow(t *testing.T, version int, persistWAL bool) {
+	{
+		{
 			ctx := context.Background()
-			path, before := newLegacyDatabase(t, persistWAL)
+			path, before := newLegacyDatabase(t, persistWAL, version)
 
 			store, err := Open(ctx, path)
 			if err != nil {
@@ -53,6 +66,18 @@ func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
 			if accounts != 0 || adopted != 0 {
 				t.Fatalf("migration invented %d accounts and %d agent links", accounts, adopted)
 			}
+			// Loopback pairings (the ones with terminal_input) gained
+			// administration; the relay pairing did not. Every pending
+			// challenge is treated the same way.
+			for _, table := range []string{"browser_clients", "browser_pairing_challenges"} {
+				var loopback, relay int
+				if err := connection.QueryRowContext(ctx, `SELECT MIN(capability_mask), MAX(capability_mask) FROM `+table).Scan(&relay, &loopback); err != nil {
+					t.Fatal(err)
+				}
+				if want := int(BrowserCapabilityKnownMask); loopback != want || relay != int(testRelayMask) {
+					t.Fatalf("%s masks after migration: loopback=%d relay=%d, want %d and %d", table, loopback, relay, want, testRelayMask)
+				}
+			}
 			if err := connection.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -77,7 +102,7 @@ func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
 			if after := snapshotRows(t, ctx, again); !reflect.DeepEqual(before, after) {
 				t.Fatal("reopening a migrated home changed rows")
 			}
-		})
+		}
 	}
 }
 
@@ -116,7 +141,7 @@ func TestCurrentHomeOpensWithoutMigration(t *testing.T) {
 }
 
 func TestLegacyHomeWithUnknownObjectRefusesToMigrate(t *testing.T) {
-	path, _ := newLegacyDatabase(t, false, `CREATE TABLE stowaway (id INTEGER PRIMARY KEY)`)
+	path, _ := newLegacyDatabase(t, false, legacyUserVersion, `CREATE TABLE stowaway (id INTEGER PRIMARY KEY)`)
 	store, err := Open(context.Background(), path)
 	if store != nil {
 		store.Close()
@@ -124,13 +149,13 @@ func TestLegacyHomeWithUnknownObjectRefusesToMigrate(t *testing.T) {
 	if !errors.Is(err, ErrForeignDatabase) {
 		t.Fatalf("Open = %v, want ErrForeignDatabase", err)
 	}
-	requireUnmigrated(t, path)
+	requireUnmigrated(t, path, legacyUserVersion)
 }
 
 func TestLegacyHomeWithForeignKeyViolationRefusesToMigrate(t *testing.T) {
 	orphan := `INSERT INTO tasks(id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms)
 		VALUES(X'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', X'01010101010101010101010101010101', X'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', X'abababababababababababababababab', 1, 't', '', 'queued', 0, NULL, NULL, NULL, 1, 6, 6)`
-	path, _ := newLegacyDatabase(t, false, orphan)
+	path, _ := newLegacyDatabase(t, false, legacyUserVersion, orphan)
 	store, err := Open(context.Background(), path)
 	if store != nil {
 		store.Close()
@@ -138,37 +163,73 @@ func TestLegacyHomeWithForeignKeyViolationRefusesToMigrate(t *testing.T) {
 	if !errors.Is(err, ErrCorruptState) {
 		t.Fatalf("Open = %v, want ErrCorruptState", err)
 	}
-	requireUnmigrated(t, path)
+	requireUnmigrated(t, path, legacyUserVersion)
 }
 
 // requireUnmigrated proves a refused open left the home exactly as it was.
-func requireUnmigrated(t *testing.T, path string) {
+func requireUnmigrated(t *testing.T, path string, wantVersion int) {
 	t.Helper()
 	ctx := context.Background()
 	pool, connection := openRawDatabase(t, path, false)
 	defer pool.Close()
 	defer connection.Close()
-	if _, version, err := inspectIdentity(ctx, connection); err != nil || version != legacyUserVersion {
-		t.Fatalf("refused open left user_version = %d, %v, want %d", version, err, legacyUserVersion)
+	if _, version, err := inspectIdentity(ctx, connection); err != nil || version != wantVersion {
+		t.Fatalf("refused open left user_version = %d, %v, want %d", version, err, wantVersion)
 	}
-	var objects int
-	if err := connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('accounts', 'accounts_provider_home_unique')`).Scan(&objects); err != nil {
+	// The objects each step rewrites still carry their earlier text.
+	var stale, accounts int
+	if err := connection.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('browser_clients', 'browser_pairing_challenges') AND sql LIKE '%BETWEEN 1 AND 15%'),
+		(SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('accounts', 'accounts_provider_home_unique'))`).Scan(&stale, &accounts); err != nil {
 		t.Fatal(err)
 	}
-	if objects != 0 {
-		t.Fatalf("refused open created %d accounts objects", objects)
+	if stale != 2 || (wantVersion == legacyUserVersion) != (accounts == 0) {
+		t.Fatalf("refused open rewrote objects: pre-v3 browser tables=%d accounts objects=%d for v%d", stale, accounts, wantVersion)
 	}
 }
 
-// newLegacyDatabase builds a populated home in the exact pre-accounts shape by
-// downgrading a real one: every row is written through the public API, then the
-// three objects the accounts slice changed are put back the way v1 had them.
-// The returned snapshot is every v1 row, for comparison after the migration.
-func newLegacyDatabase(t *testing.T, persistWAL bool, extra ...string) (string, map[string][]string) {
+func must[T any](value T, ok bool) T {
+	if !ok {
+		panic("no migratable schema for that version")
+	}
+	return value
+}
+
+// The relay pairing mask: every bit but terminal_input and administration.
+const testRelayMask = BrowserCapabilityObserve | BrowserCapabilityPrivateHumanRequestDetail | BrowserCapabilityHumanActions
+
+// newLegacyDatabase builds a populated home in the exact shape of an earlier
+// user_version by downgrading a real one: every row is written through the
+// public API, then the objects later versions changed are put back the way
+// that version had them. The returned snapshot is every row, for comparison
+// after the migration.
+func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...string) (string, map[string][]string) {
 	t.Helper()
 	ctx := context.Background()
 	store, path := newTestStore(t)
 	seedDurableAuthority(t, store)
+	// One loopback pairing and one relay pairing, each redeemed and each
+	// with a second challenge still pending, written the way the daemon
+	// writes them. The pre-v3 loopback mask is every bit but administration.
+	loopback := BrowserCapabilityObserve | BrowserCapabilityPrivateHumanRequestDetail | BrowserCapabilityHumanActions | BrowserCapabilityTerminalInput
+	boot := browserTestBoot(t, 1)
+	for index, mask := range []BrowserCapabilityMask{loopback, testRelayMask} {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		redeemed := HashBrowserChallenge([]byte(fmt.Sprintf("redeemed %d", index)))
+		pending := HashBrowserChallenge([]byte(fmt.Sprintf("pending %d", index)))
+		for _, digest := range []BrowserChallengeDigest{redeemed, pending} {
+			if _, err := store.CreateBrowserPairingChallenge(ctx, digest, boot, "https://app.example", mask, mustTime(t, 1), mustTime(t, 2)); err != nil {
+				t.Fatalf("mint pairing challenge: %v", err)
+			}
+		}
+		publicKey := elliptic.Marshal(elliptic.P256(), key.X, key.Y)
+		if _, err := store.RedeemBrowserPairingChallenge(ctx, redeemed, boot, "https://app.example", browserTestID(t, byte(10+index)), publicKey, mustTime(t, 1)); err != nil {
+			t.Fatalf("redeem pairing challenge: %v", err)
+		}
+	}
 	project := projectID(t, 1)
 	for _, agent := range []struct {
 		seed     byte
@@ -205,7 +266,8 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, extra ...string) (string, 
 	if err := setForeignKeys(ctx, connection, false); err != nil {
 		t.Fatal(err)
 	}
-	legacy := expectedSchemaOf(legacySchemaStatements())
+	wantStatements := must(migratableSchema(version))
+	legacy := expectedSchemaOf(wantStatements)
 	statements := []string{"BEGIN IMMEDIATE"}
 	statements = append(statements, extra...)
 	for _, statement := range statements {
@@ -213,20 +275,30 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, extra ...string) (string, 
 			t.Fatalf("prepare legacy home: %v", err)
 		}
 	}
-	if err := rebuildTable(ctx, connection, legacy, "agents", testAgentColumns, "agents_id_project_unique"); err != nil {
+	if err := rebuildTable(ctx, connection, legacy, "browser_pairing_challenges", previousPairingChallengeColumns, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := rebuildTable(ctx, connection, legacy, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique"); err != nil {
+	if err := rebuildTable(ctx, connection, legacy, "browser_clients", previousBrowserClientColumns, ""); err != nil {
 		t.Fatal(err)
 	}
-	for _, statement := range []string{"DROP TABLE accounts", fmt.Sprintf("PRAGMA user_version = %d", legacyUserVersion), "COMMIT"} {
+	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
+	if version == legacyUserVersion {
+		if err := rebuildTable(ctx, connection, legacy, "agents", testAgentColumns, "agents_id_project_unique"); err != nil {
+			t.Fatal(err)
+		}
+		if err := rebuildTable(ctx, connection, legacy, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique"); err != nil {
+			t.Fatal(err)
+		}
+		downgrade = append([]string{"DROP TABLE accounts"}, downgrade...)
+	}
+	for _, statement := range downgrade {
 		if _, err := connection.ExecContext(ctx, statement); err != nil {
-			t.Fatalf("downgrade to v1: %v", err)
+			t.Fatalf("downgrade to v%d: %v", version, err)
 		}
 	}
 	if len(extra) == 0 {
-		if err := validateSchemaVersion(ctx, connection, legacyUserVersion, legacySchemaStatements()); err != nil {
-			t.Fatalf("fixture is not an exact v1 home: %v", err)
+		if err := validateSchemaVersion(ctx, connection, version, wantStatements); err != nil {
+			t.Fatalf("fixture is not an exact v%d home: %v", version, err)
 		}
 	}
 	requireLegacyPopulation(t, ctx, connection)
@@ -278,6 +350,11 @@ func openRawDatabase(t *testing.T, path string, persistWAL bool) (*sql.DB, *sql.
 // migration stopped copying.
 const testAgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 
+var testBrowserColumns = map[string]string{
+	"browser_pairing_challenges": strings.ReplaceAll(previousPairingChallengeColumns, "capability_mask, ", ""),
+	"browser_clients":            strings.ReplaceAll(previousBrowserClientColumns, "capability_mask, ", ""),
+}
+
 // snapshotRows reads every v1 table, agents through the list above because the
 // added account_id makes SELECT * differ either side of the migration.
 func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[string][]string {
@@ -288,8 +365,13 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 			continue
 		}
 		columns := "*"
-		if name == "agents" {
+		switch name {
+		case "agents":
 			columns = testAgentColumns
+		case "browser_pairing_challenges", "browser_clients":
+			// The v3 migration rewrites masks on purpose; the migration test
+			// asserts them separately.
+			columns = testBrowserColumns[name]
 		}
 		rows, err := connection.QueryContext(ctx, "SELECT "+columns+" FROM "+name+" ORDER BY 1")
 		if err != nil {
@@ -322,15 +404,18 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 // database: every table the migration touches has to carry real rows.
 func requireLegacyPopulation(t *testing.T, ctx context.Context, connection *sql.Conn) {
 	t.Helper()
-	var projects, agents, providers, tasks, runs, kinds int
+	var projects, agents, providers, tasks, runs, kinds, clients, challenges, events int
 	if err := connection.QueryRowContext(ctx, `SELECT
 		(SELECT COUNT(*) FROM projects), (SELECT COUNT(*) FROM agents), (SELECT COUNT(DISTINCT provider) FROM agents),
-		(SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM runs), (SELECT COUNT(DISTINCT entity_kind) FROM invalidations)`).
-		Scan(&projects, &agents, &providers, &tasks, &runs, &kinds); err != nil {
+		(SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM runs), (SELECT COUNT(DISTINCT entity_kind) FROM invalidations),
+		(SELECT COUNT(DISTINCT capability_mask) FROM browser_clients), (SELECT COUNT(DISTINCT capability_mask) FROM browser_pairing_challenges),
+		(SELECT COUNT(*) FROM browser_security_events WHERE client_id IS NOT NULL)`).
+		Scan(&projects, &agents, &providers, &tasks, &runs, &kinds, &clients, &challenges, &events); err != nil {
 		t.Fatal(err)
 	}
-	if projects < 1 || agents < 3 || providers != 3 || tasks < 1 || runs < 1 || kinds != 7 {
-		t.Fatalf("thin fixture: projects=%d agents=%d providers=%d tasks=%d runs=%d invalidation kinds=%d", projects, agents, providers, tasks, runs, kinds)
+	if projects < 1 || agents < 3 || providers != 3 || tasks < 1 || runs < 1 || kinds != 7 || clients != 2 || challenges != 2 || events < 1 {
+		t.Fatalf("thin fixture: projects=%d agents=%d providers=%d tasks=%d runs=%d invalidation kinds=%d client masks=%d challenge masks=%d client events=%d",
+			projects, agents, providers, tasks, runs, kinds, clients, challenges, events)
 	}
 }
 
@@ -349,7 +434,8 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
+		{"current", schemaStatements, "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
+		{"v2", previousSchemaStatements(), "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
 		{"v1", legacySchemaStatements(), "63a444a2fe57a994b712bfe5b56764d684b2cb3ed73d7324465d894107f96f33"},
 	} {
 		sum := sha256.Sum256([]byte(strings.Join(pin.statements, "\n")))
@@ -363,11 +449,19 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 // that reaches inside the migration transaction: the two above are rejected by
 // the preflight, on its disposable copy, before any pool exists.
 func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
+	for _, version := range []int{legacyUserVersion, previousUserVersion} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t, version)
+		})
+	}
+}
+
+func testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T, version int) {
 	ctx := context.Background()
 	// An invalidation head that no longer matches the log passes the exact
 	// schema, the integrity check and foreign_key_check that the preflight
 	// runs, and fails only the durable-control pass inside the transaction.
-	path, before := newLegacyDatabase(t, false, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
+	path, before := newLegacyDatabase(t, false, version, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
 	evidence := captureDatabaseEvidence(t, path)
 	store, err := Open(ctx, path)
 	if store != nil {
@@ -377,7 +471,7 @@ func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
 		t.Fatalf("Open = %v, want ErrCorruptState", err)
 	}
 	assertDatabaseEvidenceUnchanged(t, path, evidence)
-	requireUnmigrated(t, path)
+	requireUnmigrated(t, path, version)
 
 	// Repaired, the same home migrates and keeps the rows it always had.
 	pool, connection := openRawDatabase(t, path, false)
@@ -414,7 +508,7 @@ func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
 // replacement.
 func TestRefusedMigrationReturnsTheWriterConnection(t *testing.T) {
 	ctx := context.Background()
-	path, _ := newLegacyDatabase(t, false, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
+	path, _ := newLegacyDatabase(t, false, legacyUserVersion, `UPDATE factory SET next_invalidation_sequence = next_invalidation_sequence + 5 WHERE singleton = 1`)
 	store, err := openPools(path)
 	if err != nil {
 		t.Fatal(err)

@@ -38,7 +38,7 @@ const (
 	writeLimit          = 2 * time.Second
 	readHeaderLimit     = 2 * time.Second
 	shutdownHeaderLimit = 2 * time.Second
-	implementedCaps     = browserprotocol.CapabilityObserve | browserprotocol.CapabilityPrivateHumanRequestDetail | browserprotocol.CapabilityHumanActions | browserprotocol.CapabilityTerminalInput
+	implementedCaps     = browserprotocol.CapabilityObserve | browserprotocol.CapabilityPrivateHumanRequestDetail | browserprotocol.CapabilityHumanActions | browserprotocol.CapabilityTerminalInput | browserprotocol.CapabilityAdministration
 )
 
 type Config struct {

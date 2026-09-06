@@ -96,12 +96,16 @@ const (
 	CapabilityPrivateHumanRequestDetail
 	CapabilityHumanActions
 	CapabilityTerminalInput
+	// CapabilityAdministration gates the operator's provider logins: their
+	// discovery, linking, and assignment to agents through AGENT_UPDATE.
+	CapabilityAdministration
 )
 
 const knownCapabilities = CapabilityObserve |
 	CapabilityPrivateHumanRequestDetail |
 	CapabilityHumanActions |
-	CapabilityTerminalInput
+	CapabilityTerminalInput |
+	CapabilityAdministration
 
 // CapabilityHumanActions covers bounded operator mutations, including task
 // enqueue. It remains one durable bit so existing browser pairings and the

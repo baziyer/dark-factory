@@ -272,6 +272,8 @@ export class BrowserSession {
     if (request.accountId !== undefined) body.account_id = request.accountId;
     if (request.paused !== undefined) body.paused = request.paused;
     if (bounded(request.model, MAX_AGENT_MODEL_BYTES) || bounded(request.reasoningEffort, MAX_AGENT_MODEL_BYTES)) return Promise.reject(new SessionError("invalid_request"));
+    // Which login an agent runs as is administration, like the logins themselves.
+    if (request.accountId !== undefined && (this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
     return this.#consoleRequest("AGENT_UPDATE_RESULT", request.agentId, request.expectedRevision, "agent-update", (id) => encodeClientControl({ type: "AGENT_UPDATE", id, body }));
   }
 
@@ -303,12 +305,12 @@ export class BrowserSession {
   /** The provider logins present on the daemon's machine. A linked one
    * carries the account identity an agent selects; nothing secret is served. */
   discoverAccounts(): Promise<readonly DiscoveredAccountView[]> {
-    return this.#accountRequest("ACCOUNTS", CAPABILITIES.observe, "accounts", (id) => encodeClientControl({ type: "ACCOUNTS_DISCOVER", id, body: {} }));
+    return this.#accountRequest("ACCOUNTS", CAPABILITIES.administration, "accounts", (id) => encodeClientControl({ type: "ACCOUNTS_DISCOVER", id, body: {} }));
   }
 
   /** Registers one already-existing login so agents can be pointed at it. */
   linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<AccountLinkResult> {
-    return this.#accountRequest("ACCOUNT_LINK_RESULT", CAPABILITIES.human_actions, "account-link", (id) => encodeClientControl({ type: "ACCOUNT_LINK", id, body: { provider: request.provider, home: request.home, label: request.label } }));
+    return this.#accountRequest("ACCOUNT_LINK_RESULT", CAPABILITIES.administration, "account-link", (id) => encodeClientControl({ type: "ACCOUNT_LINK", id, body: { provider: request.provider, home: request.home, label: request.label } }));
   }
 
   /** Mints one remote pairing invitation. The mint is never retried: a failed
@@ -829,7 +831,7 @@ export class BrowserSession {
   }
 
   #validateStored(value: StoredClientKey): void {
-    const knownCapabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+    const knownCapabilities = CAPABILITIES.observe | CAPABILITIES.private_human_request_detail | CAPABILITIES.human_actions | CAPABILITIES.terminal_input | CAPABILITIES.administration;
     if (value === null || typeof value !== "object") throw new SessionError("storage_unavailable");
     const algorithm = value.key?.algorithm as EcKeyAlgorithm | undefined;
     if (typeof value.clientId !== "string" || !(value.publicKeySEC1 instanceof Uint8Array) || value.key === undefined || value.key === null || value.publicKeySEC1.length !== PUBLIC_KEY_BYTES || value.publicKeySEC1[0] !== 4 || value.key.extractable || algorithm?.name !== "ECDSA" || algorithm.namedCurve !== "P-256" || !Number.isSafeInteger(value.capabilities) || value.capabilities < CAPABILITIES.observe || (value.capabilities & ~knownCapabilities) !== 0) throw new SessionError("storage_unavailable");
