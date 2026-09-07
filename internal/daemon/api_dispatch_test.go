@@ -328,6 +328,29 @@ func TestDaemonDispatchesSendBackThroughBothDomains(t *testing.T) {
 		t.Fatalf("operator sending back a queued task = %v", err)
 	}
 	waitDispatch(t, done)
+	// Another project's task is unauthorized before its provider is asked
+	// anything, so a note's length cannot probe it.
+	elsewhere, stranger, foreign := testID(71), testID(72), testID(73)
+	done = fixture.serve(t)
+	if _, err := operator.CreateProject(ctx, api.CreateProjectInput{ID: elsewhere, Name: "elsewhere", Root: filepath.Join(filepath.Dir(fixture.socket), "elsewhere-root")}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.CreateAgent(ctx, api.CreateAgentInput{ID: stranger, ProjectID: elsewhere, Name: "stranger", Role: "worker", Provider: "claude_code", ToolBudgetLimit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.EnqueueTask(ctx, api.EnqueueTaskInput{ID: foreign, ProjectID: elsewhere, AssignedAgentID: stranger, IncarnationID: testID(74), Title: "not yours", Body: strings.Repeat("x", 7000)}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: foreign, Note: strings.Repeat("&", 1024)}); !errors.As(err, &remote) || remote.Code() != api.RemoteUnauthorized {
+		t.Fatalf("another project's task with an oversized note = %v", err)
+	}
+	waitDispatch(t, done)
 	// A credential the kernel would refuse learns nothing: an unknown bearer
 	// naming a missing task is unauthorized, never not found.
 	wrongToken := filepath.Join(filepath.Dir(fixture.socket), "wrong-send-back.token")

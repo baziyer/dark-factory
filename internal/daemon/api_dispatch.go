@@ -466,12 +466,14 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 	// An attempt is authenticated before anything is read on its behalf, so a
 	// credential the kernel would refuse learns nothing about any task.
 	var digest kernel.AttemptDigest
-	if raw, attempt := call.AttemptDigest(); attempt {
+	var authority kernel.AttemptAuthority
+	raw, attempt := call.AttemptDigest()
+	if attempt {
 		kDigest, err := attemptDigest(raw)
 		if err != nil {
 			return newErrorReply(api.RemoteInvalidRequest)
 		}
-		authority, err := daemon.store.AuthenticateAttempt(ctx, kDigest)
+		authority, err = daemon.store.AuthenticateAttempt(ctx, kDigest)
 		if err != nil {
 			return newErrorReply(remoteErrorCode(err))
 		}
@@ -490,6 +492,11 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 	if !found {
 		return newErrorReply(api.RemoteNotFound)
 	}
+	// Another project's task is not this orchestrator's to read further,
+	// let alone measure against its provider.
+	if attempt && current.ProjectID != authority.ProjectID {
+		return newErrorReply(api.RemoteUnauthorized)
+	}
 	agent, found, err := daemon.store.Agent(ctx, current.AssignedAgentID)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
@@ -501,7 +508,7 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 		return newErrorReply(api.RemoteTooLarge)
 	}
 	var task kernel.Task
-	if _, attempt := call.AttemptDigest(); attempt {
+	if attempt {
 		task, err = daemon.store.SendBackTaskForAttempt(ctx, digest, taskID, input.Note, at)
 		if err != nil {
 			return newErrorReply(remoteErrorCode(err))
