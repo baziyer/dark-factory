@@ -873,6 +873,12 @@ func verifyOpenRoot(fd int, expected StageIdentity) error {
 		return err
 	}
 	if !rootAuthority(stat, expected, uint32(os.Geteuid())) {
+		// The same directory with another mode is the worker's doing (its
+		// cwd is the tree root) and a refusal of the tree; anything else is
+		// not the tree that was recorded.
+		if uint64(stat.Dev) == expected.device && stat.Ino == expected.inode && stat.Mode&unix.S_IFMT == unix.S_IFDIR && stat.Uid == uint32(os.Geteuid()) {
+			return &ValidationError{Reason: "tree root mode or special bits changed", Tree: true}
+		}
 		return errors.New("tree root authority or identity changed")
 	}
 	return nil
@@ -968,7 +974,7 @@ func scanTree(ctx context.Context, rootFD int, rootDevice uint64, format ObjectF
 	}
 	slices.Sort(directories)
 	if !slices.Equal(manifest.directories, directories) {
-		return Manifest{}, &ValidationError{Reason: "empty or unselected prepared directory exists"}
+		return Manifest{}, &ValidationError{Reason: "empty or unselected prepared directory exists", Tree: true}
 	}
 	return manifest, nil
 }
@@ -992,6 +998,16 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			path = prefix + "/" + name
 		}
 		if _, err := validatePath([]byte(path)); err != nil {
+			// A path the tree itself holds (too long, too deep, not UTF-8, a
+			// .git) is the tree's refusal, not the arguments'.
+			var validation *ValidationError
+			var limit *LimitError
+			if errors.As(err, &validation) {
+				return &ValidationError{Reason: validation.Reason, Tree: true}
+			}
+			if errors.As(err, &limit) {
+				return &LimitError{Reason: limit.Reason, Tree: true}
+			}
 			return err
 		}
 		var before unix.Stat_t
@@ -999,7 +1015,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			return err
 		}
 		if uint64(before.Dev) != rootDevice || before.Uid != uint32(os.Geteuid()) {
-			return &ValidationError{Reason: "prepared entry ownership or device differs"}
+			return &ValidationError{Reason: "prepared entry ownership or device differs", Tree: true}
 		}
 		switch before.Mode & unix.S_IFMT {
 		case unix.S_IFDIR:
@@ -1007,7 +1023,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			// what its umask allows. Either way the owner has everything,
 			// nobody else may write, and no special bit is set.
 			if before.Mode&0o7022 != 0 || before.Mode&0o700 != 0o700 {
-				return &ValidationError{Reason: "prepared directory mode or special bits differ"}
+				return &ValidationError{Reason: "prepared directory mode or special bits differ", Tree: true}
 			}
 			childFD, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0)
 			if err != nil {
@@ -1032,10 +1048,10 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			// owner may execute it, as git does.
 			permissions := before.Mode & 0o7777
 			if before.Nlink != 1 || permissions&0o7022 != 0 || permissions&0o600 != 0o600 {
-				return &ValidationError{Reason: "prepared file link, mode or special bits differ"}
+				return &ValidationError{Reason: "prepared file link, mode or special bits differ", Tree: true}
 			}
 			if before.Size < 0 || uint64(before.Size) > MaxBlobBytes || *total > MaxTotalBlobBytes-uint64(before.Size) {
-				return &LimitError{Reason: "reconstructed byte limit exceeded"}
+				return &LimitError{Reason: "reconstructed byte limit exceeded", Tree: true}
 			}
 			fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0)
 			if err != nil {
@@ -1065,7 +1081,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			*entries = append(*entries, entry)
 			*total += uint64(opened.Size)
 		default:
-			return &ValidationError{Reason: "non-regular prepared entry forbidden"}
+			return &ValidationError{Reason: "non-regular prepared entry forbidden", Tree: true}
 		}
 	}
 	if syncDirectories {
@@ -1146,7 +1162,7 @@ func directoryNames(ctx context.Context, dirFD int, budget *entryBudget, hook ma
 			budget.observed++
 			if budget.observed > budget.limit {
 				file.Close()
-				return nil, &LimitError{Reason: "reconstructed total entry count exceeded"}
+				return nil, &LimitError{Reason: "reconstructed total entry count exceeded", Tree: true}
 			}
 			names = append(names, entry.Name())
 		}

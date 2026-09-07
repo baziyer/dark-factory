@@ -732,14 +732,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		final, err := daemon.store.FinalizeRun(context.Background(), run.ID, current.Revision, at)
 		return final, errors.Join(err, ctx.Err())
 	}
-	settledFacts, settleErr := change.InspectPublished(context.Background(), spec.ChangeParent, finalName, workerResult.Tree, workerResult.Format, workerResult.Base)
-	if settleErr != nil {
-		return current, errors.Join(settleErr, ctx.Err())
-	}
-	settledAvailability, settleErr := kernelAvailability(settledFacts)
-	if settleErr != nil {
-		return current, errors.Join(settleErr, ctx.Err())
-	}
+	var settleErr error
 	changeState, found, settleErr = daemon.store.Change(context.Background(), changeID)
 	if settleErr != nil || !found {
 		if settleErr == nil {
@@ -747,7 +740,19 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		}
 		return current, errors.Join(settleErr, ctx.Err())
 	}
-	settlement, settleErr := kernel.NewRetainedChangeSettlement(changeState.Revision, settledAvailability)
+	var settlement kernel.ChangeSettlement
+	settledFacts, settleErr := change.InspectPublished(context.Background(), spec.ChangeParent, finalName, workerResult.Tree, workerResult.Format, workerResult.Base)
+	if refused, refusal := publicationRefused(settleErr); refused {
+		// The tree the worker left cannot be published as it is. That is the
+		// run's outcome, recorded now, not a reason to leave it finalizing.
+		settlement, settleErr = refusedSettlement(spec.ChangeParent, changeState, run.ID, refusal)
+	} else if settleErr == nil {
+		var settledAvailability kernel.ChangeAvailability
+		settledAvailability, settleErr = kernelAvailability(settledFacts)
+		if settleErr == nil {
+			settlement, settleErr = kernel.NewRetainedChangeSettlement(changeState.Revision, settledAvailability)
+		}
+	}
 	if settleErr != nil {
 		return current, errors.Join(settleErr, ctx.Err())
 	}

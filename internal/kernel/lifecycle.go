@@ -835,7 +835,7 @@ func (store *Store) finalizeRun(ctx context.Context, runID RunID, expected Revis
 		return Run{}, tx.Rollback(ErrNotFound)
 	}
 	if run.Phase == RunTerminal && run.Revision.Int64() > expected.Int64() {
-		if run.Proposal == nil || run.Terminal == nil || !run.Terminal.equal(*run.Proposal) {
+		if run.Proposal == nil || run.Terminal == nil || !run.Terminal.equal(*run.Proposal) || settlement != nil && settlement.refusal != nil && !run.Terminal.equal(*settlement.refusal) {
 			return Run{}, tx.Rollback(ErrConflict)
 		}
 		if err := tx.Rollback(nil); err != nil {
@@ -876,6 +876,11 @@ func (store *Store) finalizeRun(ctx context.Context, runID RunID, expected Revis
 		return Run{}, tx.Rollback(ErrConflict)
 	}
 	terminal := *run.Proposal
+	if settlement != nil && settlement.refusal != nil {
+		// The daemon refused the published tree: its refusal is the outcome,
+		// recorded as the proposal too so the record stays one story.
+		terminal = *settlement.refusal
+	}
 	resources := relationships.resources
 	if !exactResourceSet(resources, false) {
 		return Run{}, tx.Rollback(ErrConflict)
@@ -918,7 +923,7 @@ func (store *Store) finalizeRun(ctx context.Context, runID RunID, expected Revis
 	changeRevision := int64(0)
 	if settlement != nil {
 		settlingChange = relationships.change
-		if settlingChange == nil || run.ChangeID == nil || settlingChange.Revision != settlement.expected || at.Int64() < settlingChange.UpdatedAt.Int64() || !relationships.changeOwnership.canSettleAs(settlement.phase) {
+		if settlingChange == nil || run.ChangeID == nil || settlingChange.Revision != settlement.expected || at.Int64() < settlingChange.UpdatedAt.Int64() || !relationships.changeOwnership.canSettleAs(settlement.phase, settlement.refusal != nil) {
 			return Run{}, tx.Rollback(ErrConflict)
 		}
 		if settlement.phase == ChangeRetained && (settlement.availability == nil || settlingChange.TreeIdentity == nil || *settlingChange.TreeIdentity != settlement.availability.tree || run.RunningAt == nil && !changeAvailabilityMatches(*settlingChange, *settlement.availability)) {
@@ -932,7 +937,7 @@ func (store *Store) finalizeRun(ctx context.Context, runID RunID, expected Revis
 		return Run{}, tx.Rollback(err)
 	}
 	terminalKind, terminalCode, terminalDetail, terminalResult := proposalSQL(terminal)
-	updated, err = tx.connection.ExecContext(ctx, `UPDATE runs SET phase = 'terminal', terminal_kind = ?, terminal_code = ?, terminal_detail = ?, terminal_result = ?, terminal_at_ms = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND phase = 'finalizing' AND proposal_kind IS NOT NULL AND credential_revoked_at_ms IS NOT NULL AND revision = ?`, terminalKind, terminalCode, terminalDetail, terminalResult, at.Int64(), at.Int64(), run.ID.Bytes(), expected.Int64())
+	updated, err = tx.connection.ExecContext(ctx, `UPDATE runs SET phase = 'terminal', proposal_kind = ?, proposal_code = ?, proposal_detail = ?, proposal_result = ?, terminal_kind = ?, terminal_code = ?, terminal_detail = ?, terminal_result = ?, terminal_at_ms = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND phase = 'finalizing' AND proposal_kind IS NOT NULL AND credential_revoked_at_ms IS NOT NULL AND revision = ?`, terminalKind, terminalCode, terminalDetail, terminalResult, terminalKind, terminalCode, terminalDetail, terminalResult, at.Int64(), at.Int64(), run.ID.Bytes(), expected.Int64())
 	if err := requireOneRow(updated, err); err != nil {
 		return Run{}, tx.Rollback(err)
 	}
@@ -942,7 +947,7 @@ func (store *Store) finalizeRun(ctx context.Context, runID RunID, expected Revis
 		case ChangeRetained:
 			updated, err = tx.connection.ExecContext(ctx, `UPDATE changes SET phase = 'retained', tree_digest = ?, entry_count = ?, total_bytes = ?, settled_run_id = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND phase = 'available' AND revision = ? AND settled_run_id IS NULL AND tree_dev = ? AND tree_inode = ?`, settlement.availability.commitment.Bytes(), int64(settlement.availability.entries), int64(settlement.availability.bytes), run.ID.Bytes(), at.Int64(), change.ID.Bytes(), settlement.expected.Int64(), settlement.availability.tree.device, settlement.availability.tree.inode)
 		case ChangeAbandoned:
-			updated, err = tx.connection.ExecContext(ctx, `UPDATE changes SET phase = 'abandoned', object_format = NULL, base_commit = NULL, repository_dev = NULL, repository_inode = NULL, tree_digest = NULL, entry_count = NULL, total_bytes = NULL, tree_dev = NULL, tree_inode = NULL, prepared_at_ms = NULL, available_at_ms = NULL, settled_run_id = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND phase IN ('reserved', 'prepared') AND revision = ? AND settled_run_id IS NULL`, run.ID.Bytes(), at.Int64(), change.ID.Bytes(), settlement.expected.Int64())
+			updated, err = tx.connection.ExecContext(ctx, `UPDATE changes SET phase = 'abandoned', object_format = NULL, base_commit = NULL, repository_dev = NULL, repository_inode = NULL, tree_digest = NULL, entry_count = NULL, total_bytes = NULL, tree_dev = NULL, tree_inode = NULL, prepared_at_ms = NULL, available_at_ms = NULL, settled_run_id = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND phase IN ('reserved', 'prepared', 'available') AND revision = ? AND settled_run_id IS NULL`, run.ID.Bytes(), at.Int64(), change.ID.Bytes(), settlement.expected.Int64())
 		default:
 			return Run{}, tx.Rollback(ErrCorruptState)
 		}
