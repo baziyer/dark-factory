@@ -271,8 +271,8 @@ func TestSendBackRefusesATaskWithoutARun(t *testing.T) {
 }
 
 // A running orchestrator of the same project may send a worker's finished
-// task back; its own task, another project's, a worker's credential and a
-// revoked credential may not.
+// task back; before it runs, its own task, another project's task, an
+// unknown credential and (below) a worker's credential may not.
 func TestOrchestratorAttemptSendsBackAWorkerTask(t *testing.T) {
 	success, _ := NewSuccessProposal("finished")
 	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
@@ -308,6 +308,21 @@ func TestOrchestratorAttemptSendsBackAWorkerTask(t *testing.T) {
 	}
 	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, taskID(t, 99), "missing", mustTime(t, 101)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing task = %v", err)
+	}
+	elsewhere, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 60), Name: "elsewhere", Root: "/elsewhere"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 61), ProjectID: elsewhere.ID, Name: "stranger", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 62), ProjectID: elsewhere.ID, AssignedAgentID: stranger.ID, IncarnationID: incarnationID(t, 63), Title: "not yours"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, foreign.ID, "another project", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("another project's task = %v", err)
 	}
 	sent, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "five findings", mustTime(t, 102))
 	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != 2 || !strings.HasSuffix(sent.Body, "five findings") {

@@ -58,11 +58,14 @@ JOIN tasks t ON t.id = c.task_id
 JOIN agents a ON a.id = r.agent_id
 JOIN projects p ON p.id = c.project_id
 WHERE c.phase = 'retained' AND r.phase = 'terminal' AND r.terminal_kind = 'succeeded' AND r.role = 'worker'
+  AND r.admitted_task_work_revision = t.work_revision
 ORDER BY r.terminal_at_ms"
 ```
 
 Handle only rows whose `project` is yours. The retained tree of a change is
-`$home/changes/<change_id>`. A change is finished when its `enqueue-HEAD8`
+`$home/changes/<change_id>`. The last condition keeps out a task that was
+sent back and not yet retried: its change still holds the tree the review
+refused. A change is finished when its `enqueue-HEAD8`
 operation (step 5) for its current head is `completed` in the App journal
 and the merge was observed; anything short of that is resumed at the first
 step whose operation is not completed, as section 2 says. A task sent back
@@ -115,11 +118,14 @@ worker left behind is not published.
 export GIT_DIR=$PWD/repo/.git GIT_WORK_TREE=$home/changes/$change_id GIT_INDEX_FILE=$PWD/change.index
 git fetch -q origin "$from"
 git read-tree "$from" && git add -A
-git diff --cached --name-status "$from"   # A / M / D per path
-git diff --cached --numstat "$from"       # for the delta paragraph
-git ls-files --stage                      # mode and blob per path
+git diff --cached --no-renames --name-status "$from" > changed.txt   # A / M / D per path, never R
+git diff --cached --no-renames --numstat "$from"                     # for the delta paragraph
+git ls-files --stage                                                 # mode and blob per path
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ```
+
+`--no-renames` matters: a rename would otherwise arrive as one `R` line
+with two paths, and the old path's deletion would never reach the App.
 
 Prepare the entries once, into a file, rather than pasting base64 into the
 call by hand:
@@ -130,7 +136,7 @@ python3 - "$tree" changed.txt > entries.json <<'PY'
 import base64, json, os, sys
 tree, listing = sys.argv[1], sys.argv[2]
 entries = []
-for line in open(listing):                     # from: git diff --cached --name-status
+for line in open(listing):                     # changed.txt from above
     status, path = line.rstrip('\n').split('\t', 1)
     if status == 'D':
         entries.append({'path': path})
@@ -280,7 +286,8 @@ reason it stopped.
 
 A request-human does not wait for the answer, and the request goes stale
 the moment the run ends, so a run that raised one ends with `attempt block`
-carrying the same text: the blocked task keeps the reason on the console
-until a person sends it back or queues a new instruction. A run that raised
+carrying the same text (cut to 4 KiB, the detail's bound; the question
+allows 8 KiB): the blocked task keeps the reason on the console until a
+person sends it back or queues a new instruction. A run that raised
 none ends with `attempt succeed`. The next standing-instruction run picks
 up where the journal says you stopped.

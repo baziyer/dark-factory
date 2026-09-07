@@ -485,6 +485,8 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 			return newErrorReply(remoteErrorCode(err))
 		}
 	}
+	// The task is queued again; the scheduler should not wait for its tick.
+	daemon.notifyScheduler()
 	return daemon.mutation(ctx, task.Revision)
 }
 

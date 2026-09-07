@@ -47,8 +47,9 @@ func (store *Store) SendBackTask(ctx context.Context, id TaskID, expected Revisi
 }
 
 // SendBackTaskForAttempt is the orchestrator's form of SendBackTask: the
-// attempt must be a running orchestrator of the task's project, and the task
-// must not be the attempt's own.
+// attempt must be a running orchestrator, the task must belong to its
+// project (another project's is not its authority), and the task must not
+// be the attempt's own.
 func (store *Store) SendBackTaskForAttempt(ctx context.Context, digest AttemptDigest, id TaskID, note string, at UnixMillis) (Task, error) {
 	if id.zero() {
 		return Task{}, fmt.Errorf("%w: invalid task send-back", ErrInvalidValue)
@@ -75,7 +76,10 @@ func (store *Store) SendBackTaskForAttempt(ctx context.Context, digest AttemptDi
 	if !found {
 		return Task{}, tx.Rollback(ErrNotFound)
 	}
-	if task.ProjectID != run.ProjectID || task.ID == run.TaskID {
+	if task.ProjectID != run.ProjectID {
+		return Task{}, tx.Rollback(ErrUnauthorized)
+	}
+	if task.ID == run.TaskID {
 		return Task{}, tx.Rollback(ErrConflict)
 	}
 	updated, err := sendBackTask(ctx, tx.connection, task, note, at)
