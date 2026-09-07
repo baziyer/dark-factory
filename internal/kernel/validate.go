@@ -453,7 +453,10 @@ func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, ru
 // automaton over the complete contiguous worker history. A fresh predecessor
 // may introduce retained provenance with the exact +4 settle-and-reopen gap.
 // Once retained, every later admission must use the exact +2 retained retry
-// gap; another +4 can never reset or reintroduce that provenance.
+// gap; another +4 can never reset or reintroduce that provenance. The one
+// reset is a refused publication, which abandons the Change and reopens it
+// reserved: +4 from a fresh predecessor or +2 from a retained one, and the
+// retry is fresh either way.
 func workerChangeProvenanceForRun(ctx context.Context, connection *sql.Conn, run Run) (workerChangeProvenance, error) {
 	if run.AdmittedTaskWorkRevision.Int64() < 1 || run.AdmittedChangeRevision == nil || run.ChangeID == nil {
 		return 0, fmt.Errorf("%w: incomplete worker Change history", ErrCorruptState)

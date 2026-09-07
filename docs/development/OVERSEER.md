@@ -209,7 +209,10 @@ itself runs only in the merge queue, so it is never the signal here.
 
 If a merged PR touched `cmd/` or `internal/`, the live service needs a
 reinstall, and if it touched `web/`, the site needs a re-vendor; raise one
-human request naming the merge commit and which of the two applies. Then
+human request naming the merge commit and which of the two applies. A
+worker run whose tree the daemon refused ends failed with the reason and
+leaves the tree at `$home/changes/<change_id>.refused-<run8>` for a person
+to read and remove; it is never yours to publish. Then
 report with `attempt succeed --result`, one line per change: change id, PR
 number, and merged commit or the reason it stopped.
 

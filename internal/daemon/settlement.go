@@ -84,8 +84,11 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 func publicationRefused(err error) (bool, error) {
 	var validation *change.ValidationError
 	var limit *change.LimitError
-	if errors.As(err, &validation) && validation.Tree || errors.As(err, &limit) && limit.Tree {
-		return true, err
+	if errors.As(err, &validation) && validation.Tree {
+		return true, validation
+	}
+	if errors.As(err, &limit) && limit.Tree {
+		return true, limit
 	}
 	return false, nil
 }
@@ -120,17 +123,18 @@ func refusedSettlement(changeParent string, changeState kernel.Change, runID ker
 		if err := os.Rename(source, target); err != nil {
 			return kernel.ChangeSettlement{}, err
 		}
-		// The settlement commits after the move, so the move must be on disk
-		// first: a retry prepares under the Change's own name, and a name
-		// still taken after a crash would refuse every retry for good.
-		if err := syncDirectory(changeParent); err != nil {
-			return kernel.ChangeSettlement{}, err
-		}
+	}
+	// The settlement commits after the move, so the move must be on disk
+	// first, on every pass: a retry prepares under the Change's own name, and
+	// a name still taken after a crash would refuse every retry for good. A
+	// pass that finds the move made cannot know an earlier pass synced it.
+	if err := syncChangeParent(changeParent); err != nil {
+		return kernel.ChangeSettlement{}, err
 	}
 	return kernel.NewRefusedChangeSettlement(changeState.Revision, fmt.Sprintf("%v; the tree was moved to changes/%s", refusal, aside))
 }
 
-func syncDirectory(path string) error {
+func syncChangeParent(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
 		return err

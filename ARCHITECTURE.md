@@ -34,9 +34,9 @@ proposed, with the reason.
 Only the finalizer writes `terminal`. It may do so only when every ephemeral
 resource is released and every retained artifact is durably transferred to its
 next owner. Cleanup failure leaves the run visibly `finalizing`; it never
-pretends that a resource disappeared. The current
-daemon accepts only `VerificationNone`; non-None verification policies are
-rejected as unsupported before a provider runs.
+pretends that a resource disappeared. The current daemon accepts only
+`VerificationNone`; non-None verification policies are rejected as
+unsupported before a provider runs.
 
 ## Authority invariants
 
