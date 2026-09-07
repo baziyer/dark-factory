@@ -11,15 +11,15 @@ exists only after admission.
 
 ```text
 Task: queued --------> running ----------------------> terminal result
-        ^                |                                     |
-        |                v                                     |
-Run:  admitted -> running -> finalizing -> terminal            |
-        |                                                      |
-        +------ send-back (next work revision, note appended) -+
+                         |
+                         v
+Run:  admitted -> running -> finalizing -> terminal
           |          |           |
           |          |           +-- immutable outcome request, no authority
           |          +-- exact attempt bearer authorizes bounded effects
           +-- child may be prepared but cannot exec
+
+Send-back: terminal result -> queued at the next work revision, note appended
 
 Resource: declared -> active -> releasing -> released
                                       \----> unresolved

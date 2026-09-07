@@ -197,6 +197,51 @@ func TestTaskAddMintsDistinctTaskAndIncarnationIdentities(t *testing.T) {
 	}
 }
 
+func TestTaskSendBackCarriesTaskAndNote(t *testing.T) {
+	fixture := newAPIFixture(t)
+	defer fixture.close(t)
+	taskID := strings.Repeat("33", 16)
+	var received api.SendBackInput
+	var kind api.CallKind
+	done := serveOne(fixture.listener, func(call api.Call) api.Reply {
+		kind = call.Kind()
+		received, _ = call.SendBackInput()
+		reply, err := api.NewMutationReply(api.MutationResult{Head: 12, Revision: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reply
+	})
+	var stdout, stderr bytes.Buffer
+	exit := run(context.Background(), []string{"task", "send-back", "--task", taskID, "--note", "private note sentinel"}, webEnvironment(fixture), &stdout, &stderr)
+	awaitServer(t, done)
+	if exit != 0 || stderr.Len() != 0 {
+		t.Fatalf("task send-back = exit %d stderr %q", exit, stderr.String())
+	}
+	if kind != api.CallSendBackTask || received != (api.SendBackInput{TaskID: taskID, Note: "private note sentinel"}) {
+		t.Fatalf("daemon received kind %v, %+v", kind, received)
+	}
+	var printed struct {
+		ID       string `json:"id"`
+		Head     uint64 `json:"head"`
+		Revision uint64 `json:"revision"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil || printed.ID != taskID || printed.Head != 12 || printed.Revision != 4 {
+		t.Fatalf("printed %q, %v", stdout.String(), err)
+	}
+	if strings.Contains(stdout.String(), "private note sentinel") {
+		t.Fatal("output leaked the note")
+	}
+	for _, args := range [][]string{
+		{"task", "send-back", "--task", taskID, "--note", "n", "--name", "x"},
+		{"task", "send-back", "--task", taskID, "--note", "n", "--project", taskID},
+	} {
+		if _, help, ok := parse(args); help || ok {
+			t.Fatalf("parsed %q", strings.Join(args, " "))
+		}
+	}
+}
+
 func TestDispatchReadsExactFactoryRevisionThenSets(t *testing.T) {
 	fixture := newAPIFixture(t)
 	defer fixture.close(t)

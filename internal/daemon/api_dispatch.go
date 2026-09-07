@@ -480,7 +480,7 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 	if !found {
 		return newErrorReply(api.RemoteConflict)
 	}
-	if !provider.TaskFits(agent.Provider, []byte(kernel.SentBackBody(current, input.Note))) {
+	if _, _, err := provider.PrepareTask(agent.Provider, []byte(kernel.SentBackBody(current, input.Note))); err != nil {
 		return newErrorReply(api.RemoteTooLarge)
 	}
 	var task kernel.Task

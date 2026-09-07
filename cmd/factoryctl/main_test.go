@@ -347,6 +347,7 @@ func TestAttemptCommandsUseExactTypedCalls(t *testing.T) {
 		{name: "block", args: []string{"attempt", "block", "--detail", "private-block-sentinel"}, kind: api.CallBlock, text: "private-block-sentinel"},
 		{name: "fail empty", args: []string{"attempt", "fail"}, kind: api.CallFail},
 		{name: "fail detail", args: []string{"attempt", "fail", "--detail", "private-fail-sentinel"}, kind: api.CallFail, text: "private-fail-sentinel"},
+		{name: "send back", args: []string{"attempt", "send-back", "--task", "fedcba9876543210fedcba9876543210", "--note", "private-note-sentinel"}, kind: api.CallSendBack, key: "fedcba9876543210fedcba9876543210", text: "private-note-sentinel"},
 		{name: "human request", args: []string{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question", "private-question-sentinel"}, kind: api.CallRequestHuman, key: "0123456789abcdef0123456789abcdef", text: "private-question-sentinel"},
 	}
 	for _, test := range tests {
@@ -393,10 +394,17 @@ func TestAttemptCommandsUseExactTypedCalls(t *testing.T) {
 				if !ok || input != (api.HumanQuestionInput{IdempotencyKey: test.key, Question: test.text}) {
 					t.Fatalf("human question = %+v, %t", input, ok)
 				}
+			case api.CallSendBack:
+				input, ok := result.call.SendBackInput()
+				if !ok || input != (api.SendBackInput{TaskID: test.key, Note: test.text}) {
+					t.Fatalf("send-back = %+v, %t", input, ok)
+				}
 			}
 			wantOutput := "attempt outcome request accepted: head=17 revision=9\n"
 			if test.kind == api.CallRequestHuman {
 				wantOutput = "human request accepted: head=17 revision=9\n"
+			} else if test.kind == api.CallSendBack {
+				wantOutput = "task sent back: head=17 revision=9\n"
 			}
 			if stdout.String() != wantOutput || stderr.Len() != 0 {
 				t.Fatalf("output = stdout %q, stderr %q", stdout.String(), stderr.String())

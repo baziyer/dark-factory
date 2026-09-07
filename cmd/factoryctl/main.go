@@ -629,11 +629,11 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 		}
 		seen[name] = true
 		switch {
-		case name == "--name" && command.kind != commandTaskAdd && validOperatorText(value, 1, 128):
+		case name == "--name" && (command.kind == commandProjectCreate || command.kind == commandAgentCreate) && validOperatorText(value, 1, 128):
 			command.name = value
 		case name == "--root" && command.kind == commandProjectCreate && validHomeArg(value) && validOperatorText(value, 1, 4096):
 			command.root = value
-		case name == "--project" && command.kind != commandProjectCreate && validHumanRequestKey(value):
+		case name == "--project" && (command.kind == commandAgentCreate || command.kind == commandTaskAdd) && validHumanRequestKey(value):
 			command.project = value
 		case name == "--agent" && command.kind == commandTaskAdd && validHumanRequestKey(value):
 			command.agent = value
