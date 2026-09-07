@@ -103,11 +103,21 @@ id.
 
 ## 3. Publish the change as a branch
 
-The branch is `factory/<first 12 hex of change_id>`. First `observe_ref` for
-it. Absent: this is the first publication, and the commit goes on top of
-`base_commit`. Present: the task was sent back and the worker continued, so
-the commit goes on top of the branch's head, `branch_head`, and the diff is
-against that head, not the base. Set `from` to whichever applies.
+The branch is `factory/<first 12 hex of change_id>`. The task's
+`work_revision` from section 1 says which publication this is:
+
+- `1`: the first publication. The commit goes on top of `base_commit`, under
+  `publish-1`, `publish-2`, and so on. If the branch already exists, an
+  earlier run of yours stopped partway: resume at the first `publish-N` the
+  journal lacks (its `expected_head_sha` is the head the last completed one
+  returned), then at the issue and the pull request, as section 2 says.
+- above `1`: the task was sent back and the worker continued from the tree it
+  left. `observe_ref` for the branch; it exists, at `branch_head`, and the
+  commit goes on top of it under `publish-<HEAD8 of branch_head>-1`, with the
+  diff against that head, not the base. A branch that does not exist here
+  means the earlier publication never happened: treat it as the first.
+
+Set `from` to `base_commit` or `branch_head` accordingly.
 
 Compute the diff against `from` without a checkout: the clone's object
 store, its index filled from `from`, and the retained tree as the work tree.
@@ -175,9 +185,13 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 
 ## 4. Open the issue and the pull request
 
-A follow-up publication (the branch existed) already has both: the journal
-shows `issue` and `pr` completed. Skip this section and go to the review,
-naming the pull request from the `pr` operation's result.
+A follow-up publication (`work_revision` above 1 with the branch present)
+already has both: the journal shows `issue` and `pr` completed, and the
+pull request number is in the `pr` operation's result. Do not create
+either again. Still write the body file the review reads: the pull request
+body as it stands (the `pr` operation's request holds it), followed by a
+paragraph headed by the new head that says what this commit changes against
+the previous head, from the diff you just computed. Then go to the review.
 
 `create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
@@ -241,18 +255,24 @@ and 5 when it could not prepare the checkout, and leaves
   An ALLOW the App did not record shows up the same way: the queue's review
   check refuses the entry.
 - REQUEST_CHANGES: you do not fix code. Send the task back to its worker
-  with the pull request link and the findings verbatim as the note:
+  with a note that names the pull request and the review and tells the
+  worker how to read the findings; the findings themselves live on the
+  review, which the worker can fetch without a credential:
 
   ```sh
-  "$DARK_FACTORY_FACTORYCTL" attempt send-back --task "$task_id" --note "$(cat findings.md)"
+  note="Review $REVIEW_URL blocked pull request $PR_URL (head $HEAD_SHA) with must-change findings. Read them with: curl -s https://api.github.com/repos/OWNER/REPO/pulls/$PR/reviews | python3 -c 'import json,sys; [print(r[\"body\"]) for r in json.load(sys.stdin)]' and fix each in the tree you left; the pull request stays open."
+  "$DARK_FACTORY_FACTORYCTL" attempt send-back --task "$task_id" --note "$note"
   ```
 
-  The note is appended to the task, the task is queued again, and the
-  worker's next run continues from the retained tree. A later run of yours
-  finds the same change id at the next work revision and publishes the new
-  tree on top of the branch (section 3). Stop handling this change for now.
-  A note is at most 8 KiB; cut the findings to their must-change items if
-  they do not fit, and name the review link so the worker can read the rest.
+  The review's link is the `Review recorded` line at the top of
+  `review-$PR-$HEAD8.log`. The note is appended to the task's body, which the
+  worker's provider receives whole and which must stay under 7 KiB in all
+  (the App's task bounds are larger than a provider's prompt), so keep the
+  note to that shape: a pointer, never the findings pasted. The task is
+  queued again and the worker's next run continues from the retained tree; a
+  later run of yours finds the same change id at the next work revision and
+  publishes the new tree on top of the branch (section 3). Stop handling
+  this change for now.
 - Exit 4: the pull request is no longer at the head you published, which
   only a person can have done; raise a human request.
 - Exit 2 or 5: the script refused its arguments or could not prepare the

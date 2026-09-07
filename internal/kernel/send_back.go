@@ -9,6 +9,12 @@ import (
 // MaxSendBackNoteBytes bounds the note a send-back appends to a task's body.
 const MaxSendBackNoteBytes = 8192
 
+// MaxSentBackBodyBytes bounds the body a send-back leaves. A provider receives
+// the whole body as its task: Claude Code as a typed prompt of at most 8 KiB
+// with its lead and quoting, Codex as an attempt task of at most 8 KiB. A body
+// past this would be queued only to fail at launch.
+const MaxSentBackBodyBytes = 7 << 10
+
 // SendBackTask returns a finished task to its queue at the next work revision
 // with a note appended to its body, so the worker's next run reopens the
 // retained Change and continues from the tree it left. Any terminal outcome
@@ -111,8 +117,8 @@ func sendBackTask(ctx context.Context, connection *sql.Conn, task Task, note str
 	}
 	next := task.WorkRevision.Int64() + 1
 	body := fmt.Sprintf("%s\n\n## Sent back for work revision %d\n\n%s", task.Body, next, note)
-	if byteLen(body) > 131072 {
-		return Task{}, fmt.Errorf("%w: send-back note does not fit the task body", ErrInvalidValue)
+	if byteLen(body) > MaxSentBackBodyBytes {
+		return Task{}, fmt.Errorf("%w: send-back note does not fit the provider's task bound", ErrInvalidValue)
 	}
 	result, err := connection.ExecContext(ctx, `UPDATE tasks SET status = 'queued', work_revision = ?, body = ?, blocked_reason = NULL, result = NULL, completed_at_ms = NULL, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
 		next, body, at.Int64(), task.ID.Bytes(), task.Revision.Int64())

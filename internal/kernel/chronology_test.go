@@ -227,6 +227,9 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("x", MaxSendBackNoteBytes+1), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("oversized note = %v", err)
 	}
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("y", MaxSentBackBodyBytes-len(task.Body)), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("note past the provider's task bound = %v", err)
+	}
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("send-back before the terminal run = %v", err)
 	}
