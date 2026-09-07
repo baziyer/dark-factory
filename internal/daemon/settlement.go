@@ -72,13 +72,14 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 	}
 }
 
-// publicationRefused tells the inspection's refusals of a published tree (a
-// mode, a link, an empty directory, a bound) from every other error. A
-// refusal is final: the tree will not pass tomorrow either.
+// publicationRefused tells the inspection's refusals of a published tree's
+// own contents (a mode, a link, an empty directory, a bound) from every
+// other error: a fault of the parent, the arguments or the durable record
+// may pass tomorrow and is returned as before; a refusal never will.
 func publicationRefused(err error) (bool, error) {
 	var validation *change.ValidationError
 	var limit *change.LimitError
-	if errors.As(err, &validation) || errors.As(err, &limit) {
+	if errors.As(err, &validation) && validation.Tree || errors.As(err, &limit) && limit.Tree {
 		return true, err
 	}
 	return false, nil
@@ -88,11 +89,7 @@ func publicationRefused(err error) (bool, error) {
 // Change is abandoned from available and the run fails with the reason and
 // the path of the tree, which stays on disk for a person to read.
 func refusedSettlement(changeState kernel.Change, refusal error) (kernel.ChangeSettlement, error) {
-	failure, err := kernel.NewFailureProposal(kernel.FailureSource, failureDetail(fmt.Errorf("published tree refused, left at changes/%s: %w", changeState.ID.String(), refusal)))
-	if err != nil {
-		return kernel.ChangeSettlement{}, err
-	}
-	return kernel.NewRefusedChangeSettlement(changeState.Revision, failure)
+	return kernel.NewRefusedChangeSettlement(changeState.Revision, fmt.Sprintf("%v; the tree stays at changes/%s", refusal, changeState.ID.String()))
 }
 
 // retainedSettlement re-reads the published tree the durable change row names

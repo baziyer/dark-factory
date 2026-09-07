@@ -968,7 +968,7 @@ func scanTree(ctx context.Context, rootFD int, rootDevice uint64, format ObjectF
 	}
 	slices.Sort(directories)
 	if !slices.Equal(manifest.directories, directories) {
-		return Manifest{}, &ValidationError{Reason: "empty or unselected prepared directory exists"}
+		return Manifest{}, &ValidationError{Reason: "empty or unselected prepared directory exists", Tree: true}
 	}
 	return manifest, nil
 }
@@ -999,7 +999,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			return err
 		}
 		if uint64(before.Dev) != rootDevice || before.Uid != uint32(os.Geteuid()) {
-			return &ValidationError{Reason: "prepared entry ownership or device differs"}
+			return &ValidationError{Reason: "prepared entry ownership or device differs", Tree: true}
 		}
 		switch before.Mode & unix.S_IFMT {
 		case unix.S_IFDIR:
@@ -1007,7 +1007,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			// what its umask allows. Either way the owner has everything,
 			// nobody else may write, and no special bit is set.
 			if before.Mode&0o7022 != 0 || before.Mode&0o700 != 0o700 {
-				return &ValidationError{Reason: "prepared directory mode or special bits differ"}
+				return &ValidationError{Reason: "prepared directory mode or special bits differ", Tree: true}
 			}
 			childFD, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0)
 			if err != nil {
@@ -1032,10 +1032,10 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			// owner may execute it, as git does.
 			permissions := before.Mode & 0o7777
 			if before.Nlink != 1 || permissions&0o7022 != 0 || permissions&0o600 != 0o600 {
-				return &ValidationError{Reason: "prepared file link, mode or special bits differ"}
+				return &ValidationError{Reason: "prepared file link, mode or special bits differ", Tree: true}
 			}
 			if before.Size < 0 || uint64(before.Size) > MaxBlobBytes || *total > MaxTotalBlobBytes-uint64(before.Size) {
-				return &LimitError{Reason: "reconstructed byte limit exceeded"}
+				return &LimitError{Reason: "reconstructed byte limit exceeded", Tree: true}
 			}
 			fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0)
 			if err != nil {
@@ -1065,7 +1065,7 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			*entries = append(*entries, entry)
 			*total += uint64(opened.Size)
 		default:
-			return &ValidationError{Reason: "non-regular prepared entry forbidden"}
+			return &ValidationError{Reason: "non-regular prepared entry forbidden", Tree: true}
 		}
 	}
 	if syncDirectories {
@@ -1146,7 +1146,7 @@ func directoryNames(ctx context.Context, dirFD int, budget *entryBudget, hook ma
 			budget.observed++
 			if budget.observed > budget.limit {
 				file.Close()
-				return nil, &LimitError{Reason: "reconstructed total entry count exceeded"}
+				return nil, &LimitError{Reason: "reconstructed total entry count exceeded", Tree: true}
 			}
 			names = append(names, entry.Name())
 		}

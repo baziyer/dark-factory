@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -337,19 +338,20 @@ func TestRefusedPublicationAbandonsTheAvailableChangeAndRetriesFresh(t *testing.
 	if err != nil || !found || changeState.Phase != ChangeAvailable {
 		t.Fatalf("change before refusal = %+v, found=%v, %v", changeState, found, err)
 	}
-	wrongCode, _ := NewFailureProposal(FailureInternal, "not a refusal")
-	if _, err := NewRefusedChangeSettlement(changeState.Revision, wrongCode); !errors.Is(err, ErrInvalidValue) {
-		t.Fatalf("refusal with another code = %v", err)
+	if _, err := NewRefusedChangeSettlement(changeState.Revision, ""); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("refusal without a reason = %v", err)
 	}
-	refusal, _ := NewFailureProposal(FailureSource, "published tree refused: empty directory")
-	settlement, err := NewRefusedChangeSettlement(changeState.Revision, refusal)
+	settlement, err := NewRefusedChangeSettlement(changeState.Revision, "empty directory")
 	if err != nil {
 		t.Fatal(err)
 	}
 	terminal, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, settlement, mustTime(t, 80))
 	if err != nil || terminal.Phase != RunTerminal || terminal.Terminal == nil || terminal.Terminal.Kind() != OutcomeFailed || terminal.Terminal.Code() != FailureSource ||
-		terminal.Terminal.Detail() != "published tree refused: empty directory" || terminal.Proposal == nil || !terminal.Proposal.equal(*terminal.Terminal) {
+		terminal.Terminal.Detail() != RefusedPublicationDetailPrefix+"empty directory" || terminal.Proposal == nil || !terminal.Proposal.equal(*terminal.Terminal) {
 		t.Fatalf("refused run = %+v, %v", terminal, err)
+	}
+	if long, err := NewRefusedChangeSettlement(changeState.Revision, strings.Repeat("r", 5000)); err != nil || byteLen(long.refusal.detail) != 4096 {
+		t.Fatalf("long refusal = %+v, %v", long, err)
 	}
 	task, found, err := store.Task(ctx, terminal.TaskID)
 	if err != nil || !found || task.Status != TaskFailed || task.Result != "" {
@@ -399,14 +401,79 @@ func TestRefusedSettlementNeedsAnAvailableChange(t *testing.T) {
 	if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, mustTime(t, 30)); err != nil {
 		t.Fatal(err)
 	}
-	refusal, _ := NewFailureProposal(FailureSource, "refused")
-	settlement, err := NewRefusedChangeSettlement(*run.AdmittedChangeRevision, refusal)
+	settlement, err := NewRefusedChangeSettlement(*run.AdmittedChangeRevision, "refused")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.FinalizeWorkerRun(ctx, run.ID, finalizing.Revision, settlement, mustTime(t, 33)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("refused settlement of a reserved change = %v", err)
 	}
+}
+
+// An ordinary source failure is not a refusal: a run that failed with
+// FailureSource before its Change was published abandons from reserved and
+// retries two revisions on, and one that failed with FailureSource while
+// its Change was available retains it and retries on the retained tree.
+func TestSourceFailuresThatAreNotRefusalsRetryAsBefore(t *testing.T) {
+	t.Run("reserved", func(t *testing.T) {
+		store, run, _ := admittedWorkerRun(t)
+		defer store.Close()
+		ctx := context.Background()
+		runtime := resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+		runtimeIdentity, _ := NewPathResourceIdentity(301, 302)
+		if _, err := store.ActivateResource(ctx, run.ID, runtime.ID, runtime.Revision, runtimeIdentity, mustTime(t, 19)); err != nil {
+			t.Fatal(err)
+		}
+		failure, _ := NewFailureProposal(FailureSource, "source tree could not be materialized")
+		finalizing, err := store.FailRun(ctx, run.ID, run.Revision, failure, mustTime(t, 20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime = resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+		if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, mustTime(t, 30)); err != nil {
+			t.Fatal(err)
+		}
+		abandoned, _ := NewAbandonedChangeSettlement(*run.AdmittedChangeRevision)
+		terminal, err := store.FinalizeWorkerRun(ctx, run.ID, finalizing.Revision, abandoned, mustTime(t, 33))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, keys := queueRetryForTerminal(t, store, terminal, 40)
+		result, err := store.AdmitNext(ctx, keys, mustTime(t, 50))
+		if err != nil || !result.Admitted() || result.Run.AdmittedChangeRevision.Int64() != run.AdmittedChangeRevision.Int64()+2 {
+			t.Fatalf("retry after a source failure = %+v, %v", result, err)
+		}
+		if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+			t.Fatalf("store after the retry = %v", err)
+		}
+	})
+	t.Run("available", func(t *testing.T) {
+		failure, _ := NewFailureProposal(FailureSource, "source tree could not be adopted")
+		store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, failure)
+		defer store.Close()
+		ctx := context.Background()
+		change, found, err := store.Change(ctx, *finalizing.ChangeID)
+		if err != nil || !found || change.Phase != ChangeAvailable {
+			t.Fatalf("available Change = %+v, found=%v, %v", change, found, err)
+		}
+		availability := mustChangeAvailability(t, change.Selection.commitment, change.Selection.entries, change.Selection.bytes, *change.TreeIdentity)
+		retained, _ := NewRetainedChangeSettlement(change.Revision, availability)
+		terminal, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, retained, mustTime(t, 80))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, keys := queueRetryForTerminal(t, store, terminal, 81)
+		result, err := store.AdmitNext(ctx, keys, mustTime(t, 90))
+		if err != nil || !result.Admitted() || result.Run.AdmittedChangeRevision.Int64() != change.Revision.Int64()+2 {
+			t.Fatalf("retry after a source failure on an available Change = %+v, %v", result, err)
+		}
+		if reopened, found, err := store.Change(ctx, change.ID); err != nil || !found || reopened.Phase != ChangeAvailable {
+			t.Fatalf("reopened Change = %+v, found=%v, %v", reopened, found, err)
+		}
+		if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+			t.Fatalf("store after the retained retry = %v", err)
+		}
+	})
 }
 
 // A refusal on a retry's reopened retained Change abandons it one revision
@@ -459,8 +526,7 @@ func TestRefusedPublicationOnARetainedRetryAbandonsAndRetriesFresh(t *testing.T)
 	if err != nil || !found || second.Phase != RunFinalizing {
 		t.Fatalf("retry before settlement = %+v, found=%v, %v", second, found, err)
 	}
-	refusal, _ := NewFailureProposal(FailureSource, "published tree refused: group-writable file")
-	settlement, err := NewRefusedChangeSettlement(reopened.Revision, refusal)
+	settlement, err := NewRefusedChangeSettlement(reopened.Revision, "group-writable file")
 	if err != nil {
 		t.Fatal(err)
 	}

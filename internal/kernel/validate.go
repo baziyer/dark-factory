@@ -376,7 +376,7 @@ func (ownership workerChangeOwnership) settled() bool {
 func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase, refused bool) bool {
 	switch phase {
 	case ChangeRetained:
-		return ownership.available() && !refused
+		return ownership.available()
 	case ChangeAbandoned:
 		if refused {
 			return ownership.available()
@@ -388,10 +388,9 @@ func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase, refused bo
 }
 
 // refusedPublication reports a terminal run whose published tree the daemon
-// refused: a failure with FailureSource, which nothing after an available
-// Change records otherwise.
+// refused: the failure only NewRefusedChangeSettlement writes.
 func refusedPublication(run Run) bool {
-	return run.Phase == RunTerminal && run.Terminal != nil && run.Terminal.kind == OutcomeFailed && run.Terminal.code == FailureSource
+	return run.Phase == RunTerminal && run.Terminal != nil && refusedProposal(*run.Terminal)
 }
 
 func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, run Run, change Change) (workerChangeOwnership, error) {
