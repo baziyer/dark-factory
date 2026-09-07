@@ -349,6 +349,22 @@ func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
 	}
 }
 
+// A worker that runs git init in its tree leaves a path no Change may hold;
+// the run ends with that reason rather than finalizing for good.
+func TestSupervisorRefusedPublicationForAGitDirectory(t *testing.T) {
+	program := "set -eu\nmkdir .git\nprintf 'ref: refs/heads/main\\n' > .git/HEAD\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), ".git path components are forbidden") {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	fixture.assertReleased(t, run)
+}
+
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
 	const privateTask = "exact private Codex task"
 	fixture := newSupervisorFixture(t, "unused shell task")

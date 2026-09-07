@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -64,6 +65,8 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 		settlement, err := retainedSettlement(ctx, changeParent, changeState)
 		if refused, refusal := publicationRefused(err); refused {
 			settlement, err = refusedSettlement(changeParent, changeState, run.ID, refusal)
+		} else if refusedEarlier(changeParent, changeState, run.ID, err) {
+			settlement, err = refusedSettlement(changeParent, changeState, run.ID, errRefusedEarlier)
 		}
 		if err != nil {
 			return run, err
@@ -85,6 +88,21 @@ func publicationRefused(err error) (bool, error) {
 		return true, err
 	}
 	return false, nil
+}
+
+// errRefusedEarlier stands for a refusal an earlier pass decided and moved
+// the tree for, whose settlement did not commit.
+var errRefusedEarlier = errors.New("published tree refused by an earlier pass")
+
+// refusedEarlier reports the tree gone from the Change's own name and present
+// under the name a refusal by this run moves it to: the refusal was decided
+// and the move made, and only the settlement is still owed.
+func refusedEarlier(changeParent string, changeState kernel.Change, runID kernel.RunID, err error) bool {
+	if !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	_, statErr := os.Lstat(filepath.Join(changeParent, changeState.ID.String()+".refused-"+runID.String()[:8]))
+	return statErr == nil
 }
 
 // refusedSettlement turns a refused inspection into the run's outcome: the

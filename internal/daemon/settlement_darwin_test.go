@@ -406,6 +406,73 @@ func TestRecoveryRefusedPublicationFailsTheRunVisibly(t *testing.T) {
 	}
 }
 
+// A refusal whose move was made but whose settlement did not commit is
+// settled on the next pass from the moved tree's presence alone.
+func TestSettleRunFinishesARefusalMovedEarlier(t *testing.T) {
+	fixture := newRecoveryFixtureWithRole(t, 0x98, kernel.RoleWorker)
+	ctx := context.Background()
+	run := fixture.currentRun(t)
+	changeState, found, err := fixture.store.Change(ctx, *run.ChangeID)
+	if err != nil || !found {
+		t.Fatalf("change: found=%v err=%v", found, err)
+	}
+	format, err := kernel.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := kernel.NewCommitID(format, bytes.Repeat([]byte{0x99}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := kernel.TreeDigestFromBytes(bytes.Repeat([]byte{0x9a}, kernel.DigestBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := kernel.NewFileIdentity(7, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := kernel.NewChangeSelection(format, commit, digest, 1, 64, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := kernel.NewFileIdentity(9, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := fixture.store.RecordChangePrepared(ctx, changeState.ID, changeState.Revision, selection, tree, mustKernelTime(t, 300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, err := kernel.NewChangeAvailability(digest, 1, 64, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.MarkChangeAvailable(ctx, changeState.ID, prepared.Revision, availability, mustKernelTime(t, 310)); err != nil {
+		t.Fatal(err)
+	}
+	before := fixture.failBeforeRuntime(t)
+	// Nothing at the Change's own name and nothing moved aside: not settleable.
+	if settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID); !errors.Is(err, kernel.ErrConflict) {
+		t.Fatalf("missing tree with nothing aside = %+v, %v", settled, err)
+	}
+	if after := fixture.currentRun(t); after.Phase != kernel.RunFinalizing || after.Revision != before.Revision {
+		t.Fatalf("refused settlement mutated the run: %+v -> %+v", before, after)
+	}
+	aside := filepath.Join(fixture.changeParent, changeState.ID.String()+".refused-"+fixture.run.ID.String()[:8])
+	if err := os.Mkdir(aside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+	if err != nil || settled.Phase != kernel.RunTerminal || settled.Terminal == nil || settled.Terminal.Code() != kernel.FailureSource ||
+		!strings.Contains(settled.Terminal.Detail(), "earlier pass") || !strings.Contains(settled.Terminal.Detail(), filepath.Base(aside)) {
+		t.Fatalf("settlement of an earlier refusal = %+v, %v", settled, err)
+	}
+	if abandoned, found, err := fixture.store.Change(ctx, changeState.ID); err != nil || !found || abandoned.Phase != kernel.ChangeAbandoned {
+		t.Fatalf("change after the earlier refusal = %+v, found=%v, %v", abandoned, found, err)
+	}
+}
+
 func TestScheduledCompletionSettlesReturnedReleasedRun(t *testing.T) {
 	fixture := newRecoveryFixtureWithRole(t, 0x88, kernel.RoleWorker)
 	failed := fixture.failBeforeRuntime(t)

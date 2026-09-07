@@ -746,6 +746,8 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		// The tree the worker left cannot be published as it is. That is the
 		// run's outcome, recorded now, not a reason to leave it finalizing.
 		settlement, settleErr = refusedSettlement(spec.ChangeParent, changeState, run.ID, refusal)
+	} else if refusedEarlier(spec.ChangeParent, changeState, run.ID, settleErr) {
+		settlement, settleErr = refusedSettlement(spec.ChangeParent, changeState, run.ID, errRefusedEarlier)
 	} else if settleErr == nil {
 		var settledAvailability kernel.ChangeAvailability
 		settledAvailability, settleErr = kernelAvailability(settledFacts)

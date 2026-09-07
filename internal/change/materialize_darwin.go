@@ -873,6 +873,12 @@ func verifyOpenRoot(fd int, expected StageIdentity) error {
 		return err
 	}
 	if !rootAuthority(stat, expected, uint32(os.Geteuid())) {
+		// The same directory with another mode is the worker's doing (its
+		// cwd is the tree root) and a refusal of the tree; anything else is
+		// not the tree that was recorded.
+		if uint64(stat.Dev) == expected.device && stat.Ino == expected.inode && stat.Mode&unix.S_IFMT == unix.S_IFDIR && stat.Uid == uint32(os.Geteuid()) {
+			return &ValidationError{Reason: "tree root mode or special bits changed", Tree: true}
+		}
 		return errors.New("tree root authority or identity changed")
 	}
 	return nil
@@ -995,8 +1001,12 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			// A path the tree itself holds (too long, too deep, not UTF-8, a
 			// .git) is the tree's refusal, not the arguments'.
 			var validation *ValidationError
+			var limit *LimitError
 			if errors.As(err, &validation) {
 				return &ValidationError{Reason: validation.Reason, Tree: true}
+			}
+			if errors.As(err, &limit) {
+				return &LimitError{Reason: limit.Reason, Tree: true}
 			}
 			return err
 		}
