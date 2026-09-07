@@ -303,18 +303,21 @@ func TestSupervisorWorkerFilesSettleUnderThePrivateServiceUmask(t *testing.T) {
 
 // A tree the inspection refuses for good (an empty directory, which no git
 // tree can hold) ends the run as a visible source failure naming the reason
-// and the tree's path, abandons the Change, fails the task, and frees the
-// agent for its next task.
+// and where the tree was moved, abandons the Change, fails the task, and
+// leaves the task's own retry free to prepare a fresh tree.
 func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
-	program := "set -eu\nmkdir left-empty\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	// The first run leaves an empty directory; the retry, which finds the
+	// witness of the first, does not.
+	program := "set -eu\n[ -s __WITNESS__ ] || mkdir left-empty\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
 	fixture := newSupervisorFixture(t, program)
 	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
 	if err != nil {
 		t.Fatalf("RunNext: %v", err)
 	}
 	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	aside := fixture.changeName(t, run) + ".refused-" + run.ID.String()[:8]
 	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), "published tree refused") ||
-		!strings.Contains(run.Terminal.Detail(), "empty or unselected prepared directory") || !strings.Contains(run.Terminal.Detail(), "changes/"+fixture.changeName(t, run)) {
+		!strings.Contains(run.Terminal.Detail(), "empty or unselected prepared directory") || !strings.Contains(run.Terminal.Detail(), "changes/"+aside) {
 		t.Fatalf("refused run = %+v", run.Terminal)
 	}
 	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
@@ -325,19 +328,25 @@ func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
 	if err != nil || !found || changeState.Phase != kernel.ChangeAbandoned || changeState.SettledRunID == nil || *changeState.SettledRunID != run.ID {
 		t.Fatalf("change after refusal = %+v, found=%v, %v", changeState, found, err)
 	}
-	if _, err := os.Stat(filepath.Join(fixture.changeParent, fixture.changeName(t, run), "left-empty")); err != nil {
-		t.Fatalf("refused tree was not left for a person to read: %v", err)
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, aside, "left-empty")); err != nil {
+		t.Fatalf("refused tree was not moved aside for a person to read: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.changeParent, fixture.changeName(t, run))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the Change's own name is still taken: %v", err)
 	}
 	fixture.assertReleased(t, run)
-	execSupervisorSQL(t, fixture.storePath, `INSERT INTO tasks(id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, revision, created_at_ms, updated_at_ms) SELECT randomblob(16), project_id, assigned_agent_id, randomblob(16), 1, 'after the refusal', ?, 'queued', 0, 1, updated_at_ms + 1, updated_at_ms + 1 FROM tasks WHERE id = ?`, supervisorProgram(t, false, false), run.TaskID.Bytes())
-	next, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	queueSupervisorRetry(t, fixture, run)
+	retry, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
 	if err != nil {
-		t.Fatalf("RunNext after the refusal: %v", err)
+		t.Fatalf("RunNext for the retry: %v", err)
 	}
-	if next.ID == run.ID || next.AgentID != run.AgentID {
-		t.Fatalf("next run = %+v", next)
+	if retry.ID == run.ID || retry.TaskID != run.TaskID || retry.AdmittedTaskWorkRevision.Int64() != 2 || retry.ChangeID == nil || *retry.ChangeID != *run.ChangeID {
+		t.Fatalf("retry run = %+v", retry)
 	}
-	fixture.assertTerminal(t, next, kernel.OutcomeSucceeded)
+	fixture.assertTerminal(t, retry, kernel.OutcomeSucceeded)
+	if retained, found, err := fixture.store.Change(context.Background(), *run.ChangeID); err != nil || !found || retained.Phase != kernel.ChangeRetained {
+		t.Fatalf("change after the retry = %+v, found=%v, %v", retained, found, err)
+	}
 }
 
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {

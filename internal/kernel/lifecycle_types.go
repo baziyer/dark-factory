@@ -247,6 +247,9 @@ func NewRefusedChangeSettlement(expected Revision, reason string) (ChangeSettlem
 			detail = detail[:len(detail)-1]
 		}
 	}
+	if !strings.HasPrefix(detail, RefusedPublicationDetailPrefix) || len(detail) == len(RefusedPublicationDetailPrefix) {
+		return ChangeSettlement{}, fmt.Errorf("%w: invalid refused Change settlement", ErrInvalidValue)
+	}
 	failure, err := NewFailureProposal(FailureSource, detail)
 	if err != nil {
 		return ChangeSettlement{}, err

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/dark-factory-build/dark-factory/internal/change"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
@@ -61,7 +63,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 	case kernel.ChangeAvailable:
 		settlement, err := retainedSettlement(ctx, changeParent, changeState)
 		if refused, refusal := publicationRefused(err); refused {
-			settlement, err = refusedSettlement(changeState, refusal)
+			settlement, err = refusedSettlement(changeParent, changeState, run.ID, refusal)
 		}
 		if err != nil {
 			return run, err
@@ -86,10 +88,22 @@ func publicationRefused(err error) (bool, error) {
 }
 
 // refusedSettlement turns a refused inspection into the run's outcome: the
-// Change is abandoned from available and the run fails with the reason and
-// the path of the tree, which stays on disk for a person to read.
-func refusedSettlement(changeState kernel.Change, refusal error) (kernel.ChangeSettlement, error) {
-	return kernel.NewRefusedChangeSettlement(changeState.Revision, fmt.Sprintf("%v; the tree stays at changes/%s", refusal, changeState.ID.String()))
+// tree is moved aside under the name the failure detail gives, since a retry
+// of the task prepares a fresh tree under the Change's own name, and the
+// Change is abandoned from available with the run failed for the reason. A
+// move that fails leaves the run as it was, to be settled again later.
+func refusedSettlement(changeParent string, changeState kernel.Change, runID kernel.RunID, refusal error) (kernel.ChangeSettlement, error) {
+	aside := changeState.ID.String() + ".refused-" + runID.String()[:8]
+	source, target := filepath.Join(changeParent, changeState.ID.String()), filepath.Join(changeParent, aside)
+	if _, err := os.Lstat(target); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return kernel.ChangeSettlement{}, err
+		}
+		if err := os.Rename(source, target); err != nil {
+			return kernel.ChangeSettlement{}, err
+		}
+	}
+	return kernel.NewRefusedChangeSettlement(changeState.Revision, fmt.Sprintf("%v; the tree was moved to changes/%s", refusal, aside))
 }
 
 // retainedSettlement re-reads the published tree the durable change row names

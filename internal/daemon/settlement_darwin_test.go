@@ -397,6 +397,13 @@ func TestRecoveryRefusedPublicationFailsTheRunVisibly(t *testing.T) {
 	if err != nil || !found || abandoned.Phase != kernel.ChangeAbandoned {
 		t.Fatalf("change after refusal = %+v, found=%v, %v", abandoned, found, err)
 	}
+	aside := changeState.ID.String() + ".refused-" + fixture.run.ID.String()[:8]
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, aside, "left-empty")); err != nil || !strings.Contains(settled.Terminal.Detail(), "changes/"+aside) {
+		t.Fatalf("refused tree aside: %v, detail %q", err, settled.Terminal.Detail())
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.changeParent, changeState.ID.String())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the Change's own name is still taken: %v", err)
+	}
 }
 
 func TestScheduledCompletionSettlesReturnedReleasedRun(t *testing.T) {

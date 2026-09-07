@@ -992,6 +992,12 @@ func scanDirectory(ctx context.Context, dirFD int, rootDevice uint64, format Obj
 			path = prefix + "/" + name
 		}
 		if _, err := validatePath([]byte(path)); err != nil {
+			// A path the tree itself holds (too long, too deep, not UTF-8, a
+			// .git) is the tree's refusal, not the arguments'.
+			var validation *ValidationError
+			if errors.As(err, &validation) {
+				return &ValidationError{Reason: validation.Reason, Tree: true}
+			}
 			return err
 		}
 		var before unix.Stat_t
