@@ -120,8 +120,22 @@ func refusedSettlement(changeParent string, changeState kernel.Change, runID ker
 		if err := os.Rename(source, target); err != nil {
 			return kernel.ChangeSettlement{}, err
 		}
+		// The settlement commits after the move, so the move must be on disk
+		// first: a retry prepares under the Change's own name, and a name
+		// still taken after a crash would refuse every retry for good.
+		if err := syncDirectory(changeParent); err != nil {
+			return kernel.ChangeSettlement{}, err
+		}
 	}
 	return kernel.NewRefusedChangeSettlement(changeState.Revision, fmt.Sprintf("%v; the tree was moved to changes/%s", refusal, aside))
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 // retainedSettlement re-reads the published tree the durable change row names

@@ -26,12 +26,15 @@ Resource: declared -> active -> releasing -> released
 The run outcome is distinct from its phase: succeeded, blocked with a reason,
 failed with a typed reason, or cancelled with a reason. The first durable move
 to `finalizing` freezes its requested outcome. Later completion, block, cancel,
-or exit observations are idempotent and cannot replace that request.
+or exit observations are idempotent and cannot replace that request. The one
+replacement is the daemon's refusal of a worker's published tree at
+settlement, which becomes the run's outcome in place of what the worker
+proposed, with the reason.
 
 Only the finalizer writes `terminal`. It may do so only when every ephemeral
 resource is released and every retained artifact is durably transferred to its
 next owner. Cleanup failure leaves the run visibly `finalizing`; it never
-pretends that a resource disappeared or rewrites the outcome. The current
+pretends that a resource disappeared. The current
 daemon accepts only `VerificationNone`; non-None verification policies are
 rejected as unsupported before a provider runs.
 
