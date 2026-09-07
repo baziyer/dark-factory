@@ -230,10 +230,18 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("send-back before the terminal run = %v", err)
 	}
+	// The fixture's task has a title and no body, which a run receives as
+	// the title; the send-back must keep that instruction.
+	if task.Body != "" || task.Title == "" {
+		t.Fatalf("fixture task = %+v", task)
+	}
 	sent, err := store.SendBackTask(ctx, task.ID, task.Revision, "the review wants a test", mustTime(t, 90))
 	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != task.WorkRevision.Int64()+1 || sent.Result != "" || sent.CompletedAt != nil || sent.BlockedReason != "" ||
-		!strings.HasSuffix(sent.Body, "## Sent back for work revision 2\n\nthe review wants a test") || !strings.HasPrefix(sent.Body, task.Body) {
+		sent.Body != task.Title+"\n\n## Sent back for work revision 2\n\nthe review wants a test" || sent.Body != SentBackBody(task, "the review wants a test") {
 		t.Fatalf("sent back task = %+v, %v", sent, err)
+	}
+	if body := SentBackBody(Task{Title: "titled", Body: "the body", WorkRevision: mustRevision(t, 1)}, "n"); !strings.HasPrefix(body, "the body\n\n") {
+		t.Fatalf("body with a body = %q", body)
 	}
 	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
 		t.Fatalf("store after send-back = %v", err)

@@ -9,11 +9,17 @@ import (
 // MaxSendBackNoteBytes bounds the note a send-back appends to a task's body.
 const MaxSendBackNoteBytes = 8192
 
-// SentBackBody is the body a send-back leaves: the task's body with the note
-// under a heading that names the work revision it opens. The daemon checks
-// it against the provider that will receive it before the send-back is made.
+// SentBackBody is the body a send-back leaves: the task's instruction as a
+// run receives it (the body, or the title when the body is empty) with the
+// note under a heading that names the work revision it opens. The daemon
+// checks it against the provider that will receive it before the send-back
+// is made.
 func SentBackBody(task Task, note string) string {
-	return fmt.Sprintf("%s\n\n## Sent back for work revision %d\n\n%s", task.Body, task.WorkRevision.Int64()+1, note)
+	instruction := task.Body
+	if instruction == "" {
+		instruction = task.Title
+	}
+	return fmt.Sprintf("%s\n\n## Sent back for work revision %d\n\n%s", instruction, task.WorkRevision.Int64()+1, note)
 }
 
 // SendBackTask returns a finished task to its queue at the next work revision
