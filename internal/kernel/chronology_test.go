@@ -276,6 +276,19 @@ func TestSendBackRefusesATaskWithoutARun(t *testing.T) {
 	if _, err := store.SendBackTask(ctx, cancelled.ID, cancelled.Revision, "try again", mustTime(t, 7)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("send-back without a run = %v", err)
 	}
+	// A shell agent's task is a program: no note can be appended to it,
+	// whatever its status.
+	shell, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 70), ProjectID: project.ID, Name: "shell", Role: RoleWorker, Provider: ProviderShell, ToolBudgetLimit: 2}, mustTime(t, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 71), ProjectID: project.ID, AssignedAgentID: shell.ID, IncarnationID: incarnationID(t, 72), Title: "run", Body: "printf x"}, mustTime(t, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTask(ctx, program.ID, program.Revision, "a note", mustTime(t, 10)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("send-back of a shell task = %v", err)
+	}
 }
 
 // A running orchestrator of the same project may send a worker's finished

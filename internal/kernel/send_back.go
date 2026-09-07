@@ -26,7 +26,9 @@ func SentBackBody(task Task, note string) string {
 // with a note appended to its body, so the worker's next run reopens the
 // retained Change and continues from the tree it left. Any terminal outcome
 // may be sent back, a success included: the reviewer, not the worker, decides
-// when work is done. A task that never ran has nothing to go back to.
+// when work is done; a cancelled task comes back the same way. A task that
+// never ran has nothing to go back to, and a shell agent's task is a
+// program, which no note can be appended to.
 func (store *Store) SendBackTask(ctx context.Context, id TaskID, expected Revision, note string, at UnixMillis) (Task, error) {
 	if id.zero() || expected.Int64() < 1 {
 		return Task{}, fmt.Errorf("%w: invalid task send-back", ErrInvalidValue)
@@ -113,6 +115,16 @@ func (store *Store) SendBackTaskForAttempt(ctx context.Context, digest AttemptDi
 }
 
 func sendBackTask(ctx context.Context, connection *sql.Conn, task Task, note string, at UnixMillis) (Task, error) {
+	agent, found, err := agentByID(ctx, connection, task.AssignedAgentID)
+	if err != nil {
+		return Task{}, err
+	}
+	if !found {
+		return Task{}, ErrCorruptState
+	}
+	if agent.Provider == ProviderShell {
+		return Task{}, fmt.Errorf("%w: a shell task is a program and takes no note", ErrInvalidValue)
+	}
 	switch task.Status {
 	case TaskSucceeded, TaskFailed, TaskBlocked, TaskCancelled:
 	default:

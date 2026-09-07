@@ -277,7 +277,8 @@ and 5 when it could not prepare the checkout, and leaves
   The note is appended to the task's body, which the worker's provider
   receives whole; the daemon refuses a send-back the provider could not be
   handed (`too_large`), so keep the note to that shape: a pointer, never the
-  findings pasted. A `too_large` even so means the task's own body is at
+  findings pasted. A shell agent's task is a program and cannot be sent
+  back at all (`invalid_request`); that is a human request. A `too_large` even so means the task's own body is at
   the provider's bound and no note fits: raise a human request naming the
   pull request and the task, and end the run with `attempt block`, since the
   change would otherwise come around again to the same refusal. The task is queued again and the worker's next run

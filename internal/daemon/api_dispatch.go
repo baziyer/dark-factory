@@ -463,9 +463,26 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
+	// An attempt is authenticated before anything is read on its behalf, so a
+	// credential the kernel would refuse learns nothing about any task.
+	var digest kernel.AttemptDigest
+	if raw, attempt := call.AttemptDigest(); attempt {
+		kDigest, err := attemptDigest(raw)
+		if err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		authority, err := daemon.store.AuthenticateAttempt(ctx, kDigest)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+		if authority.Role != kernel.RoleOrchestrator {
+			return newErrorReply(api.RemoteUnauthorized)
+		}
+		digest = kDigest
+	}
 	// The body a send-back leaves is the provider's whole task, so it must fit
 	// the provider of the agent that will run it, or the retry would be queued
-	// only to fail at launch. The kernel edge authorizes and writes.
+	// only to fail at launch. The kernel edge authorizes again and writes.
 	current, found, err := daemon.store.Task(ctx, taskID)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
@@ -484,12 +501,8 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 		return newErrorReply(api.RemoteTooLarge)
 	}
 	var task kernel.Task
-	if digest, attempt := call.AttemptDigest(); attempt {
-		kDigest, err := attemptDigest(digest)
-		if err != nil {
-			return newErrorReply(api.RemoteInvalidRequest)
-		}
-		task, err = daemon.store.SendBackTaskForAttempt(ctx, kDigest, taskID, input.Note, at)
+	if _, attempt := call.AttemptDigest(); attempt {
+		task, err = daemon.store.SendBackTaskForAttempt(ctx, digest, taskID, input.Note, at)
 		if err != nil {
 			return newErrorReply(remoteErrorCode(err))
 		}
