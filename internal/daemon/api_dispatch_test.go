@@ -300,6 +300,24 @@ func TestDaemonDispatchesSendBackThroughBothDomains(t *testing.T) {
 	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: own, Note: ""}); !errors.Is(err, api.ErrInvalidInput) {
 		t.Fatalf("empty note left the client = %v", err)
 	}
+	// A note the task's provider could not be handed is too large, whatever
+	// the kernel would have said about the task.
+	claude, claudeTask := testID(61), testID(62)
+	done = fixture.serve(t)
+	if _, err := operator.CreateAgent(ctx, api.CreateAgentInput{ID: claude, ProjectID: active.run.ProjectID.String(), Name: "typist", Role: "worker", Provider: "claude_code", ToolBudgetLimit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.EnqueueTask(ctx, api.EnqueueTaskInput{ID: claudeTask, ProjectID: active.run.ProjectID.String(), AssignedAgentID: claude, IncarnationID: testID(63), Title: "typed", Body: strings.Repeat("<", 4096)}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: claudeTask, Note: strings.Repeat("&", 1024)}); !errors.As(err, &remote) || remote.Code() != api.RemoteTooLarge {
+		t.Fatalf("a note past the provider's prompt = %v", err)
+	}
+	waitDispatch(t, done)
 	task, found, err := fixture.store.Task(ctx, active.run.TaskID)
 	if err != nil || !found || task.Status != kernel.TaskRunning || task.WorkRevision.Int64() != 1 {
 		t.Fatalf("task after refused send-backs = %+v, found=%v, %v", task, found, err)

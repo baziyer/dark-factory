@@ -227,9 +227,6 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("x", MaxSendBackNoteBytes+1), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("oversized note = %v", err)
 	}
-	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("y", MaxSentBackBodyBytes-len(task.Body)), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
-		t.Fatalf("note past the provider's task bound = %v", err)
-	}
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("send-back before the terminal run = %v", err)
 	}
@@ -327,8 +324,23 @@ func TestOrchestratorAttemptSendsBackAWorkerTask(t *testing.T) {
 	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, foreign.ID, "another project", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("another project's task = %v", err)
 	}
+	sibling, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 64), ProjectID: terminal.ProjectID, Name: "sibling", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 65), ProjectID: terminal.ProjectID, AssignedAgentID: sibling.ID, IncarnationID: incarnationID(t, 66), Title: "another overseer's"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, siblingTask.ID, "not a worker's", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("a sibling orchestrator's task = %v", err)
+	}
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found {
+		t.Fatalf("worker task = %+v, found=%v, %v", task, found, err)
+	}
 	sent, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "five findings", mustTime(t, 102))
-	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != 2 || !strings.HasSuffix(sent.Body, "five findings") {
+	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != 2 || sent.Body != SentBackBody(task, "five findings") {
 		t.Fatalf("orchestrator send-back = %+v, %v", sent, err)
 	}
 	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "twice", mustTime(t, 103)); !errors.Is(err, ErrConflict) {

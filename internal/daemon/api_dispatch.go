@@ -10,6 +10,7 @@ import (
 
 	"github.com/dark-factory-build/dark-factory/internal/api"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
+	"github.com/dark-factory-build/dark-factory/internal/provider"
 )
 
 // Daemon is the concrete composition root for the local API. It owns the
@@ -462,6 +463,26 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
+	// The body a send-back leaves is the provider's whole task, so it must fit
+	// the provider of the agent that will run it, or the retry would be queued
+	// only to fail at launch. The kernel edge authorizes and writes.
+	current, found, err := daemon.store.Task(ctx, taskID)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if !found {
+		return newErrorReply(api.RemoteNotFound)
+	}
+	agent, found, err := daemon.store.Agent(ctx, current.AssignedAgentID)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if !found {
+		return newErrorReply(api.RemoteConflict)
+	}
+	if !provider.TaskFits(agent.Provider, []byte(kernel.SentBackBody(current, input.Note))) {
+		return newErrorReply(api.RemoteTooLarge)
+	}
 	var task kernel.Task
 	if digest, attempt := call.AttemptDigest(); attempt {
 		kDigest, err := attemptDigest(digest)
@@ -473,13 +494,6 @@ func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
 			return newErrorReply(remoteErrorCode(err))
 		}
 	} else {
-		current, found, err := daemon.store.Task(ctx, taskID)
-		if err != nil {
-			return newErrorReply(remoteErrorCode(err))
-		}
-		if !found {
-			return newErrorReply(api.RemoteNotFound)
-		}
 		task, err = daemon.store.SendBackTask(ctx, taskID, current.Revision, input.Note, at)
 		if err != nil {
 			return newErrorReply(remoteErrorCode(err))

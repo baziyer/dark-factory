@@ -12,7 +12,8 @@ through the terminal and that prepared prompt is capped at 8 KiB:
 > `git clone --filter=blob:none https://github.com/OWNER/REPO repo`, read
 > repo/docs/development/OVERSEER.md, and follow it exactly. Before exiting,
 > report the durable outcome with `$DARK_FACTORY_FACTORYCTL attempt succeed
-> --result` (one line per change you handled, or "nothing to publish").
+> --result` (one line per change you handled, or "nothing to publish"), or
+> with `attempt block --detail` if you raised a human request.
 
 Every command below runs from the directory the session starts in, its
 private runtime home, with the clone at `repo` inside it.
@@ -188,10 +189,18 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 A follow-up publication (`work_revision` above 1 with the branch present)
 already has both: the journal shows `issue` and `pr` completed, and the
 pull request number is in the `pr` operation's result. Do not create
-either again. Still write the body file the review reads: the pull request
-body as it stands (the `pr` operation's request holds it), followed by a
-paragraph headed by the new head that says what this commit changes against
-the previous head, from the diff you just computed. Then go to the review.
+either again. Still write the body file the review reads, from the public
+API, which needs no credential:
+
+```sh
+curl -s "https://api.github.com/repos/OWNER/REPO/pulls/$PR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"])' > body.md
+```
+
+followed by a paragraph headed by the new head that says what this commit
+changes against the previous head, from the diff you just computed. A
+resumed first publication whose `pr` is completed but whose `body.md` is
+not in this run's directory takes its body the same way. Then go to the
+review.
 
 `create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
@@ -255,24 +264,23 @@ and 5 when it could not prepare the checkout, and leaves
   An ALLOW the App did not record shows up the same way: the queue's review
   check refuses the entry.
 - REQUEST_CHANGES: you do not fix code. Send the task back to its worker
-  with a note that names the pull request and the review and tells the
-  worker how to read the findings; the findings themselves live on the
-  review, which the worker can fetch without a credential:
+  with a note that names the pull request and tells the worker how to read
+  the findings; the findings themselves live on the pull request's reviews,
+  which the worker can fetch without a credential, so the note needs only
+  the pull request number and head:
 
   ```sh
-  note="Review $REVIEW_URL blocked pull request $PR_URL (head $HEAD_SHA) with must-change findings. Read them with: curl -s https://api.github.com/repos/OWNER/REPO/pulls/$PR/reviews | python3 -c 'import json,sys; [print(r[\"body\"]) for r in json.load(sys.stdin)]' and fix each in the tree you left; the pull request stays open."
+  note="Pull request https://github.com/OWNER/REPO/pull/$PR (head $HEAD_SHA) was blocked by its cold review with must-change findings. Read them with: curl -s https://api.github.com/repos/OWNER/REPO/pulls/$PR/reviews | python3 -c 'import json,sys; [print(r[\"body\"]) for r in json.load(sys.stdin)]' and fix each in the tree you left; the pull request stays open."
   "$DARK_FACTORY_FACTORYCTL" attempt send-back --task "$task_id" --note "$note"
   ```
 
-  The review's link is the `Review recorded` line at the top of
-  `review-$PR-$HEAD8.log`. The note is appended to the task's body, which the
-  worker's provider receives whole and which must stay under 7 KiB in all
-  (the App's task bounds are larger than a provider's prompt), so keep the
-  note to that shape: a pointer, never the findings pasted. The task is
-  queued again and the worker's next run continues from the retained tree; a
-  later run of yours finds the same change id at the next work revision and
-  publishes the new tree on top of the branch (section 3). Stop handling
-  this change for now.
+  The note is appended to the task's body, which the worker's provider
+  receives whole; the daemon refuses a send-back the provider could not be
+  handed (`too_large`), so keep the note to that shape: a pointer, never the
+  findings pasted. The task is queued again and the worker's next run
+  continues from the retained tree; a later run of yours finds the same
+  change id at the next work revision and publishes the new tree on top of
+  the branch (section 3). Stop handling this change for now.
 - Exit 4: the pull request is no longer at the head you published, which
   only a person can have done; raise a human request.
 - Exit 2 or 5: the script refused its arguments or could not prepare the
@@ -283,8 +291,9 @@ On a resumed run, a change whose `pr` is completed but whose `enqueue-HEAD8`
 for the current head is not needs no second review if one was recorded:
 `observe_operation` with `opid "$change_id"
 review-HEAD8` for the pull request head answers `completed` with verdict
-`allow` (enqueue), `block` (blocked: send the task back if you have not, then
-stop), `note`
+`allow` (enqueue), `block` (blocked: send the task back with the note
+above, which needs only the pull request and its head, if the task is not
+already queued at the next work revision, then stop), `note`
 (a comment that decided nothing: run the review again under a fresh id, the
 head's plus `-2`), or nothing (run the review); `executing` or
 `indeterminate` is a human request, as in section 2. The `review` check

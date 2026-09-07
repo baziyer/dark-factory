@@ -329,6 +329,14 @@ func tomlBasicString(value string) string {
 // in the daemon and are retrieved through the attempt-scoped API. Build returns
 // the same closed delivery value, which the Change worker must compare before
 // exec.
+// TaskFits reports whether a provider can be handed this task at all: Claude
+// Code as a typed prompt within its bound once quoted, Codex within its
+// attempt task bound, shell whatever the store allows.
+func TaskFits(kind kernel.Provider, task []byte) bool {
+	_, _, err := PrepareTask(kind, task)
+	return err == nil
+}
+
 func PrepareTask(kind kernel.Provider, task []byte) (TaskDelivery, []byte, error) {
 	if len(task) == 0 || len(task) > runner.MaxProviderTaskBytes || !utf8.Valid(task) || bytes.IndexByte(task, 0) >= 0 {
 		return 0, nil, ErrInvalid
