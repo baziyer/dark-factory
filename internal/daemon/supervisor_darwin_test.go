@@ -301,6 +301,45 @@ func TestSupervisorWorkerFilesSettleUnderThePrivateServiceUmask(t *testing.T) {
 	fixture.assertReleased(t, run)
 }
 
+// A tree the inspection refuses for good (an empty directory, which no git
+// tree can hold) ends the run as a visible source failure naming the reason
+// and the tree's path, abandons the Change, fails the task, and frees the
+// agent for its next task.
+func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
+	program := "set -eu\nmkdir left-empty\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), "published tree refused") ||
+		!strings.Contains(run.Terminal.Detail(), "empty or unselected prepared directory") || !strings.Contains(run.Terminal.Detail(), "changes/"+fixture.changeName(t, run)) {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found || task.Status != kernel.TaskFailed {
+		t.Fatalf("task after refusal = %+v, found=%v, %v", task, found, err)
+	}
+	changeState, found, err := fixture.store.Change(context.Background(), *run.ChangeID)
+	if err != nil || !found || changeState.Phase != kernel.ChangeAbandoned || changeState.SettledRunID == nil || *changeState.SettledRunID != run.ID {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", changeState, found, err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, fixture.changeName(t, run), "left-empty")); err != nil {
+		t.Fatalf("refused tree was not left for a person to read: %v", err)
+	}
+	fixture.assertReleased(t, run)
+	execSupervisorSQL(t, fixture.storePath, `INSERT INTO tasks(id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, revision, created_at_ms, updated_at_ms) SELECT randomblob(16), project_id, assigned_agent_id, randomblob(16), 1, 'after the refusal', ?, 'queued', 0, 1, updated_at_ms + 1, updated_at_ms + 1 FROM tasks WHERE id = ?`, supervisorProgram(t, false, false), run.TaskID.Bytes())
+	next, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext after the refusal: %v", err)
+	}
+	if next.ID == run.ID || next.AgentID != run.AgentID {
+		t.Fatalf("next run = %+v", next)
+	}
+	fixture.assertTerminal(t, next, kernel.OutcomeSucceeded)
+}
+
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
 	const privateTask = "exact private Codex task"
 	fixture := newSupervisorFixture(t, "unused shell task")

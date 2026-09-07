@@ -205,6 +205,10 @@ type ChangeSettlement struct {
 	phase        ChangePhase
 	expected     Revision
 	availability *ChangeAvailability
+	// refusal, when set, is the daemon's refusal of a published tree: the
+	// Change is abandoned from available and the run's outcome becomes this
+	// failure, whatever the worker proposed.
+	refusal *Proposal
 }
 
 func NewRetainedChangeSettlement(expected Revision, availability ChangeAvailability) (ChangeSettlement, error) {
@@ -221,7 +225,25 @@ func NewAbandonedChangeSettlement(expected Revision) (ChangeSettlement, error) {
 	return ChangeSettlement{phase: ChangeAbandoned, expected: expected}, nil
 }
 
+// NewRefusedChangeSettlement abandons an available Change whose published
+// tree the daemon refused, and makes the refusal the run's outcome. The
+// failure must carry FailureSource: that code after an available Change is
+// how history tells a refusal from a retained retry.
+func NewRefusedChangeSettlement(expected Revision, failure Proposal) (ChangeSettlement, error) {
+	if expected.Int64() < 1 || failure.kind != OutcomeFailed || failure.code != FailureSource || !failure.valid() {
+		return ChangeSettlement{}, fmt.Errorf("%w: invalid refused Change settlement", ErrInvalidValue)
+	}
+	return ChangeSettlement{phase: ChangeAbandoned, expected: expected, refusal: &failure}, nil
+}
+
+// Refused reports whether the settlement is the daemon's refusal of a
+// published tree.
+func (settlement ChangeSettlement) Refused() bool { return settlement.refusal != nil }
+
 func (settlement ChangeSettlement) valid() bool {
+	if settlement.refusal != nil && (settlement.phase != ChangeAbandoned || settlement.refusal.kind != OutcomeFailed || settlement.refusal.code != FailureSource) {
+		return false
+	}
 	return settlement.expected.Int64() >= 1 && (settlement.phase == ChangeRetained && settlement.availability != nil && settlement.availability.valid() || settlement.phase == ChangeAbandoned && settlement.availability == nil)
 }
 

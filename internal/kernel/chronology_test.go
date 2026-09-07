@@ -325,6 +325,170 @@ func TestEarlierSuccessfulRunForbidsLaterHistory(t *testing.T) {
 	assertCorruptTaskHistory(t, store, path, predecessor.ID, successor.ID)
 }
 
+// The daemon's refusal of a published tree ends the run as a source failure,
+// abandons the available Change, keeps the store valid, and lets the task
+// retry fresh on a reserved Change four revisions on.
+func TestRefusedPublicationAbandonsTheAvailableChangeAndRetriesFresh(t *testing.T) {
+	success, _ := NewSuccessProposal("finished")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
+	defer store.Close()
+	ctx := context.Background()
+	changeState, found, err := store.Change(ctx, *finalizing.ChangeID)
+	if err != nil || !found || changeState.Phase != ChangeAvailable {
+		t.Fatalf("change before refusal = %+v, found=%v, %v", changeState, found, err)
+	}
+	wrongCode, _ := NewFailureProposal(FailureInternal, "not a refusal")
+	if _, err := NewRefusedChangeSettlement(changeState.Revision, wrongCode); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("refusal with another code = %v", err)
+	}
+	refusal, _ := NewFailureProposal(FailureSource, "published tree refused: empty directory")
+	settlement, err := NewRefusedChangeSettlement(changeState.Revision, refusal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, settlement, mustTime(t, 80))
+	if err != nil || terminal.Phase != RunTerminal || terminal.Terminal == nil || terminal.Terminal.Kind() != OutcomeFailed || terminal.Terminal.Code() != FailureSource ||
+		terminal.Terminal.Detail() != "published tree refused: empty directory" || terminal.Proposal == nil || !terminal.Proposal.equal(*terminal.Terminal) {
+		t.Fatalf("refused run = %+v, %v", terminal, err)
+	}
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found || task.Status != TaskFailed || task.Result != "" {
+		t.Fatalf("task after refusal = %+v, found=%v, %v", task, found, err)
+	}
+	abandoned, found, err := store.Change(ctx, changeState.ID)
+	if err != nil || !found || abandoned.Phase != ChangeAbandoned || abandoned.SettledRunID == nil || *abandoned.SettledRunID != terminal.ID || abandoned.Revision.Int64() != changeState.Revision.Int64()+1 {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", abandoned, found, err)
+	}
+	if replay, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, settlement, mustTime(t, 81)); err != nil || replay.Revision != terminal.Revision {
+		t.Fatalf("refusal replay = %+v, %v", replay, err)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after refusal = %v", err)
+	}
+	_, keys := queueRetryForTerminal(t, store, terminal, 90)
+	result, err := store.AdmitNext(ctx, keys, mustTime(t, 100))
+	if err != nil || !result.Admitted() || result.Run.ChangeID == nil || *result.Run.ChangeID != changeState.ID || result.Run.AdmittedChangeRevision.Int64() != changeState.Revision.Int64()+2 {
+		t.Fatalf("retry after refusal = %+v, %v", result, err)
+	}
+	reopened, found, err := store.Change(ctx, changeState.ID)
+	if err != nil || !found || reopened.Phase != ChangeReserved {
+		t.Fatalf("reopened change = %+v, found=%v, %v", reopened, found, err)
+	}
+	if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+		t.Fatalf("store after retry admission = %v", err)
+	}
+}
+
+// A refusal is only for a published tree: an unpublished Change abandons
+// the ordinary way, and a refused settlement on it is a conflict.
+func TestRefusedSettlementNeedsAnAvailableChange(t *testing.T) {
+	store, run, _ := admittedWorkerRun(t)
+	defer store.Close()
+	ctx := context.Background()
+	runtime := resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+	runtimeIdentity, _ := NewPathResourceIdentity(301, 302)
+	if _, err := store.ActivateResource(ctx, run.ID, runtime.ID, runtime.Revision, runtimeIdentity, mustTime(t, 19)); err != nil {
+		t.Fatal(err)
+	}
+	failure, _ := NewFailureProposal(FailureInternal, "cleanup")
+	finalizing, err := store.FailRun(ctx, run.ID, run.Revision, failure, mustTime(t, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime = resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+	if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, mustTime(t, 30)); err != nil {
+		t.Fatal(err)
+	}
+	refusal, _ := NewFailureProposal(FailureSource, "refused")
+	settlement, err := NewRefusedChangeSettlement(*run.AdmittedChangeRevision, refusal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeWorkerRun(ctx, run.ID, finalizing.Revision, settlement, mustTime(t, 33)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("refused settlement of a reserved change = %v", err)
+	}
+}
+
+// A refusal on a retry's reopened retained Change abandons it one revision
+// on, and the next retry starts fresh two revisions later.
+func TestRefusedPublicationOnARetainedRetryAbandonsAndRetriesFresh(t *testing.T) {
+	blocked, _ := NewBlockedProposal("retry")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, blocked)
+	defer store.Close()
+	ctx := context.Background()
+	change, found, err := store.Change(ctx, *finalizing.ChangeID)
+	if err != nil || !found || change.Phase != ChangeAvailable {
+		t.Fatalf("available Change = %+v, found=%v, %v", change, found, err)
+	}
+	availability := mustChangeAvailability(t, change.Selection.commitment, change.Selection.entries, change.Selection.bytes, *change.TreeIdentity)
+	retained, _ := NewRetainedChangeSettlement(change.Revision, availability)
+	first, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, retained, mustTime(t, 80))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, retryKeys := queueRetryForTerminal(t, store, first, 81)
+	retry, err := store.AdmitNext(ctx, retryKeys, mustTime(t, 90))
+	if err != nil || !retry.Admitted() {
+		t.Fatalf("retained retry admission = %+v, %v", retry, err)
+	}
+	reopened, found, err := store.Change(ctx, change.ID)
+	if err != nil || !found || reopened.Phase != ChangeAvailable {
+		t.Fatalf("reopened Change = %+v, found=%v, %v", reopened, found, err)
+	}
+	activated := activateAllResourcesUnique(t, store, *retry.Run, 100, 3)
+	session := terminalSessionForRunTest(t, store, retry.Run.ID)
+	running, err := store.ActivateRun(ctx, retry.Run.ID, session.ID, activated.Revision, session.Revision, mustTime(t, 110))
+	if err != nil {
+		t.Fatal(err)
+	}
+	success, _ := NewSuccessProposal("changed the tree")
+	if _, err := store.ProposeAttemptOutcome(ctx, retryKeys.AttemptDigest, success, mustTime(t, 120)); err != nil {
+		t.Fatal(err)
+	}
+	observeMissingProcessExits(t, store, running.ID, 121)
+	for index, resource := range resourcesForRunTest(t, store, running.ID) {
+		if resource.State == ResourceReleased {
+			continue
+		}
+		if _, err := store.ReleaseResource(ctx, running.ID, resource.ID, resource.Revision, resource.Identity, mustTime(t, int64(130+index))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeTerminalSessionAtCurrent(t, store, running.ID, 140)
+	second, found, err := store.Run(ctx, running.ID)
+	if err != nil || !found || second.Phase != RunFinalizing {
+		t.Fatalf("retry before settlement = %+v, found=%v, %v", second, found, err)
+	}
+	refusal, _ := NewFailureProposal(FailureSource, "published tree refused: group-writable file")
+	settlement, err := NewRefusedChangeSettlement(reopened.Revision, refusal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.FinalizeWorkerRun(ctx, second.ID, second.Revision, settlement, mustTime(t, 150))
+	if err != nil || terminal.Terminal == nil || terminal.Terminal.Code() != FailureSource {
+		t.Fatalf("refused retry = %+v, %v", terminal, err)
+	}
+	abandoned, found, err := store.Change(ctx, change.ID)
+	if err != nil || !found || abandoned.Phase != ChangeAbandoned || abandoned.Revision.Int64() != reopened.Revision.Int64()+1 {
+		t.Fatalf("Change after refused retry = %+v, found=%v, %v", abandoned, found, err)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after refused retry = %v", err)
+	}
+	_, againKeys := queueRetryForTerminalSeed(t, store, terminal, 160, 47)
+	// The default retry seed shares a runtime root with the first retry's.
+	again, err := store.AdmitNext(ctx, againKeys, mustTime(t, 170))
+	if err != nil || !again.Admitted() || again.Run.AdmittedChangeRevision.Int64() != abandoned.Revision.Int64()+1 {
+		t.Fatalf("fresh retry after refusal = %+v, %v", again, err)
+	}
+	if fresh, found, err := store.Change(ctx, change.ID); err != nil || !found || fresh.Phase != ChangeReserved {
+		t.Fatalf("Change after fresh retry = %+v, found=%v, %v", fresh, found, err)
+	}
+	if _, _, err := store.Run(ctx, again.Run.ID); err != nil {
+		t.Fatalf("store after fresh retry = %v", err)
+	}
+}
+
 func TestRetryHistoryAllowsMultipleNonSuccessRuns(t *testing.T) {
 	store, predecessor, _, keys := retryQueuedWorker(t, 33)
 	defer store.Close()

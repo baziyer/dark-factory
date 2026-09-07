@@ -347,6 +347,8 @@ const (
 	workerChangeSettledRetainedFresh
 	workerChangeSettledAbandonedReserved
 	workerChangeSettledAbandonedPrepared
+	workerChangeSettledAbandonedAvailableFresh
+	workerChangeSettledAbandonedAvailableRetained
 )
 
 const (
@@ -360,22 +362,36 @@ func (ownership workerChangeOwnership) available() bool {
 
 func (ownership workerChangeOwnership) settled() bool {
 	switch ownership {
-	case workerChangeSettledRetainedRetry, workerChangeSettledRetainedFresh, workerChangeSettledAbandonedReserved, workerChangeSettledAbandonedPrepared:
+	case workerChangeSettledRetainedRetry, workerChangeSettledRetainedFresh, workerChangeSettledAbandonedReserved, workerChangeSettledAbandonedPrepared,
+		workerChangeSettledAbandonedAvailableFresh, workerChangeSettledAbandonedAvailableRetained:
 		return true
 	default:
 		return false
 	}
 }
 
-func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase) bool {
+// canSettleAs says which settlements an owned Change accepts. An available
+// Change retains, or is abandoned only by the daemon's refusal of its
+// published tree; an unpublished one abandons.
+func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase, refused bool) bool {
 	switch phase {
 	case ChangeRetained:
-		return ownership.available()
+		return ownership.available() && !refused
 	case ChangeAbandoned:
+		if refused {
+			return ownership.available()
+		}
 		return ownership == workerChangeReserved || ownership == workerChangePrepared
 	default:
 		return false
 	}
+}
+
+// refusedPublication reports a terminal run whose published tree the daemon
+// refused: a failure with FailureSource, which nothing after an available
+// Change records otherwise.
+func refusedPublication(run Run) bool {
+	return run.Phase == RunTerminal && run.Terminal != nil && run.Terminal.kind == OutcomeFailed && run.Terminal.code == FailureSource
 }
 
 func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, run Run, change Change) (workerChangeOwnership, error) {
@@ -410,6 +426,10 @@ func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, ru
 		ownership = workerChangeSettledAbandonedReserved
 	case change.Phase == ChangeAbandoned && delta == 2 && provenance == workerChangeFresh && change.SettledRunID != nil && *change.SettledRunID == run.ID:
 		ownership = workerChangeSettledAbandonedPrepared
+	case change.Phase == ChangeAbandoned && delta == 3 && provenance == workerChangeFresh && change.SettledRunID != nil && *change.SettledRunID == run.ID && refusedPublication(run):
+		ownership = workerChangeSettledAbandonedAvailableFresh
+	case change.Phase == ChangeAbandoned && delta == 1 && provenance == workerChangeRetained && change.SettledRunID != nil && *change.SettledRunID == run.ID && refusedPublication(run):
+		ownership = workerChangeSettledAbandonedAvailableRetained
 	default:
 		return 0, fmt.Errorf("%w: impossible worker Change revision", ErrCorruptState)
 	}
@@ -481,6 +501,17 @@ func workerChangeProvenanceForRun(ctx context.Context, connection *sql.Conn, run
 			return 0, fmt.Errorf("%w: invalid worker Change predecessor", ErrCorruptState)
 		}
 		delta := current.AdmittedChangeRevision.Int64() - previous.AdmittedChangeRevision.Int64()
+		if refusedPublication(previous) {
+			// The daemon refused the predecessor's published tree and
+			// abandoned the Change from available: +4 on the fresh path
+			// (available, abandoned, reopened reserved), +2 on the retained
+			// one. Either way the retry starts fresh on a reserved Change.
+			if provenance == workerChangeRetained && delta != 2 || provenance == workerChangeFresh && delta != 4 {
+				return 0, fmt.Errorf("%w: invalid refused Change retry gap", ErrCorruptState)
+			}
+			provenance = workerChangeFresh
+			continue
+		}
 		if provenance == workerChangeRetained {
 			if delta != 2 {
 				return 0, fmt.Errorf("%w: invalid retained Change retry gap", ErrCorruptState)
