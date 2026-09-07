@@ -283,9 +283,11 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 		return RecoveredResultConsumed, removeErr
 	}
 	// The consumed result's run settles to its terminal record: abandoned
-	// for an unpublished change, retained for a verified published tree. A
-	// refusal keeps the run finalizing and discoverable and is surfaced as
-	// its own disposition rather than logged indistinguishably from success.
+	// for an unpublished change, retained for a verified published tree,
+	// failed for a published tree whose own contents the inspection refuses.
+	// Any other refusal keeps the run finalizing and discoverable and is
+	// surfaced as its own disposition rather than logged indistinguishably
+	// from success.
 	if _, settleErr := daemon.settleRun(changeParent, run.ID); settleErr != nil {
 		return RecoveredResultConsumedUnsettled, settleErr
 	}

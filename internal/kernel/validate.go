@@ -347,6 +347,8 @@ const (
 	workerChangeSettledRetainedFresh
 	workerChangeSettledAbandonedReserved
 	workerChangeSettledAbandonedPrepared
+	workerChangeSettledAbandonedAvailableFresh
+	workerChangeSettledAbandonedAvailableRetained
 )
 
 const (
@@ -360,22 +362,35 @@ func (ownership workerChangeOwnership) available() bool {
 
 func (ownership workerChangeOwnership) settled() bool {
 	switch ownership {
-	case workerChangeSettledRetainedRetry, workerChangeSettledRetainedFresh, workerChangeSettledAbandonedReserved, workerChangeSettledAbandonedPrepared:
+	case workerChangeSettledRetainedRetry, workerChangeSettledRetainedFresh, workerChangeSettledAbandonedReserved, workerChangeSettledAbandonedPrepared,
+		workerChangeSettledAbandonedAvailableFresh, workerChangeSettledAbandonedAvailableRetained:
 		return true
 	default:
 		return false
 	}
 }
 
-func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase) bool {
+// canSettleAs says which settlements an owned Change accepts. An available
+// Change retains, or is abandoned only by the daemon's refusal of its
+// published tree; an unpublished one abandons.
+func (ownership workerChangeOwnership) canSettleAs(phase ChangePhase, refused bool) bool {
 	switch phase {
 	case ChangeRetained:
 		return ownership.available()
 	case ChangeAbandoned:
+		if refused {
+			return ownership.available()
+		}
 		return ownership == workerChangeReserved || ownership == workerChangePrepared
 	default:
 		return false
 	}
+}
+
+// refusedPublication reports a terminal run whose published tree the daemon
+// refused: the failure only NewRefusedChangeSettlement writes.
+func refusedPublication(run Run) bool {
+	return run.Phase == RunTerminal && run.Terminal != nil && refusedProposal(*run.Terminal)
 }
 
 func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, run Run, change Change) (workerChangeOwnership, error) {
@@ -410,6 +425,10 @@ func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, ru
 		ownership = workerChangeSettledAbandonedReserved
 	case change.Phase == ChangeAbandoned && delta == 2 && provenance == workerChangeFresh && change.SettledRunID != nil && *change.SettledRunID == run.ID:
 		ownership = workerChangeSettledAbandonedPrepared
+	case change.Phase == ChangeAbandoned && delta == 3 && provenance == workerChangeFresh && change.SettledRunID != nil && *change.SettledRunID == run.ID && refusedPublication(run):
+		ownership = workerChangeSettledAbandonedAvailableFresh
+	case change.Phase == ChangeAbandoned && delta == 1 && provenance == workerChangeRetained && change.SettledRunID != nil && *change.SettledRunID == run.ID && refusedPublication(run):
+		ownership = workerChangeSettledAbandonedAvailableRetained
 	default:
 		return 0, fmt.Errorf("%w: impossible worker Change revision", ErrCorruptState)
 	}
@@ -434,7 +453,10 @@ func classifyWorkerChangeOwnership(ctx context.Context, connection *sql.Conn, ru
 // automaton over the complete contiguous worker history. A fresh predecessor
 // may introduce retained provenance with the exact +4 settle-and-reopen gap.
 // Once retained, every later admission must use the exact +2 retained retry
-// gap; another +4 can never reset or reintroduce that provenance.
+// gap; another +4 can never reset or reintroduce that provenance. The one
+// reset is a refused publication, which abandons the Change and reopens it
+// reserved: +4 from a fresh predecessor or +2 from a retained one, and the
+// retry is fresh either way.
 func workerChangeProvenanceForRun(ctx context.Context, connection *sql.Conn, run Run) (workerChangeProvenance, error) {
 	if run.AdmittedTaskWorkRevision.Int64() < 1 || run.AdmittedChangeRevision == nil || run.ChangeID == nil {
 		return 0, fmt.Errorf("%w: incomplete worker Change history", ErrCorruptState)
@@ -481,6 +503,17 @@ func workerChangeProvenanceForRun(ctx context.Context, connection *sql.Conn, run
 			return 0, fmt.Errorf("%w: invalid worker Change predecessor", ErrCorruptState)
 		}
 		delta := current.AdmittedChangeRevision.Int64() - previous.AdmittedChangeRevision.Int64()
+		if refusedPublication(previous) {
+			// The daemon refused the predecessor's published tree and
+			// abandoned the Change from available: +4 on the fresh path
+			// (available, abandoned, reopened reserved), +2 on the retained
+			// one. Either way the retry starts fresh on a reserved Change.
+			if provenance == workerChangeRetained && delta != 2 || provenance == workerChangeFresh && delta != 4 {
+				return 0, fmt.Errorf("%w: invalid refused Change retry gap", ErrCorruptState)
+			}
+			provenance = workerChangeFresh
+			continue
+		}
 		if provenance == workerChangeRetained {
 			if delta != 2 {
 				return 0, fmt.Errorf("%w: invalid retained Change retry gap", ErrCorruptState)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/dark-factory-build/dark-factory/internal/change"
@@ -269,6 +270,206 @@ func TestRecoverySettlesThePublishedTreeAsTheWorkerLeftIt(t *testing.T) {
 	}
 	if retained.Selection.EntryCount() != uint32(facts.EntryCount())+1 || retained.Selection.TotalBytes() != facts.BlobBytes()+5 {
 		t.Fatalf("retained selection entries=%d bytes=%d, want %d and %d", retained.Selection.EntryCount(), retained.Selection.TotalBytes(), facts.EntryCount()+1, facts.BlobBytes()+5)
+	}
+}
+
+// The same recovery with a tree the inspection refuses ends the run as a
+// visible source failure instead of leaving it finalizing for good.
+func TestRecoveryRefusedPublicationFailsTheRunVisibly(t *testing.T) {
+	fixture := newRecoveryFixtureWithRole(t, 0x94, kernel.RoleWorker)
+	ctx := context.Background()
+	fixture.stageRuntime(t)
+	fixture.beginRunnerStart(t)
+	fixture.activateRunner(t)
+	fixture.writeMarker(t, runner.OuterActivationMarkerName)
+	run := fixture.currentRun(t)
+	changeState, found, err := fixture.store.Change(ctx, *run.ChangeID)
+	if err != nil || !found {
+		t.Fatalf("change: found=%v err=%v", found, err)
+	}
+	format, err := change.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := change.NewObjectID(format, bytes.Repeat([]byte{0x55}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("right\n")
+	sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(content))), content...))
+	oid, err := change.NewObjectID(format, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := change.NewEntry([]byte("nested/a"), "100644", uint64(len(content)), oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := change.NewManifest(format, base, []change.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := change.Prepare(ctx, fixture.changeParent, changeState.ID.String(), changeState.ID.String()+".stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := prepared.PopulateAndPublish(ctx, manifest, func(context.Context, change.ObjectID) ([]byte, error) { return bytes.Clone(content), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts := published.Facts()
+	tree, err := kernelStageIdentity(prepared.Identity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	kernelFormat, err := kernel.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := kernel.NewCommitID(kernelFormat, base.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := kernel.TreeDigestFromBytes(facts.Commitment().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := kernel.NewFileIdentity(7, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := kernel.NewChangeSelection(kernelFormat, commit, digest, uint32(facts.EntryCount()), facts.BlobBytes(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := fixture.store.RecordChangePrepared(ctx, changeState.ID, changeState.Revision, selection, tree, mustKernelTime(t, 300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, err := kernelAvailability(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.MarkChangeAvailable(ctx, changeState.ID, recorded.Revision, availability, mustKernelTime(t, 310)); err != nil {
+		t.Fatal(err)
+	}
+	providerIdentity, err := processResourceIdentity(runner.Identity{PID: 99995, PGID: 99995, Birth: runner.Birth{Seconds: 1700, Microseconds: 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := fixture.resourceStates(t)
+	process, group := states[kernel.ResourceProviderProcess], states[kernel.ResourceProviderGroup]
+	if _, _, err := fixture.store.ActivateProviderResources(ctx, fixture.run.ID, process.ID, process.Revision, group.ID, group.Revision, providerIdentity, mustKernelTime(t, 450)); err != nil {
+		t.Fatal(err)
+	}
+	session, found, err := fixture.store.TerminalSessionForRun(ctx, fixture.run.ID)
+	if err != nil || !found {
+		t.Fatalf("session: found=%v err=%v", found, err)
+	}
+	if fixture.run, err = fixture.store.ActivateRun(ctx, fixture.run.ID, session.ID, fixture.currentRun(t).Revision, session.Revision, mustKernelTime(t, 460)); err != nil {
+		t.Fatal(err)
+	}
+	// The worker leaves an empty directory, which no git tree can hold.
+	if err := os.Mkdir(filepath.Join(fixture.changeParent, changeState.ID.String(), "left-empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	success, err := kernel.NewSuccessProposal("made a directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.ProposeAttemptOutcome(ctx, fixture.keys.AttemptDigest, success, mustKernelTime(t, 500)); err != nil {
+		t.Fatal(err)
+	}
+	fixture.writeArtifact(t, []byte(fmt.Sprintf(`{"version":1,"attempt_id":%q,"kind":"inner_converged","proof":%q,"process":{"pid":99995,"pgid":99995,"birth":{"seconds":1700,"microseconds":4}},"exit":{"code":0}}`, fixture.run.ID.String(), hex.EncodeToString(fixture.proof[:]))))
+	disposition := fixture.sweep(t)
+	if disposition.Action != RecoveredResultConsumed || disposition.Err != nil {
+		t.Fatalf("disposition = %+v", disposition)
+	}
+	settled := fixture.currentRun(t)
+	if settled.Phase != kernel.RunTerminal || settled.Terminal == nil || settled.Terminal.Kind() != kernel.OutcomeFailed || settled.Terminal.Code() != kernel.FailureSource ||
+		!strings.Contains(settled.Terminal.Detail(), "empty or unselected prepared directory") {
+		t.Fatalf("recovered run = %+v", settled.Terminal)
+	}
+	abandoned, found, err := fixture.store.Change(ctx, changeState.ID)
+	if err != nil || !found || abandoned.Phase != kernel.ChangeAbandoned {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", abandoned, found, err)
+	}
+	aside := changeState.ID.String() + ".refused-" + fixture.run.ID.String()[:8]
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, aside, "left-empty")); err != nil || !strings.Contains(settled.Terminal.Detail(), "changes/"+aside) {
+		t.Fatalf("refused tree aside: %v, detail %q", err, settled.Terminal.Detail())
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.changeParent, changeState.ID.String())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the Change's own name is still taken: %v", err)
+	}
+}
+
+// A refusal whose move was made but whose settlement did not commit is
+// settled on the next pass from the moved tree's presence alone.
+func TestSettleRunFinishesARefusalMovedEarlier(t *testing.T) {
+	fixture := newRecoveryFixtureWithRole(t, 0x98, kernel.RoleWorker)
+	ctx := context.Background()
+	run := fixture.currentRun(t)
+	changeState, found, err := fixture.store.Change(ctx, *run.ChangeID)
+	if err != nil || !found {
+		t.Fatalf("change: found=%v err=%v", found, err)
+	}
+	format, err := kernel.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := kernel.NewCommitID(format, bytes.Repeat([]byte{0x99}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := kernel.TreeDigestFromBytes(bytes.Repeat([]byte{0x9a}, kernel.DigestBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := kernel.NewFileIdentity(7, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := kernel.NewChangeSelection(format, commit, digest, 1, 64, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := kernel.NewFileIdentity(9, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := fixture.store.RecordChangePrepared(ctx, changeState.ID, changeState.Revision, selection, tree, mustKernelTime(t, 300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, err := kernel.NewChangeAvailability(digest, 1, 64, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.MarkChangeAvailable(ctx, changeState.ID, prepared.Revision, availability, mustKernelTime(t, 310)); err != nil {
+		t.Fatal(err)
+	}
+	before := fixture.failBeforeRuntime(t)
+	// Nothing at the Change's own name and nothing moved aside: not settleable.
+	if settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID); !errors.Is(err, kernel.ErrConflict) {
+		t.Fatalf("missing tree with nothing aside = %+v, %v", settled, err)
+	}
+	if after := fixture.currentRun(t); after.Phase != kernel.RunFinalizing || after.Revision != before.Revision {
+		t.Fatalf("refused settlement mutated the run: %+v -> %+v", before, after)
+	}
+	aside := filepath.Join(fixture.changeParent, changeState.ID.String()+".refused-"+fixture.run.ID.String()[:8])
+	if err := os.Mkdir(aside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+	if err != nil || settled.Phase != kernel.RunTerminal || settled.Terminal == nil || settled.Terminal.Code() != kernel.FailureSource ||
+		!strings.Contains(settled.Terminal.Detail(), "earlier pass") || !strings.Contains(settled.Terminal.Detail(), filepath.Base(aside)) {
+		t.Fatalf("settlement of an earlier refusal = %+v, %v", settled, err)
+	}
+	if abandoned, found, err := fixture.store.Change(ctx, changeState.ID); err != nil || !found || abandoned.Phase != kernel.ChangeAbandoned {
+		t.Fatalf("change after the earlier refusal = %+v, found=%v, %v", abandoned, found, err)
 	}
 }
 

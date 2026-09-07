@@ -301,6 +301,70 @@ func TestSupervisorWorkerFilesSettleUnderThePrivateServiceUmask(t *testing.T) {
 	fixture.assertReleased(t, run)
 }
 
+// A tree the inspection refuses for good (an empty directory, which no git
+// tree can hold) ends the run as a visible source failure naming the reason
+// and where the tree was moved, abandons the Change, fails the task, and
+// leaves the task's own retry free to prepare a fresh tree.
+func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
+	// The first run leaves an empty directory; the retry, which finds the
+	// witness of the first, does not.
+	program := "set -eu\n[ -s __WITNESS__ ] || mkdir left-empty\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	aside := fixture.changeName(t, run) + ".refused-" + run.ID.String()[:8]
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), "published tree refused") ||
+		!strings.Contains(run.Terminal.Detail(), "empty or unselected prepared directory") || !strings.Contains(run.Terminal.Detail(), "changes/"+aside) {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found || task.Status != kernel.TaskFailed {
+		t.Fatalf("task after refusal = %+v, found=%v, %v", task, found, err)
+	}
+	changeState, found, err := fixture.store.Change(context.Background(), *run.ChangeID)
+	if err != nil || !found || changeState.Phase != kernel.ChangeAbandoned || changeState.SettledRunID == nil || *changeState.SettledRunID != run.ID {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", changeState, found, err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, aside, "left-empty")); err != nil {
+		t.Fatalf("refused tree was not moved aside for a person to read: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.changeParent, fixture.changeName(t, run))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the Change's own name is still taken: %v", err)
+	}
+	fixture.assertReleased(t, run)
+	queueSupervisorRetry(t, fixture, run)
+	retry, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext for the retry: %v", err)
+	}
+	if retry.ID == run.ID || retry.TaskID != run.TaskID || retry.AdmittedTaskWorkRevision.Int64() != 2 || retry.ChangeID == nil || *retry.ChangeID != *run.ChangeID {
+		t.Fatalf("retry run = %+v", retry)
+	}
+	fixture.assertTerminal(t, retry, kernel.OutcomeSucceeded)
+	if retained, found, err := fixture.store.Change(context.Background(), *run.ChangeID); err != nil || !found || retained.Phase != kernel.ChangeRetained {
+		t.Fatalf("change after the retry = %+v, found=%v, %v", retained, found, err)
+	}
+}
+
+// A worker that runs git init in its tree leaves a path no Change may hold;
+// the run ends with that reason rather than finalizing for good.
+func TestSupervisorRefusedPublicationForAGitDirectory(t *testing.T) {
+	program := "set -eu\nmkdir .git\nprintf 'ref: refs/heads/main\\n' > .git/HEAD\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), ".git path components are forbidden") {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	fixture.assertReleased(t, run)
+}
+
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
 	const privateTask = "exact private Codex task"
 	fixture := newSupervisorFixture(t, "unused shell task")
