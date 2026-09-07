@@ -43,9 +43,11 @@ const (
   factoryctl attempt block --detail TEXT
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
+  factoryctl attempt send-back --task ID --note TEXT
   factoryctl project create --name TEXT --root ABSOLUTE
   factoryctl agent create --project ID --name TEXT --provider shell|claude_code|codex --tool-budget N [--role worker|orchestrator] [--model TEXT] [--reasoning-effort low|medium|high|xhigh|max|ultra] [--account ID]
   factoryctl task add --project ID --agent ID --title TEXT [--body TEXT] [--priority N]
+  factoryctl task send-back --task ID --note TEXT
   factoryctl dispatch on|off
   factoryctl web status
   factoryctl web list-clients [--after CLIENT_ID]
@@ -70,6 +72,7 @@ const (
 	commandBlock
 	commandFail
 	commandRequestHuman
+	commandSendBack
 	commandAttemptTask
 	commandWebStatus
 	commandWebListClients
@@ -85,6 +88,7 @@ const (
 	commandProjectCreate
 	commandAgentCreate
 	commandTaskAdd
+	commandTaskSendBack
 	commandDispatch
 )
 
@@ -164,7 +168,7 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 	if command.kind == commandRemoteStatus {
 		return runRemote(ctx, getenv, stdout, stderr)
 	}
-	if command.kind == commandProjectCreate || command.kind == commandAgentCreate || command.kind == commandTaskAdd || command.kind == commandDispatch {
+	if command.kind == commandProjectCreate || command.kind == commandAgentCreate || command.kind == commandTaskAdd || command.kind == commandTaskSendBack || command.kind == commandDispatch {
 		return runOperator(ctx, command, getenv, stdout, stderr)
 	}
 
@@ -199,6 +203,8 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		result, err = client.Fail(callContext, command.text)
 	case commandRequestHuman:
 		result, err = client.RequestHuman(callContext, api.HumanQuestionInput{IdempotencyKey: command.idempotencyKey, Question: command.text})
+	case commandSendBack:
+		result, err = client.SendBack(callContext, api.SendBackInput{TaskID: command.id, Note: command.text})
 	default:
 		err = api.ErrInvalidInput
 	}
@@ -208,6 +214,8 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 	}
 	if command.kind == commandRequestHuman {
 		_, _ = fmt.Fprintf(stdout, "human request accepted: head=%d revision=%d\n", result.Head, result.Revision)
+	} else if command.kind == commandSendBack {
+		_, _ = fmt.Fprintf(stdout, "task sent back: head=%d revision=%d\n", result.Head, result.Revision)
 	} else {
 		_, _ = fmt.Fprintf(stdout, "attempt outcome request accepted: head=%d revision=%d\n", result.Head, result.Revision)
 	}
@@ -247,7 +255,7 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	}
 	if len(args) == 3 && helpFlag(args[2]) {
 		switch args[1] {
-		case "task", "succeed", "block", "fail", "request-human":
+		case "task", "succeed", "block", "fail", "request-human", "send-back":
 			return attemptCommand{}, true, true
 		case "status", "list-clients", "revoke":
 			if args[0] == "web" {
@@ -287,6 +295,10 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	case "request-human":
 		if len(args) == 6 && args[2] == "--idempotency-key" && validHumanRequestKey(args[3]) && args[4] == "--question" && validQuestion(args[5]) {
 			return attemptCommand{kind: commandRequestHuman, idempotencyKey: args[3], text: args[5]}, false, true
+		}
+	case "send-back":
+		if len(args) == 6 && args[2] == "--task" && validHumanRequestKey(args[3]) && args[4] == "--note" && validQuestion(args[5]) {
+			return attemptCommand{kind: commandSendBack, id: args[3], text: args[5]}, false, true
 		}
 	}
 	return attemptCommand{}, false, false
@@ -580,7 +592,7 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 	}
 	if len(args) >= 3 && helpFlag(args[2]) {
 		switch args[0] + " " + args[1] {
-		case "project create", "agent create", "task add":
+		case "project create", "agent create", "task add", "task send-back":
 			return attemptCommand{}, true, true
 		}
 	}
@@ -601,6 +613,8 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 		command.kind = commandAgentCreate
 	case "task add":
 		command.kind = commandTaskAdd
+	case "task send-back":
+		command.kind = commandTaskSendBack
 	default:
 		return attemptCommand{}, false, false
 	}
@@ -643,6 +657,10 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 			command.title = value
 		case name == "--body" && command.kind == commandTaskAdd && validOperatorText(value, 0, 131072):
 			command.body = value
+		case name == "--task" && command.kind == commandTaskSendBack && validHumanRequestKey(value):
+			command.id = value
+		case name == "--note" && command.kind == commandTaskSendBack && validQuestion(value):
+			command.text = value
 		case name == "--priority" && command.kind == commandTaskAdd:
 			priority, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || value != strconv.FormatInt(priority, 10) || priority < -1_000_000 || priority > 1_000_000 {
@@ -665,6 +683,10 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 		}
 	case commandTaskAdd:
 		if command.project == "" || command.agent == "" || command.title == "" {
+			return attemptCommand{}, false, false
+		}
+	case commandTaskSendBack:
+		if command.id == "" || command.text == "" {
 			return attemptCommand{}, false, false
 		}
 	}
@@ -718,6 +740,8 @@ func writeFailure(stderr io.Writer, kind commandKind, err error) {
 		subject = "task request"
 	} else if kind == commandRequestHuman {
 		subject, input = "human request", "human request input"
+	} else if kind == commandSendBack {
+		subject, input = "send-back", "send-back input"
 	}
 	message := "factoryctl: " + subject + " failed\n"
 	var remote *api.RemoteError
@@ -817,6 +841,16 @@ func runOperator(ctx context.Context, command attemptCommand, getenv func(string
 			Head          uint64 `json:"head"`
 			Revision      uint64 `json:"revision"`
 		}{ID: id, IncarnationID: incarnation, Head: result.Head, Revision: result.Revision})
+	case commandTaskSendBack:
+		result, callErr := client.SendBackTask(callContext, api.SendBackInput{TaskID: command.id, Note: command.text})
+		if callErr != nil {
+			return writeWebFailure(stderr, "task send-back", callErr)
+		}
+		return writeJSON(stdout, struct {
+			ID       string `json:"id"`
+			Head     uint64 `json:"head"`
+			Revision uint64 `json:"revision"`
+		}{ID: command.id, Head: result.Head, Revision: result.Revision})
 	case commandDispatch:
 		snapshot, callErr := client.Snapshot(callContext)
 		if callErr != nil {

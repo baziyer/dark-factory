@@ -160,6 +160,8 @@ func (daemon *Daemon) dispatch(ctx context.Context, call api.Call) api.Reply {
 		return daemon.attemptTask(ctx, call)
 	case api.CallRequestHuman:
 		return daemon.requestHuman(ctx, call)
+	case api.CallSendBack, api.CallSendBackTask:
+		return daemon.sendBack(ctx, call)
 	case api.CallWebStatus:
 		status, err := daemon.WebStatus(ctx)
 		if err != nil {
@@ -442,6 +444,48 @@ func (daemon *Daemon) clearOutcomeReceipt(attempt *liveAttempt) {
 
 func attemptOutcomeCall(kind api.CallKind) bool {
 	return kind == api.CallSucceed || kind == api.CallBlock || kind == api.CallFail
+}
+
+// sendBack returns a finished task to its queue: through an orchestrator's
+// attempt credential, bound to its project, or as the operator, who names any
+// task at its current revision.
+func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
+	input, ok := call.SendBackInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	taskID, err := parseTaskID(input.TaskID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	var task kernel.Task
+	if digest, attempt := call.AttemptDigest(); attempt {
+		kDigest, err := attemptDigest(digest)
+		if err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		task, err = daemon.store.SendBackTaskForAttempt(ctx, kDigest, taskID, input.Note, at)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+	} else {
+		current, found, err := daemon.store.Task(ctx, taskID)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+		if !found {
+			return newErrorReply(api.RemoteNotFound)
+		}
+		task, err = daemon.store.SendBackTask(ctx, taskID, current.Revision, input.Note, at)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+	}
+	return daemon.mutation(ctx, task.Revision)
 }
 
 func (daemon *Daemon) requestHuman(ctx context.Context, call api.Call) api.Reply {

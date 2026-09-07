@@ -268,6 +268,44 @@ func TestDaemonDispatchesAttemptOutcomeAfterCommit(t *testing.T) {
 	waitDispatch(t, done)
 }
 
+// A send-back reaches the kernel through both domains with the kernel's own
+// refusals mapped to remote codes: an orchestrator may not send back its own
+// task, the operator may not send back a task still running, and a task that
+// does not exist is not found. The accepting paths are the kernel's tests.
+func TestDaemonDispatchesSendBackThroughBothDomains(t *testing.T) {
+	fixture := newDispatchFixture(t)
+	active := prepareActiveAttempt(t, fixture, 51)
+	ctx := context.Background()
+	operator, err := api.NewOperatorClient(fixture.socket, fixture.operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := active.run.TaskID.String()
+	var remote *api.RemoteError
+	done := fixture.serve(t)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: own, Note: "myself"}); !errors.As(err, &remote) || remote.Code() != api.RemoteConflict {
+		t.Fatalf("orchestrator sending back its own task = %v", err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: own, Note: "still running"}); !errors.As(err, &remote) || remote.Code() != api.RemoteConflict {
+		t.Fatalf("operator sending back a running task = %v", err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: testID(99), Note: "nobody"}); !errors.As(err, &remote) || remote.Code() != api.RemoteNotFound {
+		t.Fatalf("operator sending back a missing task = %v", err)
+	}
+	waitDispatch(t, done)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: own, Note: ""}); !errors.Is(err, api.ErrInvalidInput) {
+		t.Fatalf("empty note left the client = %v", err)
+	}
+	task, found, err := fixture.store.Task(ctx, active.run.TaskID)
+	if err != nil || !found || task.Status != kernel.TaskRunning || task.WorkRevision.Int64() != 1 {
+		t.Fatalf("task after refused send-backs = %+v, found=%v, %v", task, found, err)
+	}
+}
+
 func TestDaemonDispatchesHumanQuestionWithDurableIdempotency(t *testing.T) {
 	fixture := newDispatchFixture(t)
 	active := prepareActiveAttempt(t, fixture, 31)

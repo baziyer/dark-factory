@@ -186,6 +186,8 @@ func TestParseExactAttemptCommands(t *testing.T) {
 		{name: "explicit empty success", args: []string{"attempt", "succeed", "--result", ""}, command: attemptCommand{kind: commandSucceed}},
 		{name: "explicit empty failure", args: []string{"attempt", "fail", "--detail", ""}, command: attemptCommand{kind: commandFail}},
 		{name: "human request", args: []string{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question", "what now?"}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "0123456789abcdef0123456789abcdef", text: "what now?"}},
+		{name: "send back", args: []string{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", "five findings"}, command: attemptCommand{kind: commandSendBack, id: "0123456789abcdef0123456789abcdef", text: "five findings"}},
+		{name: "send back maximum note", args: []string{"attempt", "send-back", "--task", "ffffffffffffffffffffffffffffffff", "--note", strings.Repeat("n", 8192)}, command: attemptCommand{kind: commandSendBack, id: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("n", 8192)}},
 		{name: "human request maximum question", args: []string{"attempt", "request-human", "--idempotency-key", "ffffffffffffffffffffffffffffffff", "--question", strings.Repeat("q", 8192)}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("q", 8192)}},
 	}
 	for _, test := range tests {
@@ -272,6 +274,12 @@ func TestInvalidSyntaxStopsBeforeEnvironmentOrConnection(t *testing.T) {
 		{"attempt", "succeed", "--socket", "/private/socket"},
 		{"attempt", "fail", "--run", "private-run"},
 		{"attempt", "request-human"},
+		{"attempt", "send-back"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", ""},
+		{"attempt", "send-back", "--task", "0123456789abcdef", "--note", "short id"},
+		{"attempt", "send-back", "--note", "reordered", "--task", "0123456789abcdef0123456789abcdef"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", strings.Repeat("n", 8193)},
 		{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question"},
 		{"attempt", "request-human", "--idempotency-key=0123456789abcdef0123456789abcdef", "--question", "private-question"},
 		{"attempt", "request-human", "--question", "private-question", "--idempotency-key", "0123456789abcdef0123456789abcdef"},

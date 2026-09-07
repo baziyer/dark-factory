@@ -293,6 +293,24 @@ func TestServerDecodesClosedMethodMatrix(t *testing.T) {
 				t.Fatalf("failure detail = %q, %t", detail, ok)
 			}
 		}},
+		{name: "send back", domain: attemptDomain, bearer: attemptBearer, body: `{"method":"send_back","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"private-note-sentinel"}}`, kind: CallSendBack, check: func(t *testing.T, call Call) {
+			input, ok := call.SendBackInput()
+			if !ok || input.TaskID != "0123456789abcdef0123456789abcdef" || input.Note != "private-note-sentinel" {
+				t.Fatalf("send-back input = %+v, %t", input, ok)
+			}
+			if _, ok := call.AttemptDigest(); !ok {
+				t.Fatal("send-back carries no attempt digest")
+			}
+		}},
+		{name: "send back task", domain: operatorDomain, bearer: operatorBearer, body: `{"method":"send_back_task","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"operator note"}}`, kind: CallSendBackTask, check: func(t *testing.T, call Call) {
+			input, ok := call.SendBackInput()
+			if !ok || input.TaskID != "0123456789abcdef0123456789abcdef" || input.Note != "operator note" {
+				t.Fatalf("send-back task input = %+v, %t", input, ok)
+			}
+			if _, ok := call.AttemptDigest(); ok {
+				t.Fatal("operator send-back carries an attempt digest")
+			}
+		}},
 		{name: "request human", domain: attemptDomain, bearer: attemptBearer, body: `{"method":"request_human","params":{"idempotency_key":"0123456789abcdef0123456789abcdef","question":"private-question-sentinel"}}`, kind: CallRequestHuman, check: func(t *testing.T, call Call) {
 			input, ok := call.HumanQuestionInput()
 			if !ok || input.IdempotencyKey != "0123456789abcdef0123456789abcdef" || input.Question != "private-question-sentinel" {
@@ -449,6 +467,11 @@ func TestServerRejectsDomainFallbackAndInvalidRequests(t *testing.T) {
 		{name: "empty block detail", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"block","params":{"detail":""}}`), code: RemoteInvalidRequest},
 		{name: "oversized failure detail", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"fail","params":{"detail":"` + strings.Repeat("x", 4097) + `"}}`), code: RemoteInvalidRequest},
 		{name: "request human operator domain", domain: operatorDomain, bearer: operatorBearer, body: []byte(`{"method":"request_human","params":{"idempotency_key":"0123456789abcdef0123456789abcdef","question":"question"}}`), code: RemoteForbidden},
+		{name: "send back operator domain", domain: operatorDomain, bearer: operatorBearer, body: []byte(`{"method":"send_back","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"n"}}`), code: RemoteForbidden},
+		{name: "send back task attempt domain", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"send_back_task","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"n"}}`), code: RemoteForbidden},
+		{name: "send back short task", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"send_back","params":{"task_id":"0123456789abcdef","note":"n"}}`), code: RemoteInvalidRequest},
+		{name: "send back empty note", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"send_back","params":{"task_id":"0123456789abcdef0123456789abcdef","note":""}}`), code: RemoteInvalidRequest},
+		{name: "send back oversized note", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"send_back","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"` + strings.Repeat("x", 8193) + `"}}`), code: RemoteInvalidRequest},
 		{name: "request human zero key", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"request_human","params":{"idempotency_key":"00000000000000000000000000000000","question":"question"}}`), code: RemoteInvalidRequest},
 		{name: "request human uppercase key", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"request_human","params":{"idempotency_key":"0123456789ABCDEF0123456789abcdef","question":"question"}}`), code: RemoteInvalidRequest},
 		{name: "request human nonhex key", domain: attemptDomain, bearer: attemptBearer, body: []byte(`{"method":"request_human","params":{"idempotency_key":"0123456789abcdef0123456789abcdegf","question":"question"}}`), code: RemoteInvalidRequest},

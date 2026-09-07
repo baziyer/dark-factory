@@ -361,6 +361,10 @@ func TestAttemptClientHasExactScopedOutcomesAndNoOperatorFallback(t *testing.T) 
 			_, err := client.RequestHuman(context.Background(), HumanQuestionInput{IdempotencyKey: "0123456789abcdef0123456789abcdef", Question: "private-question-sentinel"})
 			return err
 		}},
+		{name: "send back", request: `{"method":"send_back","params":{"task_id":"0123456789abcdef0123456789abcdef","note":"private-note-sentinel"}}`, invoke: func(client *AttemptClient) error {
+			_, err := client.SendBack(context.Background(), SendBackInput{TaskID: "0123456789abcdef0123456789abcdef", Note: "private-note-sentinel"})
+			return err
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

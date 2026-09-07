@@ -31,9 +31,14 @@ without any remote credential, and the Maintainer App as the one MCP server
 - Never record a review verdict yourself. The review is a separate headless
   session started by `scripts/cold-review.sh`; you read its verdict.
 - One change at a time, in the order the runs finished.
+- A review that asks for changes is not a decision for a human: send the task
+  back to its worker with the findings (`attempt send-back`, section 5) and
+  the worker's next run continues from the tree it left.
 - When a step needs a decision you are not sure of, or a publication is
-  blocked twice, raise it with `attempt request-human` and stop. That is the
-  NEEDS YOU card on the operator's console.
+  blocked twice, raise it with `attempt request-human` and end the run with
+  `attempt block` carrying the same text (section 6). The request is the
+  NEEDS YOU card on the operator's console while the run lives; the blocked
+  task keeps the reason after it ends.
 
 ## 1. Find what a worker finished
 
@@ -44,6 +49,7 @@ The daemon home is two directories above `$DARK_FACTORY_SOCKET`. Its store is
 home=$(dirname "$(dirname "$DARK_FACTORY_SOCKET")")
 sqlite3 -readonly -json "file:$home/factory.sqlite3?mode=ro" "
 SELECT lower(hex(c.id)) AS change_id, lower(hex(c.base_commit)) AS base_commit,
+       lower(hex(t.id)) AS task_id, t.work_revision,
        p.name AS project, p.root, t.title, t.body,
        r.terminal_result AS result, a.name AS agent
 FROM changes c
@@ -56,12 +62,13 @@ ORDER BY r.terminal_at_ms"
 ```
 
 Handle only rows whose `project` is yours. The retained tree of a change is
-`$home/changes/<change_id>`. A change is finished when its `enqueue`
-operation (step 5) is `completed` in the App journal and the merge was
-observed; anything short of that is resumed at the first step whose
-operation is not completed, as section 2 says, and a change whose pull
-request exists but was blocked waits for a new retained change (section 5
-says how to tell).
+`$home/changes/<change_id>`. A change is finished when its `enqueue-HEAD8`
+operation (step 5) for its current head is `completed` in the App journal
+and the merge was observed; anything short of that is resumed at the first
+step whose operation is not completed, as section 2 says. A task sent back
+after a review (section 5) comes around again as the same change id at a
+higher `work_revision`, with its branch and pull request already open:
+section 3 publishes the new tree on top of that branch.
 
 ## 2. Derive one operation id per step, and check the journal first
 
@@ -70,11 +77,16 @@ step so a retry is a replay, never a second publication:
 
 ```sh
 opid() { python3 -c "import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, 'dark-factory:' + sys.argv[1] + ':' + sys.argv[2]))" "$1" "$2"; }
-# opid CHANGE_ID STEP   with STEP one of: issue, publish-1, publish-2, ..., pr, review-HEAD8, review-HEAD8-2, enqueue
+# opid CHANGE_ID STEP   with STEP one of:
+#   issue, pr                                  once per change
+#   publish-1, publish-2, ...                  the first publication, one per commit
+#   publish-HEAD8-1, publish-HEAD8-2, ...      a follow-up on top of branch head HEAD8
+#   review-HEAD8, review-HEAD8-2               the review of pull request head HEAD8
+#   enqueue-HEAD8                              the enqueue of pull request head HEAD8
 ```
 
-`review-HEAD8` takes the first eight hex digits of the pull request head it
-reviews, so a fix pushed later gets a review of its own.
+`HEAD8` is the first eight hex digits of the commit named, so a follow-up
+commit, its review and its enqueue each get ids of their own.
 
 One id per App write: a change that needs several commits (step 3) uses
 `publish-1`, `publish-2` and so on, one per commit, and the same request under
@@ -88,19 +100,46 @@ id.
 
 ## 3. Publish the change as a branch
 
-Compute the diff against the base commit without a checkout: the clone's
-object store, its index filled from the base commit, and the retained tree as
-the work tree. `git add -A` respects the tree's own `.gitignore`, so build
-output the worker left behind is not published.
+The branch is `factory/<first 12 hex of change_id>`. First `observe_ref` for
+it. Absent: this is the first publication, and the commit goes on top of
+`base_commit`. Present: the task was sent back and the worker continued, so
+the commit goes on top of the branch's head, `branch_head`, and the diff is
+against that head, not the base. Set `from` to whichever applies.
+
+Compute the diff against `from` without a checkout: the clone's object
+store, its index filled from `from`, and the retained tree as the work tree.
+`git add -A` respects the tree's own `.gitignore`, so build output the
+worker left behind is not published.
 
 ```sh
 export GIT_DIR=$PWD/repo/.git GIT_WORK_TREE=$home/changes/$change_id GIT_INDEX_FILE=$PWD/change.index
-git fetch -q origin "$base_commit"
-git read-tree "$base_commit" && git add -A
-git diff --cached --name-status "$base_commit"   # A / M / D per path
-git diff --cached --numstat "$base_commit"       # for the delta paragraph
-git ls-files --stage                             # mode and blob per path
+git fetch -q origin "$from"
+git read-tree "$from" && git add -A
+git diff --cached --name-status "$from"   # A / M / D per path
+git diff --cached --numstat "$from"       # for the delta paragraph
+git ls-files --stage                      # mode and blob per path
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+```
+
+Prepare the entries once, into a file, rather than pasting base64 into the
+call by hand:
+
+```sh
+tree=$home/changes/$change_id
+python3 - "$tree" changed.txt > entries.json <<'PY'
+import base64, json, os, sys
+tree, listing = sys.argv[1], sys.argv[2]
+entries = []
+for line in open(listing):                     # from: git diff --cached --name-status
+    status, path = line.rstrip('\n').split('\t', 1)
+    if status == 'D':
+        entries.append({'path': path})
+        continue
+    full = os.path.join(tree, path)
+    mode = '100755' if os.access(full, os.X_OK) else '100644'
+    entries.append({'path': path, 'mode': mode, 'content_base64': base64.b64encode(open(full, 'rb').read()).decode()})
+json.dump(entries, sys.stdout)
+PY
 ```
 
 Build the `changes` array for `publish_commit`: added and modified paths carry
@@ -118,14 +157,21 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 
 1. `observe_ref` for `main` and keep the answer as `main_head`. If it is not
    `base_commit`, main moved since the worker started; publish anyway from
-   `base_commit` and let the queue merge it, but say so in the body.
-2. `publish_commit` with `operation_id = opid "$change_id" publish-1`, `branch`,
-   `expected_head_sha = base_commit`, a one-line message from the task title,
-   and the first (or only) 50 entries. It returns the new head commit; a
-   second commit uses `opid "$change_id" publish-2` and that head, and so on. The last
-   returned head is the pull request head.
+   `from` and let the queue merge it, but say so in the body.
+2. `publish_commit` with `branch`, `expected_head_sha = from`, `message` =
+   the task title and nothing else (the App takes exactly one line: no blank
+   line, no trailers, no session link; a second line is refused as
+   `invalid_input`), and the first (or only) 50 entries. The operation id is
+   `opid "$change_id" publish-1` for a first publication and
+   `opid "$change_id" publish-<HEAD8 of from>-1` for a follow-up. It returns
+   the new head commit; a second commit uses the next number and that head,
+   and so on. The last returned head is the pull request head.
 
 ## 4. Open the issue and the pull request
+
+A follow-up publication (the branch existed) already has both: the journal
+shows `issue` and `pr` completed. Skip this section and go to the review,
+naming the pull request from the `pr` operation's result.
 
 `create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
@@ -148,6 +194,8 @@ human request, not a retry.
 - How it was verified: what the worker's result text says it ran, and that
   the merge queue runs `scripts/local-ci.sh`. Claim nothing you did not see.
 - Never an email, an org name, an account id, or a `/Users/<name>` path.
+- End with the repository's generated-with line and nothing after it. You
+  have no session link; never invent one.
 
 Write that body to a file; the review needs it.
 
@@ -173,7 +221,7 @@ and 5 when it could not prepare the checkout, and leaves
 
 - Exit 3: run it once more; a second 3 is a human request with the log's
   last lines.
-- ALLOW: `enqueue_pull_request` with `opid "$change_id" enqueue`, the PR number, the head
+- ALLOW: `enqueue_pull_request` with `opid "$change_id" enqueue-HEAD8`, the PR number, the head
   and `base = main`. Then `observe_pull_request_merge`, with the PR number,
   the head, `base = main` and the enqueue operation id, every 60 s for up to
   30 minutes;
@@ -186,20 +234,31 @@ and 5 when it could not prepare the checkout, and leaves
   raise a human request with the PR link; never enqueue again on your own.
   An ALLOW the App did not record shows up the same way: the queue's review
   check refuses the entry.
-- REQUEST_CHANGES: you do not fix code. Raise a human request with the PR
-  link and the findings verbatim; the human enqueues the fix as a task to the
-  worker. Stop handling this change until a new retained change for the same
-  task appears.
+- REQUEST_CHANGES: you do not fix code. Send the task back to its worker
+  with the pull request link and the findings verbatim as the note:
+
+  ```sh
+  "$DARK_FACTORY_FACTORYCTL" attempt send-back --task "$task_id" --note "$(cat findings.md)"
+  ```
+
+  The note is appended to the task, the task is queued again, and the
+  worker's next run continues from the retained tree. A later run of yours
+  finds the same change id at the next work revision and publishes the new
+  tree on top of the branch (section 3). Stop handling this change for now.
+  A note is at most 8 KiB; cut the findings to their must-change items if
+  they do not fit, and name the review link so the worker can read the rest.
 - Exit 4: the pull request is no longer at the head you published, which
   only a person can have done; raise a human request.
 - Exit 2 or 5: the script refused its arguments or could not prepare the
   checkout; the log was not written. Check the head and base you passed once,
   then raise a human request with the script's message.
 
-On a resumed run, a change whose `pr` is completed but whose `enqueue` is not
-needs no second review if one was recorded: `observe_operation` with `opid "$change_id"
+On a resumed run, a change whose `pr` is completed but whose `enqueue-HEAD8`
+for the current head is not needs no second review if one was recorded:
+`observe_operation` with `opid "$change_id"
 review-HEAD8` for the pull request head answers `completed` with verdict
-`allow` (enqueue), `block` (blocked: wait for a new retained change), `note`
+`allow` (enqueue), `block` (blocked: send the task back if you have not, then
+stop), `note`
 (a comment that decided nothing: run the review again under a fresh id, the
 head's plus `-2`), or nothing (run the review); `executing` or
 `indeterminate` is a human request, as in section 2. The `review` check
@@ -210,14 +269,18 @@ itself runs only in the merge queue, so it is never the signal here.
 If a merged PR touched `cmd/` or `internal/`, the live service needs a
 reinstall, and if it touched `web/`, the site needs a re-vendor; raise one
 human request naming the merge commit and which of the two applies. Then
-report with `attempt succeed --result`, one line per change: change id, PR
-number, and merged commit or the reason it stopped.
+report, one line per change: change id, PR number, and merged commit or the
+reason it stopped.
 
 ```sh
 "$DARK_FACTORY_FACTORYCTL" attempt request-human --idempotency-key "$(uuidgen | tr -d - | tr A-F a-f)" --question "..."
-"$DARK_FACTORY_FACTORYCTL" attempt succeed --result "..."
+"$DARK_FACTORY_FACTORYCTL" attempt block --detail "..."      # when a human request was raised
+"$DARK_FACTORY_FACTORYCTL" attempt succeed --result "..."    # otherwise
 ```
 
-A request-human does not wait for the answer; finish the run after raising
-it. The next standing-instruction run picks up where the journal says you
-stopped.
+A request-human does not wait for the answer, and the request goes stale
+the moment the run ends, so a run that raised one ends with `attempt block`
+carrying the same text: the blocked task keeps the reason on the console
+until a person sends it back or queues a new instruction. A run that raised
+none ends with `attempt succeed`. The next standing-instruction run picks
+up where the journal says you stopped.
