@@ -812,6 +812,58 @@ func TestTerminalResizeIsExactAndUncertaintyIsVisible(t *testing.T) {
 	}
 }
 
+func TestOrdinaryTerminalEffectKeepsConfiguredLimit(t *testing.T) {
+	const ordinaryLimit = 25 * time.Millisecond
+	fixture := newTerminalEffectFixtureConfigured(t, func(attempt *liveAttempt) {
+		attempt.effectLimit = ordinaryLimit
+	})
+	type outcome struct {
+		result terminalEffectResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := fixture.attempt.runTerminalEffect(runner.TerminalCommand{Kind: runner.TerminalGenerationInstall, Generation: 1})
+		done <- outcome{result: result, err: err}
+	}()
+	if command := readTerminalEffectWire(t, fixture.peer); command.Kind != string(runner.TerminalGenerationInstall) {
+		t.Fatalf("ordinary terminal effect command = %+v", command)
+	}
+	time.Sleep(2 * ordinaryLimit)
+	got := <-done
+	if got.err != nil || !errors.Is(got.result.err, context.DeadlineExceeded) {
+		t.Fatalf("ordinary terminal effect = %+v, %v", got.result, got.err)
+	}
+}
+
+func TestCodexHumanReplyWaitsPastOrdinaryEffectLimitForDeferredSubmit(t *testing.T) {
+	const ordinaryLimit = 25 * time.Millisecond
+	fixture := newTerminalEffectFixtureConfigured(t, func(attempt *liveAttempt) {
+		attempt.effectLimit = ordinaryLimit
+	})
+	var key [kernel.IDBytes]byte
+	copy(key[:], adapterID(t, 209))
+	request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{IdempotencyKey: key, QuestionText: "question"}, adapterTime(t, 399))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := fixture.adapter.daemon.humanReply(context.Background(), fixture.principal, request.ID, request.Revision, "deferred reply")
+		done <- err
+	}()
+	command := readTerminalEffectWire(t, fixture.peer)
+	if command.Kind != string(runner.TerminalHumanReply) || !command.Submit {
+		t.Fatalf("codex human reply command = %+v", command)
+	}
+	// A delayed CR is allowed to outlive the ordinary terminal-effect budget.
+	time.Sleep(2 * ordinaryLimit)
+	replyTerminalEffect(t, fixture.peer, command, runner.TerminalResultOK, uint32(len(command.Payload)))
+	if err := <-done; err != nil {
+		t.Fatalf("deferred codex human reply = %v", err)
+	}
+}
+
 func TestHumanReplyUsesExactRunAndResolvesOnlyAfterFullDelivery(t *testing.T) {
 	fixture := newTerminalEffectFixture(t)
 	var key [kernel.IDBytes]byte

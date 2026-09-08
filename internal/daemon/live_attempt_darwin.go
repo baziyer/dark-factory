@@ -485,6 +485,9 @@ func (attempt *liveAttempt) runTerminalEffect(command runner.TerminalCommand) (t
 	if limit <= 0 {
 		limit = liveAttemptEffectLimit
 	}
+	if command.Kind == runner.TerminalHumanReply && command.Submit {
+		limit += runner.DeferredSubmitBudget
+	}
 	deadline := time.Now().Add(limit)
 	for {
 		remaining := time.Until(deadline)

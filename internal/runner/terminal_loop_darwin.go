@@ -119,11 +119,15 @@ type terminalOwner struct {
 // startupEnterCeiling regardless. Recognise the provider's own prompt if
 // these ever prove wrong for a CLI.
 const (
-	startupRawCeiling   = 2 * time.Second
-	startupEnterFloor   = time.Second
-	startupEnterQuiet   = 500 * time.Millisecond
-	startupEnterCeiling = 5 * time.Second
-	startupEnterTick    = 100 * time.Millisecond
+	startupRawCeiling         = 2 * time.Second
+	startupEnterFloor         = time.Second
+	startupEnterQuiet         = 500 * time.Millisecond
+	startupEnterCeiling       = 5 * time.Second
+	startupEnterTick          = 100 * time.Millisecond
+	terminalPayloadWriteLimit = 250 * time.Millisecond
+	// DeferredSubmitBudget is the extra daemon effect budget for a deferred
+	// Codex submit: its paste, ceiling/tick, and standalone CR write.
+	DeferredSubmitBudget = startupEnterCeiling + 2*terminalPayloadWriteLimit + startupEnterTick
 )
 
 // awaitRawMode waits, up to the ceiling, for the provider to clear canonical
@@ -523,7 +527,7 @@ func (o *terminalOwner) writeTerminalPayload(payload []byte) (uint32, TerminalRe
 	if o == nil || o.stopRequested || o.ptyEOF || !o.ptyOpen || o.child == nil {
 		return 0, TerminalResultRejected
 	}
-	n, err := o.child.writePTYOwned(payload, 250*time.Millisecond)
+	n, err := o.child.writePTYOwned(payload, terminalPayloadWriteLimit)
 	count, status := terminalPayloadResult(n, len(payload), err)
 	if status == TerminalResultOK {
 		return count, status
