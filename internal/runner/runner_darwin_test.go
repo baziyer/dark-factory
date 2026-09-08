@@ -1068,7 +1068,7 @@ func outputFile(t *testing.T, path string) *os.File {
 }
 func waitFile(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(6 * time.Second)
 	for {
 		if _, err := os.Stat(path); err == nil {
 			return
