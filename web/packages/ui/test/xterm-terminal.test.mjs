@@ -105,10 +105,12 @@ test("module or mount failure is reported to the finite owner", async () => {
 
   const broken = fakeModules();
   broken.modules.Terminal.prototype.open = () => { throw new Error("mount"); };
-  startXtermTerminal(() => ({}), async () => broken.modules, { onSurface: () => {}, onError: () => { failures += 1; } }, fakeWindow(broken.state));
+  const surfaces = [];
+  startXtermTerminal(() => ({}), async () => broken.modules, { onSurface: (surface) => surfaces.push(surface), onError: () => { failures += 1; } }, fakeWindow(broken.state));
   await tick();
   assert.equal(failures, 2);
   assert.equal(broken.state.disposes, 1);
+  assert.deepEqual(surfaces, []);
 });
 
 test("initial fit reports one size and each later window fit reports one size", async () => {

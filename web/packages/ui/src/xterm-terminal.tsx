@@ -120,6 +120,7 @@ function mountXtermTerminal(element: HTMLDivElement, modules: XtermModules, call
   let binary: { dispose(): void } | undefined;
   let resized: { dispose(): void } | undefined;
   let listenerInstalled = false;
+  let surfacePublished = false;
   let disposed = false;
   const safe = (action: () => void): void => {
     try { action(); } catch { /* teardown continues through each owned resource */ }
@@ -133,7 +134,7 @@ function mountXtermTerminal(element: HTMLDivElement, modules: XtermModules, call
     safe(() => data?.dispose());
     safe(() => binary?.dispose());
     safe(() => resized?.dispose());
-    safe(() => callbacks.onSurface(undefined));
+    if (surfacePublished) safe(() => callbacks.onSurface(undefined));
     safe(() => terminal?.dispose());
   };
 
@@ -152,6 +153,7 @@ function mountXtermTerminal(element: HTMLDivElement, modules: XtermModules, call
     fit.fit();
     initialResize = false;
     callbacks.onSurface(surface);
+    surfacePublished = true;
     callbacks.onResize?.(terminal.rows, terminal.cols);
     terminal.focus();
     listenerInstalled = true;

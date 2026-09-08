@@ -1055,6 +1055,53 @@ test("selected terminal close detaches once, keeps the session ready, and permit
   assert.equal(context.latest().terminal.phase, "ready");
 });
 
+test("a current Xterm teardown rebinds the selected terminal", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  const terminal = await openTerminal(context);
+  const version = context.latest().terminal.surfaceVersion;
+
+  context.controller.endTerminalSurface(terminal.token, version);
+  await flush();
+
+  assert.equal(context.sessionCloses(), 0);
+  assert.equal(context.calls.at(-1).kind, "detach");
+  assert.equal(context.latest().selectedAgent.id, agent.id);
+  assert.equal(context.latest().terminal.phase, "idle");
+  assert.equal(context.latest().terminal.surfaceVersion, version + 1);
+
+  await remountSurface(context);
+  context.targetGates.at(-1).resolve(target);
+  await flush();
+  assert.equal(context.latest().terminal.phase, "ready");
+});
+
+test("an Xterm mount failure keeps the selected terminal available for an explicit retry", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  context.controller.selectAgent(agent);
+  const token = {};
+  context.controller.beginTerminalSurface(token);
+  const version = context.latest().terminal.surfaceVersion;
+
+  context.controller.terminalError(token, version);
+  assert.equal(context.sessionCloses(), 0);
+  assert.equal(context.latest().selectedAgent.id, agent.id);
+  assert.equal(context.latest().terminal.phase, "idle");
+  assert.equal(context.latest().terminal.error.code, "internal");
+  assert.equal(context.latest().terminal.surfaceVersion, version);
+
+  context.controller.closeAgentTerminal();
+  const remounted = await remountSurface(context);
+  context.targetGates.at(-1).resolve(target);
+  await flush();
+  assert.equal(context.latest().terminal.phase, "ready");
+  assert.equal(context.latest().terminal.error, undefined);
+  assert.notEqual(remounted.token, token);
+});
+
 test("terminal failure is finite and never exposes protocol authority or output bytes in the public snapshot", async () => {
   const context = terminalHarness();
   context.controller.start();
