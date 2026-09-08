@@ -484,6 +484,9 @@ func (store *Store) beginHumanReplyTx(ctx context.Context, tx *writeTx, requestI
 	if !found {
 		return HumanDelivery{}, tx.Rollback(ErrCorruptState)
 	}
+	if !actorRun.zero() && run.Role != RoleWorker {
+		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
+	}
 	if !actorProject.zero() && (run.ProjectID != actorProject || run.ID == actorRun) {
 		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
 	}

@@ -175,6 +175,15 @@ func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id Ta
 	if digest != nil && task.ProjectID != overseer.ProjectID {
 		return Task{}, tx.Rollback(ErrUnauthorized)
 	}
+	if digest != nil {
+		agent, found, err := agentByID(ctx, tx.connection, task.AssignedAgentID)
+		if err != nil {
+			return Task{}, tx.Rollback(err)
+		}
+		if !found || agent.Role != RoleWorker {
+			return Task{}, tx.Rollback(ErrUnauthorized)
+		}
+	}
 	if task.Status != TaskQueued {
 		return Task{}, tx.Rollback(ErrConflict)
 	}

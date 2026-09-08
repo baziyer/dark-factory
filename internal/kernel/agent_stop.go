@@ -69,6 +69,9 @@ func (store *Store) stopRunTx(ctx context.Context, tx *writeTx, request TaskInte
 	if run.TaskID != task.ID {
 		return TaskIntervention{}, ErrConflict
 	}
+	if request.Actor == TaskInterventionOrchestrator && run.Role != RoleWorker {
+		return TaskIntervention{}, ErrUnauthorized
+	}
 	if request.ActorRunID != nil {
 		actor, found, err := runByID(ctx, tx.connection, *request.ActorRunID)
 		if err != nil {

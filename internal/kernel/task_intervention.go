@@ -345,6 +345,9 @@ func reserveTaskInterventionTx(ctx context.Context, tx *writeTx, request TaskInt
 	if task.ProjectID != run.ProjectID || task.ID != run.TaskID || task.Revision != request.ExpectedTaskRevision || run.Revision != request.ExpectedRunRevision || task.Status != TaskRunning || run.Phase != RunRunning || at.Int64() < task.UpdatedAt.Int64() || at.Int64() < run.UpdatedAt.Int64() {
 		return TaskIntervention{}, false, ErrRevisionConflict
 	}
+	if request.Actor == TaskInterventionOrchestrator && run.Role != RoleWorker {
+		return TaskIntervention{}, false, ErrUnauthorized
+	}
 	if request.ActorRunID != nil {
 		actorRun, found, err := runByID(ctx, tx.connection, *request.ActorRunID)
 		if err != nil || !found {

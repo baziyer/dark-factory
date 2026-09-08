@@ -90,3 +90,23 @@ func TestOverseerCannotAnswerItsOwnHumanRequest(t *testing.T) {
 		t.Fatalf("self answer = %v", err)
 	}
 }
+
+func TestOverseerHumanReplyTargetsOnlyWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, worker, overseer, _ := runningWorkerAndOverseer(t)
+	defer store.Close()
+	request, err := store.CreateHumanQuestionForAttempt(ctx, worker.CredentialDigest, NewHumanQuestion{IdempotencyKey: humanKey(247), QuestionText: "worker question"}, mustTime(t, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withLegacyOrchestratorTarget(t, store, worker.ID, func(tx *writeTx) {
+		_, err := store.beginHumanReplyTx(ctx, tx, request.ID, request.Revision, humanDeliveryID(t, 248), "answer", mustTime(t, 41), overseer.ProjectID, overseer.ID)
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("legacy orchestrator target reply = %v", err)
+		}
+	})
+	delivery, err := store.BeginHumanReplyForAttempt(ctx, overseer.CredentialDigest, request.ID, request.Revision, humanDeliveryID(t, 249), "answer", mustTime(t, 42))
+	if err != nil || delivery.RunID != worker.ID {
+		t.Fatalf("worker reply = %+v, %v", delivery, err)
+	}
+}

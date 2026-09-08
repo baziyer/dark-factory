@@ -77,3 +77,31 @@ func TestStopTaskRevalidatesBrowserAuthority(t *testing.T) {
 		t.Fatal("unauthorized stop changed run")
 	}
 }
+
+func TestStopRunForAttemptTargetsOnlyWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, worker, overseer, _ := runningWorkerAndOverseer(t)
+	defer store.Close()
+	task, found, err := store.Task(ctx, worker.TaskID)
+	if err != nil || !found {
+		t.Fatalf("worker task = %+v, found=%v, err=%v", task, found, err)
+	}
+	operation, err := TaskInterventionIDFromBytes(bytes.Repeat([]byte{224}, IDBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withLegacyOrchestratorTarget(t, store, worker.ID, func(tx *writeTx) {
+		_, err := store.stopRunTx(ctx, tx, TaskInterventionRequest{OperationID: operation, TaskID: task.ID, RunID: worker.ID, ExpectedTaskRevision: task.Revision, ExpectedRunRevision: worker.Revision, Actor: TaskInterventionOrchestrator, ActorRunID: &overseer.ID, Kind: TaskInterventionStop}, nil, mustTime(t, 400))
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("legacy orchestrator target stop = %v", err)
+		}
+	})
+	operation, err = TaskInterventionIDFromBytes(bytes.Repeat([]byte{225}, IDBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.StopRunForAttempt(ctx, overseer.CredentialDigest, TaskInterventionRequest{OperationID: operation, TaskID: task.ID, RunID: worker.ID, ExpectedTaskRevision: task.Revision, ExpectedRunRevision: worker.Revision, Kind: TaskInterventionStop}, nil, mustTime(t, 401))
+	if err != nil || receipt.State != TaskInterventionDelivered {
+		t.Fatalf("worker stop = %+v, %v", receipt, err)
+	}
+}

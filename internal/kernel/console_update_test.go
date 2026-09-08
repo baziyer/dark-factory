@@ -123,6 +123,38 @@ func TestUpdateTaskEditsAndCancelsOnlyWhileQueued(t *testing.T) {
 	}
 }
 
+func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, run, keys := runningOrchestratorRun(t)
+	defer store.Close()
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 230), ProjectID: run.ProjectID, Name: "other overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 231), ProjectID: run.ProjectID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 232), Title: "overseer work"}, mustTime(t, 41))
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority := int64(1)
+	for _, patch := range []TaskPatch{{Priority: &priority}, {Cancel: true}} {
+		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, patch, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("orchestrator task patch = %v", err)
+		}
+	}
+	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 233), ProjectID: run.ProjectID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, 43))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 234), ProjectID: run.ProjectID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 235), Title: "worker work"}, mustTime(t, 44))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, TaskPatch{Priority: &priority}, mustTime(t, 45))
+	if err != nil || updated.Priority != priority {
+		t.Fatalf("worker task patch = %+v, %v", updated, err)
+	}
+}
+
 // A task re-queued after a terminal run is the second shape cancellation can
 // reach: work revision 2, with a run history stopping one revision behind it.
 // The run-topology invariant admitted only a queued task there.
