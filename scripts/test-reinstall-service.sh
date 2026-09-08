@@ -45,6 +45,8 @@ git -C "$test_repository" config core.hooksPath "$temporary/configured-hooks"
 
 printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '\n' >"$fake_home/.dark-factory/home.lock"
+mkdir -p "$fake_home/.dark-factory.service"
+printf '{"relay_origin":"wss://relay.example"}\n' >"$fake_home/.dark-factory.service/receipt"
 printf '0\n' >"$temporary/dispatch-enabled"
 printf '0\n' >"$temporary/active-runs"
 : >"$temporary/pids"
@@ -222,7 +224,7 @@ builds=$(wc -l <"$DARK_FACTORY_TEST_GO_LOG" | tr -d ' ')
     || fail "builds did not require VCS metadata: $(tr '\n' ';' <"$DARK_FACTORY_TEST_GO_LOG")"
 printf '%s\n' \
     "service uninstall --home $fake_home/.dark-factory" \
-    "service install --home $fake_home/.dark-factory --relay-origin wss://relay.darkfactory.build" \
+    "service install --home $fake_home/.dark-factory --relay-origin wss://relay.example" \
     "service status --home $fake_home/.dark-factory" \
     "web status" \
     "remote status" >"$temporary/expected.log"

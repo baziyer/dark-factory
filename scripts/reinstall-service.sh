@@ -27,13 +27,15 @@ db="$home/factory.sqlite3"
 socket="$home/runtimes/factory.sock"
 worktree="$repository_root/.worktrees/build-$sha"
 bin="$repository_root/.worktrees/bin-$sha"
-relay_origin=wss://relay.darkfactory.build
+# The receipt is the service manager's durable record of the exact plist it
+# installed. An absent member means the local-only service had no relay.
+relay_origin=$(sed -n 's/.*"relay_origin":"\([^"]*\)".*/\1/p' "$home.service/receipt" 2>/dev/null || :)
 
 # Dispatch must stay off while the script builds and replaces the service, so
 # the supervisor cannot admit work after this count is read.
 refuse_dispatch_enabled() {
     dispatch=$(sqlite3 "$db" "SELECT dispatch_enabled FROM factory WHERE singleton = 1")
-    [ "$dispatch" = 0 ] || { echo "refusing: dispatch is enabled; run 'factoryctl dispatch off' and wait for work to drain" >&2; exit 1; }
+    [ "$dispatch" = 0 ] || { echo "refusing: dispatch is enabled; keep it off through reinstall and wait for work to drain" >&2; exit 1; }
 }
 
 # Checked before the build and again right before the uninstall that would

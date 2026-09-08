@@ -24,9 +24,10 @@ up `$HOME/.dark-factory/factory.sqlite3` to
 waits (bounded) for the previous daemon to leave and for the new one to accept
 on its socket, and prints service, web and remote status. It refuses to run
 unless dispatch is off and the store holds no non-terminal run, checked once
-before the build and again right before the uninstall. First run `factoryctl
-dispatch off`, wait for work to drain, then run the reinstall. After the new
-service is healthy, run `factoryctl dispatch on`. Binaries land in
+before the build and again right before the uninstall. In one coordinated
+maintenance window, run `factoryctl dispatch off`, wait for work to drain, and
+keep dispatch off until the reinstall exits and the new service is healthy;
+then run `factoryctl dispatch on`. Binaries land in
 `.worktrees/bin-<sha>`. If it stops after the uninstall because the previous
 daemon still accepts connections or retains `home.lock`, the service is
 uninstalled: rerun once that daemon has exited.
