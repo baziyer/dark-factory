@@ -25,7 +25,12 @@ worktree="$site/.worktrees/deploy-$sha"
 
 [ -f "$site/.vercel/project.json" ] || { echo "no Vercel link at $site/.vercel/project.json" >&2; exit 1; }
 git -C "$site" fetch -q origin
-[ -d "$worktree" ] || git -C "$site" worktree add -q --detach "$worktree" "$sha"
+# An empty hooksPath, as new-worktree.sh: the site repository's configured
+# hooks (a pnpm install sets core.hooksPath) must not run on the deploy path.
+empty_hooks=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-empty-hooks.XXXXXX")
+trap 'rmdir "$empty_hooks" 2>/dev/null || true' EXIT
+[ -d "$worktree" ] || git -C "$site" -c core.hooksPath="$empty_hooks" \
+    worktree add -q --detach "$worktree" "$sha"
 [ -z "$(git -C "$worktree" status --porcelain=v1 --untracked-files=all)" ] \
     || { echo "worktree not clean: $worktree" >&2; exit 1; }
 [ "$(git -C "$worktree" rev-parse HEAD)" = "$sha" ] \

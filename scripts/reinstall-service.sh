@@ -77,7 +77,12 @@ install_stalled() {
 refuse_active_runs
 
 git -C "$repository_root" fetch -q origin
-[ -d "$worktree" ] || git -C "$repository_root" worktree add -q --detach "$worktree" "$sha"
+# An empty hooksPath, as new-worktree.sh: the repository's configured hooks
+# must not run inside the worktree the live service is built from.
+empty_hooks=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-empty-hooks.XXXXXX")
+trap 'rmdir "$empty_hooks" 2>/dev/null || true' EXIT
+[ -d "$worktree" ] || git -C "$repository_root" -c core.hooksPath="$empty_hooks" \
+    worktree add -q --detach "$worktree" "$sha"
 [ -z "$(git -C "$worktree" status --porcelain=v1 --untracked-files=all)" ] \
     || { echo "worktree not clean: $worktree" >&2; exit 1; }
 [ "$(git -C "$worktree" rev-parse HEAD)" = "$sha" ] \
@@ -85,7 +90,8 @@ git -C "$repository_root" fetch -q origin
 
 # The compiler pinned the way the release workflow pins it, from the go.mod
 # being built: the vcs.* checks below prove the source, not the toolchain.
-go_version=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$worktree/go.mod")
+# A missing go.mod reads as no version and takes the refusal below.
+go_version=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$worktree/go.mod" 2>/dev/null || :)
 case "$go_version" in
     *.*.*) ;;
     *) echo "could not read the exact Go version from $worktree/go.mod" >&2; exit 1 ;;
@@ -101,12 +107,10 @@ for cmd in factoryctl factoryd factory-runner; do
         || { echo "$cmd built from a modified tree" >&2; exit 1; }
 done
 
-backups="$HOME/.dark-factory-backups"
-backup="$backups/$(date -u +%Y%m%dT%H%M%S)-$sha"
-mkdir -p "$backup"
-chmod 700 "$backups" "$backup"
-sqlite3 "$db" ".backup $backup/factory.sqlite3"
-chmod 600 "$backup/factory.sqlite3"
+backup="$HOME/.dark-factory-backups/$(date -u +%Y%m%dT%H%M%S)-$sha"
+# Owner-only from creation: a chmod after the copy leaves the store readable
+# for as long as the copy takes.
+(umask 077 && mkdir -p "$backup" && sqlite3 "$db" ".backup $backup/factory.sqlite3")
 echo "backup: $backup (user_version $(sqlite3 "$backup/factory.sqlite3" 'PRAGMA user_version'))"
 
 refuse_active_runs

@@ -33,6 +33,12 @@ git clone -q --bare "$site" "$temporary/origin.git"
 git -C "$site" remote add origin "$temporary/origin.git"
 sha=$(git -C "$site" rev-parse HEAD)
 printf '{"projectId":"fixture"}\n' >"$site/.vercel/project.json"
+# A hook the site repository configures, as a pnpm install does: it must not
+# run when the script adds its worktree.
+mkdir -p "$temporary/configured-hooks"
+printf '#!/bin/sh\n: >"%s"\n' "$temporary/post-checkout-ran" >"$temporary/configured-hooks/post-checkout"
+chmod 700 "$temporary/configured-hooks/post-checkout"
+git -C "$site" config core.hooksPath "$temporary/configured-hooks"
 
 # Each fake records its name, arguments and working directory. node fails
 # when DARK_FACTORY_TEST_VERIFY_FAILS is set, the way a broken artifact does.
@@ -72,6 +78,7 @@ rm "$DARK_FACTORY_TEST_LOG"
 
 "$script" "$sha" >/dev/null || fail "clean deploy exited non-zero"
 [ "$(git -C "$worktree" rev-parse HEAD)" = "$sha" ] || fail "worktree not at the commit"
+[ ! -e "$temporary/post-checkout-ran" ] || fail "configured post-checkout hook executed"
 cmp -s "$site/.vercel/project.json" "$worktree/.vercel/project.json" || fail "Vercel link not copied"
 printf '%s\n' \
     "corepack pnpm install --frozen-lockfile --prefer-offline @ $worktree" \

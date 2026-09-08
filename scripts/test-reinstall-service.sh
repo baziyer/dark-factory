@@ -17,6 +17,9 @@ fail() {
     exit 1
 }
 
+# The default macOS umask: the fixture store and anything the script creates
+# without guarding against it are world-readable.
+umask 022
 test_repository=$temporary/repository
 fake_bin=$temporary/fake-bin
 fake_home=$temporary/home
@@ -33,6 +36,12 @@ git -C "$test_repository" commit -q -m fixture
 git clone -q --bare "$test_repository" "$temporary/origin.git"
 git -C "$test_repository" remote add origin "$temporary/origin.git"
 sha=$(git -C "$test_repository" rev-parse HEAD)
+# A hook the repository configures, as test-new-worktree.sh: it must not run
+# when the script adds its worktree.
+mkdir -p "$temporary/configured-hooks"
+printf '#!/bin/sh\n: >"%s"\n' "$temporary/post-checkout-ran" >"$temporary/configured-hooks/post-checkout"
+chmod 700 "$temporary/configured-hooks/post-checkout"
+git -C "$test_repository" config core.hooksPath "$temporary/configured-hooks"
 
 printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '0\n' >"$temporary/active-runs"
@@ -67,7 +76,12 @@ cat >"$fake_bin/sqlite3" <<'FAKE'
 set -eu
 case "$2" in
     "SELECT count(*) FROM runs WHERE phase <> 'terminal'") cat "$DARK_FACTORY_TEST_ACTIVE_RUNS" ;;
-    ".backup "*) cp "$1" "${2#.backup }" ;;
+    ".backup "*)
+        cp "$1" "${2#.backup }"
+        # The modes while the store is being copied, before any later chmod.
+        stat -f %Lp "$HOME/.dark-factory-backups" "$(dirname "${2#.backup }")" "${2#.backup }" \
+            >"$DARK_FACTORY_TEST_BACKUP_MODES"
+        ;;
     "PRAGMA user_version") echo 7 ;;
     *) exit 1 ;;
 esac
@@ -124,6 +138,7 @@ printf '#!/bin/sh\n' >"$fake_bin/sleep"
 chmod 755 "$fake_bin"/*
 export PATH="$fake_bin:$PATH" HOME="$fake_home"
 export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
+export DARK_FACTORY_TEST_BACKUP_MODES="$temporary/backup-modes"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
 export DARK_FACTORY_TEST_PIDS="$temporary/pids"
 script=$test_repository/scripts/reinstall-service.sh
@@ -169,9 +184,9 @@ case "$backup" in
     *) fail "unexpected backup path: $backup" ;;
 esac
 cmp -s "$backup" "$fake_home/.dark-factory/factory.sqlite3" || fail "backup content differs"
-[ "$(stat -f %Lp "$fake_home/.dark-factory-backups")" = 700 ] || fail "backups directory mode"
-[ "$(stat -f %Lp "$(dirname "$backup")")" = 700 ] || fail "backup directory mode"
-[ "$(stat -f %Lp "$backup")" = 600 ] || fail "backup file mode"
+[ ! -e "$temporary/post-checkout-ran" ] || fail "configured post-checkout hook executed"
+printf '700\n700\n600\n' | cmp -s - "$DARK_FACTORY_TEST_BACKUP_MODES" \
+    || fail "backup modes while the store was copied: $(tr '\n' ' ' <"$DARK_FACTORY_TEST_BACKUP_MODES")"
 for cmd in factoryctl factoryd factory-runner; do
     [ -x "$test_repository/.worktrees/bin-$sha/$cmd" ] || fail "$cmd not built"
     grep -q '^# pins GOTOOLCHAIN=go1.2.3 GOENV=off GOAUTH=off$' "$test_repository/.worktrees/bin-$sha/$cmd" \
@@ -223,5 +238,20 @@ printf 'stray\n' >"$test_repository/.worktrees/build-$sha/stray"
 "$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "dirty worktree accepted"
 grep -q 'worktree not clean' "$temporary/stderr" || fail "dirty worktree: wrong refusal"
 untouched "dirty worktree"
+
+# Without an exact three-part Go version there is nothing to pin the toolchain to.
+refuses_go_mod() {
+    git -C "$test_repository" commit -q -am "$1"
+    bad=$(git -C "$test_repository" rev-parse HEAD)
+    "$script" "$bad" >/dev/null 2>"$temporary/stderr" && fail "$1 accepted"
+    grep -q 'could not read the exact Go version' "$temporary/stderr" \
+        || fail "$1: wrong refusal: $(cat "$temporary/stderr")"
+    [ ! -e "$test_repository/.worktrees/bin-$bad" ] || fail "$1: built anyway"
+    untouched "$1"
+}
+printf 'module fixture\n\ngo 1.2\n' >"$test_repository/go.mod"
+refuses_go_mod "two-part go version"
+git -C "$test_repository" rm -q go.mod
+refuses_go_mod "missing go.mod"
 
 echo "reinstall-service tests passed"
