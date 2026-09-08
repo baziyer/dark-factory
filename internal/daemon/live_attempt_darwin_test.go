@@ -466,24 +466,39 @@ func TestLiveAttemptSlowSubscriberIsDroppedExactlyOnce(t *testing.T) {
 }
 
 func TestLiveAttemptCreditedReplayDoesNotOverflowBrowserAttachment(t *testing.T) {
-	runID, sessionID := liveTestIDs(t, 10013)
-	attempt := newLiveAttempt(nil, runID, sessionID, nil)
-	attachment := &TerminalAttachment{
-		queue:       make(chan TerminalEvent, terminalSubscriberEventCap),
-		correlation: 1,
+	fixture := newTerminalEffectFixture(t)
+	attachment, err := fixture.adapter.daemon.AttachTerminal(context.Background(), fixture.run.ID, fixture.session.ID, fixture.run.Revision, fixture.session.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	attempt.subs[attachment] = struct{}{}
-	attempt.correlations[attachment.correlation] = attachment
-	attempt.routeAttached(runner.TerminalFrame{Kind: runner.TerminalAttached, Correlation: attachment.correlation, Sequence: 0, Floor: 0, Head: liveAttemptCredit, Status: runner.TerminalResultOK})
-	for range liveAttemptCredit / terminalPayloadCap {
-		start := attachment.expected
-		attempt.routeReplay(attachment, runner.TerminalFrame{Kind: runner.TerminalOutput, Correlation: 1, Start: start, End: start + terminalPayloadCap, Payload: make([]byte, terminalPayloadCap)})
+	attach := readTerminalEffectWire(t, fixture.peer)
+	if attach.Kind != string(runner.TerminalAttach) || attach.Correlation == 0 || attach.Sequence != 0 {
+		t.Fatalf("attach command = %+v", attach)
 	}
-	if _, present := attempt.subs[attachment]; !present || attachment.finished {
-		t.Fatalf("credited replay dropped browser attachment: present=%v finished=%v", present, attachment.finished)
+	if credit := readTerminalEffectWire(t, fixture.peer); credit.Kind != string(runner.TerminalCredit) || credit.Credit != liveAttemptCredit {
+		t.Fatalf("initial replay credit = %+v", credit)
 	}
-	if got := len(attachment.queue); got != terminalSubscriberEventCap {
-		t.Fatalf("queued replay events = %d, want %d", got, terminalSubscriberEventCap)
+
+	// Do not read attachment.Events: this is a paused browser while the runner
+	// replays one full credited burst through the ordinary controller route.
+	writeTerminalEffectWire(t, fixture.peer, terminalEffectWireFrame{Version: 1, Kind: string(runner.TerminalAttached), Correlation: attach.Correlation, Head: liveAttemptCredit, Status: string(runner.TerminalResultOK)})
+	for start := uint64(0); start < liveAttemptCredit; start += terminalPayloadCap {
+		writeTerminalEffectWire(t, fixture.peer, terminalEffectWireFrame{
+			Version: 1, Kind: string(runner.TerminalOutput), Correlation: attach.Correlation,
+			Start: start, End: start + terminalPayloadCap, Payload: make([]byte, terminalPayloadCap),
+		})
+	}
+
+	want := liveAttemptCredit/terminalPayloadCap + 1 // 128 output frames plus ATTACHED.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(attachment.queue) != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if _, present := fixture.attempt.subs[attachment]; !present || attachment.finished {
+		t.Fatalf("credited replay dropped paused browser attachment: present=%v finished=%v", present, attachment.finished)
+	}
+	if got := len(attachment.queue); got != want {
+		t.Fatalf("queued credited replay events = %d, want %d", got, want)
 	}
 }
 
