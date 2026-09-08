@@ -29,8 +29,15 @@ worktree="$repository_root/.worktrees/build-$sha"
 bin="$repository_root/.worktrees/bin-$sha"
 relay_origin=wss://relay.darkfactory.build
 
+# Dispatch must stay off while the script builds and replaces the service, so
+# the supervisor cannot admit work after this count is read.
+refuse_dispatch_enabled() {
+    dispatch=$(sqlite3 "$db" "SELECT dispatch_enabled FROM factory WHERE singleton = 1")
+    [ "$dispatch" = 0 ] || { echo "refusing: dispatch is enabled; run 'factoryctl dispatch off' and wait for work to drain" >&2; exit 1; }
+}
+
 # Checked before the build and again right before the uninstall that would
-# kill a run the supervisor admitted while the build was running.
+# kill work that was still draining while the build was running.
 refuse_active_runs() {
     active=$(sqlite3 "$db" "SELECT count(*) FROM runs WHERE phase <> 'terminal'")
     [ "$active" = 0 ] || { echo "refusing: $active non-terminal run(s) in $db" >&2; exit 1; }
@@ -73,6 +80,7 @@ install_stalled() {
 }
 
 [ -f "$db" ] || { echo "no store at $db" >&2; exit 1; }
+refuse_dispatch_enabled
 refuse_active_runs
 
 git -C "$repository_root" fetch -q origin
@@ -112,6 +120,7 @@ backup="$HOME/.dark-factory-backups/$(date -u +%Y%m%dT%H%M%S)-$sha"
 (umask 077 && mkdir -p "$backup" && sqlite3 "$db" ".backup $backup/factory.sqlite3")
 echo "backup: $backup (user_version $(sqlite3 "$backup/factory.sqlite3" 'PRAGMA user_version'))"
 
+refuse_dispatch_enabled
 refuse_active_runs
 "$bin/factoryctl" service uninstall --home "$home"
 # bootout returns once launchd forgets the job; factoryd unlinks its socket

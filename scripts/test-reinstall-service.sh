@@ -45,6 +45,7 @@ git -C "$test_repository" config core.hooksPath "$temporary/configured-hooks"
 
 printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '\n' >"$fake_home/.dark-factory/home.lock"
+printf '0\n' >"$temporary/dispatch-enabled"
 printf '0\n' >"$temporary/active-runs"
 : >"$temporary/pids"
 
@@ -69,6 +70,7 @@ case "$1" in
             "${GOTOOLCHAIN-unset}" "${GOENV-unset}" "${GOAUTH-unset}" >"$out"
         chmod 755 "$out"
         [ -z "${DARK_FACTORY_TEST_ADMIT_DURING_BUILD-}" ] || printf '1\n' >"$DARK_FACTORY_TEST_ACTIVE_RUNS"
+        [ -z "${DARK_FACTORY_TEST_ENABLE_DISPATCH_DURING_BUILD-}" ] || printf '1\n' >"$DARK_FACTORY_TEST_DISPATCH_ENABLED"
         ;;
     version) cat "$3" ;;
     *) exit 1 ;;
@@ -78,6 +80,7 @@ cat >"$fake_bin/sqlite3" <<'FAKE'
 #!/bin/sh
 set -eu
 case "$2" in
+    "SELECT dispatch_enabled FROM factory WHERE singleton = 1") cat "$DARK_FACTORY_TEST_DISPATCH_ENABLED" ;;
     "SELECT count(*) FROM runs WHERE phase <> 'terminal'") cat "$DARK_FACTORY_TEST_ACTIVE_RUNS" ;;
     ".backup "*)
         cp "$1" "${2#.backup }"
@@ -142,6 +145,7 @@ printf '#!/bin/sh\n' >"$fake_bin/sleep"
 chmod 755 "$fake_bin"/*
 export PATH="$fake_bin:$PATH" HOME="$fake_home"
 export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
+export DARK_FACTORY_TEST_DISPATCH_ENABLED="$temporary/dispatch-enabled"
 export DARK_FACTORY_TEST_BACKUP_MODES="$temporary/backup-modes"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
 export DARK_FACTORY_TEST_GO_LOG="$temporary/go.log"
@@ -171,12 +175,25 @@ grep -q '^usage:' "$temporary/stderr" || fail "bad argument: usage not printed"
 [ ! -e "$test_repository/.worktrees" ] || fail "usage error created a worktree"
 untouched "usage error"
 
+printf '1\n' >"$temporary/dispatch-enabled"
+"$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "dispatch enabled accepted"
+grep -q 'dispatch is enabled' "$temporary/stderr" || fail "dispatch enabled: wrong refusal"
+[ ! -e "$test_repository/.worktrees" ] || fail "dispatch enabled created a worktree"
+untouched "dispatch enabled"
+printf '0\n' >"$temporary/dispatch-enabled"
+
 printf '1\n' >"$temporary/active-runs"
 "$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "active run accepted"
 grep -q 'non-terminal run' "$temporary/stderr" || fail "active run: wrong refusal"
 [ ! -e "$test_repository/.worktrees" ] || fail "active run created a worktree"
 untouched "active run"
 printf '0\n' >"$temporary/active-runs"
+
+DARK_FACTORY_TEST_ENABLE_DISPATCH_DURING_BUILD=1 "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "dispatch enabled during build accepted"
+grep -q 'dispatch is enabled' "$temporary/stderr" || fail "dispatch enabled during build: wrong refusal"
+[ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "dispatch enabled during build: service uninstalled"
+printf '0\n' >"$temporary/dispatch-enabled"
 
 DARK_FACTORY_TEST_ADMIT_DURING_BUILD=1 "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
     && fail "run admitted during the build accepted"

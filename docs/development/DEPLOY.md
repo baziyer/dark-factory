@@ -23,10 +23,13 @@ up `$HOME/.dark-factory/factory.sqlite3` to
 `factoryctl service uninstall` and `service install` with the new binaries,
 waits (bounded) for the previous daemon to leave and for the new one to accept
 on its socket, and prints service, web and remote status. It refuses to run
-while the store holds a non-terminal run, checked once before the build and
-again right before the uninstall. Binaries land in `.worktrees/bin-<sha>`. If
-it stops after the uninstall because processes naming the home survive, the
-service is uninstalled: rerun once they have exited.
+unless dispatch is off and the store holds no non-terminal run, checked once
+before the build and again right before the uninstall. First run `factoryctl
+dispatch off`, wait for work to drain, then run the reinstall. After the new
+service is healthy, run `factoryctl dispatch on`. Binaries land in
+`.worktrees/bin-<sha>`. If it stops after the uninstall because the previous
+daemon still accepts connections or retains `home.lock`, the service is
+uninstalled: rerun once that daemon has exited.
 
 `scripts/local-ci.sh` runs `scripts/test-reinstall-service.sh` and
 `scripts/test-deploy-site.sh`, which exercise both scripts against fakes.
@@ -44,13 +47,20 @@ change that only narrows the granted mask needs no ordering.
 
 **Schema change.** When a change bumps `PRAGMA user_version`, keep the previous
 build's `.worktrees/bin-<sha>` for rollback. The daemon migrates the store
-before it listens, so the script's socket wait timing out means the migration
-did not finish; confirm that from `service status` and the daemon log. A daemon
-that died mid-migration leaves `factory.sqlite3-wal` and `factory.sqlite3-shm`
-next to the store; with them still present the daemon either refuses to open
-the restored file or replays the newer schema's WAL onto it. The restore is:
-copy the backup the script printed over `$HOME/.dark-factory/factory.sqlite3`,
-delete both sidecars, then reinstall from the previous binaries.
+before it listens, but a socket timeout does not prove that the new daemon has
+stopped. Before restoring, run `factoryctl service uninstall --home
+$HOME/.dark-factory` and confirm the daemon released `home.lock`:
+
+```sh
+perl -MFcntl=:flock -e 'open my $lock, "+<", shift or exit 1; flock $lock, LOCK_EX | LOCK_NB or exit 1' "$HOME/.dark-factory/home.lock"
+```
+
+A daemon that died mid-migration leaves `factory.sqlite3-wal` and
+`factory.sqlite3-shm` next to the store; with them still present the daemon
+either refuses to open the restored file or replays the newer schema's WAL onto
+it. Only after the stop and lock check, copy the backup the script printed over
+`$HOME/.dark-factory/factory.sqlite3`, delete both sidecars, then reinstall
+from the previous binaries.
 
 ## Where the service runs from
 
