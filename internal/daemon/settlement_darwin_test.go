@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dark-factory-build/dark-factory/internal/change"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
@@ -149,7 +151,44 @@ func TestSettleRunAllowsAFullRetainedTreeScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.failBeforeRuntime(t)
-	settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+	// Hold the retained inspection while an independent durable update advances
+	// the factory clock. The settlement timestamp must be read after that
+	// inspection, or the kernel rejects its stale finalization.
+	var clock atomic.Int64
+	clock.Store(500)
+	fixture.daemon.now = func() time.Time { return time.UnixMilli(clock.Load()) }
+	inspectionHeld := make(chan struct{})
+	continueInspection := make(chan struct{})
+	fixture.daemon.settleRetained = func(ctx context.Context, parent string, state kernel.Change) (kernel.ChangeSettlement, error) {
+		close(inspectionHeld)
+		<-continueInspection
+		return retainedSettlement(ctx, parent, state)
+	}
+	type settlementResult struct {
+		run kernel.Run
+		err error
+	}
+	settledResult := make(chan settlementResult, 1)
+	go func() {
+		run, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+		settledResult <- settlementResult{run, err}
+	}()
+	select {
+	case <-inspectionHeld:
+	case <-time.After(time.Second):
+		t.Fatal("settlement did not reach retained inspection")
+	}
+	factory, err := fixture.store.Factory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.SetDispatch(ctx, factory.Revision, false, mustKernelTime(t, 600)); err != nil {
+		t.Fatalf("concurrent dispatch update: %v", err)
+	}
+	clock.Store(700)
+	close(continueInspection)
+	result := <-settledResult
+	settled, err := result.run, result.err
 	if err != nil || settled.Phase != kernel.RunTerminal || settled.Terminal == nil {
 		t.Fatalf("large retained settlement = %+v, %v", settled, err)
 	}

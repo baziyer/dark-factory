@@ -37,11 +37,11 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 	if run.Phase != kernel.RunFinalizing || run.Proposal == nil {
 		return run, fmt.Errorf("%w: run is not settleable", kernel.ErrConflict)
 	}
-	at, err := daemon.timestamp()
-	if err != nil {
-		return run, err
-	}
 	if run.Role == kernel.RoleOrchestrator {
+		at, err := daemon.timestamp()
+		if err != nil {
+			return run, err
+		}
 		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
 		final, err := daemon.store.FinalizeRun(storeCtx, run.ID, run.Revision, at)
 		cancel()
@@ -65,19 +65,31 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 		if err != nil {
 			return run, err
 		}
+		at, err := daemon.timestamp()
+		if err != nil {
+			return run, err
+		}
 		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
 		final, err := daemon.store.FinalizeWorkerRun(storeCtx, run.ID, run.Revision, settlement, at)
 		cancel()
 		return final, err
 	case kernel.ChangeAvailable:
+		settleRetained := daemon.settleRetained
+		if settleRetained == nil {
+			settleRetained = retainedSettlement
+		}
 		inspectionCtx, cancel := context.WithTimeout(context.Background(), supervisorInspectionWindow)
-		settlement, err := retainedSettlement(inspectionCtx, changeParent, changeState)
+		settlement, err := settleRetained(inspectionCtx, changeParent, changeState)
 		cancel()
 		if refused, refusal := publicationRefused(err); refused {
 			settlement, err = refusedSettlement(changeParent, changeState, run.ID, refusal)
 		} else if refusedEarlier(changeParent, changeState, run.ID, err) {
 			settlement, err = refusedSettlement(changeParent, changeState, run.ID, errRefusedEarlier)
 		}
+		if err != nil {
+			return run, err
+		}
+		at, err := daemon.timestamp()
 		if err != nil {
 			return run, err
 		}

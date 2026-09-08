@@ -20,6 +20,10 @@ type Daemon struct {
 	store *kernel.Store
 	now   func() time.Time
 
+	// settleRetained is a package-test-only seam for an inspection that races a
+	// durable update. Production settlement always uses retainedSettlement.
+	settleRetained func(context.Context, string, kernel.Change) (kernel.ChangeSettlement, error)
+
 	browserMu          sync.Mutex
 	browserLifecycleMu sync.Mutex
 	browsers           map[*BrowserRuntime]struct{}
