@@ -1,8 +1,10 @@
 package kernel
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -203,39 +205,184 @@ func TestRetryAdmissionCannotPrecedeQueuedTaskUpdate(t *testing.T) {
 	_ = terminal
 }
 
-func TestSuccessfulTerminalCannotBeRetried(t *testing.T) {
+// A finished task, a success included, goes back to its queue at the next
+// work revision with the note in its body, the store stays valid, and the
+// retry is admitted on the task's own Change.
+func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	success, _ := NewSuccessProposal("finished")
 	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
-	path := storePath(t, store)
+	defer store.Close()
 	terminal, err := finalizeTestRun(t, store, finalizing, 80)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, keys := queueRetryForTerminal(t, store, terminal, 80)
-	before := captureWriteFootprint(t, store)
-	if _, _, err := store.Run(context.Background(), terminal.ID); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Run = %v", err)
+	ctx := context.Background()
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found || task.Status != TaskSucceeded {
+		t.Fatalf("finished task = %+v, found=%v, %v", task, found, err)
 	}
-	if _, err := store.Snapshot(context.Background()); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Snapshot = %v", err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "", mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("empty note = %v", err)
 	}
-	if _, err := store.RecoverableRuns(context.Background()); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry RecoverableRuns = %v", err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("x", MaxSendBackNoteBytes+1), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("oversized note = %v", err)
 	}
-	if result, err := store.AdmitNext(context.Background(), keys, mustTime(t, 80)); !errors.Is(err, ErrCorruptState) || result.Admitted() {
-		t.Fatalf("successful terminal retry admission = %+v, %v", result, err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("send-back before the terminal run = %v", err)
 	}
-	if after := captureWriteFootprint(t, store); after != before {
-		t.Fatalf("successful terminal retry footprint before=%+v after=%+v", before, after)
+	// The fixture's task has a title and no body, which a run receives as
+	// the title; the send-back must keep that instruction.
+	if task.Body != "" || task.Title == "" {
+		t.Fatalf("fixture task = %+v", task)
 	}
-	if err := store.Close(); err != nil {
+	sent, err := store.SendBackTask(ctx, task.ID, task.Revision, "the review wants a test", mustTime(t, 90))
+	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != task.WorkRevision.Int64()+1 || sent.Result != "" || sent.CompletedAt != nil || sent.BlockedReason != "" ||
+		sent.Body != task.Title+"\n\n## Sent back for work revision 2\n\nthe review wants a test" || sent.Body != SentBackBody(task, "the review wants a test") {
+		t.Fatalf("sent back task = %+v, %v", sent, err)
+	}
+	if body := SentBackBody(Task{Title: "titled", Body: "the body", WorkRevision: mustRevision(t, 1)}, "n"); !strings.HasPrefix(body, "the body\n\n") {
+		t.Fatalf("body with a body = %q", body)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after send-back = %v", err)
+	}
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "again", mustTime(t, 91)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale revision = %v", err)
+	}
+	if _, err := store.SendBackTask(ctx, sent.ID, sent.Revision, "again", mustTime(t, 92)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("queued task sent back = %v", err)
+	}
+	candidate := changeID(t, 110)
+	keys := admissionKeys(t, 100, &candidate)
+	result, err := store.AdmitNext(ctx, keys, mustTime(t, 100))
+	if err != nil || !result.Admitted() || result.Run.AdmittedTaskWorkRevision.Int64() != 2 || result.Run.ChangeID == nil || *result.Run.ChangeID != *terminal.ChangeID {
+		t.Fatalf("retry admission = %+v, %v", result, err)
+	}
+}
+
+// A task that never ran has no run to go back to.
+func TestSendBackRefusesATaskWithoutARun(t *testing.T) {
+	store, _, project, agent := newAdmissionStore(t, RoleWorker, 2)
+	defer store.Close()
+	ctx := context.Background()
+	task, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 60), ProjectID: project.ID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 61), Title: "never ran"}, mustTime(t, 5))
+	if err != nil {
 		t.Fatal(err)
 	}
-	beforeDatabase := captureDatabaseEvidence(t, path)
-	if _, err := Open(context.Background(), path); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Open = %v", err)
+	cancelled, err := store.UpdateTask(ctx, task.ID, task.Revision, TaskPatch{Cancel: true}, mustTime(t, 6))
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertDatabaseEvidenceUnchanged(t, path, beforeDatabase)
+	if _, err := store.SendBackTask(ctx, cancelled.ID, cancelled.Revision, "try again", mustTime(t, 7)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("send-back without a run = %v", err)
+	}
+	// A shell agent's task is a program: no note can be appended to it,
+	// whatever its status.
+	shell, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 70), ProjectID: project.ID, Name: "shell", Role: RoleWorker, Provider: ProviderShell, ToolBudgetLimit: 2}, mustTime(t, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 71), ProjectID: project.ID, AssignedAgentID: shell.ID, IncarnationID: incarnationID(t, 72), Title: "run", Body: "printf x"}, mustTime(t, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTask(ctx, program.ID, program.Revision, "a note", mustTime(t, 10)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("send-back of a shell task = %v", err)
+	}
+}
+
+// A running orchestrator of the same project may send a worker's finished
+// task back; before it runs, its own task, another project's task, an
+// unknown credential and (below) a worker's credential may not.
+func TestOrchestratorAttemptSendsBackAWorkerTask(t *testing.T) {
+	success, _ := NewSuccessProposal("finished")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
+	defer store.Close()
+	terminal, err := finalizeTestRun(t, store, finalizing, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 250), ProjectID: terminal.ProjectID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 81))
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 251), ProjectID: terminal.ProjectID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 252), Title: "publish"}, mustTime(t, 82))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := admissionKeys(t, 120, nil)
+	admission, err := store.AdmitNext(ctx, keys, mustTime(t, 83))
+	if err != nil || !admission.Admitted() || admission.Run.Role != RoleOrchestrator {
+		t.Fatalf("orchestrator admission = %+v, %v", admission, err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "not yet running", mustTime(t, 84)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("admitted but not running orchestrator = %v", err)
+	}
+	activated := activateAllResourcesUnique(t, store, *admission.Run, 90, 7)
+	session := terminalSessionForRunTest(t, store, admission.Run.ID)
+	if _, err := store.ActivateRun(ctx, admission.Run.ID, session.ID, activated.Revision, session.Revision, mustTime(t, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, own.ID, "myself", mustTime(t, 101)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("own task = %v", err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, taskID(t, 99), "missing", mustTime(t, 101)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing task = %v", err)
+	}
+	elsewhere, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 60), Name: "elsewhere", Root: "/elsewhere"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 61), ProjectID: elsewhere.ID, Name: "stranger", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 62), ProjectID: elsewhere.ID, AssignedAgentID: stranger.ID, IncarnationID: incarnationID(t, 63), Title: "not yours"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, foreign.ID, "another project", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("another project's task = %v", err)
+	}
+	sibling, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 64), ProjectID: terminal.ProjectID, Name: "sibling", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 65), ProjectID: terminal.ProjectID, AssignedAgentID: sibling.ID, IncarnationID: incarnationID(t, 66), Title: "another overseer's"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, siblingTask.ID, "not a worker's", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("a sibling orchestrator's task = %v", err)
+	}
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found {
+		t.Fatalf("worker task = %+v, found=%v, %v", task, found, err)
+	}
+	sent, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "five findings", mustTime(t, 102))
+	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != 2 || sent.Body != SentBackBody(task, "five findings") {
+		t.Fatalf("orchestrator send-back = %+v, %v", sent, err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "twice", mustTime(t, 103)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("queued task sent back again = %v", err)
+	}
+	unknown, err := AttemptDigestFromBytes(bytes.Repeat([]byte{9}, DigestBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, unknown, terminal.TaskID, "stranger", mustTime(t, 104)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("unknown credential = %v", err)
+	}
+}
+
+// A worker's credential is never a send-back authority.
+func TestWorkerAttemptCannotSendBack(t *testing.T) {
+	store, run, keys := runningWorkerRun(t)
+	defer store.Close()
+	if _, err := store.SendBackTaskForAttempt(context.Background(), keys.AttemptDigest, run.TaskID, "myself", mustTime(t, 200)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("worker send-back = %v", err)
+	}
 }
 
 func TestNonSuccessTerminalAllowsQueuedRetry(t *testing.T) {
@@ -318,11 +465,247 @@ func TestHistoricalRetryMustFollowEveryPredecessor(t *testing.T) {
 	assertCorruptTaskHistory(t, store, path, predecessor.ID, successor.ID)
 }
 
-func TestEarlierSuccessfulRunForbidsLaterHistory(t *testing.T) {
+// A successful run may precede later history: a send-back returns a finished
+// task, a success included, to its queue.
+func TestEarlierSuccessfulRunMayPrecedeLaterHistory(t *testing.T) {
 	store, predecessor, successor := retryAdmittedWorker(t, 33, 33)
-	path := storePath(t, store)
+	defer store.Close()
 	corruptSQL(t, store, `UPDATE runs SET proposal_kind = 'succeeded', proposal_code = NULL, proposal_detail = NULL, proposal_result = 'hidden success', terminal_kind = 'succeeded', terminal_code = NULL, terminal_detail = NULL, terminal_result = 'hidden success' WHERE id = ?`, predecessor.ID.Bytes())
-	assertCorruptTaskHistory(t, store, path, predecessor.ID, successor.ID)
+	if _, _, err := store.Run(context.Background(), successor.ID); err != nil {
+		t.Fatalf("history after a successful run = %v", err)
+	}
+	if _, _, err := store.Run(context.Background(), predecessor.ID); err != nil {
+		t.Fatalf("successful predecessor = %v", err)
+	}
+}
+
+// The daemon's refusal of a published tree ends the run as a source failure,
+// abandons the available Change, keeps the store valid, and lets the task
+// retry fresh on a reserved Change four revisions on.
+func TestRefusedPublicationAbandonsTheAvailableChangeAndRetriesFresh(t *testing.T) {
+	success, _ := NewSuccessProposal("finished")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
+	defer store.Close()
+	ctx := context.Background()
+	changeState, found, err := store.Change(ctx, *finalizing.ChangeID)
+	if err != nil || !found || changeState.Phase != ChangeAvailable {
+		t.Fatalf("change before refusal = %+v, found=%v, %v", changeState, found, err)
+	}
+	if _, err := NewRefusedChangeSettlement(changeState.Revision, ""); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("refusal without a reason = %v", err)
+	}
+	settlement, err := NewRefusedChangeSettlement(changeState.Revision, "empty directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, settlement, mustTime(t, 80))
+	if err != nil || terminal.Phase != RunTerminal || terminal.Terminal == nil || terminal.Terminal.Kind() != OutcomeFailed || terminal.Terminal.Code() != FailureSource ||
+		terminal.Terminal.Detail() != RefusedPublicationDetailPrefix+"empty directory" || terminal.Proposal == nil || !terminal.Proposal.equal(*terminal.Terminal) {
+		t.Fatalf("refused run = %+v, %v", terminal, err)
+	}
+	if long, err := NewRefusedChangeSettlement(changeState.Revision, strings.Repeat("r", 5000)); err != nil || byteLen(long.refusal.detail) != 4096 {
+		t.Fatalf("long refusal = %+v, %v", long, err)
+	}
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found || task.Status != TaskFailed || task.Result != "" {
+		t.Fatalf("task after refusal = %+v, found=%v, %v", task, found, err)
+	}
+	abandoned, found, err := store.Change(ctx, changeState.ID)
+	if err != nil || !found || abandoned.Phase != ChangeAbandoned || abandoned.SettledRunID == nil || *abandoned.SettledRunID != terminal.ID || abandoned.Revision.Int64() != changeState.Revision.Int64()+1 {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", abandoned, found, err)
+	}
+	if replay, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, settlement, mustTime(t, 81)); err != nil || replay.Revision != terminal.Revision {
+		t.Fatalf("refusal replay = %+v, %v", replay, err)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after refusal = %v", err)
+	}
+	_, keys := queueRetryForTerminal(t, store, terminal, 90)
+	result, err := store.AdmitNext(ctx, keys, mustTime(t, 100))
+	if err != nil || !result.Admitted() || result.Run.ChangeID == nil || *result.Run.ChangeID != changeState.ID || result.Run.AdmittedChangeRevision.Int64() != changeState.Revision.Int64()+2 {
+		t.Fatalf("retry after refusal = %+v, %v", result, err)
+	}
+	reopened, found, err := store.Change(ctx, changeState.ID)
+	if err != nil || !found || reopened.Phase != ChangeReserved {
+		t.Fatalf("reopened change = %+v, found=%v, %v", reopened, found, err)
+	}
+	if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+		t.Fatalf("store after retry admission = %v", err)
+	}
+}
+
+// A refusal is only for a published tree: an unpublished Change abandons
+// the ordinary way, and a refused settlement on it is a conflict.
+func TestRefusedSettlementNeedsAnAvailableChange(t *testing.T) {
+	store, run, _ := admittedWorkerRun(t)
+	defer store.Close()
+	ctx := context.Background()
+	runtime := resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+	runtimeIdentity, _ := NewPathResourceIdentity(301, 302)
+	if _, err := store.ActivateResource(ctx, run.ID, runtime.ID, runtime.Revision, runtimeIdentity, mustTime(t, 19)); err != nil {
+		t.Fatal(err)
+	}
+	failure, _ := NewFailureProposal(FailureInternal, "cleanup")
+	finalizing, err := store.FailRun(ctx, run.ID, run.Revision, failure, mustTime(t, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime = resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+	if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, mustTime(t, 30)); err != nil {
+		t.Fatal(err)
+	}
+	settlement, err := NewRefusedChangeSettlement(*run.AdmittedChangeRevision, "refused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeWorkerRun(ctx, run.ID, finalizing.Revision, settlement, mustTime(t, 33)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("refused settlement of a reserved change = %v", err)
+	}
+}
+
+// An ordinary source failure is not a refusal: a run that failed with
+// FailureSource before its Change was published abandons from reserved and
+// retries two revisions on, and one that failed with FailureSource while
+// its Change was available retains it and retries on the retained tree.
+func TestSourceFailuresThatAreNotRefusalsRetryAsBefore(t *testing.T) {
+	t.Run("reserved", func(t *testing.T) {
+		store, run, _ := admittedWorkerRun(t)
+		defer store.Close()
+		ctx := context.Background()
+		runtime := resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+		runtimeIdentity, _ := NewPathResourceIdentity(301, 302)
+		if _, err := store.ActivateResource(ctx, run.ID, runtime.ID, runtime.Revision, runtimeIdentity, mustTime(t, 19)); err != nil {
+			t.Fatal(err)
+		}
+		failure, _ := NewFailureProposal(FailureSource, "source tree could not be materialized")
+		finalizing, err := store.FailRun(ctx, run.ID, run.Revision, failure, mustTime(t, 20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime = resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)
+		if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, mustTime(t, 30)); err != nil {
+			t.Fatal(err)
+		}
+		abandoned, _ := NewAbandonedChangeSettlement(*run.AdmittedChangeRevision)
+		terminal, err := store.FinalizeWorkerRun(ctx, run.ID, finalizing.Revision, abandoned, mustTime(t, 33))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, keys := queueRetryForTerminal(t, store, terminal, 40)
+		result, err := store.AdmitNext(ctx, keys, mustTime(t, 50))
+		if err != nil || !result.Admitted() || result.Run.AdmittedChangeRevision.Int64() != run.AdmittedChangeRevision.Int64()+2 {
+			t.Fatalf("retry after a source failure = %+v, %v", result, err)
+		}
+		if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+			t.Fatalf("store after the retry = %v", err)
+		}
+	})
+	t.Run("available", func(t *testing.T) {
+		failure, _ := NewFailureProposal(FailureSource, "source tree could not be adopted")
+		store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, failure)
+		defer store.Close()
+		ctx := context.Background()
+		change, found, err := store.Change(ctx, *finalizing.ChangeID)
+		if err != nil || !found || change.Phase != ChangeAvailable {
+			t.Fatalf("available Change = %+v, found=%v, %v", change, found, err)
+		}
+		availability := mustChangeAvailability(t, change.Selection.commitment, change.Selection.entries, change.Selection.bytes, *change.TreeIdentity)
+		retained, _ := NewRetainedChangeSettlement(change.Revision, availability)
+		terminal, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, retained, mustTime(t, 80))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, keys := queueRetryForTerminal(t, store, terminal, 81)
+		result, err := store.AdmitNext(ctx, keys, mustTime(t, 90))
+		if err != nil || !result.Admitted() || result.Run.AdmittedChangeRevision.Int64() != change.Revision.Int64()+2 {
+			t.Fatalf("retry after a source failure on an available Change = %+v, %v", result, err)
+		}
+		if reopened, found, err := store.Change(ctx, change.ID); err != nil || !found || reopened.Phase != ChangeAvailable {
+			t.Fatalf("reopened Change = %+v, found=%v, %v", reopened, found, err)
+		}
+		if _, _, err := store.Run(ctx, result.Run.ID); err != nil {
+			t.Fatalf("store after the retained retry = %v", err)
+		}
+	})
+}
+
+// A refusal on a retry's reopened retained Change abandons it one revision
+// on, and the next retry starts fresh two revisions later.
+func TestRefusedPublicationOnARetainedRetryAbandonsAndRetriesFresh(t *testing.T) {
+	blocked, _ := NewBlockedProposal("retry")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, blocked)
+	defer store.Close()
+	ctx := context.Background()
+	change, found, err := store.Change(ctx, *finalizing.ChangeID)
+	if err != nil || !found || change.Phase != ChangeAvailable {
+		t.Fatalf("available Change = %+v, found=%v, %v", change, found, err)
+	}
+	availability := mustChangeAvailability(t, change.Selection.commitment, change.Selection.entries, change.Selection.bytes, *change.TreeIdentity)
+	retained, _ := NewRetainedChangeSettlement(change.Revision, availability)
+	first, err := store.FinalizeWorkerRun(ctx, finalizing.ID, finalizing.Revision, retained, mustTime(t, 80))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, retryKeys := queueRetryForTerminal(t, store, first, 81)
+	retry, err := store.AdmitNext(ctx, retryKeys, mustTime(t, 90))
+	if err != nil || !retry.Admitted() {
+		t.Fatalf("retained retry admission = %+v, %v", retry, err)
+	}
+	reopened, found, err := store.Change(ctx, change.ID)
+	if err != nil || !found || reopened.Phase != ChangeAvailable {
+		t.Fatalf("reopened Change = %+v, found=%v, %v", reopened, found, err)
+	}
+	activated := activateAllResourcesUnique(t, store, *retry.Run, 100, 3)
+	session := terminalSessionForRunTest(t, store, retry.Run.ID)
+	running, err := store.ActivateRun(ctx, retry.Run.ID, session.ID, activated.Revision, session.Revision, mustTime(t, 110))
+	if err != nil {
+		t.Fatal(err)
+	}
+	success, _ := NewSuccessProposal("changed the tree")
+	if _, err := store.ProposeAttemptOutcome(ctx, retryKeys.AttemptDigest, success, mustTime(t, 120)); err != nil {
+		t.Fatal(err)
+	}
+	observeMissingProcessExits(t, store, running.ID, 121)
+	for index, resource := range resourcesForRunTest(t, store, running.ID) {
+		if resource.State == ResourceReleased {
+			continue
+		}
+		if _, err := store.ReleaseResource(ctx, running.ID, resource.ID, resource.Revision, resource.Identity, mustTime(t, int64(130+index))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeTerminalSessionAtCurrent(t, store, running.ID, 140)
+	second, found, err := store.Run(ctx, running.ID)
+	if err != nil || !found || second.Phase != RunFinalizing {
+		t.Fatalf("retry before settlement = %+v, found=%v, %v", second, found, err)
+	}
+	settlement, err := NewRefusedChangeSettlement(reopened.Revision, "group-writable file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.FinalizeWorkerRun(ctx, second.ID, second.Revision, settlement, mustTime(t, 150))
+	if err != nil || terminal.Terminal == nil || terminal.Terminal.Code() != FailureSource {
+		t.Fatalf("refused retry = %+v, %v", terminal, err)
+	}
+	abandoned, found, err := store.Change(ctx, change.ID)
+	if err != nil || !found || abandoned.Phase != ChangeAbandoned || abandoned.Revision.Int64() != reopened.Revision.Int64()+1 {
+		t.Fatalf("Change after refused retry = %+v, found=%v, %v", abandoned, found, err)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after refused retry = %v", err)
+	}
+	_, againKeys := queueRetryForTerminalSeed(t, store, terminal, 160, 47)
+	// The default retry seed shares a runtime root with the first retry's.
+	again, err := store.AdmitNext(ctx, againKeys, mustTime(t, 170))
+	if err != nil || !again.Admitted() || again.Run.AdmittedChangeRevision.Int64() != abandoned.Revision.Int64()+1 {
+		t.Fatalf("fresh retry after refusal = %+v, %v", again, err)
+	}
+	if fresh, found, err := store.Change(ctx, change.ID); err != nil || !found || fresh.Phase != ChangeReserved {
+		t.Fatalf("Change after fresh retry = %+v, found=%v, %v", fresh, found, err)
+	}
+	if _, _, err := store.Run(ctx, again.Run.ID); err != nil {
+		t.Fatalf("store after fresh retry = %v", err)
+	}
 }
 
 func TestRetryHistoryAllowsMultipleNonSuccessRuns(t *testing.T) {

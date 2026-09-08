@@ -173,7 +173,7 @@ func writeFrame(w io.Writer, value any, limit int) error {
 		return fmt.Errorf("runner: frame header: %w", err)
 	}
 	if err := writeFully(w, body); err != nil {
-		return fmt.Errorf("runner: frame body: %w", err)
+		return fmt.Errorf("runner: frame body (%T, %d bytes): %w", value, len(body), err)
 	}
 	return nil
 }

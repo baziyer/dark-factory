@@ -715,13 +715,48 @@ func TestInspectPublishedDetectsIdentityBaseBytesModesAndRootAuthority(t *testin
 	if tampered.Commitment().Equal(fixture.manifest.Commitment()) {
 		t.Fatal("same-size byte tamper trusted stored commitment")
 	}
+	// A provider under the service umask leaves 0600 files and 0700
+	// directories, and one that runs chmod may leave 0755 of either; none of
+	// those changes what is published. Group or other write and special bits
+	// are refused, and the owner's execute bit is what the entry records.
 	if err := unix.Chmod(file, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
-		t.Fatal("file mode tamper accepted")
+	private, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base)
+	if err != nil || !private.Commitment().Equal(tampered.Commitment()) {
+		t.Fatalf("private file mode: %v, commitment changed=%v", err, err == nil && !private.Commitment().Equal(tampered.Commitment()))
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err != nil {
+		t.Fatalf("shared directory mode: %v", err)
+	}
+	if err := unix.Chmod(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base)
+	if err != nil || executable.Commitment().Equal(tampered.Commitment()) {
+		t.Fatalf("owner-executable file: %v, commitment unchanged=%v", err, err == nil && executable.Commitment().Equal(tampered.Commitment()))
+	}
+	for _, refused := range []uint32{0o666, 0o664, 0o4755, 0o1644, 0o400} {
+		if err := unix.Chmod(file, refused); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
+			t.Fatalf("file mode %o accepted", refused)
+		}
 	}
 	if err := unix.Chmod(file, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
+		t.Fatal("group-writable directory accepted")
+	}
+	if err := unix.Chmod(filepath.Join(parent, "change", "nested"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Chmod(filepath.Join(parent, "change"), 0o777); err != nil {
@@ -729,6 +764,114 @@ func TestInspectPublishedDetectsIdentityBaseBytesModesAndRootAuthority(t *testin
 	}
 	if _, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base); err == nil {
 		t.Fatal("root authority tamper accepted")
+	}
+}
+
+// The inspection marks a refusal of the tree's own contents as Tree and a
+// fault of the parent or the arguments as not: the daemon ends a run for
+// the first and retries the second later.
+func TestInspectPublishedMarksTreeRefusals(t *testing.T) {
+	parent := secureTempDir(t)
+	fixture := newFixture(t, "sha1", []fixtureFile{{[]byte("nested/a"), "100644", []byte("right")}})
+	prepared := mustPrepare(t, parent, "change", "stage")
+	identity := prepared.Identity()
+	if _, err := prepared.PopulateAndPublish(context.Background(), fixture.manifest, fixture.source); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inspect := func() error {
+		_, err := InspectPublished(context.Background(), parent, "change", identity, fixture.manifest.format, fixture.manifest.base)
+		return err
+	}
+	tree := func(err error) bool {
+		var validation *ValidationError
+		var limit *LimitError
+		return errors.As(err, &validation) && validation.Tree || errors.As(err, &limit) && limit.Tree
+	}
+	root := filepath.Join(parent, "change")
+	// An empty directory, a .git, a path too deep, a root the worker chmods:
+	// the tree's own.
+	for _, refusal := range []struct {
+		name string
+		make func()
+		undo func()
+	}{
+		{"empty directory", func() { mustMkdir(t, filepath.Join(root, "left-empty")) }, func() { mustRemove(t, filepath.Join(root, "left-empty")) }},
+		{".git", func() {
+			mustMkdir(t, filepath.Join(root, ".git"))
+			mustWrite(t, filepath.Join(root, ".git", "HEAD"), "ref")
+		}, func() { mustRemoveAll(t, filepath.Join(root, ".git")) }},
+		{"too deep", func() {
+			deep := root
+			for range MaxDepth + 1 {
+				deep = filepath.Join(deep, "d")
+			}
+			if err := os.MkdirAll(deep, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, filepath.Join(deep, "leaf"), "x")
+		}, func() { mustRemoveAll(t, filepath.Join(root, "d")) }},
+		{"root mode", func() { mustChmod(t, root, 0o755) }, func() { mustChmod(t, root, 0o700) }},
+	} {
+		refusal.make()
+		err := inspect()
+		if err == nil || !tree(err) {
+			t.Fatalf("%s: not a tree refusal: %v", refusal.name, err)
+		}
+		refusal.undo()
+	}
+	if err := inspect(); err != nil {
+		t.Fatalf("tree restored: %v", err)
+	}
+	// The parent's mode is the environment's, not the tree's.
+	mustChmod(t, parent, 0o755)
+	if err := inspect(); err == nil || tree(err) {
+		t.Fatalf("parent mode fault marked as the tree's: %v", err)
+	}
+	mustChmod(t, parent, 0o700)
+	// A tree that is gone is not a refusal either.
+	if err := os.Rename(root, root+".elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspect(); err == nil || tree(err) || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing tree: %v", err)
+	}
+}
+
+func mustMkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRemove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRemoveAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustChmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 

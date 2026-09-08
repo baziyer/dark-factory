@@ -30,6 +30,8 @@ const (
 	CallBlock
 	CallFail
 	CallRequestHuman
+	CallSendBack
+	CallSendBackTask
 	CallWebStatus
 	CallWebListClients
 	CallWebRevokeClient
@@ -57,6 +59,7 @@ type Call struct {
 	agent            CreateAgentInput
 	task             EnqueueTaskInput
 	humanQuestion    HumanQuestionInput
+	sendBack         SendBackInput
 	webClient        WebClientRevocationInput
 	webAfter         string
 	expectedRevision uint64
@@ -72,7 +75,7 @@ func (call Call) GoString() string {
 
 func (call Call) AttemptDigest() (AttemptDigest, bool) {
 	switch call.kind {
-	case CallAttemptTask, CallSucceed, CallBlock, CallFail, CallRequestHuman:
+	case CallAttemptTask, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack:
 		return call.digest, true
 	default:
 		return AttemptDigest{}, false
@@ -105,6 +108,12 @@ func (call Call) Detail() (string, bool) {
 
 func (call Call) HumanQuestionInput() (HumanQuestionInput, bool) {
 	return call.humanQuestion, call.kind == CallRequestHuman
+}
+
+// SendBackInput is the task and note of a send-back, from an orchestrator's
+// attempt (send_back) or the operator (send_back_task).
+func (call Call) SendBackInput() (SendBackInput, bool) {
+	return call.sendBack, call.kind == CallSendBack || call.kind == CallSendBackTask
 }
 
 func (call Call) WebClientRevocationInput() (WebClientRevocationInput, bool) {
@@ -491,6 +500,10 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		if err := decodeExact(request.Params, &call.humanQuestion); err != nil || !validID(call.humanQuestion.IdempotencyKey) || !validText(call.humanQuestion.Question, 1, 8192) {
 			return Call{}, RemoteInvalidRequest
 		}
+	case CallSendBack, CallSendBackTask:
+		if err := decodeExact(request.Params, &call.sendBack); err != nil || !validID(call.sendBack.TaskID) || !validText(call.sendBack.Note, 1, 8192) {
+			return Call{}, RemoteInvalidRequest
+		}
 	case CallWebRevokeClient:
 		if err := decodeExact(request.Params, &call.webClient); err != nil || !validID(call.webClient.ID) || call.webClient.ExpectedRevision == 0 {
 			return Call{}, RemoteInvalidRequest
@@ -538,6 +551,10 @@ func methodKind(method string) (CallKind, byte) {
 		return CallFail, attemptDomain
 	case "request_human":
 		return CallRequestHuman, attemptDomain
+	case "send_back":
+		return CallSendBack, attemptDomain
+	case "send_back_task":
+		return CallSendBackTask, operatorDomain
 	case "web_status":
 		return CallWebStatus, operatorDomain
 	case "web_list_clients":
@@ -612,7 +629,7 @@ func replyMatches(kind CallKind, reply replyKind) bool {
 		return reply == replySnapshot
 	case CallAttemptTask:
 		return reply == replyAttemptTask
-	case CallCreateProject, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman:
+	case CallCreateProject, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack, CallSendBackTask:
 		return reply == replyMutation
 	case CallWebStatus:
 		return reply == replyWebStatus

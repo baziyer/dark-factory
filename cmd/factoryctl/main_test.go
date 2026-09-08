@@ -186,6 +186,8 @@ func TestParseExactAttemptCommands(t *testing.T) {
 		{name: "explicit empty success", args: []string{"attempt", "succeed", "--result", ""}, command: attemptCommand{kind: commandSucceed}},
 		{name: "explicit empty failure", args: []string{"attempt", "fail", "--detail", ""}, command: attemptCommand{kind: commandFail}},
 		{name: "human request", args: []string{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question", "what now?"}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "0123456789abcdef0123456789abcdef", text: "what now?"}},
+		{name: "send back", args: []string{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", "five findings"}, command: attemptCommand{kind: commandSendBack, id: "0123456789abcdef0123456789abcdef", text: "five findings"}},
+		{name: "send back maximum note", args: []string{"attempt", "send-back", "--task", "ffffffffffffffffffffffffffffffff", "--note", strings.Repeat("n", 8192)}, command: attemptCommand{kind: commandSendBack, id: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("n", 8192)}},
 		{name: "human request maximum question", args: []string{"attempt", "request-human", "--idempotency-key", "ffffffffffffffffffffffffffffffff", "--question", strings.Repeat("q", 8192)}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("q", 8192)}},
 	}
 	for _, test := range tests {
@@ -272,6 +274,12 @@ func TestInvalidSyntaxStopsBeforeEnvironmentOrConnection(t *testing.T) {
 		{"attempt", "succeed", "--socket", "/private/socket"},
 		{"attempt", "fail", "--run", "private-run"},
 		{"attempt", "request-human"},
+		{"attempt", "send-back"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", ""},
+		{"attempt", "send-back", "--task", "0123456789abcdef", "--note", "short id"},
+		{"attempt", "send-back", "--note", "reordered", "--task", "0123456789abcdef0123456789abcdef"},
+		{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", strings.Repeat("n", 8193)},
 		{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question"},
 		{"attempt", "request-human", "--idempotency-key=0123456789abcdef0123456789abcdef", "--question", "private-question"},
 		{"attempt", "request-human", "--question", "private-question", "--idempotency-key", "0123456789abcdef0123456789abcdef"},
@@ -339,6 +347,7 @@ func TestAttemptCommandsUseExactTypedCalls(t *testing.T) {
 		{name: "block", args: []string{"attempt", "block", "--detail", "private-block-sentinel"}, kind: api.CallBlock, text: "private-block-sentinel"},
 		{name: "fail empty", args: []string{"attempt", "fail"}, kind: api.CallFail},
 		{name: "fail detail", args: []string{"attempt", "fail", "--detail", "private-fail-sentinel"}, kind: api.CallFail, text: "private-fail-sentinel"},
+		{name: "send back", args: []string{"attempt", "send-back", "--task", "fedcba9876543210fedcba9876543210", "--note", "private-note-sentinel"}, kind: api.CallSendBack, key: "fedcba9876543210fedcba9876543210", text: "private-note-sentinel"},
 		{name: "human request", args: []string{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question", "private-question-sentinel"}, kind: api.CallRequestHuman, key: "0123456789abcdef0123456789abcdef", text: "private-question-sentinel"},
 	}
 	for _, test := range tests {
@@ -385,10 +394,17 @@ func TestAttemptCommandsUseExactTypedCalls(t *testing.T) {
 				if !ok || input != (api.HumanQuestionInput{IdempotencyKey: test.key, Question: test.text}) {
 					t.Fatalf("human question = %+v, %t", input, ok)
 				}
+			case api.CallSendBack:
+				input, ok := result.call.SendBackInput()
+				if !ok || input != (api.SendBackInput{TaskID: test.key, Note: test.text}) {
+					t.Fatalf("send-back = %+v, %t", input, ok)
+				}
 			}
 			wantOutput := "attempt outcome request accepted: head=17 revision=9\n"
 			if test.kind == api.CallRequestHuman {
 				wantOutput = "human request accepted: head=17 revision=9\n"
+			} else if test.kind == api.CallSendBack {
+				wantOutput = "task sent back: head=17 revision=9\n"
 			}
 			if stdout.String() != wantOutput || stderr.Len() != 0 {
 				t.Fatalf("output = stdout %q, stderr %q", stdout.String(), stderr.String())

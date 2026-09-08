@@ -135,7 +135,12 @@ state.
   released runner, deliberately not terminal), F (held lease concludes
   nothing). Census admits attempt-result.json with outer-marker + token
   provenance; recovered runtime exposes marker facts, notice-less
-  authentication, and exact removal.
+  authentication, and exact removal. A runtime root left unresolved by
+  a refused cleanup (result already consumed and removed) is tried again
+  by the sweep, without opening the part-removed tree as a runtime: a
+  held lifetime lease still concludes nothing; a removal that now
+  succeeds releases the root and settles the run; one still refused
+  leaves the run finalizing, as the supervisor left it.
 - Spec corrections from building it: cell D needs no new session-close
   edge — the run deliberately remains finalizing with unresolved residue
   (finalizeRun refuses unresolved footprints), which is the intended
@@ -177,8 +182,9 @@ state.
   edges at the scheduler completion seam and the sweep's converging arms:
   an unpublished candidate change settles abandoned; a published change
   settles retained after the published tree is re-read and verified
-  against the durable selection (finalName is the change ID, format/base/
-  stage come from the stored selection and tree identity). The black-box
+  against its recorded identity, base and format (finalName is the change
+  ID, format/base/stage come from the stored selection and tree identity);
+  the tree's contents settle as the worker left them. The black-box
   daemon E2E proves the consumed-on-boot crash cut ends at a terminal
   failed task with its published change retained, before the socket opens.
 - A settlement refusal is surfaced, never fatal and never silent: the

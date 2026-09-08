@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 type ObjectFormat uint8
@@ -205,6 +206,10 @@ type ChangeSettlement struct {
 	phase        ChangePhase
 	expected     Revision
 	availability *ChangeAvailability
+	// refusal, when set, is the daemon's refusal of a published tree: the
+	// Change is abandoned from available and the run's outcome becomes this
+	// failure, whatever the worker proposed.
+	refusal *Proposal
 }
 
 func NewRetainedChangeSettlement(expected Revision, availability ChangeAvailability) (ChangeSettlement, error) {
@@ -221,7 +226,46 @@ func NewAbandonedChangeSettlement(expected Revision) (ChangeSettlement, error) {
 	return ChangeSettlement{phase: ChangeAbandoned, expected: expected}, nil
 }
 
+// RefusedPublicationDetailPrefix opens the failure detail of a refused
+// publication. Only NewRefusedChangeSettlement writes a FailureSource
+// failure with it, so a run's history can tell a refusal, which abandons an
+// available Change, from every other source failure.
+const RefusedPublicationDetailPrefix = "published tree refused: "
+
+// NewRefusedChangeSettlement abandons an available Change whose published
+// tree the daemon refused, and makes the refusal the run's outcome: a
+// FailureSource failure whose detail is the prefix and the reason, cut to
+// the detail's bound.
+func NewRefusedChangeSettlement(expected Revision, reason string) (ChangeSettlement, error) {
+	if expected.Int64() < 1 || reason == "" {
+		return ChangeSettlement{}, fmt.Errorf("%w: invalid refused Change settlement", ErrInvalidValue)
+	}
+	detail := RefusedPublicationDetailPrefix + reason
+	for byteLen(detail) > 4096 {
+		detail = detail[:len(detail)-1]
+		for len(detail) > 0 && !utf8.ValidString(detail) {
+			detail = detail[:len(detail)-1]
+		}
+	}
+	if !strings.HasPrefix(detail, RefusedPublicationDetailPrefix) || len(detail) == len(RefusedPublicationDetailPrefix) {
+		return ChangeSettlement{}, fmt.Errorf("%w: invalid refused Change settlement", ErrInvalidValue)
+	}
+	failure, err := NewFailureProposal(FailureSource, detail)
+	if err != nil {
+		return ChangeSettlement{}, err
+	}
+	return ChangeSettlement{phase: ChangeAbandoned, expected: expected, refusal: &failure}, nil
+}
+
+// refusedProposal is the shape only a refused publication has.
+func refusedProposal(proposal Proposal) bool {
+	return proposal.kind == OutcomeFailed && proposal.code == FailureSource && strings.HasPrefix(proposal.detail, RefusedPublicationDetailPrefix)
+}
+
 func (settlement ChangeSettlement) valid() bool {
+	if settlement.refusal != nil && (settlement.phase != ChangeAbandoned || !refusedProposal(*settlement.refusal)) {
+		return false
+	}
 	return settlement.expected.Int64() >= 1 && (settlement.phase == ChangeRetained && settlement.availability != nil && settlement.availability.valid() || settlement.phase == ChangeAbandoned && settlement.availability == nil)
 }
 

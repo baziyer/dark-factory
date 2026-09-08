@@ -71,19 +71,42 @@ func (c *AttemptController) spend() error {
 	return closeErr
 }
 
-func NewAttemptController() (*AttemptController, *os.File, error) {
+// controlSocketBytes is each control socket's send and receive buffer. Darwin
+// gives a Unix stream socket eight kilobytes, and the attempt config the
+// daemon writes before the runner exists to read it carries the provider's
+// prompt, so a real task's config did not fit and the write sat against a
+// peer that could not drain it until the control timeout. Darwin sets a
+// buffer to exactly the size asked or refuses, so the set is the check.
+const controlSocketBytes = maxConfigBytes + maxFrameBytes
+
+// newControlSocketPair makes one non-blocking Unix stream pair whose buffers
+// hold the largest frame either side writes with no reader at the peer.
+func newControlSocketPair() ([2]int, error) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		return nil, nil, err
+		return [2]int{}, err
 	}
-	if err := unix.SetNonblock(fds[0], true); err != nil {
+	for _, fd := range fds {
+		if err == nil {
+			err = unix.SetNonblock(fd, true)
+		}
+		for _, option := range []int{unix.SO_SNDBUF, unix.SO_RCVBUF} {
+			if err == nil {
+				err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, option, controlSocketBytes)
+			}
+		}
+	}
+	if err != nil {
 		unix.Close(fds[0])
 		unix.Close(fds[1])
-		return nil, nil, err
+		return [2]int{}, err
 	}
-	if err := unix.SetNonblock(fds[1], true); err != nil {
-		unix.Close(fds[0])
-		unix.Close(fds[1])
+	return fds, nil
+}
+
+func NewAttemptController() (*AttemptController, *os.File, error) {
+	fds, err := newControlSocketPair()
+	if err != nil {
 		return nil, nil, err
 	}
 	unix.CloseOnExec(fds[0])
@@ -1094,18 +1117,8 @@ func runAttempt(daemon, dir, lifetime *os.File, cfg attemptConfig, workerConfig 
 }
 
 func newControlPair(parentName, childName string) (*os.File, *os.File, error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	fds, err := newControlSocketPair()
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := unix.SetNonblock(fds[0], true); err != nil {
-		unix.Close(fds[0])
-		unix.Close(fds[1])
-		return nil, nil, err
-	}
-	if err := unix.SetNonblock(fds[1], true); err != nil {
-		unix.Close(fds[0])
-		unix.Close(fds[1])
 		return nil, nil, err
 	}
 	unix.CloseOnExec(fds[0])

@@ -142,7 +142,7 @@ func removeRecordedRuntimeWithHook(ctx context.Context, parent *RuntimeParent, b
 		var stat unix.Stat_t
 		if err := unix.Fstatat(fd, name, &stat, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
 			continue
-		} else if err != nil || !validRuntimeOrdinaryFile(stat, rootIdentity.device, true) {
+		} else if err != nil || !validRuntimeOrdinaryFile(stat, rootIdentity.device) {
 			return false, invalidContract(err)
 		}
 		if err := unix.Unlinkat(fd, name, 0); err != nil {
@@ -251,8 +251,14 @@ func removeRuntimeTree(ctx context.Context, parentFD int, name string, device ui
 				return false, err
 			}
 			mutated = true
-		case unix.S_IFREG:
-			if !validRuntimeOrdinaryFile(stat, device, false) {
+		case unix.S_IFREG, unix.S_IFLNK, unix.S_IFSOCK, unix.S_IFIFO:
+			// A provider's home and temp directory hold whatever it made: a
+			// module cache of hard links, a socket a test listened on, a
+			// symlink into node_modules. Unlinking a name never follows it
+			// and never touches what another name shares, so every name on
+			// this device owned by this user goes; a name on another device
+			// or another owner is not this runtime's to remove.
+			if !validRuntimeOrdinaryName(stat, device) {
 				return false, errInvalidContract
 			}
 			if *budget == 0 {
@@ -330,9 +336,20 @@ func validRuntimeOrdinaryDirectory(stat unix.Stat_t, device uint64, exactMode bo
 	return !exactMode || stat.Mode&0o7777 == 0o700
 }
 
-func validRuntimeOrdinaryFile(stat unix.Stat_t, device uint64, exactMode bool) bool {
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || uint64(stat.Dev) != device || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0 {
-		return false
-	}
-	return !exactMode || stat.Mode&0o7777 == 0o600
+// validRuntimeOrdinaryName is the bound on a non-directory name inside a
+// runtime's home or temp tree, whose kind the caller has already matched: on
+// the runtime's device, owned by this user, with no special bits. Its link
+// count is the provider's business.
+// ponytail: a special bit on a provider's own file still refuses the cleanup
+// for good (a name confers nothing when unlinked, so this keeps evidence, not
+// safety); unlink those too if a provider ever leaves one.
+func validRuntimeOrdinaryName(stat unix.Stat_t, device uint64) bool {
+	return uint64(stat.Dev) == device && stat.Uid == uint32(os.Geteuid()) && stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) == 0
+}
+
+// validRuntimeOrdinaryFile is the bound on one of the runtime's own files at
+// its root: a single-link regular file of this user's on the runtime's device
+// at exactly 0600.
+func validRuntimeOrdinaryFile(stat unix.Stat_t, device uint64) bool {
+	return stat.Mode&unix.S_IFMT == unix.S_IFREG && uint64(stat.Dev) == device && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == 1 && stat.Mode&0o7777 == 0o600
 }

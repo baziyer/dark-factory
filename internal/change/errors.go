@@ -2,13 +2,23 @@ package change
 
 import "fmt"
 
-// ValidationError reports unsafe manifest or filesystem input.
-type ValidationError struct{ Reason string }
+// ValidationError reports unsafe manifest or filesystem input. Tree marks a
+// refusal of the published tree's own contents (an entry's mode, link,
+// kind or an empty directory), which no retry of the same tree can pass,
+// as against a fault of the arguments, the parent or the durable record.
+type ValidationError struct {
+	Reason string
+	Tree   bool
+}
 
 func (e *ValidationError) Error() string { return "invalid Change input: " + e.Reason }
 
-// LimitError reports a frozen manifest or materialization bound.
-type LimitError struct{ Reason string }
+// LimitError reports a frozen manifest or materialization bound. Tree marks
+// a bound the published tree's contents exceeded.
+type LimitError struct {
+	Reason string
+	Tree   bool
+}
 
 func (e *LimitError) Error() string { return "Change limit exceeded: " + e.Reason }
 

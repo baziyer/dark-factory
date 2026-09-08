@@ -257,6 +257,14 @@ type HumanQuestionInput struct {
 	Question       string `json:"question"`
 }
 
+// SendBackInput returns a finished task to its worker's queue with a note.
+// An orchestrator's attempt names a task of its own project; the operator
+// names any task.
+type SendBackInput struct {
+	TaskID string `json:"task_id"`
+	Note   string `json:"note"`
+}
+
 type WebClientRevocationInput struct {
 	ID               string `json:"id"`
 	ExpectedRevision uint64 `json:"expected_revision"`

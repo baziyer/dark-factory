@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,13 @@ func TestMain(m *testing.M) {
 	if filepath.Base(os.Args[0]) == "codex" {
 		if err := runSupervisorCodexFixture(); err != nil {
 			fmt.Fprintln(os.Stderr, "supervisor Codex fixture failed")
+			os.Exit(70)
+		}
+		os.Exit(0)
+	}
+	if filepath.Base(os.Args[0]) == "claude" {
+		if err := runSupervisorClaudeFixture(); err != nil {
+			fmt.Fprintln(os.Stderr, "supervisor Claude fixture failed")
 			os.Exit(70)
 		}
 		os.Exit(0)
@@ -192,6 +200,169 @@ func TestSupervisorRunsOrchestratorInItsPrivateHomeWithoutAChange(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(fixture.runtimeParentPath, run.ID.String())); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("runtime remains: %v", err)
 	}
+}
+
+// runSupervisorClaudeFixture stands in for the Claude CLI: it takes its
+// terminal out of canonical mode as the CLI does, reads the prompt the
+// runner types until the keystroke that submits it, and reports whether the
+// task quoted at the prompt's end is exactly the task the attempt holds.
+func runSupervisorClaudeFixture() error {
+	termios, err := unix.IoctlGetTermios(0, unix.TIOCGETA)
+	if err != nil {
+		return err
+	}
+	termios.Lflag &^= unix.ICANON | unix.ECHO
+	termios.Cc[unix.VMIN], termios.Cc[unix.VTIME] = 1, 0
+	if err := unix.IoctlSetTermios(0, unix.TIOCSETA, termios); err != nil {
+		return err
+	}
+	var line []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			return err
+		}
+		line = append(line, buf[:n]...)
+		if end := bytes.IndexAny(line, "\r\n"); end >= 0 {
+			line = line[:end]
+			break
+		}
+	}
+	client, err := api.NewAttemptClientFromEnvironment(os.Getenv("DARK_FACTORY_SOCKET"))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	task, err := client.Task(ctx)
+	if err != nil {
+		return err
+	}
+	var typed string
+	if quote := bytes.IndexByte(line, '"'); quote < 0 {
+		return fmt.Errorf("no quoted task in %d typed bytes", len(line))
+	} else if err := json.Unmarshal(line[quote:], &typed); err != nil {
+		return fmt.Errorf("quoted task in %d typed bytes: %w", len(line), err)
+	}
+	if typed != task.Task {
+		return fmt.Errorf("typed task is %d bytes, the attempt's is %d", len(typed), len(task.Task))
+	}
+	_, err = client.Succeed(ctx, "exact")
+	return err
+}
+
+// A Claude task longer than a terminal line or a socket buffer reaches the
+// CLI whole, through the real runner, worker and PTY.
+func TestSupervisorClaudeReceivesALongTaskThroughTheTerminal(t *testing.T) {
+	task := strings.Repeat("Codify the operator scripts and the deploy order. ", 128)
+	fixture := newSupervisorFixture(t, "unused shell task")
+	if err := replaceSupervisorAgentLaunchControls(fixture.storePath, fixture.agentID, kernel.ProviderClaudeCode, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	execSupervisorSQL(t, fixture.storePath, `UPDATE tasks SET title = ?, body = ? WHERE id = ?`, "long task", task, fixture.taskID.Bytes())
+	tools := filepath.Join(fixture.root, "tools")
+	if err := os.Mkdir(tools, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copySupervisorExecutable(t, supervisorTestExecutable(t), filepath.Join(tools, "claude"))
+	fixture.spec.ToolPath = tools + ":" + fixture.spec.ToolPath
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
+	if run.Proposal == nil || run.Proposal.Result() != "exact" {
+		t.Fatalf("Claude receipt = %+v", run.Proposal)
+	}
+	fixture.assertReleased(t, run)
+}
+
+// The provider inherits the daemon's umask. The service runs under 077, so
+// a file it makes is 0600 and a directory 0700; a run whose worker made any
+// file must still settle, with those modes kept, not repaired.
+func TestSupervisorWorkerFilesSettleUnderThePrivateServiceUmask(t *testing.T) {
+	previous := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(previous) })
+	program := "set -eu\nprintf made > made.txt\nmkdir made\nprintf inner > made/inner.txt\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeSucceeded)
+	retained := filepath.Join(fixture.changeParent, fixture.changeName(t, run))
+	if info, err := os.Stat(filepath.Join(retained, "made.txt")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("retained file = %v, %v", info, err)
+	}
+	if info, err := os.Stat(filepath.Join(retained, "made")); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("retained directory = %v, %v", info, err)
+	}
+	fixture.assertReleased(t, run)
+}
+
+// A tree the inspection refuses for good (an empty directory, which no git
+// tree can hold) ends the run as a visible source failure naming the reason
+// and where the tree was moved, abandons the Change, fails the task, and
+// leaves the task's own retry free to prepare a fresh tree.
+func TestSupervisorRefusedPublicationFailsTheRunVisibly(t *testing.T) {
+	// The first run leaves an empty directory; the retry, which finds the
+	// witness of the first, does not.
+	program := "set -eu\n[ -s __WITNESS__ ] || mkdir left-empty\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	aside := fixture.changeName(t, run) + ".refused-" + run.ID.String()[:8]
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), "published tree refused") ||
+		!strings.Contains(run.Terminal.Detail(), "empty or unselected prepared directory") || !strings.Contains(run.Terminal.Detail(), "changes/"+aside) {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found || task.Status != kernel.TaskFailed {
+		t.Fatalf("task after refusal = %+v, found=%v, %v", task, found, err)
+	}
+	changeState, found, err := fixture.store.Change(context.Background(), *run.ChangeID)
+	if err != nil || !found || changeState.Phase != kernel.ChangeAbandoned || changeState.SettledRunID == nil || *changeState.SettledRunID != run.ID {
+		t.Fatalf("change after refusal = %+v, found=%v, %v", changeState, found, err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.changeParent, aside, "left-empty")); err != nil {
+		t.Fatalf("refused tree was not moved aside for a person to read: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.changeParent, fixture.changeName(t, run))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the Change's own name is still taken: %v", err)
+	}
+	fixture.assertReleased(t, run)
+	queueSupervisorRetry(t, fixture, run)
+	retry, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext for the retry: %v", err)
+	}
+	if retry.ID == run.ID || retry.TaskID != run.TaskID || retry.AdmittedTaskWorkRevision.Int64() != 2 || retry.ChangeID == nil || *retry.ChangeID != *run.ChangeID {
+		t.Fatalf("retry run = %+v", retry)
+	}
+	fixture.assertTerminal(t, retry, kernel.OutcomeSucceeded)
+	if retained, found, err := fixture.store.Change(context.Background(), *run.ChangeID); err != nil || !found || retained.Phase != kernel.ChangeRetained {
+		t.Fatalf("change after the retry = %+v, found=%v, %v", retained, found, err)
+	}
+}
+
+// A worker that runs git init in its tree leaves a path no Change may hold;
+// the run ends with that reason rather than finalizing for good.
+func TestSupervisorRefusedPublicationForAGitDirectory(t *testing.T) {
+	program := "set -eu\nmkdir .git\nprintf 'ref: refs/heads/main\\n' > .git/HEAD\nprintf x >> __WITNESS__\n" + quoteShell(supervisorTestExecutable(t)) + " --supervisor-attempt-succeed typed-success\n"
+	fixture := newSupervisorFixture(t, program)
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if err != nil {
+		t.Fatalf("RunNext: %v", err)
+	}
+	fixture.assertTerminal(t, run, kernel.OutcomeFailed)
+	if run.Terminal == nil || run.Terminal.Code() != kernel.FailureSource || !strings.Contains(run.Terminal.Detail(), ".git path components are forbidden") {
+		t.Fatalf("refused run = %+v", run.Terminal)
+	}
+	fixture.assertReleased(t, run)
 }
 
 func TestSupervisorCodexRetrievesExactTaskWithUsablePTY(t *testing.T) {
@@ -969,16 +1140,67 @@ func TestSupervisorCleanupUncertaintyBlocksTerminal(t *testing.T) {
 	if run.Phase != kernel.RunFinalizing || run.Terminal != nil {
 		t.Fatalf("cleanup uncertainty terminalized run: %+v", run)
 	}
-	resources := fixture.resources(t, run.ID)
-	for _, resource := range resources {
-		if resource.Kind == kernel.ResourceRuntimeRoot {
-			if resource.State != kernel.ResourceUnresolved {
-				t.Fatalf("runtime cleanup state = %s", resource.State.String())
+	runtimeRoot := func() kernel.Resource {
+		for _, resource := range fixture.resources(t, run.ID) {
+			if resource.Kind == kernel.ResourceRuntimeRoot {
+				return resource
 			}
-			return
+		}
+		t.Fatal("runtime resource missing")
+		return kernel.Resource{}
+	}
+	if state := runtimeRoot().State; state != kernel.ResourceUnresolved {
+		t.Fatalf("runtime cleanup state = %s", state.String())
+	}
+	// The startup sweep tries the cleanup again. While the name is still
+	// refused the run stays as it is, and while something alive holds the
+	// runtime's lifetime lease the sweep concludes nothing; once a person
+	// has made the name removable, the sweep removes the runtime, releases
+	// it and settles the run.
+	runtimePath := filepath.Join(fixture.runtimeParentPath, run.ID.String())
+	unsafe := filepath.Join(runtimePath, "tmp", "unsafe")
+	sweep := func(want RecoveredRunAction) {
+		t.Helper()
+		dispositions, sweepErr := fixture.daemon.RecoverAbandonedRuns(context.Background(), fixture.runtimeParent, fixture.changeParent)
+		if sweepErr != nil || len(dispositions) != 1 || dispositions[0].Action != want {
+			t.Fatalf("sweep = %+v, %v; want %s", dispositions, sweepErr, want)
 		}
 	}
-	t.Fatal("runtime resource missing")
+	unchanged := func() {
+		t.Helper()
+		if current, _, _ := fixture.store.Run(context.Background(), run.ID); current.Phase != kernel.RunFinalizing || runtimeRoot().State != kernel.ResourceUnresolved {
+			t.Fatalf("sweep settled a run whose runtime is still refused or held: %+v", current)
+		}
+	}
+	sweep(RecoveredUncertain)
+	unchanged()
+	lease, err := os.OpenFile(filepath.Join(runtimePath, runner.RuntimeLifetimeLeaseName), os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lease.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sweep(RecoveredLiveHolder)
+	unchanged()
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sweep(RecoveredConverged)
+	current, _, err := fixture.store.Run(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.assertTerminal(t, current, kernel.OutcomeSucceeded)
+	if state := runtimeRoot().State; state != kernel.ResourceReleased {
+		t.Fatalf("runtime state after sweep = %s", state.String())
+	}
+	if _, statErr := os.Lstat(filepath.Dir(filepath.Dir(unsafe))); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("runtime still present after sweep: %v", statErr)
+	}
 }
 
 func TestSupervisorCancellationStillJoinsAndCleansOwnedProcesses(t *testing.T) {
@@ -2017,7 +2239,7 @@ func cleanupFailureProgram(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return "set -eu\nprintf x > __WITNESS__\nmkfifo \"$TMPDIR/unsafe\"\n" + quoteShell(executable) + " --supervisor-attempt-succeed typed-success\n"
+	return "set -eu\nprintf x > __WITNESS__\nprintf x > \"$TMPDIR/unsafe\" && chmod 4600 \"$TMPDIR/unsafe\"\n" + quoteShell(executable) + " --supervisor-attempt-succeed typed-success\n"
 }
 
 func quoteShell(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
