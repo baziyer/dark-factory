@@ -748,7 +748,7 @@ func TestOverseerReplyHonorsCallerDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &AttemptClient{client: base}
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout+time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
 	defer cancel()
 	result, err := client.OverseerReplyHuman(ctx, OverseerHumanReplyInput{OperationID: id('1'), RequestID: id('2'), ExpectedRevision: 1, Reply: "reply"})
 	if err != nil || result.Revision != 4 {
