@@ -162,6 +162,24 @@ func (daemon *Daemon) recoverRun(ctx context.Context, parent *RuntimeParent, cha
 		}
 		return daemon.recoverReleasedRuntimeResidue(ctx, run, runnerProcess, providerProcess, providerGroup)
 	}
+	if run.Phase == kernel.RunFinalizing && runtimeRoot.State == kernel.ResourceUnresolved &&
+		runnerProcess.State == kernel.ResourceReleased && providerProcess.State == kernel.ResourceReleased && providerGroup.State == kernel.ResourceReleased &&
+		recoverable.TerminalSession.State == kernel.TerminalSessionClosed {
+		// The supervisor consumed and removed the result, then could not
+		// remove the runtime: what is left is a partly removed tree, which
+		// cannot speak and may not open as a runtime. A held lifetime lease
+		// still concludes nothing: something alive inherited it. Otherwise
+		// try the removal again; what refused it may be gone, or removable
+		// under a later rule.
+		if presence, observeErr := ObserveRuntimeLifetime(parent, run.ID.String(), fileIdentity); observeErr == nil && presence == RuntimeLeaseHeld {
+			return RecoveredLiveHolder, nil
+		}
+		if removeErr := daemon.removeRecordedRuntime(parent, run.ID, fileIdentity); removeErr != nil {
+			return RecoveredUncertain, removeErr
+		}
+		_, settleErr := daemon.settleRun(changeParent, run.ID)
+		return RecoveredConverged, settleErr
+	}
 	recovered, err := OpenRecoveredRuntime(ctx, parent, run.ID.String(), fileIdentity)
 	if err != nil {
 		if errors.Is(err, errRuntimeBusy) {
@@ -479,6 +497,10 @@ func (daemon *Daemon) removeRecoveredRuntime(ctx context.Context, parent *Runtim
 	if err := recovered.Close(); err != nil {
 		return err
 	}
+	return daemon.removeRecordedRuntime(parent, runID, fileIdentity)
+}
+
+func (daemon *Daemon) removeRecordedRuntime(parent *RuntimeParent, runID kernel.RunID, fileIdentity runner.FileIdentity) error {
 	deadline := time.Now().Add(4 * time.Second)
 	for {
 		done, err := RemoveRecordedRuntime(context.Background(), parent, runID.String(), fileIdentity)

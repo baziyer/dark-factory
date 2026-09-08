@@ -1140,16 +1140,67 @@ func TestSupervisorCleanupUncertaintyBlocksTerminal(t *testing.T) {
 	if run.Phase != kernel.RunFinalizing || run.Terminal != nil {
 		t.Fatalf("cleanup uncertainty terminalized run: %+v", run)
 	}
-	resources := fixture.resources(t, run.ID)
-	for _, resource := range resources {
-		if resource.Kind == kernel.ResourceRuntimeRoot {
-			if resource.State != kernel.ResourceUnresolved {
-				t.Fatalf("runtime cleanup state = %s", resource.State.String())
+	runtimeRoot := func() kernel.Resource {
+		for _, resource := range fixture.resources(t, run.ID) {
+			if resource.Kind == kernel.ResourceRuntimeRoot {
+				return resource
 			}
-			return
+		}
+		t.Fatal("runtime resource missing")
+		return kernel.Resource{}
+	}
+	if state := runtimeRoot().State; state != kernel.ResourceUnresolved {
+		t.Fatalf("runtime cleanup state = %s", state.String())
+	}
+	// The startup sweep tries the cleanup again. While the name is still
+	// refused the run stays as it is, and while something alive holds the
+	// runtime's lifetime lease the sweep concludes nothing; once a person
+	// has made the name removable, the sweep removes the runtime, releases
+	// it and settles the run.
+	runtimePath := filepath.Join(fixture.runtimeParentPath, run.ID.String())
+	unsafe := filepath.Join(runtimePath, "tmp", "unsafe")
+	sweep := func(want RecoveredRunAction) {
+		t.Helper()
+		dispositions, sweepErr := fixture.daemon.RecoverAbandonedRuns(context.Background(), fixture.runtimeParent, fixture.changeParent)
+		if sweepErr != nil || len(dispositions) != 1 || dispositions[0].Action != want {
+			t.Fatalf("sweep = %+v, %v; want %s", dispositions, sweepErr, want)
 		}
 	}
-	t.Fatal("runtime resource missing")
+	unchanged := func() {
+		t.Helper()
+		if current, _, _ := fixture.store.Run(context.Background(), run.ID); current.Phase != kernel.RunFinalizing || runtimeRoot().State != kernel.ResourceUnresolved {
+			t.Fatalf("sweep settled a run whose runtime is still refused or held: %+v", current)
+		}
+	}
+	sweep(RecoveredUncertain)
+	unchanged()
+	lease, err := os.OpenFile(filepath.Join(runtimePath, runner.RuntimeLifetimeLeaseName), os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lease.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sweep(RecoveredLiveHolder)
+	unchanged()
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sweep(RecoveredConverged)
+	current, _, err := fixture.store.Run(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.assertTerminal(t, current, kernel.OutcomeSucceeded)
+	if state := runtimeRoot().State; state != kernel.ResourceReleased {
+		t.Fatalf("runtime state after sweep = %s", state.String())
+	}
+	if _, statErr := os.Lstat(filepath.Dir(filepath.Dir(unsafe))); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("runtime still present after sweep: %v", statErr)
+	}
 }
 
 func TestSupervisorCancellationStillJoinsAndCleansOwnedProcesses(t *testing.T) {
@@ -2188,7 +2239,7 @@ func cleanupFailureProgram(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return "set -eu\nprintf x > __WITNESS__\nmkfifo \"$TMPDIR/unsafe\"\n" + quoteShell(executable) + " --supervisor-attempt-succeed typed-success\n"
+	return "set -eu\nprintf x > __WITNESS__\nprintf x > \"$TMPDIR/unsafe\" && chmod 4600 \"$TMPDIR/unsafe\"\n" + quoteShell(executable) + " --supervisor-attempt-succeed typed-success\n"
 }
 
 func quoteShell(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }

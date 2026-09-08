@@ -1526,7 +1526,7 @@ func TestRemoveRecordedRuntimeUsesFixedBoundedGrammar(t *testing.T) {
 	})
 }
 
-func TestRemoveRecordedRuntimeRejectsUnsafeTreesAndAuthorityChanges(t *testing.T) {
+func TestRemoveRecordedRuntimeUnlinksAnyNameAndRejectsAuthorityChanges(t *testing.T) {
 	t.Run("terminal blocks before any deletion", func(t *testing.T) {
 		parent, runtime, path, identity := removableRuntimeFixture(t)
 		defer parent.Close()
@@ -1547,6 +1547,10 @@ func TestRemoveRecordedRuntimeRejectsUnsafeTreesAndAuthorityChanges(t *testing.T
 		}
 	})
 
+	// A name that is not a directory is unlinked whatever it is: the link,
+	// the socket, the fifo or one name of a hard-linked file goes, and what
+	// it pointed at or shared is untouched. A provider's tree holds all of
+	// these, and refusing any of them left its run finalizing for good.
 	for _, kind := range []string{"symlink", "fifo", "socket", "hardlink"} {
 		t.Run(kind, func(t *testing.T) {
 			var parent *RuntimeParent
@@ -1588,11 +1592,14 @@ func TestRemoveRecordedRuntimeRejectsUnsafeTreesAndAuthorityChanges(t *testing.T
 			if err := runtime.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if done, err := RemoveRecordedRuntime(context.Background(), parent, runtimeTestName, identity); !errors.Is(err, errInvalidContract) || done {
-				t.Fatalf("unsafe %s removal = %v, %v", kind, done, err)
+			if done, err := RemoveRecordedRuntime(context.Background(), parent, runtimeTestName, identity); err != nil || !done {
+				t.Fatalf("%s removal = %v, %v", kind, done, err)
 			}
 			if body, err := os.ReadFile(target); err != nil || string(body) != "external" {
 				t.Fatalf("external target mutated: %q %v", body, err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("runtime with a %s remains: %v", kind, err)
 			}
 		})
 	}
