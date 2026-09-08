@@ -75,6 +75,22 @@ function replyAttached(value, frame) {
   });
 }
 
+test("a replay cursor from session A does not cross to session B", async () => {
+  const context = makeHandle({ options: { afterSequence: 9n, afterSessionId: "33".repeat(16) } });
+  const attach = context.handle.attach();
+  const frame = lastControl(context.sent);
+  assert.equal(frame.body.after_sequence, 0n);
+  context.handle.receive(serverFrame(replyAttached({}, frame)));
+  await attach;
+
+  const sameSession = makeHandle({ options: { afterSequence: 9n, afterSessionId: sessionId } });
+  const resumed = sameSession.handle.attach();
+  const resumedFrame = lastControl(sameSession.sent);
+  assert.equal(resumedFrame.body.after_sequence, 9n);
+  sameSession.handle.receive(serverFrame(replyAttached({ floor: 8n, head: 12n, acknowledged_sequence: 9n }, resumedFrame)));
+  await resumed;
+});
+
 async function attachedWithLease(context, expiresAtMs = BigInt(context.timer.now + 30_000)) {
   const { handle, sent } = context;
   const attach = handle.attach();

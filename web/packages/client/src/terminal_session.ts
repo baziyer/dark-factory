@@ -29,6 +29,8 @@ export type SessionErrorLike = Error & { code?: string; retryable?: boolean };
 
 export type TerminalOptions = Readonly<{
   afterSequence?: bigint;
+  /** Optional session fence for a replay cursor carried from an earlier handle. */
+  afterSessionId?: string;
   onOutput?: (output: TerminalOutput) => void | Promise<void>;
   onEOF?: (event: { sessionId: string }) => void | Promise<void>;
   onExit?: (event: TerminalExit) => void | Promise<void>;
@@ -138,7 +140,10 @@ class TerminalHandleImpl implements InternalTerminalHandle {
     this.#ensureOpen();
     if (this.#outputInFlight) return Promise.reject(new SessionErrorLikeError("terminal output callback pending"));
     if (this.#attached || this.#operation !== undefined || this.#detaching) return Promise.reject(new SessionErrorLikeError("terminal operation pending"));
-    const afterSequence = this.#options.afterSequence ?? this.#acknowledgedSequence;
+    const afterSequence = this.#options.afterSequence !== undefined &&
+      (this.#options.afterSessionId === undefined || this.#options.afterSessionId === this.#target.sessionId)
+      ? this.#options.afterSequence
+      : this.#acknowledgedSequence;
     if (afterSequence < 0n || afterSequence > MAX_SQLITE_INTEGER) return Promise.reject(new ProtocolError("malformed"));
     this.#requestedAfterSequence = afterSequence;
     const id = this.#nextID("terminal-attach");

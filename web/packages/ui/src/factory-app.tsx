@@ -138,7 +138,7 @@ export function TerminalPanel({
       )}
       {!terminal.resets ? null : (
         <p className="dfFactoryConsole__terminalReset" role="status">
-          Earlier output is no longer retained; showing what the factory still holds.
+          Earlier output is no longer retained; showing new output.
         </p>
       )}
       {children}

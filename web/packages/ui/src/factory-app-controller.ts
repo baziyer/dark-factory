@@ -17,6 +17,7 @@ import {
   type DiscoveredAccountView,
   type StateView,
   type TaskItem,
+  type TerminalReset,
   type TopologyView,
 } from "@dark-factory/client";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
@@ -145,6 +146,8 @@ type AgentTerminalSelection = {
   finishing: boolean;
   /** Server replay resets survived by this terminal view (banner state). */
   resets: number;
+  /** Server session and cursor at which a replay reset can safely resume. */
+  resume?: Pick<TerminalReset, "sessionId" | "head">;
   instructionPending: boolean;
   instructionError?: SessionError | ProtocolError;
   queuedTaskID?: string;
@@ -876,6 +879,7 @@ export class FactoryAppController {
       expectedAgentRevision: selected.agent.revision,
       expectedHead: selected.head,
       surface,
+      resume: selected.resume,
       onChange: (snapshot) => this.#receiveTerminalSnapshot(generation, controller, snapshot),
     });
     this.#terminal = controller;
@@ -890,7 +894,7 @@ export class FactoryAppController {
         return;
       }
       if (this.#finishTerminalReplacement()) return;
-      if (snapshot.reset && this.#recoverFromTerminalReset()) return;
+      if (snapshot.reset !== undefined && this.#recoverFromTerminalReset(snapshot.reset)) return;
       const selected = this.#selectedAgent;
       const state = this.#state;
       const endedTask = selected?.task;
@@ -970,13 +974,14 @@ export class FactoryAppController {
    * reconcile a new controller against current state. Bounded so a reset
    * storm cannot loop; past the bound the ordinary stale teardown stands.
    */
-  #recoverFromTerminalReset(): boolean {
+  #recoverFromTerminalReset(reset: TerminalReset): boolean {
     const selected = this.#selectedAgent;
     if (selected === undefined || this.#status !== "ready" || this.#terminalResetBurst >= 3) return false;
     const current = this.#state?.agents.get(selected.agent.id);
     if (current === undefined) return false;
     this.#terminalResetBurst += 1;
     selected.resets += 1;
+    selected.resume = { sessionId: reset.sessionId, head: reset.head };
     selected.agent = { ...current };
     if (this.#state !== undefined) this.#refreshTerminalTask(selected, this.#state);
     selected.head = this.#state?.head ?? selected.head;

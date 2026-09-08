@@ -197,7 +197,7 @@ test("handle end aborts a pending display and fences a post-await output", async
     await ready(context);
     const pending = context.callbacks().onOutput({ sequence: 0n, payload: new Uint8Array([1]) });
     await tick();
-    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : undefined);
+    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : event === "onReset" ? { sessionId: "22".repeat(16), floor: 1n, head: 2n } : undefined);
     await assert.rejects(pending, (error) => error.code === "closed");
     assert.equal(context.surfaceAborts(), 1, event);
     await assert.rejects(context.callbacks().onOutput({ sequence: 1n, payload: new Uint8Array([2]) }), (error) => error.code === "closed");
@@ -208,7 +208,7 @@ test("handle end aborts a pending display and fences a post-await output", async
   const output = postAwait.callbacks().onOutput({ sequence: 0n, payload: new Uint8Array([3]) });
   await tick();
   postAwait.surfaceGate.resolve();
-  postAwait.callbacks().onReset();
+  postAwait.callbacks().onReset({ sessionId: "22".repeat(16), floor: 1n, head: 2n });
   await assert.rejects(output, (error) => error.code === "closed");
   assert.equal(postAwait.surfaceAborts(), 1);
 });
@@ -528,7 +528,7 @@ test("reset, exit and handle close revoke writable authority", async () => {
   for (const event of ["onReset", "onExit", "onClose"]) {
     const context = harness();
     await ready(context);
-    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : undefined);
+    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : event === "onReset" ? { sessionId: "22".repeat(16), floor: 1n, head: 2n } : undefined);
     assert.equal(context.controller.snapshot.phase, "closed", event);
     assert.equal(context.controller.snapshot.writable, false, event);
     assert.equal(context.controller.sendInput(new Uint8Array([1])), false, event);
