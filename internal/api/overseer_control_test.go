@@ -2,6 +2,9 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +40,47 @@ func TestMutationReplyValidatesOverseerHumanReplyState(t *testing.T) {
 	invalid.HumanReply = &OverseerHumanReplyResult{RequestID: valid.HumanReply.RequestID, State: "resolved_or_unknown"}
 	if _, err := NewMutationReply(invalid); err == nil {
 		t.Fatal("invalid delivery state accepted")
+	}
+}
+
+func TestOverseerSnapshotPagesFitTheResponseFrameAfterEscaping(t *testing.T) {
+	project := strings.Repeat("1", 32)
+	for _, selected := range []bool{false, true} {
+		snapshot := OverseerSnapshot{ProjectID: project, Head: 1, Agents: []AgentSummary{}, Tasks: []OverseerTask{}, Runs: []OverseerRun{}, Questions: []OverseerQuestion{}, History: []OverseerIntervention{}}
+		for index := 0; index < 4; index++ {
+			id := fmt.Sprintf("%032x", index+2)
+			snapshot.Agents = append(snapshot.Agents, AgentSummary{ID: id, ProjectID: project, Name: strings.Repeat("<", 128), Role: "worker", Provider: "codex", Revision: 1})
+			snapshot.Runs = append(snapshot.Runs, OverseerRun{ID: id, AgentID: id, TaskID: id, Phase: "running", Revision: 1})
+			snapshot.Questions = append(snapshot.Questions, OverseerQuestion{ID: id, AgentID: id, TaskID: id, Status: "open", Revision: 1, Question: strings.Repeat("<", 8192)})
+			snapshot.History = append(snapshot.History, OverseerIntervention{OperationID: id, TaskID: id, RunID: id, Kind: "message", Actor: "orchestrator", Payload: strings.Repeat("<", 8192), State: "delivered", Detail: strings.Repeat("<", 4096), CreatedAtMs: 1})
+			if !selected || index == 0 {
+				text := 1024
+				if selected {
+					text = 4096
+				}
+				snapshot.Tasks = append(snapshot.Tasks, OverseerTask{ID: id, ProjectID: project, AssignedAgentID: id, Title: strings.Repeat("<", 1024), Objective: strings.Repeat("<", text), Status: "queued", BlockedReason: strings.Repeat("<", 8192), Result: strings.Repeat("<", text), Revision: 1})
+			}
+		}
+		reply, err := NewOverseerSnapshotReply(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(reply.overseer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded)+responsePrelude > maxFrameBytes {
+			t.Fatalf("selected=%t encoded page is %d bytes", selected, len(encoded)+responsePrelude)
+		}
+	}
+}
+
+func TestOverseerSnapshotContinuationRequiresTaskForText(t *testing.T) {
+	id := strings.Repeat("1", 32)
+	if !validOverseerSnapshotInput(OverseerSnapshotInput{TaskID: id, Offset: 4, TextOffset: 4096, ExpectedHead: 7}) {
+		t.Fatal("valid continuation rejected")
+	}
+	if validOverseerSnapshotInput(OverseerSnapshotInput{TextOffset: 1, ExpectedHead: 7}) {
+		t.Fatal("unselected text continuation accepted")
 	}
 }

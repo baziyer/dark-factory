@@ -44,7 +44,7 @@ const (
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
   factoryctl attempt send-back --task ID --note TEXT
-  factoryctl overseer status [--task ID]
+  factoryctl overseer status [--task ID] [--offset N --head HEAD] [--text-offset RUNES --head HEAD]
   factoryctl overseer task add --agent ID --title TEXT [--body TEXT] [--priority N] [--task-id ID --incarnation-id ID]
   factoryctl overseer task update --task ID --revision REVISION [--priority N] [--agent ID] [--cancel]
   factoryctl overseer task send-back --task ID --note TEXT
@@ -138,6 +138,9 @@ type attemptCommand struct {
 	toolBudget      uint64
 	priority        int64
 	prioritySet     bool
+	offset          uint64
+	head            uint64
+	textOffset      uint64
 	enabled         bool
 	operationID     string
 	taskRevision    uint64
@@ -732,13 +735,46 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 
 func parseOverseer(args []string) (attemptCommand, bool, bool) {
 	if len(args) >= 2 && args[1] == "status" {
-		if len(args) == 2 {
-			return attemptCommand{kind: commandOverseerStatus}, false, true
+		command := attemptCommand{kind: commandOverseerStatus}
+		seen := map[string]bool{}
+		for index := 2; index < len(args); index += 2 {
+			if index+1 >= len(args) || seen[args[index]] {
+				return attemptCommand{}, false, false
+			}
+			seen[args[index]] = true
+			value := args[index+1]
+			switch args[index] {
+			case "--task":
+				if !validHumanRequestKey(value) {
+					return attemptCommand{}, false, false
+				}
+				command.id = value
+			case "--offset":
+				offset, ok := parseOverseerOffset(value, true)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.offset = offset
+			case "--head":
+				head, ok := parseRevision(value)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.head = head
+			case "--text-offset":
+				offset, ok := parseOverseerOffset(value, false)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.textOffset = offset
+			default:
+				return attemptCommand{}, false, false
+			}
 		}
-		if len(args) == 4 && args[2] == "--task" && validHumanRequestKey(args[3]) {
-			return attemptCommand{kind: commandOverseerStatus, id: args[3]}, false, true
+		if command.head == 0 && (command.offset != 0 || command.textOffset != 0) || command.textOffset != 0 && command.id == "" {
+			return attemptCommand{}, false, false
 		}
-		return attemptCommand{}, false, false
+		return command, false, true
 	}
 	if len(args) < 3 {
 		return attemptCommand{}, false, false
@@ -931,6 +967,19 @@ func parseRevision(value string) (uint64, bool) {
 	return parsed, err == nil && parsed > 0 && parsed <= uint64(^uint64(0)>>1)
 }
 
+func parseOverseerOffset(value string, allowZero bool) (uint64, bool) {
+	if value == "" || len(value) > 19 || value[0] == '0' && (len(value) > 1 || !allowZero) {
+		return 0, false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return parsed, err == nil && parsed <= uint64(^uint64(0)>>1)
+}
+
 func helpFlag(value string) bool { return value == "-h" || value == "--help" }
 
 func validHumanRequestKey(value string) bool {
@@ -1103,13 +1152,7 @@ func runOverseer(ctx context.Context, command attemptCommand, getenv func(string
 	callContext, cancel := context.WithTimeout(ctx, serviceRequestTimeout)
 	defer cancel()
 	if command.kind == commandOverseerStatus {
-		var result api.OverseerSnapshot
-		var callErr error
-		if command.id == "" {
-			result, callErr = client.OverseerSnapshot(callContext)
-		} else {
-			result, callErr = client.OverseerTaskSnapshot(callContext, command.id)
-		}
+		result, callErr := client.OverseerSnapshotPage(callContext, api.OverseerSnapshotInput{TaskID: command.id, Offset: command.offset, ExpectedHead: command.head, TextOffset: command.textOffset})
 		if callErr != nil {
 			return writeWebFailure(stderr, "overseer status", callErr)
 		}

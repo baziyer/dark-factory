@@ -267,6 +267,13 @@ func (client *AttemptClient) OverseerTaskSnapshot(ctx context.Context, taskID st
 	return client.overseerSnapshot(ctx, OverseerSnapshotInput{TaskID: taskID})
 }
 
+func (client *AttemptClient) OverseerSnapshotPage(ctx context.Context, input OverseerSnapshotInput) (OverseerSnapshot, error) {
+	if !validOverseerSnapshotInput(input) {
+		return OverseerSnapshot{}, ErrInvalidInput
+	}
+	return client.overseerSnapshot(ctx, input)
+}
+
 func (client *AttemptClient) overseerSnapshot(ctx context.Context, input OverseerSnapshotInput) (OverseerSnapshot, error) {
 	var result OverseerSnapshot
 	if err := client.client.call(ctx, "overseer_snapshot", input, &result); err != nil {
@@ -796,7 +803,10 @@ func validOverseerTaskUpdateInput(input OverseerTaskUpdateInput) bool {
 }
 
 func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
-	if !validID(snapshot.ProjectID) || snapshot.Head == 0 || snapshot.Agents == nil || snapshot.Tasks == nil || snapshot.Runs == nil || snapshot.Questions == nil || snapshot.History == nil || len(snapshot.Agents) > maxSnapshotEntries || len(snapshot.Tasks) > maxSnapshotEntries || len(snapshot.Runs) > maxSnapshotEntries || len(snapshot.Questions) > maxSnapshotEntries || len(snapshot.History) > kernel.MaxTaskInterventionHistory {
+	if !validID(snapshot.ProjectID) || snapshot.Head == 0 || snapshot.Agents == nil || snapshot.Tasks == nil || snapshot.Runs == nil || snapshot.Questions == nil || snapshot.History == nil || len(snapshot.Agents) > kernel.OverseerSnapshotPageSize || len(snapshot.Tasks) > kernel.OverseerSnapshotPageSize || len(snapshot.Runs) > kernel.OverseerSnapshotPageSize || len(snapshot.Questions) > kernel.OverseerSnapshotPageSize || len(snapshot.History) > kernel.OverseerSnapshotPageSize {
+		return false
+	}
+	if snapshot.NextOffset != nil && *snapshot.NextOffset == 0 || snapshot.NextTextOffset != nil && *snapshot.NextTextOffset == 0 {
 		return false
 	}
 	for _, agent := range snapshot.Agents {
@@ -825,6 +835,13 @@ func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
 		}
 	}
 	return true
+}
+
+func validOverseerSnapshotInput(input OverseerSnapshotInput) bool {
+	if input.TaskID != "" && !validID(input.TaskID) || input.ExpectedHead > uint64(^uint64(0)>>1) || input.Offset > uint64(^uint64(0)>>1)-kernel.OverseerSnapshotPageSize || input.TextOffset > 131072 || input.TextOffset != 0 && input.TaskID == "" {
+		return false
+	}
+	return input.ExpectedHead != 0 || input.Offset == 0 && input.TextOffset == 0
 }
 
 func validOverseerWorkerMessageInput(input OverseerWorkerMessageInput) bool {

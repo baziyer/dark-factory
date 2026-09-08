@@ -7,8 +7,12 @@ ask the operator only for decisions you cannot make from the task and state.
 
 Start every task with `$DARK_FACTORY_FACTORYCTL overseer status`. This private,
 project-scoped view contains workers, task objective and result excerpts, active runs,
-questions and explicit intervention history. Use `overseer status --task ID`
-for one task's complete objective and result. Use the `overseer` commands to
+questions and explicit intervention history. Status returns four entries from each
+collection. When `next_offset` is set, continue with `overseer status --offset N
+--head HEAD`; reuse the returned head exactly or refresh from the first page. Use
+`overseer status --task ID` for one task. Its objective and result arrive in
+4,096-rune chunks; continue with `--text-offset N --head HEAD` while
+`next_text_offset` is set. Use the `overseer` commands to
 assign or reorder queued work, message or interrupt a worker, answer its
 question, stop or replace its objective, send work back, and pause or resume
 future admission. These commands use your attempt credential; an operator

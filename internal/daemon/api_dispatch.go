@@ -613,15 +613,20 @@ func (daemon *Daemon) overseerSnapshot(ctx context.Context, call api.Call) api.R
 	if !ok {
 		return newErrorReply(api.RemoteInvalidRequest)
 	}
-	var selected *kernel.TaskID
+	request := kernel.OverseerSnapshotRequest{Offset: input.Offset, TextOffset: input.TextOffset}
+	expectedHead, err := kernel.NewEventSequence(int64(input.ExpectedHead))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	request.ExpectedHead = expectedHead
 	if input.TaskID != "" {
 		id, err := parseTaskID(input.TaskID)
 		if err != nil {
 			return newErrorReply(api.RemoteInvalidRequest)
 		}
-		selected = &id
+		request.TaskID = &id
 	}
-	snapshot, err := daemon.store.OverseerSnapshotForAttempt(ctx, digest, selected)
+	snapshot, err := daemon.store.OverseerSnapshotForAttempt(ctx, digest, request)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}

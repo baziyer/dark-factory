@@ -516,7 +516,7 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 			return Call{}, RemoteInvalidRequest
 		}
 	case CallOverseerSnapshot:
-		if err := decodeExact(request.Params, &call.overseerSnapshot); err != nil || call.overseerSnapshot.TaskID != "" && !validID(call.overseerSnapshot.TaskID) {
+		if err := decodeExact(request.Params, &call.overseerSnapshot); err != nil || !validOverseerSnapshotInput(call.overseerSnapshot) {
 			return Call{}, RemoteInvalidRequest
 		}
 	case CallWebListClients:

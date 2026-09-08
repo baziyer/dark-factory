@@ -641,7 +641,7 @@ func TestCodexOverseerDiscoversScopedControlsWithoutChangingWorkerTask(t *testin
 		t.Fatal("worker was given overseer authority instructions")
 	}
 	prompt := overseerArgs[len(overseerArgs)-1]
-	for _, command := range []string{"attempt task", "overseer status", "worker interrupt", "worker replace", "Maintainer App"} {
+	for _, command := range []string{"attempt task", "overseer status", "next_offset", "next_text_offset", "worker interrupt", "worker replace", "Maintainer App"} {
 		if !strings.Contains(prompt, command) {
 			t.Fatalf("overseer cannot discover %q", command)
 		}

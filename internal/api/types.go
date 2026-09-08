@@ -234,13 +234,15 @@ type DashboardSnapshot struct {
 // orchestrator. Its project identity is derived from the attempt credential;
 // callers cannot select a different project.
 type OverseerSnapshot struct {
-	ProjectID string                 `json:"project_id"`
-	Head      uint64                 `json:"head"`
-	Agents    []AgentSummary         `json:"agents"`
-	Tasks     []OverseerTask         `json:"tasks"`
-	Runs      []OverseerRun          `json:"runs"`
-	Questions []OverseerQuestion     `json:"questions"`
-	History   []OverseerIntervention `json:"history"`
+	ProjectID      string                 `json:"project_id"`
+	Head           uint64                 `json:"head"`
+	NextOffset     *uint64                `json:"next_offset"`
+	NextTextOffset *uint64                `json:"next_text_offset"`
+	Agents         []AgentSummary         `json:"agents"`
+	Tasks          []OverseerTask         `json:"tasks"`
+	Runs           []OverseerRun          `json:"runs"`
+	Questions      []OverseerQuestion     `json:"questions"`
+	History        []OverseerIntervention `json:"history"`
 }
 
 type OverseerIntervention struct {
@@ -257,10 +259,13 @@ type OverseerIntervention struct {
 	CreatedAtMs      uint64 `json:"created_at_ms"`
 }
 
-// OverseerSnapshotInput optionally selects one task for its complete private
-// objective and result. An unselected status response uses bounded excerpts.
+// OverseerSnapshotInput pages every collection together. A continuation must
+// fence the head returned by the preceding page. Task text is chunked by rune.
 type OverseerSnapshotInput struct {
-	TaskID string `json:"task_id,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	Offset       uint64 `json:"offset,omitempty"`
+	ExpectedHead uint64 `json:"expected_head,omitempty"`
+	TextOffset   uint64 `json:"text_offset,omitempty"`
 }
 
 // OverseerTask carries private task progress for the authenticated project's

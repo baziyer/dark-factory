@@ -45,7 +45,7 @@ func projectSnapshot(snapshot kernel.DashboardSnapshot) api.DashboardSnapshot {
 
 func projectOverseerSnapshot(snapshot kernel.OverseerSnapshot) api.OverseerSnapshot {
 	result := api.OverseerSnapshot{
-		ProjectID: snapshot.ProjectID.String(), Head: uint64(snapshot.Head.Int64()),
+		ProjectID: snapshot.ProjectID.String(), Head: uint64(snapshot.Head.Int64()), NextOffset: snapshot.NextOffset, NextTextOffset: snapshot.NextTextOffset,
 		Agents: []api.AgentSummary{}, Tasks: []api.OverseerTask{}, Runs: []api.OverseerRun{}, Questions: []api.OverseerQuestion{}, History: []api.OverseerIntervention{},
 	}
 	for _, agent := range snapshot.Agents {
