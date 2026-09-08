@@ -825,6 +825,8 @@ func (current *connection) handleTerminalAck(ack browserprotocol.TerminalAck) bo
 	if current.terminalAck == current.terminalSent && current.terminalAckTimer != nil {
 		current.terminalAckTimer.Stop()
 		current.terminalAckTimer = nil
+	} else if current.terminalAckTimer != nil {
+		current.terminalAckTimer.Reset(current.server.terminalAckTimeout)
 	}
 	if current.terminalPending != nil && current.terminalPendingReady(*current.terminalPending) {
 		pending := *current.terminalPending

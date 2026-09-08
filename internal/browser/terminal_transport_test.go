@@ -568,6 +568,58 @@ func TestTerminalTransportDisconnectsAfterControlledACKTimeout(t *testing.T) {
 	expectTerminalReadError(t, connection)
 }
 
+func TestTerminalTransportACKProgressExtendsTimeoutWhileOutputRemains(t *testing.T) {
+	backend := newTerminalTestBackend()
+	backend.authentication.Capabilities = browserprotocol.CapabilityObserve | browserprotocol.CapabilityTerminalInput
+	ackTimeout := 200 * time.Millisecond
+	server := startTerminalServerWithAckTimeout(t, backend, ackTimeout)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticateTerminalTest(t, connection)
+	writeClientFrame(t, connection, terminalAttachRequest(t, "attach", 0))
+	sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventAttached, Accepted: true, Sequence: 0, Floor: 0, Head: browserprotocol.MaxTerminalUnackedBytes + browserprotocol.MaxTerminalPayload})
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTerminalAttached {
+		t.Fatalf("attached frame=%+v", frame)
+	}
+	for start := uint64(0); start < browserprotocol.MaxTerminalUnackedBytes; start += browserprotocol.MaxTerminalPayload {
+		payload := bytes.Repeat([]byte{'x'}, browserprotocol.MaxTerminalPayload)
+		sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventOutput, Start: start, End: start + uint64(len(payload)), Payload: payload})
+		_ = readTerminalBinary(t, connection)
+	}
+	// The ninth frame is held at the browser's 64 KiB credit limit. Its later
+	// delivery proves the forward ACK was accepted while output remains pending.
+	payload := bytes.Repeat([]byte{'y'}, browserprotocol.MaxTerminalPayload)
+	sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventOutput, Start: browserprotocol.MaxTerminalUnackedBytes, End: browserprotocol.MaxTerminalUnackedBytes + uint64(len(payload)), Payload: payload})
+	time.Sleep(ackTimeout / 2)
+	ack, err := browserprotocol.EncodeTerminalAck(browserprotocol.TerminalAck{SessionID: projectID, NextSequence: browserprotocol.MaxTerminalPayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientFrame(t, connection, ack)
+	if frame := readTerminalBinary(t, connection); frame.Sequence != browserprotocol.MaxTerminalUnackedBytes || !bytes.Equal(frame.Payload, payload) {
+		t.Fatalf("released frame=%+v", frame)
+	}
+
+	// This passes the original deadline but not the deadline renewed by the
+	// forward ACK. The remaining output must keep observing without a close.
+	time.Sleep(ackTimeout * 5 / 8)
+	read := beginTerminalRead(connection)
+	select {
+	case result := <-read:
+		t.Fatalf("terminal closed after forward ACK: kind=%v err=%v", result.kind, result.err)
+	case <-time.After(ackTimeout / 8):
+	}
+	// No further ACK is progress, so the renewed deadline still closes the
+	// connection and preserves the existing stalled-reader protection.
+	select {
+	case result := <-read:
+		if result.err == nil {
+			t.Fatalf("expected stalled ACK close, got kind=%v bytes=%d", result.kind, len(result.payload))
+		}
+	case <-time.After(ackTimeout):
+		t.Fatal("terminal remained open after ACK progress stopped")
+	}
+}
+
 func TestTerminalTransportResetAndDetachJoinAttachment(t *testing.T) {
 	backend := newTerminalTestBackend()
 	backend.authentication.Capabilities = browserprotocol.CapabilityObserve | browserprotocol.CapabilityTerminalInput
