@@ -75,6 +75,25 @@ func TestOverseerSnapshotPagesFitTheResponseFrameAfterEscaping(t *testing.T) {
 	}
 }
 
+func TestOverseerSnapshotReplyKeepsEmptyCollections(t *testing.T) {
+	snapshot := OverseerSnapshot{
+		ProjectID: strings.Repeat("1", 32), Head: 1,
+		Agents: []AgentSummary{}, Tasks: []OverseerTask{}, Runs: []OverseerRun{}, Questions: []OverseerQuestion{}, History: []OverseerIntervention{},
+	}
+	reply, err := NewOverseerSnapshotReply(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(reply.overseer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded OverseerSnapshot
+	if err := decodeExact(encoded, &decoded); err != nil || !validOverseerSnapshot(decoded) {
+		t.Fatalf("empty snapshot round trip = %v, %#v", err, decoded)
+	}
+}
+
 func TestOverseerSnapshotContinuationRequiresTaskForText(t *testing.T) {
 	id := strings.Repeat("1", 32)
 	if !validOverseerSnapshotInput(OverseerSnapshotInput{TaskID: id, Offset: 4, TextOffset: 4096, ExpectedHead: 7}) {

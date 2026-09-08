@@ -182,7 +182,7 @@ function AgentTaskTools({ terminal, controller }: { terminal: FactoryTerminalVie
   return (
     <>
       <AgentSteering terminal={terminal} controller={controller} />
-      <AgentInstruction terminal={terminal} mode="queue" onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
+      <AgentInstruction terminal={terminal} mode="queue" onDraftChange={(instruction) => controller.setAgentInstructionDraft(instruction)} onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
     </>
   );
 }
@@ -191,7 +191,7 @@ function AgentIdleTools({ terminal, controller }: { terminal: FactoryTerminalVie
   const mode = terminal.paused || terminal.queued ? "queue" : "now";
   return (
     <>
-      <AgentInstruction terminal={terminal} mode={mode} onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
+      <AgentInstruction terminal={terminal} mode={mode} onDraftChange={(instruction) => controller.setAgentInstructionDraft(instruction)} onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
       {terminal.history === undefined && !terminal.historyPending ? null : <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />}
     </>
   );
@@ -248,13 +248,20 @@ function TaskHistory({ terminal, onRefresh }: { terminal: FactoryTerminalView; o
 export function AgentInstruction({
   terminal,
   mode = "now",
+  onDraftChange,
   onSubmit,
 }: {
   terminal: FactoryTerminalView;
   mode?: "now" | "queue";
+  onDraftChange?: (instruction: string) => void;
   onSubmit: (instruction: string, mode?: "now" | "queue") => Promise<boolean>;
 }) {
-  const [instruction, setInstruction] = useState("");
+  const [localInstruction, setLocalInstruction] = useState("");
+  const instruction = onDraftChange === undefined ? localInstruction : terminal.instructionDraft ?? "";
+  const setInstruction = (value: string) => {
+    if (onDraftChange === undefined) setLocalInstruction(value);
+    else onDraftChange(value);
+  };
   const submit = async (event?: SyntheticEvent) => {
     event?.preventDefault();
     if ((mode === "now" && terminal.paused) || terminal.instructionPending || instruction.trim().length === 0) return;

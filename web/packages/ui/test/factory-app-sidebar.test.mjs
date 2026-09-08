@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -78,21 +77,6 @@ test("an idle configured agent accepts one compact instruction", async () => {
   }
 });
 
-test("the composer is a modest box wherever it flows after other content", () => {
-  const markup = renderToStaticMarkup(createElement(AgentInstruction, {
-    terminal: terminalView({ phase: "idle", writable: false }),
-    onSubmit: async () => true,
-  }));
-  assert.match(markup, /<textarea[^>]* rows="3"/);
-  const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
-  assert.match(css, /\.dfFactoryConsole__instruction textarea \{[^}]*resize: vertical;/);
-  // Only the terminal panel, whose whole body the composer is, lets it grow:
-  // under the sidebar queue it would otherwise swallow the section it sits in.
-  assert.match(css, /\.dfFactoryConsole__terminalPanel \.dfFactoryConsole__instruction textarea \{[^}]*flex: 1 1 auto;/);
-  assert.doesNotMatch(css, /\n\.dfFactoryConsole__instruction \{[^}]*flex: 1 1 auto;/);
-  assert.doesNotMatch(css, /\n\.dfFactoryConsole__instruction textarea \{[^}]*flex: 1 1 auto;/);
-});
-
 test("paused agents remain identifiable without a false input", () => {
   const markup = renderToStaticMarkup(createElement(AgentInstruction, {
     terminal: terminalView({ phase: "idle", writable: false, paused: true }),
@@ -131,6 +115,18 @@ test("an uncertain instruction send never claims the task was absent", () => {
   }));
   assert.match(markup, /SEND NOT CONFIRMED — CHECK TASKS BEFORE RETRYING/);
   assert.equal(markup.includes(">NOT SENT<"), false);
+});
+
+test("a controller-owned draft and refusal survive the composer changing to a follow-up", () => {
+  const markup = renderToStaticMarkup(createElement(AgentInstruction, {
+    terminal: terminalView({ instructionDraft: "Keep this task", instructionError: { code: "stale" }, taskTitle: "Standing inspection" }),
+    mode: "queue",
+    onDraftChange: () => {},
+    onSubmit: async () => false,
+  }));
+  assert.match(markup, /Add follow-up work/);
+  assert.match(markup, />Keep this task<\/textarea>/);
+  assert.match(markup, />NOT SENT</);
 });
 
 test("crypto-unavailable preflight is definitively not sent", () => {

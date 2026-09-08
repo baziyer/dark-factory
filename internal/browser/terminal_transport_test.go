@@ -30,6 +30,7 @@ type terminalTestBackend struct {
 	replyResult                                 browserprotocol.HumanRequestReplyResult
 	cancelResult                                browserprotocol.HumanRequestCancelRunResult
 	leaseResult                                 TerminalLeaseResult
+	controlEntered, controlRelease              chan struct{}
 }
 
 type terminalTestAttachment struct {
@@ -135,10 +136,41 @@ func (backend *terminalTestBackend) InputTerminal(_ context.Context, request Ter
 	backend.terminalMu.Unlock()
 	return uint32(len(request.Frame.Payload)), nil
 }
-func (backend *terminalTestBackend) ReplyHumanRequest(context.Context, Principal, browserprotocol.HumanRequestReply) (browserprotocol.HumanRequestReplyResult, error) {
+func (backend *terminalTestBackend) waitControl(ctx context.Context) error {
+	if backend.controlEntered == nil {
+		return nil
+	}
+	select {
+	case <-backend.controlEntered:
+	default:
+		close(backend.controlEntered)
+	}
+	select {
+	case <-backend.controlRelease:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (backend *terminalTestBackend) ControlAgent(ctx context.Context, _ Principal, request browserprotocol.AgentControl) (browserprotocol.AgentControlResult, error) {
+	if err := backend.waitControl(ctx); err != nil {
+		return browserprotocol.AgentControlResult{}, err
+	}
+	return browserprotocol.AgentControlResult{OperationID: request.OperationID, TaskID: request.TaskID, RunID: request.RunID, SuccessorTaskID: request.SuccessorTaskID, Status: "delivered"}, nil
+}
+func (*terminalTestBackend) TaskHistory(_ context.Context, _ [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskHistoryGet) (browserprotocol.TaskHistory, error) {
+	return browserprotocol.TaskHistory{TaskID: request.TaskID, Entries: []browserprotocol.TaskHistoryEntry{}}, nil
+}
+func (backend *terminalTestBackend) ReplyHumanRequest(ctx context.Context, _ Principal, request browserprotocol.HumanRequestReply) (browserprotocol.HumanRequestReplyResult, error) {
+	if err := backend.waitControl(ctx); err != nil {
+		return browserprotocol.HumanRequestReplyResult{}, err
+	}
 	return backend.replyResult, nil
 }
-func (backend *terminalTestBackend) CancelHumanRequestRun(context.Context, Principal, browserprotocol.HumanRequestCancelRun) (browserprotocol.HumanRequestCancelRunResult, error) {
+func (backend *terminalTestBackend) CancelHumanRequestRun(ctx context.Context, _ Principal, request browserprotocol.HumanRequestCancelRun) (browserprotocol.HumanRequestCancelRunResult, error) {
+	if err := backend.waitControl(ctx); err != nil {
+		return browserprotocol.HumanRequestCancelRunResult{}, err
+	}
 	return backend.cancelResult, nil
 }
 
@@ -224,6 +256,97 @@ func sendTerminalEvent(t *testing.T, backend *terminalTestBackend, event Termina
 	case attachment.events <- event:
 	case <-time.After(time.Second):
 		t.Fatal("terminal event queue did not accept event")
+	}
+}
+
+func TestTerminalTransportKeepsTinyOutputFlowingDuringSlowControl(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request func(*terminalTestBackend) ([]byte, error)
+		result  browserprotocol.MessageType
+	}{
+		{
+			name: "agent control",
+			request: func(*terminalTestBackend) ([]byte, error) {
+				return browserprotocol.EncodeAgentControl("control", browserprotocol.AgentControl{
+					OperationID: strings.Repeat("11", 16), TaskID: strings.Repeat("12", 16), RunID: strings.Repeat("13", 16),
+					ExpectedTaskRevision: 1, ExpectedRunRevision: 1, Action: "message", Instruction: "continue",
+				})
+			},
+			result: browserprotocol.TypeAgentControlResult,
+		},
+		{
+			name: "human reply",
+			request: func(backend *terminalTestBackend) ([]byte, error) {
+				backend.replyResult = browserprotocol.HumanRequestReplyResult{RequestID: requestID, Revision: 3, Status: "resolved"}
+				return browserprotocol.EncodeHumanRequestReply("reply", browserprotocol.HumanRequestReply{RequestID: requestID, ExpectedRevision: 1, Reply: "continue"})
+			},
+			result: browserprotocol.TypeHumanRequestReplyResult,
+		},
+		{
+			name: "human cancellation",
+			request: func(backend *terminalTestBackend) ([]byte, error) {
+				backend.cancelResult = browserprotocol.HumanRequestCancelRunResult{RunID: testID, RunRevision: 2, RequestID: requestID, RequestRevision: 2}
+				return browserprotocol.EncodeHumanRequestCancelRun("cancel", browserprotocol.HumanRequestCancelRun{RequestID: requestID, ExpectedRequestRevision: 1, ExpectedRunRevision: 1})
+			},
+			result: browserprotocol.TypeHumanRequestCancelRunResult,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newTerminalTestBackend()
+			backend.authentication.Capabilities = browserprotocol.CapabilityObserve | browserprotocol.CapabilityHumanActions | browserprotocol.CapabilityTerminalInput
+			backend.controlEntered, backend.controlRelease = make(chan struct{}), make(chan struct{})
+			server := startTerminalServer(t, backend)
+			connection, _ := dialServer(t, server, testOrigin)
+			authenticateTerminalTest(t, connection)
+			writeClientFrame(t, connection, terminalAttachRequest(t, "attach", 0))
+			sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventAttached, Accepted: true})
+			if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTerminalAttached {
+				t.Fatalf("attach result = %+v", frame)
+			}
+			payload, err := test.request(backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeClientFrame(t, connection, payload)
+			select {
+			case <-backend.controlEntered:
+			case <-time.After(time.Second):
+				t.Fatal("control did not reach backend")
+			}
+
+			attachment := backend.currentAttachment(t)
+			sent := make(chan error, 1)
+			go func() {
+				for sequence := uint64(0); sequence < 130; sequence++ {
+					select {
+					case attachment.events <- TerminalEvent{Kind: TerminalEventOutput, Start: sequence, End: sequence + 1, Payload: []byte{byte(sequence)}}:
+					case <-time.After(time.Second):
+						sent <- errors.New("terminal output stopped behind slow control")
+						return
+					}
+				}
+				sent <- nil
+			}()
+			for sequence := uint64(0); sequence < 130; sequence++ {
+				frame := readTerminalBinary(t, connection)
+				if frame.Sequence != sequence || len(frame.Payload) != 1 || frame.Payload[0] != byte(sequence) {
+					t.Fatalf("tiny output[%d] = %+v", sequence, frame)
+				}
+				ack, err := browserprotocol.EncodeTerminalAck(browserprotocol.TerminalAck{SessionID: projectID, NextSequence: browserprotocol.Decimal(sequence + 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeClientFrame(t, connection, ack)
+			}
+			if err := <-sent; err != nil {
+				t.Fatal(err)
+			}
+			close(backend.controlRelease)
+			if frame := readServerFrame(t, connection); frame.Type != test.result {
+				t.Fatalf("control result = %+v", frame)
+			}
+		})
 	}
 }
 

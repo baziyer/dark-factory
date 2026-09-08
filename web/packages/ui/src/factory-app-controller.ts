@@ -75,6 +75,8 @@ export type FactoryTerminalView = Readonly<{
   paused: boolean;
   instructionPending: boolean;
   instructionError?: SessionError | ProtocolError;
+  /** Draft task text survives a same-agent state refresh. */
+  instructionDraft: string;
   controlPending?: AgentControlAction;
   controlError?: SessionError | ProtocolError;
   controlStatus?: "delivered" | "delivery_unknown" | "rejected" | "stopping" | "queued";
@@ -162,6 +164,8 @@ type AgentTerminalSelection = {
   resume?: Pick<TerminalReset, "sessionId" | "head">;
   instructionPending: boolean;
   instructionError?: SessionError | ProtocolError;
+  instructionDraft: string;
+  instructionAttempt: number;
   controlPending?: AgentControlAction;
   controlError?: SessionError | ProtocolError;
   controlStatus?: FactoryTerminalView["controlStatus"];
@@ -231,6 +235,7 @@ export class FactoryAppController {
   #accounts: readonly DiscoveredAccountView[] | undefined;
   #accountsPending = false;
   #accountsError: string | undefined;
+  #instructionAttempt = 0;
   #generation = 0;
   #started = false;
   #closed = false;
@@ -436,16 +441,25 @@ export class FactoryAppController {
     if (this.#closed || this.#status !== "ready" || selected === undefined || session === undefined || this.#edit?.pending === true) return;
     if (Object.values(config).every((value) => value === undefined)) return;
     const generation = this.#generation;
-    this.#edit = { target: selected.agent.id, pending: true };
+    const edit: FactoryEditView = { target: selected.agent.id, pending: true };
+    this.#edit = edit;
     this.#publish();
     try {
       await session.updateAgent({ agentId: selected.agent.id, expectedRevision: selected.agent.revision, ...config });
-      if (!this.#current(generation)) return;
+      if (!this.#current(generation) || this.#edit !== edit) return;
       this.#edit = undefined;
     } catch (error) {
-      if (!this.#current(generation)) return;
+      if (!this.#current(generation) || this.#edit !== edit) return;
       this.#edit = { target: selected.agent.id, pending: false, error: finiteError(error) };
     }
+    this.#publish();
+  }
+
+  /** Keep operator-authored task text outside a transient sidebar component. */
+  setAgentInstructionDraft(instruction: string): void {
+    const selected = this.#selectedAgent;
+    if (this.#closed || selected === undefined || selected.instructionDraft === instruction) return;
+    selected.instructionDraft = instruction;
     this.#publish();
   }
 
@@ -454,14 +468,15 @@ export class FactoryAppController {
     const session = this.#client?.session;
     if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
     const generation = this.#generation;
-    this.#edit = { target: task.id, pending: true };
+    const edit: FactoryEditView = { target: task.id, pending: true };
+    this.#edit = edit;
     this.#publish();
     try {
       await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
-      if (!this.#current(generation)) return;
+      if (!this.#current(generation) || this.#edit !== edit) return;
       this.#edit = undefined;
     } catch (error) {
-      if (!this.#current(generation)) return;
+      if (!this.#current(generation) || this.#edit !== edit) return;
       this.#edit = { target: task.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
@@ -495,6 +510,12 @@ export class FactoryAppController {
       selected.instructionPending ||
       session === undefined
     ) return false;
+    selected.instructionDraft = instruction;
+    if (this.#edit?.pending === true && this.#edit.target === selected.agent.id) {
+      selected.instructionError = new SessionError("stale");
+      this.#publish();
+      return false;
+    }
     const byteLength = new TextEncoder().encode(body).length;
     if (byteLength < 1 || byteLength > MAX_TASK_INSTRUCTION_BYTES) {
       selected.instructionError = new SessionError(byteLength > MAX_TASK_INSTRUCTION_BYTES ? "too_large" : "invalid_request");
@@ -502,7 +523,9 @@ export class FactoryAppController {
       return false;
     }
     const generation = this.#generation;
+    const attempt = ++this.#instructionAttempt;
     selected.instructionPending = true;
+    selected.instructionAttempt = attempt;
     selected.instructionError = undefined;
     this.#publish();
     try {
@@ -512,17 +535,20 @@ export class FactoryAppController {
         instruction: body,
         ...(mode === "queue" ? { mode } : {}),
       });
-      if (!this.#current(generation) || this.#selectedAgent !== selected) return false;
-      selected.instructionPending = false;
-      selected.queuedTaskID = task.taskId;
-      if (this.#state !== undefined) this.#refreshTerminalTask(selected, this.#state);
+      const current = this.#selectedAgent;
+      if (!this.#current(generation) || current === undefined || current.agent.id !== selected.agent.id || current.instructionAttempt !== attempt) return false;
+      current.instructionPending = false;
+      current.instructionDraft = "";
+      current.queuedTaskID = task.taskId;
+      if (this.#state !== undefined) this.#refreshTerminalTask(current, this.#state);
       this.#publish();
       this.#reconcileTerminal();
       return true;
     } catch (error) {
-      if (!this.#current(generation) || this.#selectedAgent !== selected) return false;
-      selected.instructionPending = false;
-      selected.instructionError = finiteError(error);
+      const current = this.#selectedAgent;
+      if (!this.#current(generation) || current === undefined || current.agent.id !== selected.agent.id || current.instructionAttempt !== attempt) return false;
+      current.instructionPending = false;
+      current.instructionError = finiteError(error);
       this.#publish();
       return false;
     }
@@ -1020,7 +1046,7 @@ export class FactoryAppController {
         if (running !== undefined && !sameTaskIdentity(endedTask, running)) {
           selected.task = running;
           selected.finishing = false;
-          selected.instructionError = undefined;
+          if (selected.instructionDraft === "") selected.instructionError = undefined;
           this.#terminalRetry = undefined;
         } else if (running !== undefined) {
           // The provider terminal can close before durable task finalization
@@ -1168,7 +1194,7 @@ export class FactoryAppController {
     const changedTask = selected.task?.id !== current?.id;
     selected.task = current;
     selected.finishing = false;
-    if (current !== undefined) selected.instructionError = undefined;
+    if (current !== undefined && selected.instructionDraft === "") selected.instructionError = undefined;
     if (current !== undefined && (selected.historyTaskID !== current.id || selected.historyTaskRevision !== current.revision)) {
       selected.historyTaskID = current.id;
       selected.history = undefined;
@@ -1210,20 +1236,26 @@ export class FactoryAppController {
     this.#terminalReplacement = undefined;
     this.#dropPendingTerminalInput();
     this.#retireTerminal();
-    // A refused edit belongs to the agent it was made against; a new selection
-    // must not inherit its error.
-    this.#edit = undefined;
+    const prior = this.#selectedAgent;
     const candidate = replacement.agentId === undefined ? undefined : this.#state?.agents.get(replacement.agentId);
     const agent = candidate?.revision === replacement.agentRevision ? candidate : undefined;
     const task = agent === undefined || this.#state === undefined ? undefined : agentCurrentTask(agent, this.#state);
     const queuedTask = agent === undefined || this.#state === undefined ? undefined : agentQueuedTask(agent, this.#state);
+    const sameAgent = agent !== undefined && prior?.agent.id === agent.id;
+    // A refused edit belongs to the agent it was made against; a new selection
+    // must not inherit its error. A committed config update does replace the
+    // selected agent, though, so its pending fence stays with that agent.
+    if (!sameAgent || this.#edit?.target !== agent?.id || this.#edit.pending !== true) this.#edit = undefined;
     this.#selectedAgent = agent === undefined ? undefined : {
       agent: { ...agent },
       head: this.#state?.head ?? 0n,
       task: task === undefined ? undefined : { id: task.id, revision: task.revision },
       finishing: false,
       resets: 0,
-      instructionPending: false,
+      instructionDraft: sameAgent ? prior.instructionDraft : "",
+      instructionAttempt: sameAgent ? prior.instructionAttempt : 0,
+      instructionError: sameAgent ? prior.instructionError : undefined,
+      instructionPending: sameAgent ? prior.instructionPending : false,
       historyPending: false,
       queuedTaskID: queuedTask?.id,
     };
@@ -1306,6 +1338,7 @@ export class FactoryAppController {
         paused: this.#selectedAgent.agent.paused,
         instructionPending: this.#selectedAgent.instructionPending,
         instructionError: this.#selectedAgent.instructionError,
+        instructionDraft: this.#selectedAgent.instructionDraft,
         controlPending: this.#selectedAgent.controlPending,
         controlError: this.#selectedAgent.controlError,
         controlStatus: this.#selectedAgent.controlStatus,

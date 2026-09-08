@@ -421,22 +421,6 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
 			return false
 		}
-	case browserprotocol.AgentControl:
-		backend, ok := current.server.backend.(AgentControlBackend)
-		if !ok {
-			err = ErrUnauthorized
-			break
-		}
-		result, backendErr := backend.ControlAgent(ctx, current.principal, body)
-		if backendErr != nil {
-			err = backendErr
-			break
-		}
-		if result.OperationID != body.OperationID || result.TaskID != body.TaskID || result.RunID != body.RunID || result.SuccessorTaskID != body.SuccessorTaskID {
-			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
-			return false
-		}
-		payload, err = browserprotocol.EncodeAgentControlResult(frame.ID, result)
 	case browserprotocol.TaskHistoryGet:
 		backend, ok := current.server.backend.(AgentControlBackend)
 		if !ok {
@@ -498,13 +482,12 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeTaskUpdateResult(frame.ID, result)
-	case browserprotocol.TopologyGet, browserprotocol.RunPathsGet:
-		// Both may walk a tree under the call budget. That must not hold up
-		// state and terminal frames, so one walker goroutine answers them in
-		// arrival order, each under its own budget from the moment it starts;
-		// the websocket permits concurrent writes. The queue holds a window's
-		// budget, so only a client the window would refuse anyway finds it
-		// full and is told to try again.
+	case browserprotocol.TopologyGet, browserprotocol.RunPathsGet, browserprotocol.AgentControl, browserprotocol.HumanRequestReply, browserprotocol.HumanRequestCancelRun:
+		// These may use their whole call budget. That must not hold up state
+		// and terminal frames, so one worker answers them in arrival order,
+		// each under its own budget from the moment it starts; the websocket
+		// permits concurrent writes. The queue holds a window's budget, so only
+		// a client the window would refuse anyway finds it full and retries.
 		if current.walks == nil {
 			current.walks = make(chan browserprotocol.ControlFrame, maxRequests)
 			current.walked = make(chan struct{})
@@ -549,36 +532,6 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			break
 		}
 		payload, err = browserprotocol.EncodeRemoteInviteResult(frame.ID, invitation)
-	case browserprotocol.HumanRequestReply:
-		if current.server.terminalBackend == nil {
-			err = ErrUnauthorized
-			break
-		}
-		result, backendErr := current.server.terminalBackend.ReplyHumanRequest(ctx, current.principal, body)
-		if backendErr != nil {
-			err = backendErr
-			break
-		}
-		if validationErr := validateHumanReplyResult(body, result); validationErr != nil {
-			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
-			return false
-		}
-		payload, err = browserprotocol.EncodeHumanRequestReplyResult(frame.ID, result)
-	case browserprotocol.HumanRequestCancelRun:
-		if current.server.terminalBackend == nil {
-			err = ErrUnauthorized
-			break
-		}
-		result, backendErr := current.server.terminalBackend.CancelHumanRequestRun(ctx, current.principal, body)
-		if backendErr != nil {
-			err = backendErr
-			break
-		}
-		if validationErr := validateHumanCancelRunResult(body, result); validationErr != nil {
-			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
-			return false
-		}
-		payload, err = browserprotocol.EncodeHumanRequestCancelRunResult(frame.ID, result)
 	case browserprotocol.TerminalAttach:
 		if current.attachment != nil || current.server.terminalBackend == nil {
 			err = ErrUnauthorized
@@ -1055,8 +1008,8 @@ func stopSubscription(subscription StateSubscription) error {
 	}
 }
 
-// walk answers queued walks one at a time until the connection ends; the
-// cleanup in run waits for it, so a walk in flight is joined, never leaked.
+// walk answers the serialized slow request queue until the connection ends;
+// cleanup in run waits for it, so a request in flight is joined, never leaked.
 func (current *connection) walk() {
 	defer close(current.walked)
 	for current.ctx.Err() == nil {
@@ -1068,10 +1021,10 @@ func (current *connection) walk() {
 	}
 }
 
-// observe answers TOPOLOGY_GET and RUN_PATHS_GET off the serve goroutine. It
-// reads only members that are fixed once authenticated, and it ends the
-// connection the same way dispatch would: on an unauthorized refusal, a
-// backend result that does not match the request, or a failed write.
+// observe answers the slow request queue off the serve goroutine. It reads
+// only members that are fixed once authenticated, and it ends the connection
+// the same way dispatch would: on an unauthorized refusal, a backend result
+// that does not match the request, or a failed write.
 func (current *connection) observe(frame browserprotocol.ControlFrame) {
 	ctx, cancel := context.WithTimeout(current.ctx, backendCallLimit)
 	defer cancel()
@@ -1112,6 +1065,52 @@ func (current *connection) observe(frame browserprotocol.ControlFrame) {
 			break
 		}
 		payload, err = browserprotocol.EncodeRunPaths(frame.ID, result)
+	case browserprotocol.AgentControl:
+		backend, ok := current.server.backend.(AgentControlBackend)
+		if !ok {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := backend.ControlAgent(ctx, current.principal, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.OperationID != body.OperationID || result.TaskID != body.TaskID || result.RunID != body.RunID || result.SuccessorTaskID != body.SuccessorTaskID {
+			err = errBackendResult
+			break
+		}
+		payload, err = browserprotocol.EncodeAgentControlResult(frame.ID, result)
+	case browserprotocol.HumanRequestReply:
+		if current.server.terminalBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.terminalBackend.ReplyHumanRequest(ctx, current.principal, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if validationErr := validateHumanReplyResult(body, result); validationErr != nil {
+			err = validationErr
+			break
+		}
+		payload, err = browserprotocol.EncodeHumanRequestReplyResult(frame.ID, result)
+	case browserprotocol.HumanRequestCancelRun:
+		if current.server.terminalBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.terminalBackend.CancelHumanRequestRun(ctx, current.principal, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if validationErr := validateHumanCancelRunResult(body, result); validationErr != nil {
+			err = validationErr
+			break
+		}
+		payload, err = browserprotocol.EncodeHumanRequestCancelRunResult(frame.ID, result)
 	}
 	if err != nil {
 		mapped := errorFrame(err)

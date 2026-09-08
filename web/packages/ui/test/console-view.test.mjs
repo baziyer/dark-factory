@@ -78,6 +78,13 @@ test("the first console selection prefers the overseer deterministically", () =>
   assert.equal(primaryAgent({ ...state, agents: new Map(workers.map((agent) => [agent.id, agent])) }).id, workers.slice().sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))[0].id);
 });
 
+test("an active overseer beats a paused namesake before name ordering", () => {
+  const paused = { ...fixtureState.agents.get(pausedAgentID), name: "overseer", paused: true };
+  const active = { ...paused, id: "fe".repeat(16), name: "overseer-sol", paused: false };
+  const state = { ...fixtureState, agents: new Map([[paused.id, paused], [active.id, active]]) };
+  assert.equal(primaryAgent(state).id, active.id);
+});
+
 test("counters count only store-backed facts", () => {
   const counters = factoryCounters(fixtureState);
   assert.equal(counters.queued, 1);

@@ -36,16 +36,33 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 	if !factory.DispatchEnabled {
 		return rollbackNoAdmission(tx, NoAdmissionDispatchDisabled)
 	}
-	task, found, err := scanTask(tx.connection.QueryRowContext(ctx, `SELECT t.id, t.project_id, t.assigned_agent_id, t.incarnation_id, t.work_revision, t.title, t.body, t.sent_back_instruction_bytes, t.status, t.priority, t.blocked_reason, t.result, t.completed_at_ms, t.revision, t.created_at_ms, t.updated_at_ms
-		FROM tasks AS t
-		JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
-		WHERE t.status = 'queued'
-		  AND a.paused = 0
-		  AND a.tool_calls_used < a.tool_budget_limit
-		  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
-		  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') < ?)
-		    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') < 1))
-		ORDER BY t.priority DESC, t.created_at_ms ASC, t.id ASC
+	task, found, err := scanTask(tx.connection.QueryRowContext(ctx, `WITH delivered_successors AS MATERIALIZED (
+			SELECT DISTINCT successor_task_id
+			FROM task_interventions
+			WHERE state = 'delivered' AND successor_task_id IS NOT NULL
+		), eligible AS (
+			SELECT t.id, t.project_id, t.assigned_agent_id, t.incarnation_id, t.work_revision, t.title, t.body, t.sent_back_instruction_bytes, t.status, t.priority, t.blocked_reason, t.result, t.completed_at_ms, t.revision, t.created_at_ms, t.updated_at_ms,
+				d.successor_task_id IS NOT NULL AS replacement
+			FROM tasks AS t
+			JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
+			LEFT JOIN delivered_successors AS d ON d.successor_task_id = t.id
+			WHERE t.status = 'queued'
+			  AND a.paused = 0
+			  AND a.tool_calls_used < a.tool_budget_limit
+			  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
+			  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') < ?)
+			    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') < 1))
+		), next_for_worker AS (
+			SELECT *, ROW_NUMBER() OVER (
+				PARTITION BY assigned_agent_id
+				ORDER BY replacement DESC, priority DESC, created_at_ms ASC, id ASC
+			) AS rank
+			FROM eligible
+		)
+		SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, sent_back_instruction_bytes, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms
+		FROM next_for_worker
+		WHERE rank = 1
+		ORDER BY priority DESC, created_at_ms ASC, id ASC
 		LIMIT 1`, factory.Capacity))
 	if err != nil {
 		return AdmissionResult{}, tx.Rollback(err)

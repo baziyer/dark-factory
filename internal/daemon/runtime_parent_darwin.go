@@ -276,8 +276,11 @@ func (parent *RuntimeParent) begin() (*runtimeParentOperation, error) {
 	if parent.closing || parent.closed || parent.dir == nil || parent.lock == nil {
 		return nil, invalidContract(parent.closeErr)
 	}
-	if parent.operation {
-		return nil, errRuntimeBusy
+	for parent.operation && !parent.closing {
+		parent.cond.Wait()
+	}
+	if parent.closing || parent.closed || parent.dir == nil || parent.lock == nil {
+		return nil, invalidContract(parent.closeErr)
 	}
 	if err := parent.verifyRetained(); err != nil {
 		return nil, invalidContract(err)
