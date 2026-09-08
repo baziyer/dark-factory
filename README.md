@@ -18,12 +18,22 @@ no commit, push, pull-request, or repository-publication operation.
   launch path is fixture-proven for an existing local CLI and signed-in account;
   its real-provider smoke remains outstanding. See the [provider
   contract](docs/providers.md).
-- The browser console shows durable factory, agent, and task state. A paired
-  browser can select a configured idle agent, submit a direct instruction, and
-  create a normal durable task; dispatch, queue, and run state remain canonical
-  in the daemon. The terminal appears only for a running task, where it
-  supports observation and input, HumanRequest reply, and cancellation. Project
-  and agent setup stays in `factoryctl`.
+- The browser opens on the overseer, with every worker directly accessible.
+  Send an instruction in a ready agent's terminal pane to create a durable
+  task. Type in a live terminal to work with that session, or use Message for
+  a recorded intervention. Codex Interrupt stops generation while preserving the
+  task; Stop ends it; Start new preserves its history and queues a replacement.
+  Completed output stays visible. Add to queue accepts later work while busy.
+  Project and agent setup stays in `factoryctl`.
+- Agent status is Ready, Working, Needs you, or Paused. Working means a task
+  is running, including startup and cleanup. Queued work alone is Ready with
+  a queue/capacity hint. Pausing stops future tasks; an already-running task
+  keeps Working with its queue marked paused.
+- The overseer can inspect and control its project's workers through scoped
+  `factoryctl overseer` commands, using its own attempt credential. Worker
+  events and explicit interventions trigger bounded standing instructions,
+  including events received while the overseer was busy. Factory capacity
+  counts workers; one overseer can run alongside them.
 - There is no external HTTP/GitHub intake and no in-runtime updater.
 
 Each project has agents and durable tasks. An admitted attempt gets a fresh

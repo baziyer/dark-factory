@@ -32,10 +32,9 @@ The gate checks:
 
 - `gofmt` and `go vet` are clean. Any affected focused `-race` check treats a
   race report as a failure, not a warning.
-- The SQLite schema is one fresh set of statements in
-  `internal/kernel/schema.go`. There is deliberately no migration directory
-  and no upcaster: the Go home and schema are new, so a schema change is an
-  edit to that set plus the causal tests that pin it.
+- The SQLite schema is defined in `internal/kernel/schema.go`. Changes also
+  extend the versioned transactions in `internal/kernel/migrate.go`, with a
+  preservation test for existing homes as well as fresh-schema checks.
 
 ## Where to start
 

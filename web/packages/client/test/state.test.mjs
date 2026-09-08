@@ -97,6 +97,14 @@ test("the Go-produced snapshot fixture becomes one complete TypeScript state vie
   assert.throws(() => { view.head = 0n; }, TypeError);
 });
 
+test("factory capacity counts workers while active runs include the overseer", () => {
+  const body = snapshotBody({ factory: { dispatch_enabled: true, capacity: 1, active_runs: 2, revision: 1n } });
+  const frame = { type: "STATE_SNAPSHOT", id: "state", body };
+  assert.equal(decodeServerControl(encodeServerControl(frame)).body.factory.active_runs, 2);
+  body.factory.active_runs = 3;
+  expectMalformed(() => decodeServerControl(encodeServerControl(frame)));
+});
+
 test("STATE_GET carries no selector and STATE_CHANGED carries only a head", () => {
   const request = encodeStateGet("state", {});
   assert.equal(request, `{"type":"STATE_GET","id":"state","body":{}}`);

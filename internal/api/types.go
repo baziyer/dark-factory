@@ -117,8 +117,31 @@ type RemoteStatus struct {
 }
 
 type MutationResult struct {
-	Head     uint64 `json:"head"`
-	Revision uint64 `json:"revision"`
+	Head         uint64                      `json:"head"`
+	Revision     uint64                      `json:"revision"`
+	Intervention *OverseerInterventionResult `json:"intervention,omitempty"`
+	HumanReply   *OverseerHumanReplyResult   `json:"human_reply,omitempty"`
+}
+
+type OverseerHumanReplyResult struct {
+	RequestID string `json:"request_id"`
+	State     string `json:"state"`
+}
+
+func validMutation(result MutationResult) bool {
+	if result.Revision == 0 {
+		return false
+	}
+	if result.Intervention != nil && (!validID(result.Intervention.OperationID) || (result.Intervention.State != "delivered" && result.Intervention.State != "unknown" && result.Intervention.State != "rejected") || !validText(result.Intervention.Detail, 0, 4096)) {
+		return false
+	}
+	return result.HumanReply == nil || validID(result.HumanReply.RequestID) && (result.HumanReply.State == "resolved" || result.HumanReply.State == "delivery_unknown")
+}
+
+type OverseerInterventionResult struct {
+	OperationID string `json:"operation_id"`
+	State       string `json:"state"`
+	Detail      string `json:"detail"`
 }
 
 // AttemptTask is the exact private task text visible only to the authenticated
@@ -205,6 +228,155 @@ type DashboardSnapshot struct {
 	Projects []ProjectSummary `json:"projects"`
 	Agents   []AgentSummary   `json:"agents"`
 	Tasks    []TaskSummary    `json:"tasks"`
+}
+
+// OverseerSnapshot is the private, project-scoped view granted to a running
+// orchestrator. Its project identity is derived from the attempt credential;
+// callers cannot select a different project.
+type OverseerSnapshot struct {
+	ProjectID      string                 `json:"project_id"`
+	Head           uint64                 `json:"head"`
+	NextOffset     *uint64                `json:"next_offset"`
+	NextTextOffset *uint64                `json:"next_text_offset"`
+	Agents         []AgentSummary         `json:"agents"`
+	Tasks          []OverseerTask         `json:"tasks"`
+	Runs           []OverseerRun          `json:"runs"`
+	Questions      []OverseerQuestion     `json:"questions"`
+	History        []OverseerIntervention `json:"history"`
+}
+
+type OverseerIntervention struct {
+	OperationID      string `json:"operation_id"`
+	TaskID           string `json:"task_id"`
+	RunID            string `json:"run_id"`
+	SuccessorTaskID  string `json:"successor_task_id"`
+	Kind             string `json:"kind"`
+	Actor            string `json:"actor"`
+	Payload          string `json:"payload"`
+	PayloadTruncated bool   `json:"payload_truncated"`
+	State            string `json:"state"`
+	Detail           string `json:"detail"`
+	CreatedAtMs      uint64 `json:"created_at_ms"`
+}
+
+// OverseerSnapshotInput pages every collection together. A continuation must
+// fence the head returned by the preceding page. Task text is chunked by rune.
+type OverseerSnapshotInput struct {
+	TaskID       string `json:"task_id,omitempty"`
+	Offset       uint64 `json:"offset,omitempty"`
+	ExpectedHead uint64 `json:"expected_head,omitempty"`
+	TextOffset   uint64 `json:"text_offset,omitempty"`
+}
+
+// OverseerTask carries private task progress for the authenticated project's
+// live orchestrator. The public dashboard has no fields for these texts.
+type OverseerTask struct {
+	ID                 string `json:"id"`
+	ProjectID          string `json:"project_id"`
+	AssignedAgentID    string `json:"assigned_agent_id"`
+	Title              string `json:"title"`
+	Objective          string `json:"objective"`
+	ObjectiveTruncated bool   `json:"objective_truncated"`
+	Status             string `json:"status"`
+	Priority           int64  `json:"priority"`
+	BlockedReason      string `json:"blocked_reason"`
+	Result             string `json:"result"`
+	ResultTruncated    bool   `json:"result_truncated"`
+	Revision           uint64 `json:"revision"`
+}
+
+// MarshalJSON applies the same terminal-safe escaping as attempt task text:
+// overseer question text is printed by factoryctl inside a provider terminal.
+func (snapshot OverseerSnapshot) MarshalJSON() ([]byte, error) {
+	type plain OverseerSnapshot
+	encoded, err := json.Marshal(plain(snapshot))
+	if err != nil {
+		return nil, err
+	}
+	return terminalSafeJSON(nil, encoded), nil
+}
+
+type OverseerRun struct {
+	ID       string `json:"id"`
+	AgentID  string `json:"agent_id"`
+	TaskID   string `json:"task_id"`
+	Phase    string `json:"phase"`
+	Revision uint64 `json:"revision"`
+}
+
+// OverseerQuestion carries the exact question only to the project's running
+// orchestrator. It is not a browser or operator dashboard projection.
+type OverseerQuestion struct {
+	ID       string `json:"id"`
+	AgentID  string `json:"agent_id"`
+	TaskID   string `json:"task_id"`
+	Status   string `json:"status"`
+	Revision uint64 `json:"revision"`
+	Question string `json:"question"`
+}
+
+// OverseerTaskCreateInput intentionally has no project selector: the daemon
+// derives it from the live orchestrator attempt.
+type OverseerTaskCreateInput struct {
+	ID              string `json:"id"`
+	AssignedAgentID string `json:"assigned_agent_id"`
+	IncarnationID   string `json:"incarnation_id"`
+	Title           string `json:"title"`
+	Body            string `json:"body"`
+	Priority        int64  `json:"priority"`
+}
+
+type OverseerTaskUpdateInput struct {
+	TaskID           string  `json:"task_id"`
+	ExpectedRevision uint64  `json:"expected_revision"`
+	Priority         *int64  `json:"priority,omitempty"`
+	AssignedAgentID  *string `json:"assigned_agent_id,omitempty"`
+	Cancel           bool    `json:"cancel,omitempty"`
+}
+
+type OverseerAgentUpdateInput struct {
+	AgentID          string `json:"agent_id"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+	Paused           bool   `json:"paused"`
+}
+
+type OverseerRunStopInput struct {
+	OperationID          string `json:"operation_id"`
+	TaskID               string `json:"task_id"`
+	ExpectedTaskRevision uint64 `json:"expected_task_revision"`
+	RunID                string `json:"run_id"`
+	ExpectedRunRevision  uint64 `json:"expected_run_revision"`
+}
+
+type OverseerRunReplaceInput struct {
+	OverseerRunStopInput
+	SuccessorTaskID        string `json:"successor_task_id"`
+	SuccessorIncarnationID string `json:"successor_incarnation_id"`
+	Instruction            string `json:"instruction"`
+}
+
+type OverseerWorkerMessageInput struct {
+	OperationID          string `json:"operation_id"`
+	TaskID               string `json:"task_id"`
+	ExpectedTaskRevision uint64 `json:"expected_task_revision"`
+	RunID                string `json:"run_id"`
+	ExpectedRunRevision  uint64 `json:"expected_run_revision"`
+	Message              string `json:"message"`
+}
+
+type OverseerWorkerInterruptInput struct {
+	OperationID          string `json:"operation_id"`
+	TaskID               string `json:"task_id"`
+	ExpectedTaskRevision uint64 `json:"expected_task_revision"`
+	RunID                string `json:"run_id"`
+	ExpectedRunRevision  uint64 `json:"expected_run_revision"`
+}
+
+type OverseerHumanReplyInput struct {
+	OperationID      string `json:"operation_id"`
+	RequestID        string `json:"request_id"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+	Reply            string `json:"reply"`
 }
 
 type CreateProjectInput struct {

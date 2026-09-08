@@ -44,6 +44,16 @@ const (
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
   factoryctl attempt send-back --task ID --note TEXT
+  factoryctl overseer status [--task ID] [--offset N --head HEAD] [--text-offset RUNES --head HEAD]
+  factoryctl overseer task add --agent ID --title TEXT [--body TEXT] [--priority N] [--task-id ID --incarnation-id ID]
+  factoryctl overseer task update --task ID --revision REVISION [--priority N] [--agent ID] [--cancel]
+  factoryctl overseer task send-back --task ID --note TEXT
+  factoryctl overseer agent pause|resume --agent ID --revision REVISION
+  factoryctl overseer worker stop --operation-id ID --task ID --task-revision REVISION --run ID --run-revision REVISION
+  factoryctl overseer worker replace --operation-id ID --task ID --task-revision REVISION --run ID --run-revision REVISION --successor-task ID --successor-incarnation ID --instruction TEXT
+  factoryctl overseer worker message --operation-id ID --task ID --task-revision REVISION --run ID --run-revision REVISION --message TEXT
+  factoryctl overseer worker interrupt --operation-id ID --task ID --task-revision REVISION --run ID --run-revision REVISION
+  factoryctl overseer human reply --operation-id ID --request ID --revision REVISION --reply TEXT
   factoryctl project create --name TEXT --root ABSOLUTE
   factoryctl agent create --project ID --name TEXT --provider shell|claude_code|codex --tool-budget N [--role worker|orchestrator] [--model TEXT] [--reasoning-effort low|medium|high|xhigh|max|ultra] [--account ID]
   factoryctl task add --project ID --agent ID --title TEXT [--body TEXT] [--priority N]
@@ -90,6 +100,16 @@ const (
 	commandTaskAdd
 	commandTaskSendBack
 	commandDispatch
+	commandOverseerStatus
+	commandOverseerTaskAdd
+	commandOverseerTaskUpdate
+	commandOverseerTaskSendBack
+	commandOverseerAgentUpdate
+	commandOverseerStopWorker
+	commandOverseerReplaceWorker
+	commandOverseerMessageWorker
+	commandOverseerInterruptWorker
+	commandOverseerReplyHuman
 )
 
 type attemptCommand struct {
@@ -117,7 +137,17 @@ type attemptCommand struct {
 	body            string
 	toolBudget      uint64
 	priority        int64
+	prioritySet     bool
+	offset          uint64
+	head            uint64
+	textOffset      uint64
 	enabled         bool
+	operationID     string
+	taskRevision    uint64
+	runRevision     uint64
+	run             string
+	paused          bool
+	cancel          bool
 }
 
 func main() {
@@ -170,6 +200,9 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 	}
 	if command.kind == commandProjectCreate || command.kind == commandAgentCreate || command.kind == commandTaskAdd || command.kind == commandTaskSendBack || command.kind == commandDispatch {
 		return runOperator(ctx, command, getenv, stdout, stderr)
+	}
+	if command.kind >= commandOverseerStatus && command.kind <= commandOverseerReplyHuman {
+		return runOverseer(ctx, command, getenv, stdout, stderr)
 	}
 
 	socket := getenv("DARK_FACTORY_SOCKET")
@@ -243,6 +276,12 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	}
 	if len(args) >= 1 && (args[0] == "project" || args[0] == "agent" || args[0] == "task" || args[0] == "dispatch") {
 		return parseOperator(args)
+	}
+	if len(args) >= 1 && args[0] == "overseer" {
+		if len(args) >= 2 && helpFlag(args[len(args)-1]) {
+			return attemptCommand{}, true, true
+		}
+		return parseOverseer(args)
 	}
 	if len(args) >= 1 && args[0] == "remote" {
 		return parseRemote(args)
@@ -667,6 +706,7 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 				return attemptCommand{}, false, false
 			}
 			command.priority = priority
+			command.prioritySet = true
 		default:
 			return attemptCommand{}, false, false
 		}
@@ -693,6 +733,221 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 	return command, false, true
 }
 
+func parseOverseer(args []string) (attemptCommand, bool, bool) {
+	if len(args) >= 2 && args[1] == "status" {
+		command := attemptCommand{kind: commandOverseerStatus}
+		seen := map[string]bool{}
+		for index := 2; index < len(args); index += 2 {
+			if index+1 >= len(args) || seen[args[index]] {
+				return attemptCommand{}, false, false
+			}
+			seen[args[index]] = true
+			value := args[index+1]
+			switch args[index] {
+			case "--task":
+				if !validHumanRequestKey(value) {
+					return attemptCommand{}, false, false
+				}
+				command.id = value
+			case "--offset":
+				offset, ok := parseOverseerOffset(value, true)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.offset = offset
+			case "--head":
+				head, ok := parseRevision(value)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.head = head
+			case "--text-offset":
+				offset, ok := parseOverseerOffset(value, false)
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				command.textOffset = offset
+			default:
+				return attemptCommand{}, false, false
+			}
+		}
+		if command.head == 0 && (command.offset != 0 || command.textOffset != 0) || command.textOffset != 0 && command.id == "" {
+			return attemptCommand{}, false, false
+		}
+		return command, false, true
+	}
+	if len(args) < 3 {
+		return attemptCommand{}, false, false
+	}
+	command := attemptCommand{}
+	switch strings.Join(args[1:3], " ") {
+	case "task add":
+		command.kind = commandOverseerTaskAdd
+	case "task update":
+		command.kind = commandOverseerTaskUpdate
+	case "task send-back":
+		command.kind = commandOverseerTaskSendBack
+	case "agent pause":
+		command.kind, command.paused = commandOverseerAgentUpdate, true
+	case "agent resume":
+		command.kind = commandOverseerAgentUpdate
+	case "worker stop":
+		command.kind = commandOverseerStopWorker
+	case "worker replace":
+		command.kind = commandOverseerReplaceWorker
+	case "worker message":
+		command.kind = commandOverseerMessageWorker
+	case "worker interrupt":
+		command.kind = commandOverseerInterruptWorker
+	case "human reply":
+		command.kind = commandOverseerReplyHuman
+	default:
+		return attemptCommand{}, false, false
+	}
+	seen := map[string]bool{}
+	for index := 3; index < len(args); {
+		name := args[index]
+		if name == "--cancel" && command.kind == commandOverseerTaskUpdate {
+			if seen[name] {
+				return attemptCommand{}, false, false
+			}
+			seen[name], command.cancel = true, true
+			index++
+			continue
+		}
+		if index+1 >= len(args) || seen[name] {
+			return attemptCommand{}, false, false
+		}
+		seen[name] = true
+		value := args[index+1]
+		index += 2
+		switch name {
+		case "--agent":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.agent = value
+		case "--task":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.id = value
+		case "--task-id":
+			if command.kind != commandOverseerTaskAdd || !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.id = value
+		case "--incarnation-id":
+			if command.kind != commandOverseerTaskAdd || !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.project = value
+		case "--run":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.run = value
+		case "--request":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.id = value
+		case "--successor-task":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.project = value
+		case "--successor-incarnation":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.account = value
+		case "--title":
+			if command.kind != commandOverseerTaskAdd || !validOperatorText(value, 1, 1024) {
+				return attemptCommand{}, false, false
+			}
+			command.title = value
+		case "--body":
+			if command.kind != commandOverseerTaskAdd || !validOperatorText(value, 0, 131072) {
+				return attemptCommand{}, false, false
+			}
+			command.body = value
+		case "--priority":
+			priority, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || value != strconv.FormatInt(priority, 10) || priority < -1_000_000 || priority > 1_000_000 || command.kind != commandOverseerTaskAdd && command.kind != commandOverseerTaskUpdate {
+				return attemptCommand{}, false, false
+			}
+			command.priority = priority
+			command.prioritySet = true
+		case "--revision":
+			revision, ok := parseRevision(value)
+			if !ok {
+				return attemptCommand{}, false, false
+			}
+			command.expectedRevision = revision
+		case "--task-revision":
+			revision, ok := parseRevision(value)
+			if !ok {
+				return attemptCommand{}, false, false
+			}
+			command.taskRevision = revision
+		case "--run-revision":
+			revision, ok := parseRevision(value)
+			if !ok {
+				return attemptCommand{}, false, false
+			}
+			command.runRevision = revision
+		case "--note", "--detail", "--message", "--reply", "--instruction":
+			if !validQuestion(value) {
+				return attemptCommand{}, false, false
+			}
+			command.text = value
+		case "--operation-id":
+			if !validHumanRequestKey(value) {
+				return attemptCommand{}, false, false
+			}
+			command.operationID = value
+		default:
+			return attemptCommand{}, false, false
+		}
+	}
+	switch command.kind {
+	case commandOverseerTaskAdd:
+		if command.agent == "" || command.title == "" || command.id == "" != (command.project == "") {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerTaskUpdate:
+		if command.id == "" || command.expectedRevision == 0 || !command.cancel && command.agent == "" && !command.prioritySet {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerTaskSendBack:
+		if command.id == "" || command.text == "" {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerAgentUpdate:
+		if command.agent == "" || command.expectedRevision == 0 {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerStopWorker:
+		if command.operationID == "" || command.id == "" || command.run == "" || command.taskRevision == 0 || command.runRevision == 0 {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerReplaceWorker:
+		if command.operationID == "" || command.id == "" || command.run == "" || command.taskRevision == 0 || command.runRevision == 0 || command.project == "" || command.account == "" || command.text == "" {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerMessageWorker, commandOverseerInterruptWorker:
+		if command.operationID == "" || command.id == "" || command.run == "" || command.taskRevision == 0 || command.runRevision == 0 || command.kind == commandOverseerMessageWorker && command.text == "" {
+			return attemptCommand{}, false, false
+		}
+	case commandOverseerReplyHuman:
+		if command.operationID == "" || command.id == "" || command.expectedRevision == 0 || command.text == "" {
+			return attemptCommand{}, false, false
+		}
+	}
+	return command, false, true
+}
+
 func validOperatorText(value string, minimum, maximum int) bool {
 	return len(value) >= minimum && len(value) <= maximum && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
 }
@@ -710,6 +965,19 @@ func parseRevision(value string) (uint64, bool) {
 	}
 	parsed, err := strconv.ParseUint(value, 10, 64)
 	return parsed, err == nil && parsed > 0 && parsed <= uint64(^uint64(0)>>1)
+}
+
+func parseOverseerOffset(value string, allowZero bool) (uint64, bool) {
+	if value == "" || len(value) > 19 || value[0] == '0' && (len(value) > 1 || !allowZero) {
+		return 0, false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return parsed, err == nil && parsed <= uint64(^uint64(0)>>1)
 }
 
 func helpFlag(value string) bool { return value == "-h" || value == "--help" }
@@ -868,6 +1136,76 @@ func runOperator(ctx context.Context, command attemptCommand, getenv func(string
 	default:
 		return exitUsage
 	}
+}
+
+func runOverseer(ctx context.Context, command attemptCommand, getenv func(string) string, stdout, stderr io.Writer) int {
+	socket := getenv("DARK_FACTORY_SOCKET")
+	if socket == "" {
+		_, _ = io.WriteString(stderr, "factoryctl: overseer client configuration is invalid\n")
+		return exitFailure
+	}
+	client, err := api.NewAttemptClientFromEnvironment(socket)
+	if err != nil {
+		_, _ = io.WriteString(stderr, "factoryctl: overseer client configuration is invalid\n")
+		return exitFailure
+	}
+	callContext, cancel := context.WithTimeout(ctx, serviceRequestTimeout)
+	defer cancel()
+	if command.kind == commandOverseerStatus {
+		result, callErr := client.OverseerSnapshotPage(callContext, api.OverseerSnapshotInput{TaskID: command.id, Offset: command.offset, ExpectedHead: command.head, TextOffset: command.textOffset})
+		if callErr != nil {
+			return writeWebFailure(stderr, "overseer status", callErr)
+		}
+		return writeJSON(stdout, result)
+	}
+	var result api.MutationResult
+	switch command.kind {
+	case commandOverseerTaskAdd:
+		id, incarnation := command.id, command.project
+		if id == "" {
+			var idErr error
+			id, idErr = newOperatorID()
+			if idErr != nil {
+				return writeWebFailure(stderr, "overseer task add", idErr)
+			}
+			incarnation, idErr = newOperatorID()
+			if idErr != nil {
+				return writeWebFailure(stderr, "overseer task add", idErr)
+			}
+		}
+		result, err = client.OverseerEnqueueTask(callContext, api.OverseerTaskCreateInput{ID: id, AssignedAgentID: command.agent, IncarnationID: incarnation, Title: command.title, Body: command.body, Priority: command.priority})
+	case commandOverseerTaskUpdate:
+		input := api.OverseerTaskUpdateInput{TaskID: command.id, ExpectedRevision: command.expectedRevision, Cancel: command.cancel}
+		if command.prioritySet {
+			priority := command.priority
+			input.Priority = &priority
+		}
+		if command.agent != "" {
+			agent := command.agent
+			input.AssignedAgentID = &agent
+		}
+		result, err = client.OverseerUpdateTask(callContext, input)
+	case commandOverseerTaskSendBack:
+		result, err = client.SendBack(callContext, api.SendBackInput{TaskID: command.id, Note: command.text})
+	case commandOverseerAgentUpdate:
+		result, err = client.OverseerUpdateAgent(callContext, api.OverseerAgentUpdateInput{AgentID: command.agent, ExpectedRevision: command.expectedRevision, Paused: command.paused})
+	case commandOverseerStopWorker:
+		result, err = client.OverseerStopRun(callContext, api.OverseerRunStopInput{OperationID: command.operationID, TaskID: command.id, ExpectedTaskRevision: command.taskRevision, RunID: command.run, ExpectedRunRevision: command.runRevision})
+	case commandOverseerReplaceWorker:
+		result, err = client.OverseerReplaceRun(callContext, api.OverseerRunReplaceInput{OverseerRunStopInput: api.OverseerRunStopInput{OperationID: command.operationID, TaskID: command.id, ExpectedTaskRevision: command.taskRevision, RunID: command.run, ExpectedRunRevision: command.runRevision}, SuccessorTaskID: command.project, SuccessorIncarnationID: command.account, Instruction: command.text})
+	case commandOverseerMessageWorker:
+		result, err = client.OverseerMessageWorker(callContext, api.OverseerWorkerMessageInput{OperationID: command.operationID, TaskID: command.id, ExpectedTaskRevision: command.taskRevision, RunID: command.run, ExpectedRunRevision: command.runRevision, Message: command.text})
+	case commandOverseerInterruptWorker:
+		result, err = client.OverseerInterruptWorker(callContext, api.OverseerWorkerInterruptInput{OperationID: command.operationID, TaskID: command.id, ExpectedTaskRevision: command.taskRevision, RunID: command.run, ExpectedRunRevision: command.runRevision})
+	case commandOverseerReplyHuman:
+		result, err = client.OverseerReplyHuman(callContext, api.OverseerHumanReplyInput{OperationID: command.operationID, RequestID: command.id, ExpectedRevision: command.expectedRevision, Reply: command.text})
+	default:
+		return exitUsage
+	}
+	if err != nil {
+		return writeWebFailure(stderr, "overseer control", err)
+	}
+	return writeJSON(stdout, result)
 }
 
 func runWeb(ctx context.Context, command attemptCommand, getenv func(string) string, stdout, stderr io.Writer) int {

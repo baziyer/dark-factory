@@ -294,7 +294,11 @@ func Build(request Request) (Launch, error) {
 		if request.reasoningEffort != "" {
 			argv = append(argv, "-c", fmt.Sprintf("model_reasoning_effort=%q", request.reasoningEffort))
 		}
-		argv = append(argv, codexBootstrapPrompt)
+		prompt := codexBootstrapPrompt
+		if request.role == kernel.RoleOrchestrator {
+			prompt += " You are the project overseer. Run \"$DARK_FACTORY_FACTORYCTL\" overseer status to inspect workers, tasks, questions and intervention history. Follow next_offset with --offset and --head; use --task and next_text_offset for complete text. Delegate with overseer task add; supervise with task update, agent pause/resume, worker message, worker interrupt, worker stop, worker replace and human reply. Run --help for flags. Read docs/development/OVERSEER.md before supervision; publish through your Maintainer App. Respect direct operator interventions. Do not poll or wait for workers: finish after current actions, as events remain pending for the next supervision task. Use attempt request-human only for operator decisions, keeping that session alive for its reply."
+		}
+		argv = append(argv, prompt)
 		return Launch{
 			executable: request.installation.executable, argv: argv,
 			environment: request.runtime.environment(request.provider), taskDelivery: TaskDeliveryAttemptAPI,

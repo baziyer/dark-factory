@@ -91,7 +91,7 @@ func TestInjectedConfiguredWorkerSuccessTerminalFailsClosed(t *testing.T) {
 }
 
 func TestAdmissionRejectsOverlapWithDurableRuntime(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
 	_, _ = store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 190), ProjectID: project.ID, AssignedAgentID: firstAgent.ID, IncarnationID: incarnationID(t, 191), Title: "first"}, mustTime(t, 5))
 	firstKeys := admissionKeys(t, 192, nil)
@@ -100,7 +100,7 @@ func TestAdmissionRejectsOverlapWithDurableRuntime(t *testing.T) {
 	if err != nil || !first.Admitted() {
 		t.Fatalf("first admission = %+v, %v", first, err)
 	}
-	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 194), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 14))
+	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 194), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 14))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestAdmissionRejectsOverlapWithDurableRuntime(t *testing.T) {
 }
 
 func TestInjectedRuntimeOwnershipOverlapFailsReadsAndOpen(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	path := storePath(t, store)
 	if _, err := store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 201), ProjectID: project.ID, AssignedAgentID: firstAgent.ID, IncarnationID: incarnationID(t, 202), Title: "first"}, mustTime(t, 5)); err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestInjectedRuntimeOwnershipOverlapFailsReadsAndOpen(t *testing.T) {
 	if err != nil || !first.Admitted() {
 		t.Fatalf("first admission = %+v, %v", first, err)
 	}
-	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 204), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
+	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 204), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
 	if err != nil {
 		t.Fatal(err)
 	}

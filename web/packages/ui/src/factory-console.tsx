@@ -153,7 +153,7 @@ export function FactoryConsole({
             <h1>FACTORY</h1>
           </div>
           <dl className="dfConsoleBar__counters" aria-label="Factory counters">
-            <Counter label="ACTIVE RUNS" value={state === undefined ? "—" : `${state.factory.active_runs}/${state.factory.capacity}`} />
+            <Counter label="ACTIVE RUNS" value={state === undefined ? "—" : `${state.factory.active_runs} / ${state.factory.capacity} WORKERS + 1 OVERSEER`} />
             <Counter label="QUEUED" value={`${counters.queued ?? "—"}`} />
             <Counter label="NEEDS YOU" value={`${counters.needsYou ?? "—"}`} alert={(counters.needsYou ?? 0) > 0} />
           </dl>

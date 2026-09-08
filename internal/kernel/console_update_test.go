@@ -123,6 +123,64 @@ func TestUpdateTaskEditsAndCancelsOnlyWhileQueued(t *testing.T) {
 	}
 }
 
+func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, run, keys := runningOrchestratorRun(t)
+	defer store.Close()
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 230), ProjectID: run.ProjectID, Name: "other overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 231), ProjectID: run.ProjectID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 232), Title: "overseer work"}, mustTime(t, 41))
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority := int64(1)
+	for _, update := range []struct {
+		priority *int64
+		cancel   bool
+	}{{priority: &priority}, {cancel: true}} {
+		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, update.priority, nil, update.cancel, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("orchestrator task patch = %v", err)
+		}
+	}
+	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 233), ProjectID: run.ProjectID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, 43))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 234), ProjectID: run.ProjectID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 235), Title: "worker work"}, mustTime(t, 44))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, &priority, nil, false, mustTime(t, 45))
+	if err != nil || updated.Priority != priority || updated.Title != workerTask.Title {
+		t.Fatalf("worker task patch = %+v, %v", updated, err)
+	}
+}
+
+func TestUpdateAgentForOverseerOnlyPausesWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, run, keys := runningOrchestratorRun(t)
+	defer store.Close()
+	account, err := store.LinkAccount(ctx, NewAccount{ID: accountID(t, 236), Provider: ProviderCodex, Home: "/Users/operator/.codex-overseer", Label: "overseer"}, mustTime(t, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 237), ProjectID: run.ProjectID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, Model: "gpt-5-codex", ReasoningEffort: "high", AccountID: account.ID, ToolBudgetLimit: 1}, mustTime(t, 41))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, instruction, budget := IdleStandingInstruction, uint32(1), "inspect worker work", uint32(2)
+	configured, err := store.UpdateAgent(ctx, worker.ID, worker.Revision, AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleInstruction: &instruction, IdleRunBudget: &budget}, mustTime(t, 42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateAgentForOverseer(ctx, keys.AttemptDigest, configured.ID, configured.Revision, true, mustTime(t, 43))
+	if err != nil || !updated.Paused || updated.Model != configured.Model || updated.ReasoningEffort != configured.ReasoningEffort || updated.AccountID != configured.AccountID || updated.Idle != configured.Idle {
+		t.Fatalf("overseer pause = %+v, %v", updated, err)
+	}
+}
+
 // A task re-queued after a terminal run is the second shape cancellation can
 // reach: work revision 2, with a run history stopping one revision behind it.
 // The run-topology invariant admitted only a queued task there.

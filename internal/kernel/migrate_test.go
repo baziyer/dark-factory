@@ -17,7 +17,7 @@ import (
 )
 
 func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion} {
 		for _, persistWAL := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d/wal=%v", version, persistWAL), func(t *testing.T) {
 				testLegacyHomeMigratesAndKeepsEveryRow(t, version, persistWAL)
@@ -300,13 +300,17 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	agentColumnsFor := testAgentColumnsV3
 	if version == legacyUserVersion {
 		agentColumnsFor = testAgentColumns
-	} else if version == v4UserVersion {
+	} else if version >= v4UserVersion {
 		agentColumnsFor = testAgentColumnsV4
 	}
 	if err := rebuildTable(ctx, connection, legacy, "agents", agentColumnsFor, "agents_id_project_unique", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := rebuildTable(ctx, connection, legacy, "tasks", testTaskColumns, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "", ""); err != nil {
+	taskColumnsFor := testTaskColumns
+	if version >= v5UserVersion {
+		taskColumnsFor = testTaskColumnsV5
+	}
+	if err := rebuildTable(ctx, connection, legacy, "tasks", taskColumnsFor, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if version < priorUserVersion {
@@ -318,6 +322,9 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 		}
 	}
 	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
+	if version < userVersion {
+		downgrade = append([]string{"DROP TABLE task_interventions", "DROP TABLE overseer_wake_cursors"}, downgrade...)
+	}
 	if version == legacyUserVersion {
 		if err := rebuildTable(ctx, connection, legacy, "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 			t.Fatal(err)
@@ -390,6 +397,8 @@ const testAgentColumnsV4 = `id, project_id, name, role, provider, model, reasoni
 
 // testTaskColumns is the v4 task row, before a send-back boundary was stored.
 const testTaskColumns = `id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms`
+
+const testTaskColumnsV5 = `id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, sent_back_instruction_bytes, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms`
 
 // testInvalidationColumns is the invalidation row every version has had,
 // spelled here so the fixture cannot lose a column with the migration's list.
@@ -482,7 +491,7 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "0d02a088772394ffc0c819bd6cbf7ab081acea36c98c49926babe5a511a77f27"},
+		{"current", schemaStatements, "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
 		{"v4", v4SchemaStatements(), "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
 		{"v3", priorSchemaStatements(), "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
 		{"v2", previousSchemaStatements(), "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},

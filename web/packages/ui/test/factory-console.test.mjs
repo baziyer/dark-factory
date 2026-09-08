@@ -65,7 +65,7 @@ test("one screen shows the floor, the counters, and what needs you at once", () 
     assert.match(markup, new RegExp(`aria-label="${label}"`));
   }
   // Counters read the served factory, not a second count of it.
-  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2\/8<\/dd>/);
+  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2 \/ 8 WORKERS \+ 1 OVERSEER<\/dd>/);
   assert.match(markup, /<dt>QUEUED<\/dt><dd>1<\/dd>/);
   assert.match(markup, /<dt>NEEDS YOU<\/dt><dd>1<\/dd>/);
   assert.match(markup, /Builder One asks/);
@@ -442,7 +442,7 @@ test("a terminal blocked task is neither building nor current agent work", () =>
     humanRequests: new Map(),
   });
   const markup = render({ state, view: "agents" });
-  assert.match(markup, /aria-label="Builder One: waiting"/);
+  assert.match(markup, /aria-label="Builder One: ready"/);
   assert.equal(markup.includes('aria-label="Builder One: busy"'), false);
 });
 
@@ -534,6 +534,20 @@ test("selecting an agent opens the agent sidebar with its config and queue", () 
   const readOnly = render({ selectedAgent: agentSelection() });
   assert.equal(readOnly.includes("<input"), false);
   assert.equal(readOnly.includes("OPEN TERMINAL"), false);
+});
+
+test("a paused agent with queued work says the queue is paused", () => {
+  const task = [...fixtureState.tasks.values()].find((item) => item.status === "queued");
+  const selected = fixtureState.agents.get(task.assigned_agent_id);
+  const agent = { ...selected, paused: true };
+  const agents = new Map(fixtureState.agents);
+  agents.set(agent.id, agent);
+  const markup = render({
+    state: baseState({ agents }),
+    selectedAgent: { id: agent.id, name: agent.name, revision: agent.revision },
+  });
+  assert.match(markup, />QUEUE PAUSED</);
+  assert.equal(markup.includes("QUEUED · WAITING FOR CAPACITY"), false);
 });
 
 test("the queued task row edits title, order, assignment, and cancellation", async () => {
@@ -986,11 +1000,11 @@ test("the RULES block saves an idle rule and sends only what changed", async () 
   // Waiting agents show no instruction controls; choosing the rule reveals them.
   assert.equal(field(`df-idle-instruction-${ids.agent}`), undefined);
   await act(async () => { field(`df-idle-${ids.agent}`).props.onChange({ currentTarget: { value: "standing_instruction" } }); });
-  await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "10" } }); });
+  await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "2" } }); });
   await act(async () => { field(`df-idle-instruction-${ids.agent}`).props.onChange({ currentTarget: { value: "Look for follow-up work." } }); });
   await act(async () => { field(`df-idle-budget-${ids.agent}`).props.onChange({ currentTarget: { value: "3" } }); });
   await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
-  assert.deepEqual(edits.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
+  assert.deepEqual(edits.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 2, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
   // A rule the daemon would refuse never leaves the form: no wait means no
   // save, and the form says why.
   await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "0" } }); });
@@ -999,7 +1013,11 @@ test("the RULES block saves an idle rule and sends only what changed", async () 
   const before = edits.length;
   await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
   assert.equal(edits.length, before);
-  assert.ok(renderer.root.findAllByType("p").some((paragraph) => String(paragraph.props.children).includes("needs at least a minute")));
+  assert.ok(renderer.root.findAllByType("p").some((paragraph) => String(paragraph.props.children).includes("needs at least a second")));
+  await act(async () => { field(`df-idle-after-${ids.agent}`).props.onChange({ currentTarget: { value: "1" } }); });
+  assert.equal(saveButton().props.disabled, false);
+  await act(async () => { form().props.onSubmit({ preventDefault() {} }); });
+  assert.deepEqual(edits.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 1, idleInstruction: "Look for follow-up work.", idleRunBudget: 3 });
   // On a spent rule, editing the text leaves the budget out, so the count
   // stands; retyping the same budget sends it, which restarts the count.
   const spent = { ...fixtureState.agents.get(ids.agent), idle_policy: "standing_instruction", idle_after_seconds: 600, idle_instruction: "Look for follow-up work.", idle_run_budget: 3, idle_runs_used: 3 };
@@ -1015,4 +1033,13 @@ test("the RULES block saves an idle rule and sends only what changed", async () 
   await act(async () => { spentField(`df-idle-budget-${ids.agent}`).props.onChange({ currentTarget: { value: "3" } }); });
   await act(async () => { spentRenderer.root.findAllByType("form")[0].props.onSubmit({ preventDefault() {} }); });
   assert.deepEqual(again.at(-1), { idlePolicy: "standing_instruction", idleAfterSeconds: 600, idleInstruction: "Look for follow-up work, then tidy.", idleRunBudget: 3 });
+});
+
+test("overseer supervision names worker events and a seconds cooldown", () => {
+  const agent = { ...fixtureState.agents.get(ids.agent), role: "orchestrator", idle_policy: "standing_instruction", idle_after_seconds: 10, idle_instruction: "Inspect worker activity.", idle_run_budget: 1 };
+  const agents = new Map(fixtureState.agents);
+  agents.set(agent.id, agent);
+  const markup = render({ state: baseState({ agents }), selectedAgent: { id: agent.id, name: agent.name, revision: agent.revision }, onSaveAgentConfig: () => {} });
+  for (const text of ["SUPERVISION", "WHEN WORK CHANGES", "supervise worker activity", "COOLDOWN SECONDS", "initial inspection, then worker events"]) assert.match(markup, new RegExp(text));
+  assert.match(markup, new RegExp(`id="df-idle-after-${agent.id}"[^>]*value="10"`));
 });

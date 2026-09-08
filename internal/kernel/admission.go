@@ -36,17 +36,6 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 	if !factory.DispatchEnabled {
 		return rollbackNoAdmission(tx, NoAdmissionDispatchDisabled)
 	}
-	var active int64
-	if err := tx.connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'`).Scan(&active); err != nil {
-		return AdmissionResult{}, tx.Rollback(err)
-	}
-	if active < 0 {
-		return AdmissionResult{}, tx.Rollback(ErrCorruptState)
-	}
-	if active >= int64(factory.Capacity) {
-		return rollbackNoAdmission(tx, NoAdmissionAtCapacity)
-	}
-
 	task, found, err := scanTask(tx.connection.QueryRowContext(ctx, `SELECT t.id, t.project_id, t.assigned_agent_id, t.incarnation_id, t.work_revision, t.title, t.body, t.sent_back_instruction_bytes, t.status, t.priority, t.blocked_reason, t.result, t.completed_at_ms, t.revision, t.created_at_ms, t.updated_at_ms
 		FROM tasks AS t
 		JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
@@ -54,8 +43,10 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		  AND a.paused = 0
 		  AND a.tool_calls_used < a.tool_budget_limit
 		  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
+		  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') < ?)
+		    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') < 1))
 		ORDER BY t.priority DESC, t.created_at_ms ASC, t.id ASC
-		LIMIT 1`))
+		LIMIT 1`, factory.Capacity))
 	if err != nil {
 		return AdmissionResult{}, tx.Rollback(err)
 	}
@@ -66,6 +57,20 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		}
 		if queued == 0 {
 			return rollbackNoAdmission(tx, NoAdmissionQueueEmpty)
+		}
+		var capacityBlocked int
+		if err := tx.connection.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM tasks AS t
+			JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
+			WHERE t.status = 'queued' AND a.paused = 0 AND a.tool_calls_used < a.tool_budget_limit
+			  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
+			  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') >= ?)
+			    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') >= 1))
+		)`, factory.Capacity).Scan(&capacityBlocked); err != nil {
+			return AdmissionResult{}, tx.Rollback(err)
+		}
+		if capacityBlocked != 0 {
+			return rollbackNoAdmission(tx, NoAdmissionAtCapacity)
 		}
 		return rollbackNoAdmission(tx, NoAdmissionNoEligibleWork)
 	}

@@ -444,6 +444,32 @@ func (store *Store) BeginHumanReply(ctx context.Context, clientID BrowserClientI
 	if !found || client.RevokedAt != nil || !client.CapabilityMask.Has(BrowserCapabilityHumanActions) {
 		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
 	}
+	return store.beginHumanReplyTx(ctx, tx, requestID, expected, deliveryID, reply, at, ProjectID{}, RunID{})
+}
+
+// BeginHumanReplyForAttempt answers a worker question only from a distinct,
+// live orchestrator in the same project. The authority check and delivery
+// reservation share one transaction with the target request.
+func (store *Store) BeginHumanReplyForAttempt(ctx context.Context, digest AttemptDigest, requestID HumanRequestID, expected Revision, deliveryID HumanRequestDeliveryID, reply string, at UnixMillis) (HumanDelivery, error) {
+	if requestID.zero() || deliveryID.zero() || expected.Int64() < 1 || !utf8TextWithin(reply, 1, MaxHumanRequestReplyBytes) {
+		return HumanDelivery{}, fmt.Errorf("%w: invalid human request reply", ErrInvalidValue)
+	}
+	tx, err := store.beginValidatedWrite(ctx)
+	if err != nil {
+		return HumanDelivery{}, err
+	}
+	defer tx.Close()
+	actor, found, err := runByDigest(ctx, tx.connection, digest)
+	if err != nil {
+		return HumanDelivery{}, tx.Rollback(err)
+	}
+	if !found || actor.Role != RoleOrchestrator || actor.Phase != RunRunning || actor.CredentialRevokedAt != nil {
+		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
+	}
+	return store.beginHumanReplyTx(ctx, tx, requestID, expected, deliveryID, reply, at, actor.ProjectID, actor.ID)
+}
+
+func (store *Store) beginHumanReplyTx(ctx context.Context, tx *writeTx, requestID HumanRequestID, expected Revision, deliveryID HumanRequestDeliveryID, reply string, at UnixMillis, actorProject ProjectID, actorRun RunID) (HumanDelivery, error) {
 	request, found, err := humanRequestByID(ctx, tx.connection, requestID)
 	if err != nil {
 		return HumanDelivery{}, tx.Rollback(err)
@@ -457,6 +483,12 @@ func (store *Store) BeginHumanReply(ctx context.Context, clientID BrowserClientI
 	}
 	if !found {
 		return HumanDelivery{}, tx.Rollback(ErrCorruptState)
+	}
+	if !actorRun.zero() && run.Role != RoleWorker {
+		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
+	}
+	if !actorProject.zero() && (run.ProjectID != actorProject || run.ID == actorRun) {
+		return HumanDelivery{}, tx.Rollback(ErrUnauthorized)
 	}
 	var deliveryCollision int
 	if err := tx.connection.QueryRowContext(ctx, `SELECT 1 FROM human_requests WHERE delivery_id = ?`, deliveryID.Bytes()).Scan(&deliveryCollision); err == nil {

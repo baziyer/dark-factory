@@ -58,6 +58,7 @@ type BootID struct{ identifier }
 type BrowserClientID struct{ identifier }
 type HumanRequestID struct{ identifier }
 type HumanRequestDeliveryID struct{ identifier }
+type TaskInterventionID struct{ identifier }
 
 func ProjectIDFromBytes(value []byte) (ProjectID, error) {
 	id, err := identifierFromBytes(value)
@@ -122,6 +123,10 @@ func HumanRequestDeliveryIDFromBytes(value []byte) (HumanRequestDeliveryID, erro
 	id, err := identifierFromBytes(value)
 	return HumanRequestDeliveryID{id}, err
 }
+func TaskInterventionIDFromBytes(value []byte) (TaskInterventionID, error) {
+	id, err := identifierFromBytes(value)
+	return TaskInterventionID{id}, err
+}
 
 func (id ProjectID) Bytes() []byte              { return id.bytes() }
 func (id AgentID) Bytes() []byte                { return id.bytes() }
@@ -137,6 +142,7 @@ func (id BootID) Bytes() []byte                 { return id.bytes() }
 func (id BrowserClientID) Bytes() []byte        { return id.bytes() }
 func (id HumanRequestID) Bytes() []byte         { return id.bytes() }
 func (id HumanRequestDeliveryID) Bytes() []byte { return id.bytes() }
+func (id TaskInterventionID) Bytes() []byte     { return id.bytes() }
 
 func (id ProjectID) MarshalText() ([]byte, error)              { return []byte(id.String()), nil }
 func (id AgentID) MarshalText() ([]byte, error)                { return []byte(id.String()), nil }
@@ -151,6 +157,7 @@ func (id BootID) MarshalText() ([]byte, error)                 { return []byte(i
 func (id BrowserClientID) MarshalText() ([]byte, error)        { return []byte(id.String()), nil }
 func (id HumanRequestID) MarshalText() ([]byte, error)         { return []byte(id.String()), nil }
 func (id HumanRequestDeliveryID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
+func (id TaskInterventionID) MarshalText() ([]byte, error)     { return []byte(id.String()), nil }
 
 type digest struct {
 	b [DigestBytes]byte

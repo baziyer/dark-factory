@@ -307,3 +307,29 @@ func pauseBrowserTaskAgent(t *testing.T, store *Store, agent Agent) Agent {
 	}
 	return updated
 }
+
+func TestBrowserQueueAcceptsBusyPausedAgentWithoutChangingCurrentWork(t *testing.T) {
+	store, _, _, agent := newAdmissionStore(t, RoleOrchestrator, 2)
+	defer store.Close()
+	ctx := context.Background()
+	client := terminalTargetClient(t, store, browserTestID(t, 180), BrowserCapabilityObserve|BrowserCapabilityHumanActions)
+	first, err := store.EnqueueTaskForBrowserAgent(ctx, client.ID, taskID(t, 181), incarnationID(t, 182), agent.ID, agent.Revision, "first", mustTime(t, 102))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent = pauseBrowserTaskAgent(t, store, agent)
+	next, err := store.EnqueueTaskForBrowserAgentMode(ctx, client.ID, taskID(t, 183), incarnationID(t, 184), agent.ID, agent.Revision, "next", true, mustTime(t, 130))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Task.Status != TaskQueued {
+		t.Fatal("queued task lost")
+	}
+	current, found, err := store.Task(ctx, first.Task.ID)
+	if err != nil || !found || current != first.Task {
+		t.Fatalf("current changed: %+v %v", current, err)
+	}
+	if _, err := store.EnqueueTaskForBrowserAgentMode(ctx, client.ID, taskID(t, 185), incarnationID(t, 186), agent.ID, agent.Revision, "now", false, mustTime(t, 131)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("now bypassed queue/paused agent: %v", err)
+	}
+}

@@ -69,12 +69,97 @@ func TestAdmitNextSelectsGlobalPriorityWithoutCallerNomination(t *testing.T) {
 	}
 }
 
+func TestAdmitNextUsesSeparateWorkerAndOverseerSlots(t *testing.T) {
+	ctx := context.Background()
+	store, _, project, worker := newAdmissionStore(t, RoleWorker, 1)
+	defer store.Close()
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 230), ProjectID: project.ID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 231), ProjectID: project.ID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 232), Title: "worker", Priority: 2}, mustTime(t, 5)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 233), ProjectID: project.ID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 234), Title: "overseer", Priority: 1}, mustTime(t, 6)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AdmitNext(ctx, admissionKeys(t, 90, nil), mustTime(t, 7))
+	if err != nil || !first.Admitted() || first.Run.Role != RoleWorker {
+		t.Fatalf("first admission = %+v, %v", first, err)
+	}
+	second, err := store.AdmitNext(ctx, admissionKeys(t, 100, nil), mustTime(t, 8))
+	if err != nil || !second.Admitted() || second.Run.Role != RoleOrchestrator {
+		t.Fatalf("overseer alongside worker = %+v, %v", second, err)
+	}
+}
+
+func TestAdmitNextSkipsCapacityBlockedRoleBeforePriority(t *testing.T) {
+	t.Run("worker full admits lower-priority overseer", func(t *testing.T) {
+		ctx := context.Background()
+		store, _, project, worker := newAdmissionStore(t, RoleWorker, 1)
+		defer store.Close()
+		secondWorker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 240), ProjectID: project.ID, Name: "worker-two", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 4))
+		if err != nil {
+			t.Fatal(err)
+		}
+		overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 241), ProjectID: project.ID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 5))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 242), ProjectID: project.ID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 243), Title: "first worker", Priority: 1}, mustTime(t, 6)); err != nil {
+			t.Fatal(err)
+		}
+		if admitted, err := store.AdmitNext(ctx, admissionKeys(t, 110, nil), mustTime(t, 7)); err != nil || !admitted.Admitted() || admitted.Run.Role != RoleWorker {
+			t.Fatalf("first worker = %+v, %v", admitted, err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 245), ProjectID: project.ID, AssignedAgentID: secondWorker.ID, IncarnationID: incarnationID(t, 246), Title: "blocked high worker", Priority: 9}, mustTime(t, 8)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 247), ProjectID: project.ID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 248), Title: "eligible overseer", Priority: 0}, mustTime(t, 9)); err != nil {
+			t.Fatal(err)
+		}
+		admitted, err := store.AdmitNext(ctx, admissionKeys(t, 120, nil), mustTime(t, 10))
+		if err != nil || !admitted.Admitted() || admitted.Run.Role != RoleOrchestrator {
+			t.Fatalf("blocked worker suppressed overseer: %+v, %v", admitted, err)
+		}
+	})
+	t.Run("overseer full admits lower-priority worker", func(t *testing.T) {
+		ctx := context.Background()
+		store, _, project, overseer := newAdmissionStore(t, RoleOrchestrator, 1)
+		defer store.Close()
+		secondOverseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 220), ProjectID: project.ID, Name: "overseer-two", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 4))
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 221), ProjectID: project.ID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 5))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 222), ProjectID: project.ID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 223), Title: "first overseer", Priority: 1}, mustTime(t, 6)); err != nil {
+			t.Fatal(err)
+		}
+		if admitted, err := store.AdmitNext(ctx, admissionKeys(t, 100, nil), mustTime(t, 7)); err != nil || !admitted.Admitted() || admitted.Run.Role != RoleOrchestrator {
+			t.Fatalf("first overseer = %+v, %v", admitted, err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 224), ProjectID: project.ID, AssignedAgentID: secondOverseer.ID, IncarnationID: incarnationID(t, 225), Title: "blocked high overseer", Priority: 9}, mustTime(t, 8)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 226), ProjectID: project.ID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 227), Title: "eligible worker", Priority: 0}, mustTime(t, 9)); err != nil {
+			t.Fatal(err)
+		}
+		admitted, err := store.AdmitNext(ctx, admissionKeys(t, 110, nil), mustTime(t, 10))
+		if err != nil || !admitted.Admitted() || admitted.Run.Role != RoleWorker {
+			t.Fatalf("blocked overseer suppressed worker: %+v, %v", admitted, err)
+		}
+	})
+}
+
 func TestAdmitNextSkipsIneligibleGlobalHead(t *testing.T) {
-	store, _, project, busyAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, busyAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
 	ctx := context.Background()
 	eligibleAgent, err := store.CreateAgent(ctx, NewAgent{
-		ID: agentID(t, 32), ProjectID: project.ID, Name: "eligible", Role: RoleOrchestrator,
+		ID: agentID(t, 32), ProjectID: project.ID, Name: "eligible", Role: RoleWorker,
 		Provider: ProviderCodex, ToolBudgetLimit: 5,
 	}, mustTime(t, 4))
 	if err != nil {

@@ -5,15 +5,19 @@ import {
   encodeHumanRequestCancelRun,
   encodeHumanRequestDetailGet,
   encodeHumanRequestReply,
+  encodeAgentControl,
   encodePairProve,
   encodeRemoteInvite,
   encodeStateGet,
   encodeStateWatch,
   encodeTaskEnqueue,
+  encodeTaskHistoryGet,
   encodeTerminalTargetGet,
   type AccountLinkResultBody,
   type AccountsBody,
   type AgentUpdateBody,
+  type AgentControlAction,
+  type AgentControlResultBody,
   type IdlePolicy,
   type AuthResultFrame,
   type ErrorFrame,
@@ -26,6 +30,7 @@ import {
   type StateChangedFrame,
   type StateSnapshotFrame,
   type TaskEnqueueResultBody,
+  type TaskHistoryBody,
   type TaskUpdateBody,
   type TerminalTargetDescriptor,
   type TopologyBody,
@@ -144,10 +149,24 @@ type HumanPending = {
   reject: (error: unknown) => void;
 };
 type TaskPending = { taskId: string; expectedAgentRevision: bigint; resolve: (value: { taskId: string; revision: bigint }) => void; reject: (error: unknown) => void };
+type AgentControlPending = { operationId: string; taskId: string; runId: string; resolve: (value: AgentControlResult) => void; reject: (error: unknown) => void };
+type TaskHistoryPending = { taskId: string; resolve: (value: TaskHistoryView) => void; reject: (error: unknown) => void };
 type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 export type AgentUpdateResult = Readonly<{ agentId: string; revision: bigint }>;
 export type TaskUpdateResult = Readonly<{ taskId: string; revision: bigint }>;
+export type AgentControlRequest = Readonly<{
+  operationId: string;
+  taskId: string;
+  expectedTaskRevision: bigint;
+  target: TerminalTarget;
+  action: AgentControlAction;
+  instruction?: string;
+  successorTaskId?: string;
+  successorIncarnationId?: string;
+}>;
+export type AgentControlResult = Readonly<{ operationId: string; taskId: string; runId: string; status: AgentControlResultBody["status"]; successorTaskId: string }>;
+export type TaskHistoryView = Readonly<{ taskId: string; entries: readonly Readonly<{ operationId: string; kind: AgentControlAction; actor: string; body: string; status: "pending" | "delivered" | "unknown" | "rejected"; createdAtMs: bigint }>[] }>;
 export type TopologyView = Readonly<{ projectId: string; digest: string; sourceRevision: string; nodes: readonly TopologyBody["nodes"][number][] }>;
 /** One agent's live run and the repository directories it has changed. */
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
@@ -231,6 +250,8 @@ export class BrowserSession {
   #terminalHandles = new Set<InternalTerminalHandle>();
   #humanPending = new Map<string, HumanPending>();
   #taskPending = new Map<string, TaskPending>();
+  #agentControlPending = new Map<string, AgentControlPending>();
+  #taskHistoryPending = new Map<string, TaskHistoryPending>();
   #consolePending = new Map<string, ConsolePending>();
   #invitePending = new Map<string, InvitePending>();
   #accountPending = new Map<string, AccountPending>();
@@ -249,11 +270,11 @@ export class BrowserSession {
   get pairingBlocked(): boolean { return this.#pairingBlocked; }
   get authAttempted(): boolean { return this.#authAttempted; }
 
-  enqueueAgentTask(request: { agentId: string; expectedAgentRevision: bigint; instruction: string }): Promise<{ taskId: string; revision: bigint }> {
+  enqueueAgentTask(request: { agentId: string; expectedAgentRevision: bigint; instruction: string; mode?: "now" | "queue" }): Promise<{ taskId: string; revision: bigint }> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
     if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
     if ((this.#capabilities & CAPABILITIES.human_actions) === 0) return Promise.reject(new SessionError("unauthorized"));
-    if (!validDynamicID(request.agentId) || request.expectedAgentRevision < 1n || request.expectedAgentRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
+    if (!validDynamicID(request.agentId) || request.expectedAgentRevision < 1n || request.expectedAgentRevision > MAX_SQLITE_INTEGER || request.mode !== undefined && request.mode !== "now" && request.mode !== "queue") return Promise.reject(new SessionError("invalid_request"));
     const bytes = new TextEncoder().encode(request.instruction).length;
     if (bytes < 1 || bytes > MAX_TASK_INSTRUCTION_BYTES || /^[ \t\r\n]*$/.test(request.instruction)) return Promise.reject(new SessionError("invalid_request"));
     if (this.#taskPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
@@ -261,8 +282,55 @@ export class BrowserSession {
     try { taskId = this.#randomID(); incarnationId = this.#randomID(); } catch (error) { return Promise.reject(error); }
     const id = this.#nextID("task-enqueue");
     let payload: string;
-    try { payload = encodeTaskEnqueue(id, { task_id: taskId, incarnation_id: incarnationId, agent_id: request.agentId, expected_agent_revision: request.expectedAgentRevision, instruction: request.instruction }); } catch (error) { return Promise.reject(error); }
+    try { payload = encodeTaskEnqueue(id, { task_id: taskId, incarnation_id: incarnationId, agent_id: request.agentId, expected_agent_revision: request.expectedAgentRevision, instruction: request.instruction, ...(request.mode === "queue" ? { mode: "queue" } : {}) }); } catch (error) { return Promise.reject(error); }
     const result = new Promise<{ taskId: string; revision: bigint }>((resolve, reject) => this.#taskPending.set(id, { taskId, expectedAgentRevision: request.expectedAgentRevision, resolve, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
+  }
+
+  /** One explicit control against the exact task/run the UI just resolved. */
+  controlAgent(request: AgentControlRequest): Promise<AgentControlResult> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated || (this.#capabilities & CAPABILITIES.human_actions) === 0) return Promise.reject(new SessionError("unauthorized"));
+    const needsTerminalInput = request.action === "message" || request.action === "interrupt";
+    if (needsTerminalInput && (this.#capabilities & CAPABILITIES.terminal_input) === 0) return Promise.reject(new SessionError("unauthorized"));
+    const instruction = request.instruction ?? "";
+    const successorTaskId = request.successorTaskId ?? "";
+    const successorIncarnationId = request.successorIncarnationId ?? "";
+    if (!validDynamicID(request.operationId) || !validDynamicID(request.taskId) || request.expectedTaskRevision < 1n || request.expectedTaskRevision > MAX_SQLITE_INTEGER || !validAgentControlRequest(request.action, instruction, successorTaskId, successorIncarnationId)) return Promise.reject(new SessionError("invalid_request"));
+    let target: TargetAuthority;
+    try { target = this.#targetAuthority(request.target); } catch (error) { return Promise.reject(error); }
+    if (this.#agentControlPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID("agent-control");
+    let payload: string;
+    try {
+      payload = encodeAgentControl(id, {
+        operation_id: request.operationId,
+        task_id: request.taskId,
+        run_id: target.descriptor.run_id,
+        expected_task_revision: request.expectedTaskRevision,
+        expected_run_revision: target.descriptor.run_revision,
+        action: request.action,
+        instruction,
+        successor_task_id: successorTaskId,
+        successor_incarnation_id: successorIncarnationId,
+      });
+    } catch (error) { return Promise.reject(error); }
+    const result = new Promise<AgentControlResult>((resolve, reject) => this.#agentControlPending.set(id, { operationId: request.operationId, taskId: request.taskId, runId: target.descriptor.run_id, resolve, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
+  }
+
+  /** Durable operator receipts are private to a task, never terminal bytes. */
+  getTaskHistory(taskId: string): Promise<TaskHistoryView> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated || (this.#capabilities & CAPABILITIES.private_human_request_detail) === 0) return Promise.reject(new SessionError("unauthorized"));
+    if (!validDynamicID(taskId)) return Promise.reject(new SessionError("invalid_request"));
+    if (this.#taskHistoryPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID("task-history");
+    let payload: string;
+    try { payload = encodeTaskHistoryGet(id, { task_id: taskId }); } catch (error) { return Promise.reject(error); }
+    const result = new Promise<TaskHistoryView>((resolve, reject) => this.#taskHistoryPending.set(id, { taskId, resolve, reject }));
     try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
     return result;
   }
@@ -453,6 +521,8 @@ export class BrowserSession {
     this.#pending.clear();
     this.#closeTargetPending(new SessionError("closed"));
     this.#closeTaskPending(new SessionError("closed"));
+    this.#closeAgentControlPending(new SessionError("closed"));
+    this.#closeTaskHistoryPending(new SessionError("closed"));
     this.#closeConsolePending(new SessionError("closed"));
     this.#closeInvitePending(new SessionError("closed"));
     this.#closeAccountPending(new SessionError("closed"));
@@ -622,6 +692,14 @@ export class BrowserSession {
       this.#taskResult(frame.body, frame.id);
       return;
     }
+    if (frame.type === "AGENT_CONTROL_RESULT") {
+      this.#agentControlResult(frame.body, frame.id);
+      return;
+    }
+    if (frame.type === "TASK_HISTORY") {
+      this.#taskHistoryResult(frame.body, frame.id);
+      return;
+    }
     if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS") {
       this.#consoleResult(frame);
       return;
@@ -722,6 +800,18 @@ export class BrowserSession {
         task.reject(new SessionError(frame.body.code, frame.body.retryable));
         return;
       }
+      const control = this.#agentControlPending.get(id);
+      if (control !== undefined) {
+        this.#agentControlPending.delete(id);
+        control.reject(new SessionError(frame.body.code, frame.body.retryable));
+        return;
+      }
+      const history = this.#taskHistoryPending.get(id);
+      if (history !== undefined) {
+        this.#taskHistoryPending.delete(id);
+        history.reject(new SessionError(frame.body.code, frame.body.retryable));
+        return;
+      }
       const console = this.#consolePending.get(id);
       if (console !== undefined) {
         this.#consolePending.delete(id);
@@ -805,12 +895,7 @@ export class BrowserSession {
   #nextID(prefix: string): string { return `${prefix}-${this.#requestNumber++}`; }
 
   #randomID(): string {
-    const bytes = new Uint8Array(16);
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try { this.#crypto().getRandomValues(bytes); } catch { throw new SessionError("crypto_unavailable"); }
-      if (bytes.some((value) => value !== 0)) return toHex(bytes);
-    }
-    throw new SessionError("crypto_unavailable");
+    return randomOperationID(this.#crypto());
   }
 
   #transcriptBase(): { daemon_id: string; boot_id: string; connection_nonce: string; host: string; origin: string } {
@@ -856,6 +941,8 @@ export class BrowserSession {
     this.#pending.clear();
     this.#closeTargetPending(normalized);
     this.#closeTaskPending(normalized);
+    this.#closeAgentControlPending(normalized);
+    this.#closeTaskHistoryPending(normalized);
     this.#closeConsolePending(normalized);
     this.#closeInvitePending(normalized);
     this.#closeAccountPending(normalized);
@@ -943,6 +1030,16 @@ export class BrowserSession {
     this.#taskPending.clear();
   }
 
+  #closeAgentControlPending(error: SessionError | ProtocolError): void {
+    for (const pending of this.#agentControlPending.values()) pending.reject(error);
+    this.#agentControlPending.clear();
+  }
+
+  #closeTaskHistoryPending(error: SessionError | ProtocolError): void {
+    for (const pending of this.#taskHistoryPending.values()) pending.reject(error);
+    this.#taskHistoryPending.clear();
+  }
+
   /** One shape for the four console request/result pairs. */
   #consoleRequest<T>(kind: ConsolePending["kind"], entityId: string, expectedRevision: bigint, prefix: string, encode: (id: string) => string): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
@@ -1021,6 +1118,23 @@ export class BrowserSession {
     if (pending === undefined || body.task_id !== pending.taskId || body.agent_revision !== pending.expectedAgentRevision || body.revision < 1n) throw new ProtocolError("malformed");
     this.#taskPending.delete(id);
     pending.resolve(Object.freeze({ taskId: body.task_id, revision: body.revision }));
+  }
+
+  #agentControlResult(body: AgentControlResultBody, id: string): void {
+    const pending = this.#agentControlPending.get(id);
+    if (pending === undefined || body.operation_id !== pending.operationId || body.task_id !== pending.taskId || body.run_id !== pending.runId) throw new ProtocolError("malformed");
+    this.#agentControlPending.delete(id);
+    pending.resolve(Object.freeze({ operationId: body.operation_id, taskId: body.task_id, runId: body.run_id, status: body.status, successorTaskId: body.successor_task_id }));
+  }
+
+  #taskHistoryResult(body: TaskHistoryBody, id: string): void {
+    const pending = this.#taskHistoryPending.get(id);
+    if (pending === undefined || body.task_id !== pending.taskId) throw new ProtocolError("malformed");
+    this.#taskHistoryPending.delete(id);
+    pending.resolve(Object.freeze({
+      taskId: body.task_id,
+      entries: Object.freeze(body.entries.map((entry) => Object.freeze({ operationId: entry.operation_id, kind: entry.kind, actor: entry.actor, body: entry.body, status: entry.status, createdAtMs: entry.created_at_ms }))),
+    }));
   }
 
   #mintTarget(descriptor: TerminalTargetDescriptor): TerminalTarget {
@@ -1178,7 +1292,24 @@ function reconnectDelay(value: number | undefined, fallback: number): number {
 }
 
 function bounded(value: string | undefined, maximum: number): boolean { return value !== undefined && new TextEncoder().encode(value).length > maximum; }
+function validAgentControlRequest(action: unknown, instruction: unknown, successorTaskId: unknown, successorIncarnationId: unknown): action is AgentControlAction {
+  if (typeof instruction !== "string" || typeof successorTaskId !== "string" || typeof successorIncarnationId !== "string") return false;
+  if (action === "message") return new TextEncoder().encode(instruction).length >= 1 && new TextEncoder().encode(instruction).length <= MAX_HUMAN_REPLY_BYTES && successorTaskId === "" && successorIncarnationId === "";
+  if (action === "interrupt" || action === "stop") return instruction === "" && successorTaskId === "" && successorIncarnationId === "";
+  return action === "replace" && new TextEncoder().encode(instruction).length >= 1 && new TextEncoder().encode(instruction).length <= MAX_TASK_INSTRUCTION_BYTES && validDynamicID(successorTaskId) && validDynamicID(successorIncarnationId);
+}
 function validDynamicID(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) && !/^0+$/.test(value); }
+
+/** Mint one canonical nonzero operation identity for an explicit user action. */
+export function randomOperationID(source: Crypto | undefined = globalThis.crypto): string {
+  if (source === undefined) throw new SessionError("crypto_unavailable");
+  const bytes = new Uint8Array(16);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try { source.getRandomValues(bytes); } catch { throw new SessionError("crypto_unavailable"); }
+    if (bytes.some((value) => value !== 0)) return toHex(bytes);
+  }
+  throw new SessionError("crypto_unavailable");
+}
 
 function notify<T extends readonly unknown[]>(callback: ((...args: T) => void) | undefined, ...args: T): void {
   try { callback?.(...args); } catch { /* consumer callbacks cannot break protocol ownership */ }

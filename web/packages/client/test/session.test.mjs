@@ -17,12 +17,14 @@ import {
   encodePairResult,
   encodeServerError,
   encodeAuthResult,
+  encodeAgentControlResult,
   encodeHumanRequestCancelRunResult,
   encodeHumanRequestDetail,
   encodeHumanRequestReplyResult,
   encodeServerControl,
   encodeRemoteInviteResult,
   encodeTaskEnqueueResult,
+  encodeTaskHistory,
   encodeStateChanged,
   encodeStateSnapshot,
   encodeTerminalAttached,
@@ -287,6 +289,48 @@ test("authenticated task enqueue mints exact IDs and correlates the durable resu
     agent_revision: 7n,
   }));
   await unicodeWhitespace;
+
+  const followUp = session.enqueueAgentTask({ agentId, expectedAgentRevision: 7n, instruction: "Run this after the current task", mode: "queue" });
+  const followUpFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(followUpFrame.body.mode, "queue");
+  socket.reply(encodeTaskEnqueueResult(followUpFrame.id, {
+    task_id: followUpFrame.body.task_id,
+    revision: 2n,
+    agent_revision: 7n,
+  }));
+  await followUp;
+  session.close();
+});
+
+test("agent controls and private task history keep exact task and run identities", async () => {
+  const { session, socket } = await openHumanSession();
+  const requestId = "79".repeat(16);
+  const taskId = "7a".repeat(16);
+  const operationId = "7b".repeat(16);
+  const detail = session.getHumanRequestDetail({ requestId, expectedRevision: 1n });
+  const detailFrame = decodeClientControl(socket.sent.at(-1));
+  socket.reply(encodeHumanRequestDetail(detailFrame.id, {
+    request_id: requestId, revision: 1n, question: "Continue?", can_reply: true, reply_max_bytes: 8192,
+    terminal_target: { run_id: runID, session_id: "99".repeat(16), run_revision: 3n, session_revision: 1n },
+    cancel_run: { expected_request_revision: 1n, expected_run_revision: 3n },
+  }));
+  const target = (await detail).terminalTarget;
+  assert.notEqual(target, null);
+
+  const controlled = session.controlAgent({ operationId, taskId, expectedTaskRevision: 2n, target, action: "interrupt" });
+  const control = decodeClientControl(socket.sent.at(-1));
+  assert.deepEqual(control, {
+    type: "AGENT_CONTROL", id: control.id,
+    body: { operation_id: operationId, task_id: taskId, run_id: runID, expected_task_revision: 2n, expected_run_revision: 3n, action: "interrupt", instruction: "", successor_task_id: "", successor_incarnation_id: "" },
+  });
+  socket.reply(encodeAgentControlResult(control.id, { operation_id: operationId, task_id: taskId, run_id: runID, status: "delivered", successor_task_id: "" }));
+  assert.deepEqual(await controlled, { operationId, taskId, runId: runID, status: "delivered", successorTaskId: "" });
+
+  const history = session.getTaskHistory(taskId);
+  const historyGet = decodeClientControl(socket.sent.at(-1));
+  assert.deepEqual(historyGet.body, { task_id: taskId });
+  socket.reply(encodeTaskHistory(historyGet.id, { task_id: taskId, entries: [{ operation_id: operationId, kind: "interrupt", actor: "operator", body: "", status: "delivered", created_at_ms: 100n }] }));
+  assert.deepEqual(await history, { taskId, entries: [{ operationId, kind: "interrupt", actor: "operator", body: "", status: "delivered", createdAtMs: 100n }] });
   session.close();
 });
 

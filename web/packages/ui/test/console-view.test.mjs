@@ -3,10 +3,12 @@ import test from "node:test";
 import {
   STAGE_SEQUENCE,
   agentActivity,
+  agentStatus,
   agentCurrentTask,
   agentGlyph,
   factoryCounters,
   orderTasksForHome,
+  primaryAgent,
   stageMeterFill,
   stageOfTask,
 } from "../dist/src/console-view.js";
@@ -53,6 +55,27 @@ test("agent activity precedence: an open question outranks work, pause outranks 
   const blocked = { ...noRequests, tasks: new Map([[blockedTask.id, blockedTask]]) };
   assert.equal(agentCurrentTask(state.agents.get(agentID), blocked), undefined);
   assert.equal(agentActivity(state.agents.get(agentID), blocked), "waiting");
+});
+
+test("operator statuses do not expose idle-policy implementation words", () => {
+  const state = fixtureState;
+  assert.equal(agentStatus(state.agents.get(agentID), state), "needs-you");
+  assert.equal(agentStatus(state.agents.get(pausedAgentID), state), "paused");
+  assert.equal(agentStatus(state.agents.get(idleAgentID), state), "ready");
+  const noRequests = { ...state, humanRequests: new Map() };
+  assert.equal(agentStatus(state.agents.get(agentID), noRequests), "working");
+  const queued = { ...noRequests, tasks: new Map([...noRequests.tasks].map(([id, value]) => [id, value.assigned_agent_id === agentID ? { ...value, status: "queued" } : value])) };
+  assert.equal(agentStatus(queued.agents.get(agentID), queued), "ready");
+  const paused = state.agents.get(pausedAgentID);
+  const pausedRunning = { ...task("running", "78".repeat(16)), assigned_agent_id: paused.id };
+  assert.equal(agentStatus(paused, { ...state, tasks: new Map([[pausedRunning.id, pausedRunning]]) }), "working");
+});
+
+test("the first console selection prefers the overseer deterministically", () => {
+  const state = fixtureState;
+  assert.equal(primaryAgent(state).role, "orchestrator");
+  const workers = [...state.agents.values()].filter((agent) => agent.role === "worker");
+  assert.equal(primaryAgent({ ...state, agents: new Map(workers.map((agent) => [agent.id, agent])) }).id, workers.slice().sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))[0].id);
 });
 
 test("counters count only store-backed facts", () => {

@@ -200,6 +200,42 @@ func TestParseExactAttemptCommands(t *testing.T) {
 	}
 }
 
+func TestParseOverseerTaskUpdateKeepsPriority(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	for _, test := range []struct {
+		name     string
+		args     []string
+		priority int64
+		agent    string
+	}{
+		{name: "priority only", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "-5"}, priority: -5},
+		{name: "priority and agent", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "5", "--agent", id}, priority: 5, agent: id},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command, help, ok := parse(test.args)
+			if !ok || help || command.kind != commandOverseerTaskUpdate || !command.prioritySet || command.priority != test.priority || command.agent != test.agent {
+				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
+			}
+		})
+	}
+}
+
+func TestParseOverseerStatusPaging(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	command, help, ok := parse([]string{"overseer", "status", "--task", id, "--offset", "4", "--text-offset", "4096", "--head", "7"})
+	if !ok || help || command.kind != commandOverseerStatus || command.id != id || command.offset != 4 || command.textOffset != 4096 || command.head != 7 {
+		t.Fatalf("paged status = %+v, help=%t, ok=%t", command, help, ok)
+	}
+	for _, args := range [][]string{
+		{"overseer", "status", "--offset", "4"},
+		{"overseer", "status", "--text-offset", "1", "--head", "7"},
+	} {
+		if _, _, ok := parse(args); ok {
+			t.Fatalf("invalid paged status accepted: %v", args)
+		}
+	}
+}
+
 func TestParseExplicitHomeCommands(t *testing.T) {
 	for _, test := range []struct {
 		args []string

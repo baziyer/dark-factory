@@ -21,6 +21,12 @@ type BrowserTaskEnqueue struct {
 // title or priority: those are derived here from the durable agent and fixed
 // operator semantics.
 func (store *Store) EnqueueTaskForBrowserAgent(ctx context.Context, clientID BrowserClientID, taskID TaskID, incarnationID IncarnationID, agentID AgentID, expectedAgentRevision Revision, instruction string, at UnixMillis) (BrowserTaskEnqueue, error) {
+	return store.EnqueueTaskForBrowserAgentMode(ctx, clientID, taskID, incarnationID, agentID, expectedAgentRevision, instruction, false, at)
+}
+
+// EnqueueTaskForBrowserAgentMode permits queued work while busy or paused;
+// direct instructions still require an empty, unpaused agent.
+func (store *Store) EnqueueTaskForBrowserAgentMode(ctx context.Context, clientID BrowserClientID, taskID TaskID, incarnationID IncarnationID, agentID AgentID, expectedAgentRevision Revision, instruction string, queue bool, at UnixMillis) (BrowserTaskEnqueue, error) {
 	if clientID.zero() || taskID.zero() || incarnationID.zero() || agentID.zero() || expectedAgentRevision.Int64() < 1 || strings.Trim(instruction, " \t\r\n") == "" || !utf8.ValidString(instruction) || byteLen(instruction) > 32768 {
 		return BrowserTaskEnqueue{}, fmt.Errorf("%w: invalid browser task enqueue", ErrInvalidValue)
 	}
@@ -43,7 +49,7 @@ func (store *Store) EnqueueTaskForBrowserAgent(ctx context.Context, clientID Bro
 	if !found {
 		return BrowserTaskEnqueue{}, tx.Rollback(ErrNotFound)
 	}
-	if agent.Revision != expectedAgentRevision || agent.Paused {
+	if agent.Revision != expectedAgentRevision || agent.Paused && !queue {
 		return BrowserTaskEnqueue{}, tx.Rollback(ErrRevisionConflict)
 	}
 	spec := NewTask{ID: taskID, ProjectID: agent.ProjectID, AssignedAgentID: agent.ID, IncarnationID: incarnationID, Title: "Direct instruction", Body: instruction, Priority: 0}
@@ -64,7 +70,7 @@ func (store *Store) EnqueueTaskForBrowserAgent(ctx context.Context, clientID Bro
 	if err := tx.connection.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tasks WHERE assigned_agent_id = ? AND status IN ('queued', 'running') LIMIT 1)`, agent.ID.Bytes()).Scan(&active); err != nil {
 		return BrowserTaskEnqueue{}, tx.Rollback(err)
 	}
-	if active != 0 {
+	if active != 0 && !queue {
 		return BrowserTaskEnqueue{}, tx.Rollback(ErrRevisionConflict)
 	}
 	result, err := insertTaskOnConnection(ctx, tx.connection, spec, at)

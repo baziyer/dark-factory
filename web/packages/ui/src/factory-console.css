@@ -371,6 +371,17 @@
   resize: none;
 }
 
+.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction--queue {
+  flex: 0 0 auto;
+  margin-top: 0.75rem;
+}
+
+.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction--queue textarea {
+  flex: 0 0 auto;
+  min-height: 4.5rem;
+  resize: vertical;
+}
+
 .dfFactoryConsole__instruction textarea {
   width: 100%;
   resize: vertical;
@@ -399,6 +410,31 @@
   color: var(--df-console-muted);
   font-size: 0.75rem;
 }
+
+.dfFactoryConsole__steering,
+.dfFactoryConsole__history {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.dfFactoryConsole__steering textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 0.6rem;
+  color: var(--df-console-text);
+  background: #000;
+  border: 1px solid var(--df-console-rule);
+  font: inherit;
+  line-height: 1.5;
+}
+
+.dfFactoryConsole__history { border-top: 1px solid var(--df-console-rule); padding-top: 0.6rem; }
+.dfFactoryConsole__historyHeading { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.dfFactoryConsole__historyHeading h3 { margin: 0; font-size: 0.75rem; }
+.dfFactoryConsole__history ol { display: grid; gap: 0.45rem; margin: 0; padding-left: 1.2rem; }
+.dfFactoryConsole__history li { display: grid; gap: 0.15rem; font-size: 0.7rem; overflow-wrap: anywhere; }
+.dfFactoryConsole__history li span { color: var(--df-console-muted); }
 
 .dfFactoryConsole__pairPhone {
   display: grid;
@@ -488,7 +524,7 @@
 .dfConsoleStrip__agent--needs-you { border-color: var(--df-console-warning); }
 .dfConsoleStrip__agent[aria-pressed="true"] { border-color: var(--df-console-accent); }
 .dfConsoleStrip__glyph { color: var(--df-console-accent); }
-.dfConsoleStrip__agent--idle .dfConsoleStrip__glyph { color: var(--df-console-muted); }
+.dfConsoleStrip__agent--paused .dfConsoleStrip__glyph { color: var(--df-console-muted); }
 .dfConsoleStrip__agentPhase { color: var(--df-console-muted); font-size: 0.75rem; }
 .dfConsoleStrip__agent--needs-you .dfConsoleStrip__agentPhase { color: var(--df-console-warning); }
 .dfConsoleStrip__empty { color: var(--df-console-muted); font-size: 0.8rem; list-style: none; }

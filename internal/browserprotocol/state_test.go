@@ -316,7 +316,7 @@ func TestStateExactFieldAndEnumBounds(t *testing.T) {
 	badFactories := []FactoryItem{
 		{Capacity: 0, Revision: 1},
 		{Capacity: MaxFactoryCapacity + 1, Revision: 1},
-		{Capacity: 1, ActiveRuns: 2, Revision: 1},
+		{Capacity: 1, ActiveRuns: 3, Revision: 1},
 		{Capacity: 1, Revision: 0},
 	}
 	for _, item := range badFactories {

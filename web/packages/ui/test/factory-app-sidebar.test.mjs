@@ -16,6 +16,7 @@ function terminalView(overrides = {}) {
     paused: false,
     instructionPending: false,
     queued: false,
+    hasOutputSurface: false,
     resets: 0,
     finishing: false,
     surfaceVersion: 0,
@@ -98,6 +99,28 @@ test("paused agents remain identifiable without a false input", () => {
     onSubmit: async () => true,
   }));
   assert.match(markup, />PAUSED<\/p>/);
+  assert.equal(markup.includes("textarea"), false);
+});
+
+test("paused or capacity-queued idle agents can add follow-up work", () => {
+  for (const overrides of [{ paused: true }, { queued: true }]) {
+    const markup = renderToStaticMarkup(createElement(TerminalContent, {
+      terminal: terminalView({ phase: "idle", writable: false, ...overrides }),
+      controller: {},
+    }));
+    const id = `df-instruction-${"21".repeat(16)}-queue`;
+    assert.match(markup, new RegExp(`for="${id}"`));
+    assert.match(markup, new RegExp(`id="${id}"`));
+    assert.match(markup, />ADD TO QUEUE</);
+  }
+});
+
+test("queued instructions state their capacity wait", () => {
+  const markup = renderToStaticMarkup(createElement(AgentInstruction, {
+    terminal: terminalView({ phase: "idle", writable: false, queued: true }),
+    onSubmit: async () => true,
+  }));
+  assert.match(markup, /QUEUED · WAITING FOR CAPACITY/);
   assert.equal(markup.includes("textarea"), false);
 });
 

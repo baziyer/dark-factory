@@ -25,7 +25,7 @@ function stateAt(head, overrides = {}) {
   return { ...fixtureState, head: BigInt(head), ...overrides };
 }
 
-function terminalHarness({ closeStatus = false, fail, failError = new SessionError("connection"), detachImpl, acquireImpl, enqueueImpl } = {}) {
+function terminalHarness({ closeStatus = false, fail, failError = new SessionError("connection"), detachImpl, acquireImpl, enqueueImpl, controlImpl, historyImpl } = {}) {
   let attachReset = false;
   const snapshots = [];
   const calls = [];
@@ -50,6 +50,16 @@ function terminalHarness({ closeStatus = false, fail, failError = new SessionErr
       calls.push({ kind: "enqueue", value });
       if (enqueueImpl !== undefined) return enqueueImpl(value);
       return { taskId: "51".repeat(16), revision: 1n };
+    },
+    controlAgent: async (value) => {
+      calls.push({ kind: "control", value });
+      if (controlImpl !== undefined) return controlImpl(value);
+      return { operationId: value.operationId, taskId: value.taskId, runId: "61".repeat(16), status: "delivered", successorTaskId: "" };
+    },
+    getTaskHistory: async (taskId) => {
+      calls.push({ kind: "history", taskId });
+      if (historyImpl !== undefined) return historyImpl(taskId);
+      return { taskId, entries: [] };
     },
     resolveAgentTerminal: (value) => {
       calls.push({ kind: "resolve", value });
@@ -148,6 +158,45 @@ test("public terminal composition buffers direct input until writable authority"
   assert.deepEqual(context.calls.filter((call) => call.kind === "input").map((call) => [...call.bytes]), [[98, 101, 102, 111, 114, 101], [0xc3, 0xa9], [0, 255]]);
 });
 
+test("explicit steering resolves the current terminal again and preserves a durable receipt", async () => {
+  const context = terminalHarness({ historyImpl: async (taskId) => ({ taskId, entries: [{ operationId: "62".repeat(16), kind: "message", actor: "operator", body: "Continue", status: "delivered", createdAtMs: 1n }] }) });
+  context.controller.start();
+  context.ready();
+  await openTerminal(context);
+  const steered = context.controller.controlAgent("message", "Continue");
+  await flush();
+  context.targetGates.at(-1).resolve(target);
+  assert.equal(await steered, true);
+  const control = context.calls.findLast((call) => call.kind === "control").value;
+  assert.equal(control.taskId, [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running").id);
+  assert.equal(control.expectedTaskRevision, [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running").revision);
+  assert.equal(control.action, "message");
+  assert.equal(control.instruction, "Continue");
+  assert.match(control.operationId, /^[0-9a-f]{32}$/);
+  await flush();
+  assert.equal(context.latest().terminal.controlStatus, "delivered");
+  assert.equal(context.latest().terminal.history.entries[0].body, "Continue");
+});
+
+test("a live terminal follows a same-task receipt revision without rebinding before the next control", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  await openTerminal(context);
+  const current = [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running");
+  const tasks = new Map(fixtureState.tasks).set(current.id, { ...current, revision: current.revision + 1n });
+  context.clientOptions().onState(stateAt(43, { tasks }));
+  await flush();
+
+  const steered = context.controller.controlAgent("interrupt");
+  await flush();
+  assert.deepEqual(context.calls.findLast((call) => call.kind === "resolve").value, { agentId: agent.id, expectedAgentRevision: agent.revision, expectedHead: 43n });
+  context.targetGates.at(-1).resolve(target);
+  assert.equal(await steered, true);
+  assert.equal(context.calls.findLast((call) => call.kind === "control").value.expectedTaskRevision, current.revision + 1n);
+  assert.equal(context.latest().terminal.phase, "ready");
+});
+
 test("completed work leaves its configured agent idle and able to enqueue a durable instruction", async () => {
   const context = terminalHarness();
   context.controller.start();
@@ -174,7 +223,21 @@ test("completed work leaves its configured agent idle and able to enqueue a dura
   assert.equal(context.latest().terminal.queued, true);
 });
 
-test("a selected idle agent follows its canonical pause revision without exposing input", async () => {
+test("a running or paused agent accepts an explicit follow-up without opening a second terminal", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  context.controller.selectAgent(agent);
+  assert.equal(context.latest().terminal.taskTitle, [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running")?.title);
+  assert.equal(await context.controller.enqueueAgentInstruction("Do this after the current task", "queue"), true);
+  assert.deepEqual(context.calls.at(-1), {
+    kind: "enqueue",
+    value: { agentId: agent.id, expectedAgentRevision: agent.revision, instruction: "Do this after the current task", mode: "queue" },
+  });
+  assert.equal(context.calls.some((call) => call.kind === "resolve"), false);
+});
+
+test("a paused agent refuses immediate work but accepts a queued follow-up", async () => {
   const context = terminalHarness();
   context.controller.start();
   const tasks = new Map(fixtureState.tasks);
@@ -195,6 +258,11 @@ test("a selected idle agent follows its canonical pause revision without exposin
   assert.equal(context.targetGates.length, 0);
   assert.equal(await context.controller.enqueueAgentInstruction("Must not enqueue while paused"), false);
   assert.equal(context.calls.some((call) => call.kind === "enqueue"), false);
+  assert.equal(await context.controller.enqueueAgentInstruction("Queue this for later", "queue"), true);
+  assert.deepEqual(context.calls.at(-1), {
+    kind: "enqueue",
+    value: { agentId: paused.id, expectedAgentRevision: paused.revision, instruction: "Queue this for later", mode: "queue" },
+  });
 });
 
 test("a newly running instruction turns the same idle sidebar into the real terminal", async () => {
@@ -919,13 +987,13 @@ test("terminal exit keeps the selected task pinned until durable finalization", 
   assert.equal(context.latest().terminal.queued, false);
 });
 
-test("the retired terminal surface is fenced while the selected task finalizes", async () => {
+test("a completed task retains its Xterm surface and reuses it for the next task", async () => {
   const context = terminalHarness();
   context.controller.start();
   context.ready();
   const terminal = await openTerminal(context);
 
-  const retiredSurfaceVersion = context.latest().terminal.surfaceVersion;
+  const surfaceVersion = context.latest().terminal.surfaceVersion;
   terminal.options.onExit();
   assert.equal(context.latest().selectedAgent.id, agent.id);
   assert.equal(context.latest().terminal.taskTitle, "Review the state projection");
@@ -938,13 +1006,14 @@ test("the retired terminal surface is fenced while the selected task finalizes",
   context.clientOptions().onState(stateAt(43, { tasks }));
   assert.equal(context.latest().terminal.taskTitle, undefined);
   assert.equal(context.latest().terminal.finishing, false);
+  assert.equal(context.latest().terminal.hasOutputSurface, true);
+  assert.equal(context.latest().terminal.surfaceVersion, surfaceVersion, "completion keeps the mounted scrollback");
 
-  // The old Xterm cleanup callback carries its retired surface version.
-  context.controller.endTerminalSurface(terminal.token, retiredSurfaceVersion);
-  assert.equal(context.latest().selectedAgent.id, agent.id);
-  assert.equal(context.latest().terminal.taskTitle, undefined);
-  assert.equal(context.latest().error, undefined);
-  assert.equal(await context.controller.enqueueAgentInstruction("ready for the next task"), true);
+  const successor = { ...running, id: "63".repeat(16), title: "next task", revision: 1n };
+  context.clientOptions().onState(stateAt(44, { tasks: new Map([[successor.id, successor]]) }));
+  await flush();
+  assert.equal(context.targetGates.length, 2, "the retained display accepts the next terminal without a remount");
+  assert.equal(context.latest().terminal.surfaceVersion, surfaceVersion);
 });
 
 test("clean exit after the selected task terminals clears its queued identity", async () => {
@@ -999,9 +1068,8 @@ test("clean exit immediately adopts different running work at the current head",
   terminal.options.onExit();
   assert.equal(context.latest().selectedAgent.id, agent.id);
   assert.equal(context.latest().terminal.taskTitle, "Replacement work");
-  assert.equal(context.latest().terminal.phase, "idle");
-  await remountSurface(context);
-  assert.equal(context.targetGates.length, 2, "the current replacement is not hidden by a same-head retry fence");
+  assert.equal(context.latest().terminal.phase, "resolving");
+  assert.equal(context.targetGates.length, 2, "the current replacement reuses the retained display");
   assert.deepEqual(context.calls.at(-1).value, {
     agentId: agent.id,
     expectedAgentRevision: agent.revision,
@@ -1061,12 +1129,13 @@ test("a current Xterm teardown rebinds the selected terminal", async () => {
   context.ready();
   const terminal = await openTerminal(context);
   const version = context.latest().terminal.surfaceVersion;
+  const callsBeforeTeardown = context.calls.length;
 
   context.controller.endTerminalSurface(terminal.token, version);
   await flush();
 
   assert.equal(context.sessionCloses(), 0);
-  assert.equal(context.calls.at(-1).kind, "detach");
+  assert.equal(context.calls.slice(callsBeforeTeardown).some((call) => call.kind === "detach"), true);
   assert.equal(context.latest().selectedAgent.id, agent.id);
   assert.equal(context.latest().terminal.phase, "idle");
   assert.equal(context.latest().terminal.surfaceVersion, version + 1);

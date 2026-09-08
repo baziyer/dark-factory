@@ -95,6 +95,10 @@ export const CONTROL_MANIFEST = [
   { type: "REMOTE_INVITE", direction: "client", id: "required", fixture: "remote_invite.json" },
   { type: "REMOTE_INVITE_RESULT", direction: "server", id: "required", fixture: "remote_invite_result.json" },
   { type: "ERROR", direction: "both", id: "optional", fixture: "error.json" },
+  { type: "AGENT_CONTROL", direction: "client", id: "required", fixture: "agent_control.json" },
+  { type: "AGENT_CONTROL_RESULT", direction: "server", id: "required", fixture: "agent_control_result.json" },
+  { type: "TASK_HISTORY_GET", direction: "client", id: "required", fixture: "task_history_get.json" },
+  { type: "TASK_HISTORY", direction: "server", id: "required", fixture: "task_history.json" },
 ] as const;
 export const CONTROL_TYPES = CONTROL_MANIFEST.map((entry) => entry.type);
 export type ControlType = (typeof CONTROL_TYPES)[number];

@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dark-factory-build/dark-factory/internal/install"
+	"github.com/dark-factory-build/dark-factory/internal/kernel"
 )
 
 // A frame's prelude is its auth domain and nothing else. There is no protocol
@@ -255,6 +256,91 @@ func (client *AttemptClient) SendBack(ctx context.Context, input SendBackInput) 
 	return client.client.mutate(ctx, "send_back", input)
 }
 
+func (client *AttemptClient) OverseerSnapshot(ctx context.Context) (OverseerSnapshot, error) {
+	return client.overseerSnapshot(ctx, OverseerSnapshotInput{})
+}
+
+func (client *AttemptClient) OverseerTaskSnapshot(ctx context.Context, taskID string) (OverseerSnapshot, error) {
+	if !validID(taskID) {
+		return OverseerSnapshot{}, ErrInvalidInput
+	}
+	return client.overseerSnapshot(ctx, OverseerSnapshotInput{TaskID: taskID})
+}
+
+func (client *AttemptClient) OverseerSnapshotPage(ctx context.Context, input OverseerSnapshotInput) (OverseerSnapshot, error) {
+	if !validOverseerSnapshotInput(input) {
+		return OverseerSnapshot{}, ErrInvalidInput
+	}
+	return client.overseerSnapshot(ctx, input)
+}
+
+func (client *AttemptClient) overseerSnapshot(ctx context.Context, input OverseerSnapshotInput) (OverseerSnapshot, error) {
+	var result OverseerSnapshot
+	if err := client.client.call(ctx, "overseer_snapshot", input, &result); err != nil {
+		return OverseerSnapshot{}, err
+	}
+	if !validOverseerSnapshot(result) {
+		return OverseerSnapshot{}, ErrProtocol
+	}
+	return result, nil
+}
+
+func (client *AttemptClient) OverseerEnqueueTask(ctx context.Context, input OverseerTaskCreateInput) (MutationResult, error) {
+	if !validOverseerTaskCreateInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_enqueue_task", input)
+}
+
+func (client *AttemptClient) OverseerUpdateTask(ctx context.Context, input OverseerTaskUpdateInput) (MutationResult, error) {
+	if !validOverseerTaskUpdateInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_update_task", input)
+}
+
+func (client *AttemptClient) OverseerUpdateAgent(ctx context.Context, input OverseerAgentUpdateInput) (MutationResult, error) {
+	if !validID(input.AgentID) || input.ExpectedRevision == 0 {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_update_agent", input)
+}
+
+func (client *AttemptClient) OverseerStopRun(ctx context.Context, input OverseerRunStopInput) (MutationResult, error) {
+	if !validOverseerRunStopInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_stop_run", input)
+}
+
+func (client *AttemptClient) OverseerReplaceRun(ctx context.Context, input OverseerRunReplaceInput) (MutationResult, error) {
+	if !validOverseerRunReplaceInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_replace_run", input)
+}
+
+func (client *AttemptClient) OverseerMessageWorker(ctx context.Context, input OverseerWorkerMessageInput) (MutationResult, error) {
+	if !validOverseerWorkerMessageInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_message_worker", input)
+}
+
+func (client *AttemptClient) OverseerInterruptWorker(ctx context.Context, input OverseerWorkerInterruptInput) (MutationResult, error) {
+	if !validOverseerWorkerInterruptInput(input) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_interrupt_worker", input)
+}
+
+func (client *AttemptClient) OverseerReplyHuman(ctx context.Context, input OverseerHumanReplyInput) (MutationResult, error) {
+	if !validID(input.OperationID) || !validID(input.RequestID) || input.ExpectedRevision == 0 || !validText(input.Reply, 1, 8192) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "overseer_reply_human", input)
+}
+
 func (client client) attemptDetail(ctx context.Context, method, detail string) (MutationResult, error) {
 	return client.mutate(ctx, method, struct {
 		Detail string `json:"detail"`
@@ -266,7 +352,7 @@ func (client client) mutate(ctx context.Context, method string, params any) (Mut
 	if err := client.call(ctx, method, params, &result); err != nil {
 		return MutationResult{}, err
 	}
-	if result.Revision == 0 {
+	if !validMutation(result) {
 		return MutationResult{}, ErrProtocol
 	}
 	return result, nil
@@ -680,7 +766,7 @@ func validText(value string, minimum, maximum int) bool {
 }
 
 func validSnapshot(snapshot DashboardSnapshot) bool {
-	if snapshot.Factory.Capacity < 1 || snapshot.Factory.Capacity > 1024 || snapshot.Factory.ActiveRuns > snapshot.Factory.Capacity || snapshot.Factory.Revision == 0 || snapshot.Projects == nil || snapshot.Agents == nil || snapshot.Tasks == nil || len(snapshot.Projects) > maxSnapshotEntries || len(snapshot.Agents) > maxSnapshotEntries || len(snapshot.Tasks) > maxSnapshotEntries {
+	if snapshot.Factory.Capacity < 1 || snapshot.Factory.Capacity > 1024 || snapshot.Factory.ActiveRuns > 1025 || snapshot.Factory.ActiveRuns > snapshot.Factory.Capacity+1 || snapshot.Factory.Revision == 0 || snapshot.Projects == nil || snapshot.Agents == nil || snapshot.Tasks == nil || len(snapshot.Projects) > maxSnapshotEntries || len(snapshot.Agents) > maxSnapshotEntries || len(snapshot.Tasks) > maxSnapshotEntries {
 		return false
 	}
 	for _, project := range snapshot.Projects {
@@ -699,6 +785,79 @@ func validSnapshot(snapshot DashboardSnapshot) bool {
 		}
 	}
 	return true
+}
+
+func validOverseerTaskCreateInput(input OverseerTaskCreateInput) bool {
+	return validID(input.ID) && validID(input.AssignedAgentID) && validID(input.IncarnationID) && input.ID != input.IncarnationID &&
+		validText(input.Title, 1, 1024) && validText(input.Body, 0, 131072) && input.Priority >= -1_000_000 && input.Priority <= 1_000_000
+}
+
+func validOverseerTaskUpdateInput(input OverseerTaskUpdateInput) bool {
+	if !validID(input.TaskID) || input.ExpectedRevision == 0 || input.Priority == nil && input.AssignedAgentID == nil && !input.Cancel {
+		return false
+	}
+	if input.Priority != nil && (*input.Priority < -1_000_000 || *input.Priority > 1_000_000) {
+		return false
+	}
+	return input.AssignedAgentID == nil || validID(*input.AssignedAgentID)
+}
+
+func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
+	if !validID(snapshot.ProjectID) || snapshot.Head == 0 || snapshot.Agents == nil || snapshot.Tasks == nil || snapshot.Runs == nil || snapshot.Questions == nil || snapshot.History == nil || len(snapshot.Agents) > kernel.OverseerSnapshotPageSize || len(snapshot.Tasks) > kernel.OverseerSnapshotPageSize || len(snapshot.Runs) > kernel.OverseerSnapshotPageSize || len(snapshot.Questions) > kernel.OverseerSnapshotPageSize || len(snapshot.History) > kernel.OverseerSnapshotPageSize {
+		return false
+	}
+	if snapshot.NextOffset != nil && *snapshot.NextOffset == 0 || snapshot.NextTextOffset != nil && *snapshot.NextTextOffset == 0 {
+		return false
+	}
+	for _, agent := range snapshot.Agents {
+		if !validID(agent.ID) || agent.ProjectID != snapshot.ProjectID || !validText(agent.Name, 1, 128) || (agent.Role != "worker" && agent.Role != "orchestrator") || !validProvider(agent.Provider) || agent.Revision == 0 {
+			return false
+		}
+	}
+	for _, task := range snapshot.Tasks {
+		if !validID(task.ID) || task.ProjectID != snapshot.ProjectID || !validID(task.AssignedAgentID) || !validText(task.Title, 1, 1024) || !validText(task.Objective, 0, 131072) || !validTaskStatus(task.Status) || task.Priority < -1_000_000 || task.Priority > 1_000_000 || !validText(task.BlockedReason, 0, 8192) || !validText(task.Result, 0, 131072) || task.Revision == 0 {
+			return false
+		}
+	}
+	for _, run := range snapshot.Runs {
+		if !validID(run.ID) || !validID(run.AgentID) || !validID(run.TaskID) || (run.Phase != "admitted" && run.Phase != "running" && run.Phase != "finalizing") || run.Revision == 0 {
+			return false
+		}
+	}
+	for _, question := range snapshot.Questions {
+		if !validID(question.ID) || !validID(question.AgentID) || !validID(question.TaskID) || (question.Status != "open" && question.Status != "delivering" && question.Status != "delivery_unknown") || question.Revision == 0 || !validText(question.Question, 1, 8192) {
+			return false
+		}
+	}
+	for _, item := range snapshot.History {
+		if !validID(item.OperationID) || !validID(item.TaskID) || !validID(item.RunID) || item.SuccessorTaskID != "" && !validID(item.SuccessorTaskID) || (item.Kind != "message" && item.Kind != "interrupt" && item.Kind != "stop" && item.Kind != "replace") || (item.Actor != "operator" && item.Actor != "orchestrator") || !validText(item.Payload, 0, kernel.MaxTaskInterventionPayloadBytes) || (item.State != "pending" && item.State != "delivered" && item.State != "unknown" && item.State != "rejected") || !validText(item.Detail, 0, 4096) {
+			return false
+		}
+	}
+	return true
+}
+
+func validOverseerSnapshotInput(input OverseerSnapshotInput) bool {
+	if input.TaskID != "" && !validID(input.TaskID) || input.ExpectedHead > uint64(^uint64(0)>>1) || input.Offset > uint64(^uint64(0)>>1)-kernel.OverseerSnapshotPageSize || input.TextOffset > 131072 || input.TextOffset != 0 && input.TaskID == "" {
+		return false
+	}
+	return input.ExpectedHead != 0 || input.Offset == 0 && input.TextOffset == 0
+}
+
+func validOverseerWorkerMessageInput(input OverseerWorkerMessageInput) bool {
+	return validID(input.OperationID) && validID(input.TaskID) && input.ExpectedTaskRevision != 0 && validID(input.RunID) && input.ExpectedRunRevision != 0 && validText(input.Message, 1, 8192)
+}
+
+func validOverseerWorkerInterruptInput(input OverseerWorkerInterruptInput) bool {
+	return validID(input.OperationID) && validID(input.TaskID) && input.ExpectedTaskRevision != 0 && validID(input.RunID) && input.ExpectedRunRevision != 0
+}
+
+func validOverseerRunStopInput(input OverseerRunStopInput) bool {
+	return validID(input.OperationID) && validID(input.TaskID) && input.ExpectedTaskRevision != 0 && validID(input.RunID) && input.ExpectedRunRevision != 0
+}
+
+func validOverseerRunReplaceInput(input OverseerRunReplaceInput) bool {
+	return validOverseerRunStopInput(input.OverseerRunStopInput) && validID(input.SuccessorTaskID) && validID(input.SuccessorIncarnationID) && input.SuccessorTaskID != input.SuccessorIncarnationID && validText(input.Instruction, 1, 131072)
 }
 
 func validProvider(value string) bool {
