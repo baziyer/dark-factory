@@ -226,7 +226,10 @@ class TerminalController {
           void task.then(() => this.#outputFinished(task), () => this.#outputFinished(task));
           return task;
         },
-        onOutputComplete: () => this.#pumpEffects(),
+        onOutputComplete: () => {
+          this.#outputPending = false;
+          this.#pumpEffects();
+        },
         onExit: () => this.#handleEnded(new SessionError("closed")),
         onReset: (event) => {
           if (!this.#detachRequested) this.#reset = event;
@@ -371,9 +374,7 @@ class TerminalController {
   }
 
   #outputFinished(task: Promise<void>): void {
-    if (this.#outputTask !== task) return;
-    this.#outputTask = undefined;
-    this.#outputPending = false;
+    if (this.#outputTask === task) this.#outputTask = undefined;
   }
   #handleEnded(error: SessionError | ProtocolError, retryDiscovery = false): void {
     if (this.#handleClosed) return;
