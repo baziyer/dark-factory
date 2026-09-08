@@ -5,8 +5,8 @@ takes what a worker finished and gets it merged, through the Maintainer App,
 and asks a human only when it cannot decide alone. It never writes code.
 
 The overseer's standing instruction (CONFIG → RULES → WHEN IDLE → run a
-standing instruction) is short, because a Claude launch delivers the task
-through the terminal and that prepared prompt is capped at 8 KiB:
+standing instruction) is short, because a native-provider launch delivers the
+task through the terminal and that prepared prompt is capped at 8 KiB:
 
 > You are the overseer of the project named PROJECT. Run
 > `git clone --filter=blob:none https://github.com/OWNER/REPO repo`, read
@@ -253,6 +253,10 @@ Write that body to a file; the review needs it.
 DARK_FACTORY_REVIEW_OPERATION_ID=$(opid "$change_id" "review-$(printf '%s' "$HEAD_SHA" | cut -c1-8)") \
     repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA "$base_commit" body.md "first review"
 ```
+
+`cold-review.sh` uses a fresh read-only Codex review with `gpt-5.6-sol` by
+default. Set `DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra` for the lower-cost
+variant, or `DARK_FACTORY_REVIEW_PROVIDER=claude` only when Claude is needed.
 
 The fourth argument is the change's `base_commit`, the commit the branch was
 published from, never main's live head: the reviewer's diff runs from the

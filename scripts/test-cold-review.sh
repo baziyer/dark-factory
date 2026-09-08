@@ -76,17 +76,30 @@ git -C "$remote/owner/repo" update-ref refs/pull/7/head "$head"
 git -C "$remote/owner/repo" update-ref refs/pull/8/head "$smuggle"
 git -C "$remote/owner/repo" update-ref refs/heads/main "$moved"
 
-# The session is a fake claude that records what it was allowed and answers
-# with whatever verdict the test asks for; the bridge only has to exist.
+# The fake providers record their invocation and return the requested verdict.
+# Codex writes its final message to the requested path; Claude writes it to
+# stdout, matching their real non-interactive interfaces.
 tools=$temporary/tools
 mkdir -p "$tools"
-cat >"$tools/claude" <<'FAKE'
+cat >"$tools/reviewer" <<'FAKE'
 #!/bin/sh
 { printf 'cwd=%s\n' "$PWD"; printf 'checkout=%s\n' "$(cd "$DARK_FACTORY_REVIEW_CHECKOUT" && find . -path ./.git -prune -o -print | tr '\n' ' ')"; printf 'rules=%s\n' "$(cat "$DARK_FACTORY_REVIEW_CHECKOUT/../rules.md")"; printf '%s\n' "$@"; } >"$DARK_FACTORY_FAKE_CLAUDE_ARGS"
+if [ -n "${DARK_FACTORY_FAKE_CODEX_NO_FINAL:-}" ]; then
+    echo 'provider capacity exhausted' >&2
+    exit 1
+fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output-last-message) cat "$DARK_FACTORY_FAKE_CLAUDE_REPLY" >"$2"; exit 0 ;;
+    esac
+    shift
+done
 cat "$DARK_FACTORY_FAKE_CLAUDE_REPLY"
 FAKE
+cp "$tools/reviewer" "$tools/codex"
+cp "$tools/reviewer" "$tools/claude"
 printf '#!/bin/sh\nexit 0\n' >"$tools/dark-factory-maintainer-mcp-bridge"
-chmod 700 "$tools/claude" "$tools/dark-factory-maintainer-mcp-bridge"
+chmod 700 "$tools/reviewer" "$tools/codex" "$tools/claude" "$tools/dark-factory-maintainer-mcp-bridge"
 body=$temporary/body.md
 printf 'body\n' >"$body"
 args=$temporary/args
@@ -101,6 +114,7 @@ review() {
         PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" "$@" >/dev/null 2>&1)
 }
 
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL DARK_FACTORY_REVIEW_CLAUDE_MODEL
 printf 'Findings.\nVERDICT: ALLOW\n' >"$reply"
 DARK_FACTORY_REVIEW_OPERATION_ID=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f \
     review owner/repo 7 "$head" "$base" "$body" "the focus sentinel" || fail "ALLOW did not exit 0"
@@ -123,11 +137,27 @@ done
 [ "$(sed -n 's/^rules=//p' "$args")" = "base rules" ] || fail "the reviewer was not handed the base's AGENTS.md as its rules"
 grep -q "diff $base $head" "$args" || fail "the diff does not run from the merge base"
 [ -f "$run/review-7-$(printf '%s' "$head" | cut -c1-8).log" ] || fail "no log for the review"
-grep -q -- '--strict-mcp-config' "$args" || fail "session is not strict about MCP servers"
-grep -q 'mcp__maintainer__submit_pull_request_review' "$args" || fail "verdict tool is not allowed"
-if grep -E 'mcp__maintainer,|mcp__maintainer"|mcp__maintainer$' "$args" >/dev/null; then
-    fail "session is allowed the whole App"
-fi
+grep -q '^exec$' "$args" || fail "default reviewer is not Codex exec"
+grep -q -- '--ephemeral' "$args" || fail "Codex review persists a session"
+grep -q -- '--ignore-user-config' "$args" || fail "Codex review inherits user MCP configuration"
+grep -q -- '--strict-config' "$args" || fail "Codex review permits an unsupported Maintainer allowlist"
+approval_policy='approval_policy={ granular={sandbox_approval=false,rules=false,mcp_elicitations=true,request_permissions=false,skill_approval=false}}'
+grep -Fxq "$approval_policy" "$args" || fail "Codex review does not reject non-MCP escalation"
+grep -Fxq 'approvals_reviewer="auto_review"' "$args" || fail "Codex review does not route configured approvals automatically"
+grep -q -- '--sandbox' "$args" || fail "Codex review does not select a sandbox"
+grep -q '^read-only$' "$args" || fail "Codex review sandbox is not read-only"
+grep -q -- '--ignore-rules' "$args" || fail "Codex review loads rules from the change"
+grep -q -- '--skip-git-repo-check' "$args" || fail "Codex review refuses the isolated review directory"
+grep -q '^gpt-5.6-sol$' "$args" || fail "Codex review does not default to sol"
+grep -q 'mcp_servers.dark_factory_maintainer.command' "$args" || fail "Codex review does not configure the Maintainer server"
+enabled_tools='mcp_servers.dark_factory_maintainer.enabled_tools=["maintainer_status","observe_operation","submit_pull_request_review"]'
+[ "$(grep -Fc 'mcp_servers.dark_factory_maintainer.enabled_tools=' "$args")" -eq 1 ] || fail "Codex review has more than one Maintainer tool allowlist"
+grep -Fxq "$enabled_tools" "$args" || fail "Codex review enables an unrelated Maintainer tool"
+grep -q 'ALL_TOOLS metadata' "$args" || fail "Codex prompt does not direct tool discovery"
+grep -q 'maintainer_status' "$args" || fail "Codex prompt does not observe App status before writing"
+grep -q 'observe_operation' "$args" || fail "Codex prompt does not observe the review operation before writing"
+grep -q 'submit_pull_request_review' "$args" || fail "Codex prompt does not name the verdict tool"
+grep -q 'Do not emit VERDICT until submit_pull_request_review succeeds' "$args" || fail "Codex prompt permits an unrecorded verdict"
 grep -q "$head" "$args" || fail "prompt does not name the head"
 grep -q 'the focus sentinel' "$args" || fail "prompt does not carry the focus"
 # The session must not run inside the checkout, whose CLAUDE.md, AGENTS.md
@@ -135,7 +165,39 @@ grep -q 'the focus sentinel' "$args" || fail "prompt does not carry the focus"
 case "$(sed -n 's/^cwd=//p' "$args")" in
     */repo | */repo/*) fail "session runs inside the change under review" ;;
 esac
-grep -q 'Bash(git -C ' "$args" || fail "git is not scoped to the checkout"
+grep -q "git -C .* diff $base $head" "$args" || fail "Codex prompt does not scope git to the checkout"
+# Claude remains available for the occasional review that needs it.
+: >"$args"
+DARK_FACTORY_REVIEW_PROVIDER=claude review owner/repo 7 "$head" "$base" "$body" || fail "Claude review did not exit 0"
+grep -q -- '--strict-mcp-config' "$args" || fail "Claude selection lost its strict MCP configuration"
+grep -Fq 'mcp__maintainer__maintainer_status,mcp__maintainer__observe_operation,mcp__maintainer__submit_pull_request_review,' "$args" \
+    || fail "Claude review cannot make its required read observations"
+unset DARK_FACTORY_REVIEW_PROVIDER
+# Codex's lower-cost model override cannot name Claude's fallback model.
+: >"$args"
+DARK_FACTORY_REVIEW_PROVIDER=claude DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra \
+    review owner/repo 7 "$head" "$base" "$body" || fail "Claude fallback rejected the Codex model override"
+grep -Fxq 'opus' "$args" || fail "Claude fallback inherited the Codex model override"
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL
+# Claude's own override remains available without inheriting Codex's model.
+: >"$args"
+DARK_FACTORY_REVIEW_PROVIDER=claude DARK_FACTORY_REVIEW_CLAUDE_MODEL=sonnet \
+    review owner/repo 7 "$head" "$base" "$body" || fail "Claude model selection did not exit 0"
+grep -Fxq 'sonnet' "$args" || fail "Claude model selection did not reach the session"
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_CLAUDE_MODEL
+# A caller may choose the cheaper Codex model explicitly.
+: >"$args"
+DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra review owner/repo 7 "$head" "$base" "$body" || fail "Codex model selection did not exit 0"
+grep -q '^gpt-5.6-terra$' "$args" || fail "Codex model selection did not reach the session"
+unset DARK_FACTORY_REVIEW_MODEL
+# A provider failure without a final message is a retryable no-verdict, with
+# its last diagnostic retained instead of silently becoming preparation error.
+: >"$args"
+printf 'VERDICT: ALLOW\n' >"$run/review-7-$(printf '%s' "$head" | cut -c1-8).log"
+status=0
+(export DARK_FACTORY_FAKE_CODEX_NO_FINAL=1; review owner/repo 7 "$head" "$base" "$body") >/dev/null 2>&1 || status=$?
+[ "$status" -eq 3 ] || fail "a stale Codex verdict with no new final message exited $status, want 3"
+grep -q 'provider capacity exhausted' "$run/review-7-$(printf '%s' "$head" | cut -c1-8).log.events" || fail "Codex diagnostics were discarded"
 # Given main's moved head as the base, the diff still runs from the branch
 # point, and so do the rules.
 : >"$args"
@@ -223,7 +285,7 @@ chmod 755 "$unwritable"
 # refused before any session when it does not.
 farm=$temporary/farm
 mkdir -p "$farm"
-cp "$tools/claude" "$tools/dark-factory-maintainer-mcp-bridge" "$farm/"
+cp "$tools/codex" "$tools/dark-factory-maintainer-mcp-bridge" "$farm/"
 for tool in cat cp cut find grep ls mkdir mktemp mv rm sed tail tr; do
     ln -s "$(command -v "$tool")" "$farm/$tool"
 done
@@ -255,7 +317,7 @@ status=0
 (cd "$run" && TMPDIR="$scratch" DARK_FACTORY_REVIEW_REMOTE="file://$temporary/nowhere" DARK_FACTORY_FAKE_CLAUDE_ARGS="$args" DARK_FACTORY_FAKE_CLAUDE_REPLY="$reply" \
     PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?
 [ "$status" -eq 5 ] || fail "failed clone exited $status, want 5"
-# The bridge alone on PATH: claude is missing, and that is refused before
+# The bridge alone on PATH: Codex is missing, and that is refused before
 # any session could be swallowed as a verdict.
 bridge_only=$temporary/bridge-only
 mkdir -p "$bridge_only"
@@ -264,8 +326,8 @@ cp "$tools/dark-factory-maintainer-mcp-bridge" "$bridge_only/"
 status=0
 (cd "$run" && TMPDIR="$scratch" DARK_FACTORY_REVIEW_REMOTE="file://$remote" DARK_FACTORY_FAKE_CLAUDE_ARGS="$args" DARK_FACTORY_FAKE_CLAUDE_REPLY="$reply" \
     PATH="$bridge_only:/usr/bin:/bin" "$repository_root/scripts/cold-review.sh" owner/repo 7 "$head" "$base" "$body" >/dev/null 2>&1) || status=$?
-[ "$status" -eq 2 ] || fail "missing claude exited $status, want 2"
-[ ! -s "$args" ] || fail "a missing claude still started a session"
+[ "$status" -eq 2 ] || fail "missing codex exited $status, want 2"
+[ ! -s "$args" ] || fail "a missing codex still started a session"
 status=0
 review owner/repo 7x "$head" "$base" "$body" || status=$?
 [ "$status" -eq 2 ] || fail "non-numeric pull request exited $status, want 2"
@@ -273,6 +335,6 @@ status=0
 review owner/repo 7 "$head" "$base" "$temporary/missing.md" || status=$?
 [ "$status" -eq 2 ] || fail "missing body exited $status, want 2"
 [ ! -s "$args" ] || fail "an argument refusal still started a session"
-[ -z "$(ls -A "$scratch")" ] || fail "scratch clones remain"
+[ -z "$(find "$scratch" -maxdepth 1 -type d -name 'cold-review.*' -print -quit)" ] || fail "scratch clones remain"
 
 echo "cold-review tests passed"
