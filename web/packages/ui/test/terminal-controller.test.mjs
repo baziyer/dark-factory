@@ -480,6 +480,79 @@ test("selected terminal detach drains display output before ACK, release, and de
   assert.ok(releaseIndex < detachIndex);
 });
 
+test("selected terminal drops output arriving while detach releases its lease", async () => {
+  const sent = [];
+  let handle;
+  let responseNumber = 0;
+  let sessionCloses = 0;
+  const session = {
+    resolveAgentTerminal: async () => target,
+    openTerminal: (_target, options) => {
+      handle = createTerminalHandle(
+        { runId: "44".repeat(16), sessionId: "55".repeat(16), runRevision: 1n, sessionRevision: 1n },
+        options,
+        (requestId, payload) => sent.push({ requestId, payload }),
+        () => `${String(++responseNumber).padStart(2, "0")}`.repeat(16),
+        () => {},
+        { now: 100_000, setTimeout: () => 1, clearTimeout: () => {} },
+        true,
+      );
+      return handle;
+    },
+    close: () => { sessionCloses += 1; handle?.terminate(new SessionError("closed")); },
+  };
+  const controller = new TerminalController({
+    session,
+    agentId: "66".repeat(16),
+    expectedAgentRevision: 1n,
+    expectedHead: 1n,
+    surface: { write: () => Promise.reject(new Error("unmounted")), abort: () => {} },
+    onChange: () => {},
+  });
+  controller.start();
+  await tick();
+  let request = decodeClientControl(sent.at(-1).payload);
+  handle.receive(decodeServerControl(encodeTerminalAttached(request.id, {
+    session_id: "55".repeat(16), floor: 0n, head: 0n, acknowledged_sequence: 0n, max_unacked_bytes: 65536n,
+  })));
+  await tick();
+  request = decodeClientControl(sent.at(-1).payload);
+  handle.receive(decodeServerControl(encodeTerminalLeaseResult(request.id, {
+    operation: "acquired", run_id: "44".repeat(16), session_id: "55".repeat(16), generation: 1n,
+    expires_at_ms: 200_000n, last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  })));
+  await tick();
+  const detached = controller.detach();
+  await tick();
+  request = decodeClientControl(sent.at(-1).payload);
+  assert.equal(request.type, "TERMINAL_LEASE_RELEASE");
+  assert.equal(await handle.receiveBinary({ direction: "output", sessionId: new Uint8Array(16).fill(0x55), sequence: 0n, leaseGeneration: 0n, payload: new Uint8Array([1]) }), true);
+  await tick();
+  assert.equal(sessionCloses, 0);
+  assert.equal(sent.some(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_ACK"), true);
+  handle.receive(decodeServerControl(encodeTerminalLeaseResult(request.id, {
+    operation: "released", run_id: "44".repeat(16), session_id: "55".repeat(16), generation: 2n,
+    last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  })));
+  request = decodeClientControl(sent.at(-1).payload);
+  assert.equal(request.type, "TERMINAL_DETACH");
+  handle.receive(decodeServerControl(encodeTerminalDetached(request.id, { session_id: "55".repeat(16) })));
+  await detached;
+  assert.equal(sessionCloses, 0);
+});
+
+test("selected terminal treats an in-flight display abort during detach as drained", async () => {
+  const context = harness();
+  await ready(context);
+  const output = context.callbacks().onOutput({ sequence: 0n, payload: new Uint8Array([1]) });
+  await tick();
+  const detached = context.controller.detach();
+  context.surfaceGate.reject(new Error("surface unmounted"));
+  await output;
+  await detached;
+  assert.equal(context.sessionCloses(), 0);
+});
+
 test("ambiguous terminal detach failure closes the browser session once", async () => {
   const context = harness({ detachImpl: () => Promise.reject(new SessionError("connection")) });
   await ready(context);
