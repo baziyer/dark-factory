@@ -186,6 +186,7 @@ export class FactoryAppController {
   #terminal: TerminalController | undefined;
   #terminalSurface: TerminalSurface | undefined;
   #terminalSurfaceToken: object | undefined;
+  #terminalDisplayError: SessionError | undefined;
   #terminalSurfaceVersion = 0;
   #terminalGeneration = 0;
   #terminalResetBurst = 0;
@@ -590,12 +591,7 @@ export class FactoryAppController {
 
   endTerminalSurface(token: object, surfaceVersion = this.#terminalSurfaceVersion): void {
     if (surfaceVersion !== this.#terminalSurfaceVersion || this.#terminalSurfaceToken !== token) return;
-    this.#selectedAgent = undefined;
-    this.#terminalReplacement = undefined;
-    this.#dropPendingTerminalInput();
-    this.#closeTerminal();
-    this.#error = new SessionError("internal");
-    this.#publish();
+    this.closeAgentTerminal();
   }
 
   setTerminalSurface(token: object, surface: TerminalSurface | undefined, surfaceVersion = this.#terminalSurfaceVersion): void {
@@ -605,6 +601,7 @@ export class FactoryAppController {
       return;
     }
     this.#terminalSurface = surface;
+    this.#terminalDisplayError = undefined;
     this.#error = undefined;
     this.#reconcileTerminal();
     this.#publish();
@@ -613,11 +610,8 @@ export class FactoryAppController {
   terminalError(token: object, surfaceVersion = this.#terminalSurfaceVersion): void {
     if (this.#closed || this.#selectedAgent === undefined || surfaceVersion !== this.#terminalSurfaceVersion) return;
     if (this.#terminalSurfaceToken !== undefined && this.#terminalSurfaceToken !== token) return;
-    this.#selectedAgent = undefined;
-    this.#terminalReplacement = undefined;
-    this.#dropPendingTerminalInput();
-    this.#closeTerminal();
-    this.#error = new SessionError("internal");
+    this.#terminalSurfaceToken = undefined;
+    this.#terminalDisplayError = new SessionError("internal");
     this.#publish();
   }
 
@@ -985,6 +979,7 @@ export class FactoryAppController {
     this.#terminalRetry = undefined;
     this.#terminalSurface = undefined;
     this.#terminalSurfaceToken = undefined;
+    this.#terminalDisplayError = undefined;
     this.#pendingTerminalResize = undefined;
     ++this.#terminalSurfaceVersion;
     this.#error = undefined;
@@ -1105,6 +1100,7 @@ export class FactoryAppController {
     ++this.#terminalGeneration;
     this.#terminalSurface = undefined;
     this.#terminalSurfaceToken = undefined;
+    this.#terminalDisplayError = undefined;
     this.#pendingTerminalResize = undefined;
     ++this.#terminalSurfaceVersion;
     return terminal;
@@ -1163,7 +1159,7 @@ export class FactoryAppController {
         finishing: this.#selectedAgent.finishing,
         phase: this.#terminal?.snapshot.phase ?? "idle",
         writable: this.#terminal?.snapshot.writable ?? false,
-        error: this.#terminal?.snapshot.error,
+        error: this.#terminal?.snapshot.error ?? this.#terminalDisplayError,
         paused: this.#selectedAgent.agent.paused,
         instructionPending: this.#selectedAgent.instructionPending,
         instructionError: this.#selectedAgent.instructionError,
