@@ -76,7 +76,7 @@ func TestTerminalCommandAndEventFramesRoundTrip(t *testing.T) {
 		{Kind: TerminalCredit, Credit: 4096},
 		{Kind: TerminalInput, Correlation: 5, Generation: 2, Sequence: 1, Payload: []byte("input")},
 		{Kind: TerminalResize, Correlation: 6, Generation: 2, Rows: 24, Cols: 80},
-		{Kind: TerminalHumanReply, Correlation: 7, Payload: []byte("reply without newline")},
+		{Kind: TerminalHumanReply, Correlation: 7, Payload: bytes.Repeat([]byte{'x'}, maxTerminalFramePayload), Submit: true},
 	}
 	for _, want := range commands {
 		if err := want.validate(); err != nil {
@@ -91,7 +91,7 @@ func TestTerminalCommandAndEventFramesRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := terminalCommandFromFrame(raw)
-		if err != nil || got.Kind != want.Kind || got.Correlation != want.Correlation || got.Generation != want.Generation || got.Sequence != want.Sequence || got.Credit != want.Credit || got.Rows != want.Rows || got.Cols != want.Cols || !bytes.Equal(got.Payload, want.Payload) {
+		if err != nil || got.Kind != want.Kind || got.Correlation != want.Correlation || got.Generation != want.Generation || got.Sequence != want.Sequence || got.Credit != want.Credit || got.Rows != want.Rows || got.Cols != want.Cols || got.Submit != want.Submit || !bytes.Equal(got.Payload, want.Payload) {
 			t.Fatalf("command = %+v, err=%v, want %+v", got, err, want)
 		}
 	}
@@ -100,7 +100,7 @@ func TestTerminalCommandAndEventFramesRoundTrip(t *testing.T) {
 		{Kind: TerminalGenerationResult, Correlation: 7, Generation: 2, Status: TerminalResultOK},
 		{Kind: TerminalInputResult, Correlation: 8, Generation: 2, Sequence: 1, Status: TerminalResultPartial, Count: 3},
 		{Kind: TerminalResizeResult, Correlation: 9, Generation: 2, Rows: 24, Cols: 80, Status: TerminalResultOK},
-		{Kind: TerminalHumanReplyResult, Correlation: 13, Status: TerminalResultOK, Count: 20},
+		{Kind: TerminalHumanReplyResult, Correlation: 13, Status: TerminalResultOK, Count: maxTerminalFramePayload},
 		{Kind: TerminalHumanReplyResult, Correlation: 14, Status: TerminalResultPartial, Count: 3},
 		{Kind: TerminalHumanReplyResult, Correlation: 15, Status: TerminalResultUncertain},
 		{Kind: TerminalAttached, Correlation: 10, Sequence: 12, Floor: 10, Head: 15, Status: TerminalResultOK},
@@ -135,6 +135,7 @@ func TestTerminalWireValidationRejectsAmbiguousFrames(t *testing.T) {
 		{Kind: TerminalResize, Correlation: 1, Generation: 1, Rows: 0, Cols: 80},
 		{Kind: TerminalCredit, Credit: maxTerminalCredit + 1},
 		{Kind: TerminalInput, Correlation: 1, Generation: 1, Sequence: 1, Payload: bytes.Repeat([]byte{'x'}, maxTerminalFramePayload+1)},
+		{Kind: TerminalInput, Correlation: 1, Generation: 1, Sequence: 1, Payload: []byte("input"), Submit: true},
 		{Kind: TerminalHumanReply, Correlation: 1, Payload: bytes.Repeat([]byte{'x'}, maxTerminalFramePayload+1)},
 		{Kind: TerminalHumanReply, Correlation: 1, Generation: 1, Payload: []byte("reply")},
 		{Kind: TerminalHumanReply, Correlation: 1, Sequence: 1, Payload: []byte("reply")},
@@ -288,6 +289,7 @@ func TestTerminalConversionsRejectLifecycleAndCrossUnionFields(t *testing.T) {
 		{"rows", func(f *attemptFrame) { f.Rows = 1 }},
 		{"cols", func(f *attemptFrame) { f.Cols = 1 }},
 		{"status", func(f *attemptFrame) { f.Status = "ok" }},
+		{"submit", func(f *attemptFrame) { f.Submit = true }},
 		{"payload", func(f *attemptFrame) { f.Payload = []byte("unexpected") }},
 	}
 	for _, test := range commandContaminations {
@@ -319,6 +321,7 @@ func TestTerminalConversionsRejectLifecycleAndCrossUnionFields(t *testing.T) {
 		{"rows", func(f *attemptFrame) { f.Rows = 1 }},
 		{"cols", func(f *attemptFrame) { f.Cols = 1 }},
 		{"credit", func(f *attemptFrame) { f.Credit = 1 }},
+		{"submit", func(f *attemptFrame) { f.Submit = true }},
 		{"status", func(f *attemptFrame) { f.Status = "ok" }},
 		{"payload", func(f *attemptFrame) { f.Payload = []byte("unexpected") }},
 	}

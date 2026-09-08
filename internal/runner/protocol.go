@@ -67,6 +67,7 @@ type attemptFrame struct {
 	Rows         uint16        `json:"rows,omitempty"`
 	Cols         uint16        `json:"cols,omitempty"`
 	Credit       uint32        `json:"credit,omitempty"`
+	Submit       bool          `json:"submit,omitempty"`
 	Status       string        `json:"status,omitempty"`
 }
 
@@ -74,7 +75,7 @@ func terminalCommandFrame(command TerminalCommand) attemptFrame {
 	return attemptFrame{
 		Version: commandVersion, Kind: string(command.Kind), Correlation: command.Correlation,
 		Generation: command.Generation, Sequence: command.Sequence, Credit: command.Credit,
-		Rows: command.Rows, Cols: command.Cols, Payload: append([]byte(nil), command.Payload...),
+		Rows: command.Rows, Cols: command.Cols, Submit: command.Submit, Payload: append([]byte(nil), command.Payload...),
 	}
 }
 
@@ -88,7 +89,7 @@ func terminalCommandFromFrame(frame attemptFrame) (TerminalCommand, error) {
 	command := TerminalCommand{
 		Kind: TerminalCommandKind(frame.Kind), Correlation: frame.Correlation,
 		Generation: frame.Generation, Sequence: frame.Sequence, Credit: frame.Credit,
-		Rows: frame.Rows, Cols: frame.Cols, Payload: append([]byte(nil), frame.Payload...),
+		Rows: frame.Rows, Cols: frame.Cols, Submit: frame.Submit, Payload: append([]byte(nil), frame.Payload...),
 	}
 	if err := command.validate(); err != nil {
 		return TerminalCommand{}, err
@@ -130,7 +131,7 @@ func noTerminalFields(frame attemptFrame) bool {
 	return frame.Correlation == 0 && frame.Generation == 0 && frame.Sequence == 0 &&
 		frame.Start == 0 && frame.End == 0 && frame.Floor == 0 && frame.Head == 0 &&
 		frame.Count == 0 && frame.Rows == 0 && frame.Cols == 0 && frame.Credit == 0 &&
-		frame.Status == ""
+		!frame.Submit && frame.Status == ""
 }
 
 func noLegacyFields(frame attemptFrame) bool {
@@ -148,7 +149,7 @@ func validTerminalEnvelope(frame attemptFrame, command bool) bool {
 	if command {
 		return frame.Start == 0 && frame.End == 0 && frame.Floor == 0 && frame.Head == 0 && frame.Count == 0 && frame.Status == ""
 	}
-	return frame.Credit == 0
+	return frame.Credit == 0 && !frame.Submit
 }
 
 func validCurrentExecCheckAck(frame attemptFrame) bool {

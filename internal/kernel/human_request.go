@@ -484,7 +484,7 @@ func (store *Store) BeginHumanReply(ctx context.Context, clientID BrowserClientI
 	if err := tx.Commit(ctx); err != nil {
 		return HumanDelivery{}, err
 	}
-	return HumanDelivery{RequestID: request.ID, RunID: request.RunID, DeliveryID: deliveryID, Revision: request.Revision, Reply: []byte(reply)}, nil
+	return HumanDelivery{RequestID: request.ID, RunID: request.RunID, Provider: run.Provider, DeliveryID: deliveryID, Revision: request.Revision, Reply: []byte(reply)}, nil
 }
 
 func (store *Store) AcknowledgeHumanReply(ctx context.Context, requestID HumanRequestID, deliveryID HumanRequestDeliveryID, expected Revision, at UnixMillis) error {

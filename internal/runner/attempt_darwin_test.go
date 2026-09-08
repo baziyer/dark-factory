@@ -347,7 +347,7 @@ func runAttemptWorkerHelper(args []string) error {
 		interactiveWitness := shellWitness("\"$interactive\"", filepath.Join(root, "provider.stdin"))
 		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; %sIFS= read -r startup || exit 98; %s || exit 99; IFS= read -r interactive || exit 100; %s || exit 101; while test ! -f %q; do sleep 0.01; done", greeting, startupWitness, interactiveWitness, filepath.Join(root, "finish"))
 		provider = ExecSpec{Target: "/bin/sh", Args: []string{"-c", script}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: providerCwd}
-	case "shell", "shell-input", "term", "leader", "tail", "reply", "loud-adoption":
+	case "shell", "shell-input", "term", "leader", "tail", "reply", "reply-submit", "reply-submit-exit", "loud-adoption":
 		providerWitness := shellWitness("$$", filepath.Join(root, "provider.pid"))
 		script := fmt.Sprintf("test -z \"${HOME+x}\" || exit 90; test -z \"${DARK_FACTORY_ATTEMPT_TOKEN+x}\" || exit 91; for n in 3 4 5 6 7 8 9; do test ! -e /dev/fd/$n || exit 92; done; test -f /dev/fd/10 || exit 93; test ! -s /dev/fd/10 || exit 94; test -f /dev/fd/11 || exit 97; IFS= read -r task < /dev/fd/11; test \"$task\" = one-startup || exit 98; cat /dev/fd/10/change-worker.config >/dev/null 2>&1 && exit 95; cd /dev/fd/10 >/dev/null 2>&1 && exit 96; %s; printf 'pre-output\\n'; while test ! -f %q; do sleep 0.01; done; printf 'post-output\\n'; printf x >> %q; while test ! -f %q; do sleep 0.01; done", providerWitness, filepath.Join(root, "continue"), filepath.Join(root, "provider.effect"), filepath.Join(root, "finish"))
 		if mode == "shell-input" {
@@ -362,8 +362,18 @@ func runAttemptWorkerHelper(args []string) error {
 		if mode == "tail" {
 			script = "printf 'tail-output\\n'; exit 0"
 		}
-		if mode == "reply" {
-			script = fmt.Sprintf("%s; printf 'pre-output\\n'; while test ! -f %q; do sleep 0.01; done; printf 'post-output\\n'; stty -icanon -echo min 1 time 0; dd if=/dev/stdin bs=12 count=1 2>/dev/null > %q; while test ! -f %q; do sleep 0.01; done", providerWitness, filepath.Join(root, "continue"), filepath.Join(root, "provider.reply"), filepath.Join(root, "finish"))
+		if mode == "reply" || mode == "reply-submit" || mode == "reply-submit-exit" {
+			reader := "dd if=/dev/stdin bs=12 count=1"
+			if mode == "reply-submit" || mode == "reply-submit-exit" {
+				reader = "dd if=/dev/stdin bs=1 count=12"
+			}
+			if mode == "reply-submit-exit" {
+				reader = "dd if=/dev/stdin bs=1 count=11"
+			}
+			script = fmt.Sprintf("%s; printf 'pre-output\\n'; while test ! -f %q; do sleep 0.01; done; printf 'post-output\\n'; stty -icanon -echo min 1 time 0; %s 2>/dev/null > %q; while test ! -f %q; do sleep 0.01; done", providerWitness, filepath.Join(root, "continue"), reader, filepath.Join(root, "provider.reply"), filepath.Join(root, "finish"))
+			if mode == "reply-submit-exit" {
+				script = fmt.Sprintf("%s; while test ! -f %q; do sleep 0.01; done; stty -icanon -echo min 1 time 0; %s 2>/dev/null > %q", providerWitness, filepath.Join(root, "continue"), reader, filepath.Join(root, "provider.reply"))
+			}
 			providerTask = nil
 		} else {
 			providerTask = []byte("one-startup\n")
@@ -1205,6 +1215,100 @@ func TestAttemptRunnerHumanReplyWritesExactBytesOnce(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
 		t.Fatal(err)
+	}
+	f.finishAndAck()
+}
+
+func TestAttemptRunnerHumanReplyDefersCodexSubmit(t *testing.T) {
+	f := newAttemptFixture(t, "reply-submit", "")
+	f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if event, err := f.controller.Next(4 * time.Second); err != nil || event.Kind != AttemptTerminalFrame || event.Frame == nil || event.Frame.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v err=%v", event, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "continue"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("human-reply")
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalHumanReply, Correlation: 42, Payload: payload, Submit: true}); err != nil {
+		t.Fatal(err)
+	}
+	// A combined text-and-CR write would acknowledge immediately. The runner
+	// must instead keep this one terminal effect pending until its calibrated
+	// separate submit keystroke.
+	beforeSubmit := time.Now().Add(startupEnterFloor / 2)
+	for time.Now().Before(beforeSubmit) {
+		event, err := f.controller.Next(time.Until(beforeSubmit))
+		if err != nil {
+			continue
+		}
+		if event.Kind == AttemptTerminalFrame && event.Frame != nil && event.Frame.Kind == TerminalHumanReplyResult {
+			t.Fatalf("human reply acknowledged before deferred submit: %+v", event.Frame)
+		}
+	}
+	for {
+		event, err := f.controller.Next(6 * time.Second)
+		if err != nil {
+			t.Fatalf("human reply=%+v err=%v", event, err)
+		}
+		if event.Kind != AttemptTerminalFrame || event.Frame == nil || event.Frame.Kind != TerminalHumanReplyResult {
+			continue
+		}
+		if event.Frame.Correlation != 42 || event.Frame.Status != TerminalResultOK || event.Frame.Count != uint32(len(payload)) {
+			t.Fatalf("deferred human reply result=%+v", event.Frame)
+		}
+		break
+	}
+	replyPath := filepath.Join(f.root, "provider.reply")
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		received, err := os.ReadFile(replyPath)
+		if err == nil && bytes.Equal(received, append(append([]byte(nil), payload...), '\n')) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider reply=%q err=%v, want answer then CR", received, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "finish"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.finishAndAck()
+}
+
+func TestAttemptRunnerHumanReplyRejectsWhenDeferredSubmitLosesPTY(t *testing.T) {
+	f := newAttemptFixture(t, "reply-submit-exit", "")
+	f.activateOuter()
+	f.advanceToProvider()
+	if err := f.controller.Release(StageProvider); err != nil {
+		t.Fatal(err)
+	}
+	if event, err := f.controller.Next(4 * time.Second); err != nil || event.Kind != AttemptTerminalFrame || event.Frame == nil || event.Frame.Kind != TerminalReady {
+		t.Fatalf("terminal ready=%+v err=%v", event, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "continue"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("human-reply")
+	if err := f.controller.SendTerminalCommand(TerminalCommand{Kind: TerminalHumanReply, Correlation: 43, Payload: payload, Submit: true}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		event, err := f.controller.Next(6 * time.Second)
+		if err != nil {
+			t.Fatalf("human reply=%+v err=%v", event, err)
+		}
+		if event.Kind != AttemptTerminalFrame || event.Frame == nil || event.Frame.Kind != TerminalHumanReplyResult {
+			continue
+		}
+		if event.Frame.Correlation != 43 || event.Frame.Status != TerminalResultRejected || event.Frame.Count != uint32(len(payload)) {
+			t.Fatalf("lost deferred submit=%+v", event.Frame)
+		}
+		break
 	}
 	f.finishAndAck()
 }

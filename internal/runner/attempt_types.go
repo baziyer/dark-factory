@@ -102,6 +102,7 @@ type TerminalCommand struct {
 	Credit      uint32
 	Rows        uint16
 	Cols        uint16
+	Submit      bool
 	Payload     []byte
 }
 
@@ -130,19 +131,19 @@ func (c TerminalCommand) validate() error {
 		if !validTerminalCorrelation(c.Correlation) {
 			return fmt.Errorf("runner: terminal command correlation is invalid")
 		}
-		if c.Generation == 0 || c.Sequence != 0 || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 {
+		if c.Generation == 0 || c.Sequence != 0 || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 || c.Submit {
 			return ErrState
 		}
 	case TerminalAttach:
-		if !validTerminalCorrelation(c.Correlation) || c.Generation != 0 || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 {
+		if !validTerminalCorrelation(c.Correlation) || c.Generation != 0 || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 || c.Submit {
 			return ErrState
 		}
 	case TerminalCredit:
-		if c.Correlation != 0 || c.Generation != 0 || c.Sequence != 0 || c.Credit == 0 || c.Credit > maxTerminalCredit || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 {
+		if c.Correlation != 0 || c.Generation != 0 || c.Sequence != 0 || c.Credit == 0 || c.Credit > maxTerminalCredit || c.Rows != 0 || c.Cols != 0 || len(c.Payload) != 0 || c.Submit {
 			return ErrState
 		}
 	case TerminalInput:
-		if !validTerminalCorrelation(c.Correlation) || c.Generation == 0 || c.Sequence == 0 || len(c.Payload) == 0 || len(c.Payload) > maxTerminalFramePayload || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 {
+		if !validTerminalCorrelation(c.Correlation) || c.Generation == 0 || c.Sequence == 0 || len(c.Payload) == 0 || len(c.Payload) > maxTerminalFramePayload || c.Credit != 0 || c.Rows != 0 || c.Cols != 0 || c.Submit {
 			return ErrState
 		}
 	case TerminalHumanReply:
@@ -154,7 +155,7 @@ func (c TerminalCommand) validate() error {
 			return ErrState
 		}
 	case TerminalResize:
-		if !validTerminalCorrelation(c.Correlation) || c.Generation == 0 || c.Rows == 0 || c.Rows > maxTerminalDimension || c.Cols == 0 || c.Cols > maxTerminalDimension || c.Sequence != 0 || c.Credit != 0 || len(c.Payload) != 0 {
+		if !validTerminalCorrelation(c.Correlation) || c.Generation == 0 || c.Rows == 0 || c.Rows > maxTerminalDimension || c.Cols == 0 || c.Cols > maxTerminalDimension || c.Sequence != 0 || c.Credit != 0 || len(c.Payload) != 0 || c.Submit {
 			return ErrState
 		}
 	default:

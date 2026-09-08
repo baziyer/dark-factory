@@ -63,6 +63,7 @@ type terminalEffect struct {
 	rows            uint16
 	cols            uint16
 	payload         []byte
+	submit          bool
 	requireBinding  bool
 	expectedRun     kernel.Revision
 	expectedSession kernel.Revision
@@ -364,8 +365,9 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
 		return 0, errors.Join(err, unknownErr)
 	}
-	result := attempt.submitEffect(ctx, terminalEffect{kind: terminalEffectHumanReply, payload: append([]byte(nil), delivery.Reply...)})
-	effectErr := result.effectError(len(delivery.Reply))
+	payload := append([]byte(nil), delivery.Reply...)
+	result := attempt.submitEffect(ctx, terminalEffect{kind: terminalEffectHumanReply, payload: payload, submit: delivery.Provider == kernel.ProviderCodex})
+	effectErr := result.effectError(len(payload))
 	if effectErr != nil {
 		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
 		return result.count, errors.Join(effectErr, unknownErr)

@@ -957,6 +957,10 @@ func adapterRunningRun(t *testing.T, store *kernel.Store, seed byte) kernel.Run 
 // Only a worker run carries a candidate change, and therefore a published
 // working directory, so the role is a parameter rather than a fixed fact.
 func adapterRunningRoleRun(t *testing.T, store *kernel.Store, seed byte, role kernel.AgentRole) kernel.Run {
+	return adapterRunningRoleProviderRun(t, store, seed, role, kernel.ProviderCodex)
+}
+
+func adapterRunningRoleProviderRun(t *testing.T, store *kernel.Store, seed byte, role kernel.AgentRole, agentProvider kernel.Provider) kernel.Run {
 	t.Helper()
 	ctx := context.Background()
 	projectID, _ := kernel.ProjectIDFromBytes(adapterID(t, seed))
@@ -967,7 +971,7 @@ func adapterRunningRoleRun(t *testing.T, store *kernel.Store, seed byte, role ke
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: fmt.Sprintf("run-agent-%d", seed), Role: role, Provider: kernel.ProviderCodex, ToolBudgetLimit: 4}, adapterTime(t, 201))
+	agent, err := store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: fmt.Sprintf("run-agent-%d", seed), Role: role, Provider: agentProvider, ToolBudgetLimit: 4}, adapterTime(t, 201))
 	if err != nil {
 		t.Fatal(err)
 	}

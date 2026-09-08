@@ -162,6 +162,7 @@ type NewHumanQuestion struct {
 type HumanDelivery struct {
 	RequestID  HumanRequestID
 	RunID      RunID
+	Provider   Provider
 	DeliveryID HumanRequestDeliveryID
 	Revision   Revision
 	Reply      []byte `json:"-"`
