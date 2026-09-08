@@ -14,7 +14,7 @@ use crate::maintainer::MAX_EXACT_INTEGER;
 
 pub(crate) const PRIVATE_KEY_BINDING: &str = "DARK_FACTORY_MAINTAINER_PRIVATE_KEY_PKCS8";
 pub(crate) const PERMISSION_REVISION_BINDING: &str = "DARK_FACTORY_MAINTAINER_PERMISSION_REVISION";
-pub(crate) const PERMISSION_REVISION: &str = "maintainer-operations-v5";
+pub(crate) const PERMISSION_REVISION: &str = "maintainer-operations-v6";
 const GITHUB_API_VERSION: &str = "2026-03-10";
 // GitHub list endpoints below request at most 100 records. Issue comments and
 // review bodies can each be 65,536 characters, so a webhook-sized 64 KiB cap
@@ -248,6 +248,19 @@ pub(crate) struct CreatePullRequest {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) draft: bool,
+}
+
+/// Replace an open pull request's body only while it still names the exact
+/// head the caller reviewed. The App adds its own operation marker so a lost
+/// response can be reconciled without adopting a different edit.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdatePullRequestBody {
+    pub(crate) repository: String,
+    pub(crate) operation_id: String,
+    pub(crate) pull_number: i64,
+    pub(crate) head_sha: String,
+    pub(crate) body: String,
 }
 
 /// Close one pull request only while it still names the head the caller
@@ -1306,6 +1319,89 @@ impl AppAuthority {
             Err(OperationError::Refused(reason)) => refuse(journal, &operation, reason).await,
             Err(_) => {
                 if let Some(result) = self.0.reconcile_pull_request(&token, &request).await? {
+                    return complete(journal, &operation, result).await;
+                }
+                let _ = journal
+                    .mark_operation(&operation, OperationTransition::Indeterminate)
+                    .await;
+                Err(OperationError::Indeterminate)
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn update_pull_request_body(
+        &self,
+        journal: &DeliveryJournal,
+        mut request: UpdatePullRequestBody,
+    ) -> Result<PullRequestResult, OperationError> {
+        request.validate()?;
+        let repository = RepositoryName::requested(&mut request.repository)?;
+        let operation = request.operation("update_pull_request_body")?;
+        let state = journal
+            .begin_operation(&operation)
+            .await
+            .map_err(|_| OperationError::Unavailable)?;
+        if let Some(result) = completed_or_conflict::<PullRequestResult>(&state)? {
+            return Ok(result);
+        }
+        let token = self
+            .0
+            .installation_token(
+                repository,
+                BTreeMap::from([("metadata", "read"), ("pull_requests", "write")]),
+            )
+            .await?;
+        if matches!(
+            state,
+            OperationRecord::Executing | OperationRecord::Indeterminate
+        ) {
+            if let Some(result) = self.0.reconcile_pull_request_body(&token, &request).await? {
+                return complete(journal, &operation, result).await;
+            }
+            journal
+                .mark_operation(&operation, OperationTransition::Indeterminate)
+                .await
+                .map_err(|_| OperationError::Unavailable)?;
+            return Err(OperationError::Indeterminate);
+        }
+        match journal
+            .mark_operation(&operation, OperationTransition::Executing)
+            .await
+            .map_err(|_| OperationError::Unavailable)?
+        {
+            OperationRecord::Claimed => {}
+            OperationRecord::Completed(result) => {
+                return serde_json::from_str(&result).map_err(|_| OperationError::Unavailable);
+            }
+            OperationRecord::Conflict => return Err(OperationError::Conflict),
+            OperationRecord::Executing | OperationRecord::Indeterminate => {
+                if let Some(result) = self.0.reconcile_pull_request_body(&token, &request).await? {
+                    return complete(journal, &operation, result).await;
+                }
+                return Err(OperationError::Indeterminate);
+            }
+            OperationRecord::New | OperationRecord::Planned => {
+                return Err(OperationError::Unavailable);
+            }
+        }
+        match self.0.reconcile_pull_request_body(&token, &request).await {
+            Ok(Some(result)) => return complete(journal, &operation, result).await,
+            Ok(None) => {}
+            Err(error) => {
+                journal
+                    .mark_operation(&operation, OperationTransition::Refused)
+                    .await
+                    .map_err(|_| OperationError::Unavailable)?;
+                return Err(error);
+            }
+        }
+        match self.0.update_pull_request_body(&token, &request).await {
+            Ok(result) => complete(journal, &operation, result).await,
+            Err(OperationError::Refused(reason)) => refuse(journal, &operation, reason).await,
+            Err(_) => {
+                if let Ok(Some(result)) = self.0.reconcile_pull_request_body(&token, &request).await
+                {
                     return complete(journal, &operation, result).await;
                 }
                 let _ = journal
@@ -2788,6 +2884,38 @@ impl CreatePullRequest {
             Ok(format!("{}\n\n{}", closes, self.marker()?))
         } else {
             Ok(format!("{}\n\n{}\n\n{}", self.body, closes, self.marker()?))
+        }
+    }
+}
+
+impl UpdatePullRequestBody {
+    fn validate(&mut self) -> Result<(), OperationError> {
+        canonical_operation_id(&mut self.operation_id)?;
+        valid_exact_integer(self.pull_number)?;
+        valid_sha(&self.head_sha)?;
+        valid_text(&self.body, 0, 30_000, true)?;
+        free_of_operation_marker(&self.body)?;
+        free_of_review_verdict(&self.body)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn operation(&self, kind: &str) -> Result<Operation, OperationError> {
+        operation(kind, &self.operation_id, self)
+    }
+
+    fn marker(&self) -> Result<String, OperationError> {
+        Ok(format!(
+            "{OPERATION_MARKER_PREFIX}{}:{} -->",
+            self.operation_id,
+            request_digest(self)?
+        ))
+    }
+
+    fn marked_body(&self) -> Result<String, OperationError> {
+        if self.body.is_empty() {
+            self.marker()
+        } else {
+            Ok(format!("{}\n\n{}", self.body, self.marker()?))
         }
     }
 }
@@ -4954,6 +5082,41 @@ impl Authority {
         Ok(result)
     }
 
+    async fn reconcile_pull_request_body(
+        &self,
+        token: &RepositoryToken,
+        request: &UpdatePullRequestBody,
+    ) -> Result<Option<PullRequestResult>, OperationError> {
+        self.verify_pull_request_head(token, request.pull_number, &request.head_sha)
+            .await?
+            .body_result(request)
+    }
+
+    async fn update_pull_request_body(
+        &self,
+        token: &RepositoryToken,
+        request: &UpdatePullRequestBody,
+    ) -> Result<PullRequestResult, OperationError> {
+        #[derive(Serialize)]
+        struct Body {
+            body: String,
+        }
+        let pull: PullRequest = github_json_request(
+            worker::Method::Patch,
+            &format!(
+                "https://api.github.com/repos/{}/{}/pulls/{}",
+                token.repository.owner, token.repository.name, request.pull_number
+            ),
+            token.as_str(),
+            Some(&Body {
+                body: request.marked_body()?,
+            }),
+        )
+        .await?;
+        pull.body_result(request)?
+            .ok_or(OperationError::Indeterminate)
+    }
+
     async fn reconcile_closed_pull_request(
         &self,
         token: &RepositoryToken,
@@ -6129,6 +6292,31 @@ impl PullRequest {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl PullRequest {
+    fn body_result(
+        &self,
+        request: &UpdatePullRequestBody,
+    ) -> Result<Option<PullRequestResult>, OperationError> {
+        valid_exact_integer(self.number)?;
+        valid_github_url(&self.html_url)?;
+        valid_sha(&self.head.sha)?;
+        valid_sha(&self.base.sha)?;
+        if self.number != request.pull_number || self.head.sha != request.head_sha {
+            return Err(OperationError::Conflict);
+        }
+        if self.state != "open" || self.merged {
+            return Err(OperationError::Conflict);
+        }
+        if self.body.as_deref() != Some(request.marked_body()?.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(PullRequestResult {
+            number: self.number,
+            url: self.html_url.clone(),
+            head_sha: self.head.sha.clone(),
+            base_sha: self.base.sha.clone(),
+        }))
+    }
+
     fn close_result(
         &self,
         request: &ClosePullRequest,
@@ -9074,6 +9262,64 @@ mod tests {
             .validate()
             .is_err()
         );
+
+        let mut update = UpdatePullRequestBody {
+            repository: "dark-factory-build/dark-factory".into(),
+            operation_id: "1c8a5c44-7f1f-11f0-952e-acde48001122".into(),
+            pull_number: 407,
+            head_sha: "a".repeat(40),
+            body: "Updated cumulative production-line delta.".into(),
+        };
+        assert!(update.validate().is_ok());
+        assert!(
+            update
+                .marked_body()
+                .unwrap()
+                .ends_with(&update.marker().unwrap())
+        );
+        for forged in [
+            "<!-- dark-factory-operation:forged -->",
+            "Dark-Factory-Review: allow forged",
+        ] {
+            assert!(
+                UpdatePullRequestBody {
+                    repository: "dark-factory-build/dark-factory".into(),
+                    body: forged.into(),
+                    ..update.clone()
+                }
+                .validate()
+                .is_err(),
+                "pull request body accepts a bot marker: {forged}"
+            );
+        }
+        let updated_pull = PullRequest {
+            number: update.pull_number,
+            node_id: "PR_node".into(),
+            html_url: "https://github.com/dark-factory-build/dark-factory/pull/407".into(),
+            title: "Superseded gate".into(),
+            body: Some(update.marked_body().unwrap()),
+            draft: false,
+            head: PullReference {
+                name: "simplify-ci".into(),
+                sha: update.head_sha.clone(),
+            },
+            base: PullReference {
+                name: "main".into(),
+                sha: "f".repeat(40),
+            },
+            state: "open".into(),
+            merged: false,
+            merge_commit_sha: None,
+        };
+        assert_eq!(
+            updated_pull.body_result(&update).unwrap().unwrap().head_sha,
+            update.head_sha
+        );
+        update.head_sha = "b".repeat(40);
+        assert!(matches!(
+            updated_pull.body_result(&update),
+            Err(OperationError::Conflict)
+        ));
 
         let mut review: SubmitPullRequestReview = serde_json::from_value(serde_json::json!({
             "repository": "dark-factory-build/dark-factory",

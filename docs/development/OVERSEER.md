@@ -26,7 +26,8 @@ without any remote credential, and the Maintainer App as the one MCP server
 ## What you may and may not do
 
 - Publish only through the App: `publish_commit`, `create_issue`,
-  `create_pull_request`, `enqueue_pull_request`, and the observe tools. Never
+  `create_pull_request`, `update_pull_request_body`, `enqueue_pull_request`,
+  and the observe tools. Never
   `git push`, never edit the operator's checkout, never write into a retained
   Change.
 - Never record a review verdict yourself. The review is a separate headless
@@ -85,6 +86,7 @@ opid() { python3 -c "import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, 'dark
 #   issue, pr                                  once per change
 #   publish-1, publish-2, ...                  the first publication, one per commit
 #   publish-HEAD8-1, publish-HEAD8-2, ...      a follow-up on top of branch head HEAD8
+#   body-HEAD8                                  replacement body for pull request head HEAD8
 #   review-HEAD8, review-HEAD8-2               the review of pull request head HEAD8
 #   enqueue-HEAD8                              the enqueue of pull request head HEAD8
 ```
@@ -188,19 +190,33 @@ Then, with `branch = factory/<first 12 hex of change_id>`:
 
 A follow-up publication (`work_revision` above 1 with the branch present)
 already has both: the journal shows `issue` and `pr` completed, and the
-pull request number is in the `pr` operation's result. Do not create
-either again. Still write the body file the review reads, from the public
-API, which needs no credential:
+pull request number is in the `pr` operation's result. Do not create either
+again. Before review, replace its body under `opid "$change_id"
+"body-$HEAD8"`. Build a fresh body in the repository's shape, including
+what changed and why and verification, and restate its **cumulative**
+production-line delta from the review merge base to `HEAD_SHA`; never append
+only the follow-up commit's delta. Fetch the new head and calculate that base
+and numstat directly:
+
+```sh
+git -C repo fetch -q origin "$HEAD_SHA"
+review_base=$(git -C repo merge-base "$base_commit" "$HEAD_SHA")
+git -C repo diff --numstat "$review_base" "$HEAD_SHA"
+```
+
+The supplied body must be the fresh text only: do not copy an App operation
+marker or a `Dark-Factory-Review:` line from the old body. Write it to
+`body.md`, call `observe_operation` for `body-HEAD8`, and if it is not
+completed call `update_pull_request_body` with the PR number, `HEAD_SHA`, and
+the contents of `body.md`. The App adds its own marker. Then fetch the
+rendered body for the cold review:
 
 ```sh
 curl -s "https://api.github.com/repos/OWNER/REPO/pulls/$PR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"])' > body.md
 ```
 
-followed by a paragraph headed by the new head that says what this commit
-changes against the previous head, from the diff you just computed. A
-resumed first publication whose `pr` is completed but whose `body.md` is
-not in this run's directory takes its body the same way. Then go to the
-review.
+A resumed first publication whose `pr` is completed but whose `body.md` is
+not in this run's directory takes its body the same way. Then go to the review.
 
 `create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task

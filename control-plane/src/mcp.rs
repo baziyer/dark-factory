@@ -16,7 +16,7 @@ use crate::{
         ObservePullRequestWorkflows, ObserveRef, ObserveRelease, ObserveReleaseWorkflow,
         ObserveRepository, ObserveTree, OperationError, PublishCommit, PublishReleaseTag,
         ReadPullRequestJobLog, RecoverRelease, RerunFailedPullRequestJobs, ResolveIssue,
-        SubmitPullRequestReview, canonical_operation_id,
+        SubmitPullRequestReview, UpdatePullRequestBody, canonical_operation_id,
     },
     journal::DeliveryJournal,
 };
@@ -483,6 +483,34 @@ fn tools() -> Value {
                 "draft": {"type": "boolean"}
             },
             "required": ["repository", "operation_id", "issue_number", "head", "head_sha", "base", "base_sha", "title", "body", "draft"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "integer"},
+                "url": {"type": "string"},
+                "head_sha": {"type": "string"},
+                "base_sha": {"type": "string"}
+            },
+            "required": ["number", "url", "head_sha", "base_sha"],
+            "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+    }, {
+        "name": "update_pull_request_body",
+        "title": "Replace an exact-head pull request body",
+        "description": "Replace one open pull request body only while it still names the stated head commit. The App renders its operation marker; the supplied body cannot contain an App operation or review verdict marker. Replays require the same operation UUID and request.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repository": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$"},
+                "operation_id": {"type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"},
+                "pull_number": {"type": "integer", "minimum": 1},
+                "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                "body": {"type": "string", "maxLength": 30000}
+            },
+            "required": ["repository", "operation_id", "pull_number", "head_sha", "body"],
             "additionalProperties": false
         },
         "outputSchema": {
@@ -1043,6 +1071,21 @@ async fn call_tool(id: Value, request: &Map<String, Value>, mcp: &McpState) -> R
             match mcp.app.create_pull_request(&mcp.journal, arguments).await {
                 Ok(result) => {
                     serialized_tool_result(id, &result, "Pull request is durably recorded.")
+                }
+                Err(error) => operation_error(id, error),
+            }
+        }
+        Some("update_pull_request_body") => {
+            let Ok(arguments) = serde_json::from_value::<UpdatePullRequestBody>(arguments) else {
+                return json_rpc_error(id, -32602, "Invalid params");
+            };
+            match mcp
+                .app
+                .update_pull_request_body(&mcp.journal, arguments)
+                .await
+            {
+                Ok(result) => {
+                    serialized_tool_result(id, &result, "Pull request body is durably recorded.")
                 }
                 Err(error) => operation_error(id, error),
             }
