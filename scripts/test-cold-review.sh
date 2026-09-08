@@ -139,6 +139,8 @@ grep -q "diff $base $head" "$args" || fail "the diff does not run from the merge
 grep -q '^exec$' "$args" || fail "default reviewer is not Codex exec"
 grep -q -- '--ephemeral' "$args" || fail "Codex review persists a session"
 grep -q -- '--ignore-user-config' "$args" || fail "Codex review inherits user MCP configuration"
+grep -Fxq 'approval_policy="on-request"' "$args" || fail "Codex review does not request approval through its configured reviewer"
+grep -Fxq 'approvals_reviewer="auto_review"' "$args" || fail "Codex review does not route configured approvals automatically"
 grep -q -- '--sandbox' "$args" || fail "Codex review does not select a sandbox"
 grep -q '^read-only$' "$args" || fail "Codex review sandbox is not read-only"
 grep -q -- '--ignore-rules' "$args" || fail "Codex review loads rules from the change"
