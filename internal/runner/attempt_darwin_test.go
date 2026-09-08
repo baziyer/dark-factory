@@ -251,9 +251,9 @@ func TestAttemptConfigureFreezesAndRejectsStartupInput(t *testing.T) {
 	}
 }
 
-func shellPIDWitness(pid, path string) string {
+func shellWitness(value, path string) string {
 	pending := path + ".pending"
-	return fmt.Sprintf("printf '%%s' %s > %q && mv %q %q", pid, pending, pending, path)
+	return fmt.Sprintf("printf '%%s' %s > %q && mv %q %q", value, pending, pending, path)
 }
 
 func runAttemptWorkerHelper(args []string) error {
@@ -343,19 +343,21 @@ func runAttemptWorkerHelper(args []string) error {
 		case "native-exit":
 			greeting = "exit 3; "
 		}
-		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; %sIFS= read -r startup || exit 98; printf '%%s' \"$startup\" > %q || exit 99; IFS= read -r interactive || exit 100; printf '%%s' \"$interactive\" > %q || exit 101; while test ! -f %q; do sleep 0.01; done", greeting, filepath.Join(root, "provider.startup"), filepath.Join(root, "provider.stdin"), filepath.Join(root, "finish"))
+		startupWitness := shellWitness("\"$startup\"", filepath.Join(root, "provider.startup"))
+		interactiveWitness := shellWitness("\"$interactive\"", filepath.Join(root, "provider.stdin"))
+		script := fmt.Sprintf("test ! -e /dev/fd/11 || exit 97; %sIFS= read -r startup || exit 98; %s || exit 99; IFS= read -r interactive || exit 100; %s || exit 101; while test ! -f %q; do sleep 0.01; done", greeting, startupWitness, interactiveWitness, filepath.Join(root, "finish"))
 		provider = ExecSpec{Target: "/bin/sh", Args: []string{"-c", script}, Env: []string{"PATH=/usr/bin:/bin", "LANG=C"}, Cwd: providerCwd}
 	case "shell", "shell-input", "term", "leader", "tail", "reply", "loud-adoption":
-		providerWitness := shellPIDWitness("$$", filepath.Join(root, "provider.pid"))
+		providerWitness := shellWitness("$$", filepath.Join(root, "provider.pid"))
 		script := fmt.Sprintf("test -z \"${HOME+x}\" || exit 90; test -z \"${DARK_FACTORY_ATTEMPT_TOKEN+x}\" || exit 91; for n in 3 4 5 6 7 8 9; do test ! -e /dev/fd/$n || exit 92; done; test -f /dev/fd/10 || exit 93; test ! -s /dev/fd/10 || exit 94; test -f /dev/fd/11 || exit 97; IFS= read -r task < /dev/fd/11; test \"$task\" = one-startup || exit 98; cat /dev/fd/10/change-worker.config >/dev/null 2>&1 && exit 95; cd /dev/fd/10 >/dev/null 2>&1 && exit 96; %s; printf 'pre-output\\n'; while test ! -f %q; do sleep 0.01; done; printf 'post-output\\n'; printf x >> %q; while test ! -f %q; do sleep 0.01; done", providerWitness, filepath.Join(root, "continue"), filepath.Join(root, "provider.effect"), filepath.Join(root, "finish"))
 		if mode == "shell-input" {
-			script += fmt.Sprintf("; IFS= read -r line; printf '%%s' \"$line\" > %q", filepath.Join(root, "provider.stdin"))
+			script += "; IFS= read -r line; " + shellWitness("\"$line\"", filepath.Join(root, "provider.stdin"))
 		}
 		if mode == "term" {
-			script = fmt.Sprintf("trap '' TERM; sleep 30 & %s; %s; while :; do sleep 1; done", shellPIDWitness("$!", filepath.Join(root, "descendant.pid")), providerWitness)
+			script = fmt.Sprintf("trap '' TERM; sleep 30 & %s; %s; while :; do sleep 1; done", shellWitness("$!", filepath.Join(root, "descendant.pid")), providerWitness)
 		}
 		if mode == "leader" {
-			script = fmt.Sprintf("sleep 30 & %s; %s; while test ! -f %q; do sleep 0.01; done; exit 0", shellPIDWitness("$!", filepath.Join(root, "descendant.pid")), providerWitness, filepath.Join(root, "leader.release"))
+			script = fmt.Sprintf("sleep 30 & %s; %s; while test ! -f %q; do sleep 0.01; done; exit 0", shellWitness("$!", filepath.Join(root, "descendant.pid")), providerWitness, filepath.Join(root, "leader.release"))
 		}
 		if mode == "tail" {
 			script = "printf 'tail-output\\n'; exit 0"
