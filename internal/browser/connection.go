@@ -70,6 +70,7 @@ type connection struct {
 	terminalSent      uint64
 	terminalPending   *TerminalEvent
 	terminalAckTimer  *time.Timer
+	terminalAckExpiry time.Time
 }
 
 type request struct {
@@ -802,6 +803,7 @@ func (current *connection) clearTerminal() {
 		current.terminalAckTimer.Stop()
 		current.terminalAckTimer = nil
 	}
+	current.terminalAckExpiry = time.Time{}
 	current.attachment = nil
 	current.terminalEvents = nil
 	current.terminalAttachID = ""
@@ -814,6 +816,7 @@ func (current *connection) clearTerminal() {
 func (current *connection) armTerminalAckTimer() {
 	if current.terminalAckTimer == nil {
 		current.terminalAckTimer = time.NewTimer(current.server.terminalAckTimeout)
+		current.terminalAckExpiry = time.Now().Add(current.server.terminalAckTimeout)
 	}
 }
 
@@ -821,10 +824,17 @@ func (current *connection) handleTerminalAck(ack browserprotocol.TerminalAck) bo
 	if current.attachment == nil || ack.SessionID != current.terminalAttach.SessionID || uint64(ack.NextSequence) <= current.terminalAck || uint64(ack.NextSequence) > current.terminalSent {
 		return false
 	}
+	if current.terminalAckTimer != nil && !time.Now().Before(current.terminalAckExpiry) {
+		return false
+	}
 	current.terminalAck = uint64(ack.NextSequence)
 	if current.terminalAck == current.terminalSent && current.terminalAckTimer != nil {
 		current.terminalAckTimer.Stop()
 		current.terminalAckTimer = nil
+		current.terminalAckExpiry = time.Time{}
+	} else if current.terminalAckTimer != nil {
+		current.terminalAckTimer.Reset(current.server.terminalAckTimeout)
+		current.terminalAckExpiry = time.Now().Add(current.server.terminalAckTimeout)
 	}
 	if current.terminalPending != nil && current.terminalPendingReady(*current.terminalPending) {
 		pending := *current.terminalPending
