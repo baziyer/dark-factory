@@ -179,6 +179,14 @@ func (client *OperatorClient) CreateAgent(ctx context.Context, input CreateAgent
 	return client.client.mutate(ctx, "create_agent", input)
 }
 
+// SendBackTask returns a finished task to its queue with a note.
+func (client *OperatorClient) SendBackTask(ctx context.Context, input SendBackInput) (MutationResult, error) {
+	if !validID(input.TaskID) || !validText(input.Note, 1, 8192) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "send_back_task", input)
+}
+
 func (client *OperatorClient) EnqueueTask(ctx context.Context, input EnqueueTaskInput) (MutationResult, error) {
 	if !validID(input.ID) || !validID(input.ProjectID) || !validID(input.AssignedAgentID) || !validID(input.IncarnationID) || !validText(input.Title, 1, 1024) || !validText(input.Body, 0, 131072) || input.Priority < -1_000_000 || input.Priority > 1_000_000 {
 		return MutationResult{}, ErrInvalidInput
@@ -236,6 +244,15 @@ func (client *AttemptClient) RequestHuman(ctx context.Context, input HumanQuesti
 		return MutationResult{}, ErrInvalidInput
 	}
 	return client.client.mutate(ctx, "request_human", input)
+}
+
+// SendBack returns a finished task of the attempt's project to its queue
+// with a note; only an orchestrator's attempt is allowed to.
+func (client *AttemptClient) SendBack(ctx context.Context, input SendBackInput) (MutationResult, error) {
+	if !validID(input.TaskID) || !validText(input.Note, 1, 8192) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "send_back", input)
 }
 
 func (client client) attemptDetail(ctx context.Context, method, detail string) (MutationResult, error) {

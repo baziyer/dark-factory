@@ -10,6 +10,7 @@ import (
 
 	"github.com/dark-factory-build/dark-factory/internal/api"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
+	"github.com/dark-factory-build/dark-factory/internal/provider"
 )
 
 // Daemon is the concrete composition root for the local API. It owns the
@@ -160,6 +161,8 @@ func (daemon *Daemon) dispatch(ctx context.Context, call api.Call) api.Reply {
 		return daemon.attemptTask(ctx, call)
 	case api.CallRequestHuman:
 		return daemon.requestHuman(ctx, call)
+	case api.CallSendBack, api.CallSendBackTask:
+		return daemon.sendBack(ctx, call)
 	case api.CallWebStatus:
 		status, err := daemon.WebStatus(ctx)
 		if err != nil {
@@ -442,6 +445,83 @@ func (daemon *Daemon) clearOutcomeReceipt(attempt *liveAttempt) {
 
 func attemptOutcomeCall(kind api.CallKind) bool {
 	return kind == api.CallSucceed || kind == api.CallBlock || kind == api.CallFail
+}
+
+// sendBack returns a finished task to its queue: through an orchestrator's
+// attempt credential, bound to its project, or as the operator, who names any
+// task at its current revision.
+func (daemon *Daemon) sendBack(ctx context.Context, call api.Call) api.Reply {
+	input, ok := call.SendBackInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	taskID, err := parseTaskID(input.TaskID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	// An attempt is authenticated before anything is read on its behalf, so a
+	// credential the kernel would refuse learns nothing about any task.
+	var digest kernel.AttemptDigest
+	var authority kernel.AttemptAuthority
+	raw, attempt := call.AttemptDigest()
+	if attempt {
+		kDigest, err := attemptDigest(raw)
+		if err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		authority, err = daemon.store.AuthenticateAttempt(ctx, kDigest)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+		if authority.Role != kernel.RoleOrchestrator {
+			return newErrorReply(api.RemoteUnauthorized)
+		}
+		digest = kDigest
+	}
+	// The body a send-back leaves is the provider's whole task, so it must fit
+	// the provider of the agent that will run it, or the retry would be queued
+	// only to fail at launch. The kernel edge authorizes again and writes.
+	current, found, err := daemon.store.Task(ctx, taskID)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if !found {
+		return newErrorReply(api.RemoteNotFound)
+	}
+	// Another project's task is not this orchestrator's to read further,
+	// let alone measure against its provider.
+	if attempt && current.ProjectID != authority.ProjectID {
+		return newErrorReply(api.RemoteUnauthorized)
+	}
+	agent, found, err := daemon.store.Agent(ctx, current.AssignedAgentID)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if !found {
+		return newErrorReply(api.RemoteConflict)
+	}
+	if _, _, err := provider.PrepareTask(agent.Provider, []byte(kernel.SentBackBody(current, input.Note))); err != nil {
+		return newErrorReply(api.RemoteTooLarge)
+	}
+	var task kernel.Task
+	if attempt {
+		task, err = daemon.store.SendBackTaskForAttempt(ctx, digest, taskID, input.Note, at)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+	} else {
+		task, err = daemon.store.SendBackTask(ctx, taskID, current.Revision, input.Note, at)
+		if err != nil {
+			return newErrorReply(remoteErrorCode(err))
+		}
+	}
+	// The task is queued again; the scheduler should not wait for its tick.
+	daemon.notifyScheduler()
+	return daemon.mutation(ctx, task.Revision)
 }
 
 func (daemon *Daemon) requestHuman(ctx context.Context, call api.Call) api.Reply {

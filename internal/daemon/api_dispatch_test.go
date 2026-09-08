@@ -268,6 +268,117 @@ func TestDaemonDispatchesAttemptOutcomeAfterCommit(t *testing.T) {
 	waitDispatch(t, done)
 }
 
+// A send-back reaches the kernel through both domains with the kernel's own
+// refusals mapped to remote codes: an orchestrator may not send back its own
+// task, a shell task takes no note, a queued task is a conflict, a task that
+// does not exist is not found, a note the provider could not be handed is
+// too large, and an unknown bearer learns none of that. The accepting paths
+// are the kernel's tests.
+func TestDaemonDispatchesSendBackThroughBothDomains(t *testing.T) {
+	fixture := newDispatchFixture(t)
+	active := prepareActiveAttempt(t, fixture, 51)
+	ctx := context.Background()
+	operator, err := api.NewOperatorClient(fixture.socket, fixture.operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := active.run.TaskID.String()
+	var remote *api.RemoteError
+	done := fixture.serve(t)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: own, Note: "myself"}); !errors.As(err, &remote) || remote.Code() != api.RemoteConflict {
+		t.Fatalf("orchestrator sending back its own task = %v", err)
+	}
+	waitDispatch(t, done)
+	// The fixture's orchestrator is a shell agent: its task is a program and
+	// takes no note, whatever its status.
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: own, Note: "still running"}); !errors.As(err, &remote) || remote.Code() != api.RemoteInvalidRequest {
+		t.Fatalf("operator sending back a shell task = %v", err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: testID(99), Note: "nobody"}); !errors.As(err, &remote) || remote.Code() != api.RemoteNotFound {
+		t.Fatalf("operator sending back a missing task = %v", err)
+	}
+	waitDispatch(t, done)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: own, Note: ""}); !errors.Is(err, api.ErrInvalidInput) {
+		t.Fatalf("empty note left the client = %v", err)
+	}
+	// A note the task's provider could not be handed is too large, whatever
+	// the kernel would have said about the task.
+	claude, claudeTask := testID(61), testID(62)
+	done = fixture.serve(t)
+	if _, err := operator.CreateAgent(ctx, api.CreateAgentInput{ID: claude, ProjectID: active.run.ProjectID.String(), Name: "typist", Role: "worker", Provider: "claude_code", ToolBudgetLimit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.EnqueueTask(ctx, api.EnqueueTaskInput{ID: claudeTask, ProjectID: active.run.ProjectID.String(), AssignedAgentID: claude, IncarnationID: testID(63), Title: "typed", Body: strings.Repeat("x", 7000)}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: claudeTask, Note: strings.Repeat("&", 1024)}); !errors.As(err, &remote) || remote.Code() != api.RemoteTooLarge {
+		t.Fatalf("a note past the provider's prompt = %v", err)
+	}
+	waitDispatch(t, done)
+	// A note that fits reaches the kernel, which refuses the queued task.
+	done = fixture.serve(t)
+	if _, err := operator.SendBackTask(ctx, api.SendBackInput{TaskID: claudeTask, Note: "fits"}); !errors.As(err, &remote) || remote.Code() != api.RemoteConflict {
+		t.Fatalf("operator sending back a queued task = %v", err)
+	}
+	waitDispatch(t, done)
+	// Another project's task is unauthorized before its provider is asked
+	// anything, so a note's length cannot probe it.
+	elsewhere, stranger, foreign := testID(71), testID(72), testID(73)
+	done = fixture.serve(t)
+	if _, err := operator.CreateProject(ctx, api.CreateProjectInput{ID: elsewhere, Name: "elsewhere", Root: filepath.Join(filepath.Dir(fixture.socket), "elsewhere-root")}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.CreateAgent(ctx, api.CreateAgentInput{ID: stranger, ProjectID: elsewhere, Name: "stranger", Role: "worker", Provider: "claude_code", ToolBudgetLimit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := operator.EnqueueTask(ctx, api.EnqueueTaskInput{ID: foreign, ProjectID: elsewhere, AssignedAgentID: stranger, IncarnationID: testID(74), Title: "not yours", Body: strings.Repeat("x", 7000)}); err != nil {
+		t.Fatal(err)
+	}
+	waitDispatch(t, done)
+	done = fixture.serve(t)
+	if _, err := active.client.SendBack(ctx, api.SendBackInput{TaskID: foreign, Note: strings.Repeat("&", 1024)}); !errors.As(err, &remote) || remote.Code() != api.RemoteUnauthorized {
+		t.Fatalf("another project's task with an oversized note = %v", err)
+	}
+	waitDispatch(t, done)
+	// A credential the kernel would refuse learns nothing: an unknown bearer
+	// naming a missing task is unauthorized, never not found.
+	wrongToken := filepath.Join(filepath.Dir(fixture.socket), "wrong-send-back.token")
+	if err := os.WriteFile(wrongToken, bytes.Repeat([]byte{'y'}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeToken := os.Getenv("DARK_FACTORY_ATTEMPT_TOKEN_FILE")
+	if err := os.Setenv("DARK_FACTORY_ATTEMPT_TOKEN_FILE", wrongToken); err != nil {
+		t.Fatal(err)
+	}
+	wrong, err := api.NewAttemptClientFromEnvironment(fixture.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DARK_FACTORY_ATTEMPT_TOKEN_FILE", activeToken); err != nil {
+		t.Fatal(err)
+	}
+	done = fixture.serve(t)
+	if _, err := wrong.SendBack(ctx, api.SendBackInput{TaskID: testID(98), Note: "who is there"}); !errors.As(err, &remote) || remote.Code() != api.RemoteUnauthorized {
+		t.Fatalf("unknown bearer naming a missing task = %v", err)
+	}
+	waitDispatch(t, done)
+	task, found, err := fixture.store.Task(ctx, active.run.TaskID)
+	if err != nil || !found || task.Status != kernel.TaskRunning || task.WorkRevision.Int64() != 1 {
+		t.Fatalf("task after refused send-backs = %+v, found=%v, %v", task, found, err)
+	}
+}
+
 func TestDaemonDispatchesHumanQuestionWithDurableIdempotency(t *testing.T) {
 	fixture := newDispatchFixture(t)
 	active := prepareActiveAttempt(t, fixture, 31)

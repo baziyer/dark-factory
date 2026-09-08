@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -204,39 +205,184 @@ func TestRetryAdmissionCannotPrecedeQueuedTaskUpdate(t *testing.T) {
 	_ = terminal
 }
 
-func TestSuccessfulTerminalCannotBeRetried(t *testing.T) {
+// A finished task, a success included, goes back to its queue at the next
+// work revision with the note in its body, the store stays valid, and the
+// retry is admitted on the task's own Change.
+func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	success, _ := NewSuccessProposal("finished")
 	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
-	path := storePath(t, store)
+	defer store.Close()
 	terminal, err := finalizeTestRun(t, store, finalizing, 80)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, keys := queueRetryForTerminal(t, store, terminal, 80)
-	before := captureWriteFootprint(t, store)
-	if _, _, err := store.Run(context.Background(), terminal.ID); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Run = %v", err)
+	ctx := context.Background()
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found || task.Status != TaskSucceeded {
+		t.Fatalf("finished task = %+v, found=%v, %v", task, found, err)
 	}
-	if _, err := store.Snapshot(context.Background()); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Snapshot = %v", err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "", mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("empty note = %v", err)
 	}
-	if _, err := store.RecoverableRuns(context.Background()); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry RecoverableRuns = %v", err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, strings.Repeat("x", MaxSendBackNoteBytes+1), mustTime(t, 90)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("oversized note = %v", err)
 	}
-	if result, err := store.AdmitNext(context.Background(), keys, mustTime(t, 80)); !errors.Is(err, ErrCorruptState) || result.Admitted() {
-		t.Fatalf("successful terminal retry admission = %+v, %v", result, err)
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("send-back before the terminal run = %v", err)
 	}
-	if after := captureWriteFootprint(t, store); after != before {
-		t.Fatalf("successful terminal retry footprint before=%+v after=%+v", before, after)
+	// The fixture's task has a title and no body, which a run receives as
+	// the title; the send-back must keep that instruction.
+	if task.Body != "" || task.Title == "" {
+		t.Fatalf("fixture task = %+v", task)
 	}
-	if err := store.Close(); err != nil {
+	sent, err := store.SendBackTask(ctx, task.ID, task.Revision, "the review wants a test", mustTime(t, 90))
+	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != task.WorkRevision.Int64()+1 || sent.Result != "" || sent.CompletedAt != nil || sent.BlockedReason != "" ||
+		sent.Body != task.Title+"\n\n## Sent back for work revision 2\n\nthe review wants a test" || sent.Body != SentBackBody(task, "the review wants a test") {
+		t.Fatalf("sent back task = %+v, %v", sent, err)
+	}
+	if body := SentBackBody(Task{Title: "titled", Body: "the body", WorkRevision: mustRevision(t, 1)}, "n"); !strings.HasPrefix(body, "the body\n\n") {
+		t.Fatalf("body with a body = %q", body)
+	}
+	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
+		t.Fatalf("store after send-back = %v", err)
+	}
+	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "again", mustTime(t, 91)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale revision = %v", err)
+	}
+	if _, err := store.SendBackTask(ctx, sent.ID, sent.Revision, "again", mustTime(t, 92)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("queued task sent back = %v", err)
+	}
+	candidate := changeID(t, 110)
+	keys := admissionKeys(t, 100, &candidate)
+	result, err := store.AdmitNext(ctx, keys, mustTime(t, 100))
+	if err != nil || !result.Admitted() || result.Run.AdmittedTaskWorkRevision.Int64() != 2 || result.Run.ChangeID == nil || *result.Run.ChangeID != *terminal.ChangeID {
+		t.Fatalf("retry admission = %+v, %v", result, err)
+	}
+}
+
+// A task that never ran has no run to go back to.
+func TestSendBackRefusesATaskWithoutARun(t *testing.T) {
+	store, _, project, agent := newAdmissionStore(t, RoleWorker, 2)
+	defer store.Close()
+	ctx := context.Background()
+	task, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 60), ProjectID: project.ID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 61), Title: "never ran"}, mustTime(t, 5))
+	if err != nil {
 		t.Fatal(err)
 	}
-	beforeDatabase := captureDatabaseEvidence(t, path)
-	if _, err := Open(context.Background(), path); !errors.Is(err, ErrCorruptState) {
-		t.Fatalf("successful terminal retry Open = %v", err)
+	cancelled, err := store.UpdateTask(ctx, task.ID, task.Revision, TaskPatch{Cancel: true}, mustTime(t, 6))
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertDatabaseEvidenceUnchanged(t, path, beforeDatabase)
+	if _, err := store.SendBackTask(ctx, cancelled.ID, cancelled.Revision, "try again", mustTime(t, 7)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("send-back without a run = %v", err)
+	}
+	// A shell agent's task is a program: no note can be appended to it,
+	// whatever its status.
+	shell, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 70), ProjectID: project.ID, Name: "shell", Role: RoleWorker, Provider: ProviderShell, ToolBudgetLimit: 2}, mustTime(t, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 71), ProjectID: project.ID, AssignedAgentID: shell.ID, IncarnationID: incarnationID(t, 72), Title: "run", Body: "printf x"}, mustTime(t, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTask(ctx, program.ID, program.Revision, "a note", mustTime(t, 10)); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("send-back of a shell task = %v", err)
+	}
+}
+
+// A running orchestrator of the same project may send a worker's finished
+// task back; before it runs, its own task, another project's task, an
+// unknown credential and (below) a worker's credential may not.
+func TestOrchestratorAttemptSendsBackAWorkerTask(t *testing.T) {
+	success, _ := NewSuccessProposal("finished")
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
+	defer store.Close()
+	terminal, err := finalizeTestRun(t, store, finalizing, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 250), ProjectID: terminal.ProjectID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 81))
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 251), ProjectID: terminal.ProjectID, AssignedAgentID: overseer.ID, IncarnationID: incarnationID(t, 252), Title: "publish"}, mustTime(t, 82))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := admissionKeys(t, 120, nil)
+	admission, err := store.AdmitNext(ctx, keys, mustTime(t, 83))
+	if err != nil || !admission.Admitted() || admission.Run.Role != RoleOrchestrator {
+		t.Fatalf("orchestrator admission = %+v, %v", admission, err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "not yet running", mustTime(t, 84)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("admitted but not running orchestrator = %v", err)
+	}
+	activated := activateAllResourcesUnique(t, store, *admission.Run, 90, 7)
+	session := terminalSessionForRunTest(t, store, admission.Run.ID)
+	if _, err := store.ActivateRun(ctx, admission.Run.ID, session.ID, activated.Revision, session.Revision, mustTime(t, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, own.ID, "myself", mustTime(t, 101)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("own task = %v", err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, taskID(t, 99), "missing", mustTime(t, 101)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing task = %v", err)
+	}
+	elsewhere, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 60), Name: "elsewhere", Root: "/elsewhere"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 61), ProjectID: elsewhere.ID, Name: "stranger", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 62), ProjectID: elsewhere.ID, AssignedAgentID: stranger.ID, IncarnationID: incarnationID(t, 63), Title: "not yours"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, foreign.ID, "another project", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("another project's task = %v", err)
+	}
+	sibling, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 64), ProjectID: terminal.ProjectID, Name: "sibling", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 65), ProjectID: terminal.ProjectID, AssignedAgentID: sibling.ID, IncarnationID: incarnationID(t, 66), Title: "another overseer's"}, mustTime(t, 101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, siblingTask.ID, "not a worker's", mustTime(t, 101)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("a sibling orchestrator's task = %v", err)
+	}
+	task, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found {
+		t.Fatalf("worker task = %+v, found=%v, %v", task, found, err)
+	}
+	sent, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "five findings", mustTime(t, 102))
+	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != 2 || sent.Body != SentBackBody(task, "five findings") {
+		t.Fatalf("orchestrator send-back = %+v, %v", sent, err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, keys.AttemptDigest, terminal.TaskID, "twice", mustTime(t, 103)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("queued task sent back again = %v", err)
+	}
+	unknown, err := AttemptDigestFromBytes(bytes.Repeat([]byte{9}, DigestBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SendBackTaskForAttempt(ctx, unknown, terminal.TaskID, "stranger", mustTime(t, 104)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("unknown credential = %v", err)
+	}
+}
+
+// A worker's credential is never a send-back authority.
+func TestWorkerAttemptCannotSendBack(t *testing.T) {
+	store, run, keys := runningWorkerRun(t)
+	defer store.Close()
+	if _, err := store.SendBackTaskForAttempt(context.Background(), keys.AttemptDigest, run.TaskID, "myself", mustTime(t, 200)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("worker send-back = %v", err)
+	}
 }
 
 func TestNonSuccessTerminalAllowsQueuedRetry(t *testing.T) {
@@ -319,11 +465,18 @@ func TestHistoricalRetryMustFollowEveryPredecessor(t *testing.T) {
 	assertCorruptTaskHistory(t, store, path, predecessor.ID, successor.ID)
 }
 
-func TestEarlierSuccessfulRunForbidsLaterHistory(t *testing.T) {
+// A successful run may precede later history: a send-back returns a finished
+// task, a success included, to its queue.
+func TestEarlierSuccessfulRunMayPrecedeLaterHistory(t *testing.T) {
 	store, predecessor, successor := retryAdmittedWorker(t, 33, 33)
-	path := storePath(t, store)
+	defer store.Close()
 	corruptSQL(t, store, `UPDATE runs SET proposal_kind = 'succeeded', proposal_code = NULL, proposal_detail = NULL, proposal_result = 'hidden success', terminal_kind = 'succeeded', terminal_code = NULL, terminal_detail = NULL, terminal_result = 'hidden success' WHERE id = ?`, predecessor.ID.Bytes())
-	assertCorruptTaskHistory(t, store, path, predecessor.ID, successor.ID)
+	if _, _, err := store.Run(context.Background(), successor.ID); err != nil {
+		t.Fatalf("history after a successful run = %v", err)
+	}
+	if _, _, err := store.Run(context.Background(), predecessor.ID); err != nil {
+		t.Fatalf("successful predecessor = %v", err)
+	}
 }
 
 // The daemon's refusal of a published tree ends the run as a source failure,
