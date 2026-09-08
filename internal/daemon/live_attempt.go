@@ -82,6 +82,15 @@ func (attachment *TerminalAttachment) Events() <-chan browser.TerminalEvent {
 	return attachment.queue
 }
 
+func (attachment *TerminalAttachment) ResetRequired() bool {
+	if attachment == nil {
+		return false
+	}
+	attachment.mu.Lock()
+	defer attachment.mu.Unlock()
+	return errors.Is(attachment.closeErr, ErrTerminalSlow) || errors.Is(attachment.closeErr, ErrTerminalReset)
+}
+
 // Next waits for one bounded terminal event. Context cancellation only stops
 // this observer; it never affects the provider or the live attempt owner.
 func (attachment *TerminalAttachment) Next(ctx context.Context) (TerminalEvent, error) {

@@ -41,6 +41,7 @@ type terminalTestAttachment struct {
 	closeOnce     sync.Once
 	closeErr      error
 	closeFirstErr error
+	resetRequired bool
 }
 
 func newTerminalTestBackend() *terminalTestBackend {
@@ -67,6 +68,7 @@ func startTerminalServerWithAckTimeout(t *testing.T, backend *terminalTestBacken
 }
 
 func (attachment *terminalTestAttachment) Events() <-chan TerminalEvent { return attachment.events }
+func (attachment *terminalTestAttachment) ResetRequired() bool          { return attachment.resetRequired }
 func (attachment *terminalTestAttachment) Close() error {
 	call := attachment.closeCalls.Add(1)
 	if call == 1 && attachment.closeFirstErr != nil {
@@ -491,6 +493,73 @@ func TestTerminalTransportAcknowledgesOutputBeforeClosingTerminal(t *testing.T) 
 				t.Fatalf("connection was not retained: %+v", next)
 			}
 		})
+	}
+}
+
+func TestTerminalTransportConvertsSlowAttachmentCloseToReset(t *testing.T) {
+	backend := newTerminalTestBackend()
+	backend.authentication.Capabilities = browserprotocol.CapabilityObserve
+	server := startTerminalServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticateTerminalTest(t, connection)
+	writeClientFrame(t, connection, terminalAttachRequest(t, "attach", 0))
+	sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventAttached, Accepted: true, Head: 1})
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTerminalAttached {
+		t.Fatalf("attached frame=%+v", frame)
+	}
+
+	attachment := backend.currentAttachment(t)
+	sendTerminalEvent(t, backend, TerminalEvent{Kind: TerminalEventOutput, Start: 0, End: 1, Payload: []byte("x")})
+	if output := readTerminalBinary(t, connection); output.Sequence != 0 || !bytes.Equal(output.Payload, []byte("x")) {
+		t.Fatalf("output = %+v", output)
+	}
+	// The daemon closes a bounded slow observer after its queue is full. That
+	// close must reuse the reset protocol and wait for the output ACK instead
+	// of turning the attachment lifecycle into a WebSocket close.
+	attachment.resetRequired = true
+	close(attachment.events)
+	read := beginTerminalRead(connection)
+	select {
+	case result := <-read:
+		t.Fatalf("slow close reset before output ACK: kind=%v err=%v", result.kind, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ack, err := browserprotocol.EncodeTerminalAck(browserprotocol.TerminalAck{SessionID: projectID, NextSequence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientFrame(t, connection, ack)
+	var result terminalReadResult
+	select {
+	case result = <-read:
+	case <-time.After(time.Second):
+		t.Fatal("slow close did not send reset after output ACK")
+	}
+	if result.err != nil || result.kind != websocket.MessageText {
+		t.Fatalf("slow close result kind=%v err=%v", result.kind, result.err)
+	}
+	reset, err := browserprotocol.DecodeServerControl(result.payload)
+	if err != nil || reset.Type != browserprotocol.TypeTerminalReset || reset.ID != "attach" {
+		t.Fatalf("slow close reset=%+v err=%v", reset, err)
+	}
+	body := reset.Body.(browserprotocol.TerminalReset)
+	// The reset captures the last browser-confirmed cursor at closure time.
+	// It may replay the one output awaiting ACK on the fresh surface.
+	if body.Floor != 0 || body.Head != 0 {
+		t.Fatalf("slow close resume cursor = %+v", body)
+	}
+	if attachment.closed.Load() != 1 || attachment.closeCalls.Load() != 1 {
+		t.Fatalf("slow close attachment close=%d calls=%d", attachment.closed.Load(), attachment.closeCalls.Load())
+	}
+
+	target, err := browserprotocol.EncodeTerminalTargetGet("still-open", browserprotocol.TerminalTargetGet{AgentID: strings.Repeat("01", 16), ExpectedAgentRevision: 1, ExpectedHead: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientFrame(t, connection, target)
+	if frame := readServerFrame(t, connection); frame.Type != browserprotocol.TypeTerminalTarget || frame.ID != "still-open" {
+		t.Fatalf("connection was not retained after slow close: %+v", frame)
 	}
 }
 

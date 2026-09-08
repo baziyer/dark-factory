@@ -301,11 +301,13 @@ class TerminalController {
   }
 
   async #writeOutput(generation: number, payload: Uint8Array): Promise<void> {
+    if (this.#detachRequested) return;
     const live = this.#handle !== undefined && !this.#handleClosed && !this.#closing;
     if ((!this.#current(generation) && !this.#detachRequested) || !live) return Promise.reject(new SessionError("closed"));
     try {
       await this.#options.surface.write(payload.slice());
     } catch {
+      if (this.#detachRequested) return;
       const live = this.#current(generation) && this.#liveHandle();
       if (live) this.#fail(new SessionError("internal"));
       throw new SessionError(live ? "internal" : "closed");
