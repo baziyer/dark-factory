@@ -188,9 +188,10 @@ function AgentTaskTools({ terminal, controller }: { terminal: FactoryTerminalVie
 }
 
 function AgentIdleTools({ terminal, controller }: { terminal: FactoryTerminalView; controller: FactoryAppController }) {
+  const mode = terminal.paused || terminal.queued ? "queue" : "now";
   return (
     <>
-      <AgentInstruction terminal={terminal} mode="now" onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
+      <AgentInstruction terminal={terminal} mode={mode} onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
       {terminal.history === undefined && !terminal.historyPending ? null : <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />}
     </>
   );
@@ -271,7 +272,7 @@ export function AgentInstruction({
       : "SEND NOT CONFIRMED — CHECK TASKS BEFORE RETRYING";
   return (
     <form className={`dfFactoryConsole__instruction${mode === "queue" ? " dfFactoryConsole__instruction--queue" : ""}`} onSubmit={(event) => { void submit(event); }}>
-      <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-instruction-${terminal.agentId}`}>
+      <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-instruction-${terminal.agentId}-${mode}`}>
         {mode === "queue" ? `Queue follow-up work for ${terminal.agentName}` : `Instruction for ${terminal.agentName}`}
       </label>
       <textarea

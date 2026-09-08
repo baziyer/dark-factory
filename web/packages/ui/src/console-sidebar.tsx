@@ -66,7 +66,7 @@ export function AgentPanel({
     .sort((left, right) => right.priority - left.priority);
   const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
   const errorCopy = editErrorCopy(edit);
-  const queueHint = current !== undefined && agent.paused
+  const queueHint = agent.paused
     ? "QUEUE PAUSED"
     : current === undefined && queued.length > 0
       ? "QUEUED · WAITING FOR CAPACITY"
@@ -157,24 +157,25 @@ function AgentConfig({
   const [accountId, setAccountId] = useState(agent.account_id);
   const [paused, setPaused] = useState(agent.paused);
   const [idlePolicy, setIdlePolicy] = useState(agent.idle_policy);
-  const [idleAfterMinutes, setIdleAfterMinutes] = useState(String(Math.round(agent.idle_after_seconds / 60)));
+  const [idleAfterSeconds, setIdleAfterSeconds] = useState(String(agent.idle_after_seconds));
   const [idleInstruction, setIdleInstruction] = useState(agent.idle_instruction);
   const [idleRunBudget, setIdleRunBudget] = useState(String(agent.idle_run_budget));
   const [budgetTyped, setBudgetTyped] = useState(false);
   if (onSave === undefined) return null;
   // Sending a control the operator did not touch would make the daemon
   // revalidate it, so a stored pair it no longer accepts could not be paused.
-  const idleAfterSeconds = Math.max(0, Math.floor(Number(idleAfterMinutes) || 0)) * 60;
+  const idleAfter = Math.max(0, Math.floor(Number(idleAfterSeconds) || 0));
   const idleBudget = Math.max(0, Math.floor(Number(idleRunBudget) || 0));
   const standing = idlePolicy === "standing_instruction";
+  const supervising = agent.role === "orchestrator";
   // A standing instruction is one rule, not three controls: the daemon
   // refuses a wait, text or budget it cannot run, so the form sends the whole
   // rule whenever any part of it moved, and will not submit one it can see
   // is incomplete. The budget travels only when it was typed (even the same
   // number) or the rule is new, since a budget the daemon receives starts the
   // used count again; an edit to the wait or the text leaves the count alone.
-  const ruleMoved = idlePolicy !== agent.idle_policy || idleAfterSeconds !== agent.idle_after_seconds || idleInstruction !== agent.idle_instruction || idleBudget !== agent.idle_run_budget || budgetTyped;
-  const ruleIncomplete = standing && (idleAfterSeconds < 60 || idleInstruction.trim() === "" || idleBudget < 1);
+  const ruleMoved = idlePolicy !== agent.idle_policy || idleAfter !== agent.idle_after_seconds || idleInstruction !== agent.idle_instruction || idleBudget !== agent.idle_run_budget || budgetTyped;
+  const ruleIncomplete = standing && (idleAfter < 1 || idleInstruction.trim() === "" || idleBudget < 1);
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (ruleIncomplete) return;
@@ -183,7 +184,7 @@ function AgentConfig({
       ...(reasoningEffort === agent.reasoning_effort ? {} : { reasoningEffort }),
       ...(accountId === agent.account_id ? {} : { accountId }),
       ...(paused === agent.paused ? {} : { paused }),
-      ...(!ruleMoved ? {} : standing ? { idlePolicy, idleAfterSeconds, idleInstruction, ...(budgetTyped || idlePolicy !== agent.idle_policy ? { idleRunBudget: idleBudget } : {}) } : { idlePolicy }),
+      ...(!ruleMoved ? {} : standing ? { idlePolicy, idleAfterSeconds: idleAfter, idleInstruction, ...(budgetTyped || idlePolicy !== agent.idle_policy ? { idleRunBudget: idleBudget } : {}) } : { idlePolicy }),
     });
   };
   return (
@@ -209,22 +210,23 @@ function AgentConfig({
         <input id={`df-paused-${agent.id}`} type="checkbox" checked={paused} disabled={pending} onChange={(event) => setPaused(event.currentTarget.checked)} />
         PAUSED
       </label>
-      <h3>RULES</h3>
-      <label htmlFor={`df-idle-${agent.id}`}>WHEN IDLE</label>
+      <h3>{supervising ? "SUPERVISION" : "RULES"}</h3>
+      <label htmlFor={`df-idle-${agent.id}`}>{supervising ? "WHEN WORK CHANGES" : "WHEN READY"}</label>
       <select id={`df-idle-${agent.id}`} value={idlePolicy} disabled={pending} onChange={(event) => setIdlePolicy(event.currentTarget.value as typeof idlePolicy)}>
         <option value="wait">wait for work</option>
-        <option value="standing_instruction">run a standing instruction</option>
+        <option value="standing_instruction">{supervising ? "supervise worker activity" : "run a standing instruction"}</option>
       </select>
       {idlePolicy === "standing_instruction" ? (
         <>
-          <label htmlFor={`df-idle-after-${agent.id}`}>AFTER MINUTES IDLE</label>
-          <input id={`df-idle-after-${agent.id}`} inputMode="numeric" value={idleAfterMinutes} disabled={pending} onChange={(event) => setIdleAfterMinutes(event.currentTarget.value)} />
+          <label htmlFor={`df-idle-after-${agent.id}`}>{supervising ? "COOLDOWN SECONDS" : "AFTER SECONDS READY"}</label>
+          <input id={`df-idle-after-${agent.id}`} inputMode="numeric" value={idleAfterSeconds} disabled={pending} onChange={(event) => setIdleAfterSeconds(event.currentTarget.value)} />
           <label htmlFor={`df-idle-instruction-${agent.id}`}>INSTRUCTION</label>
           <textarea id={`df-idle-instruction-${agent.id}`} rows={3} value={idleInstruction} disabled={pending} onChange={(event) => setIdleInstruction(event.currentTarget.value)} />
           <label htmlFor={`df-idle-budget-${agent.id}`}>RUN BUDGET</label>
           <input id={`df-idle-budget-${agent.id}`} inputMode="numeric" value={idleRunBudget} disabled={pending} onChange={(event) => { setBudgetTyped(true); setIdleRunBudget(event.currentTarget.value); }} />
           <p className="dfConsoleSidebar__inherit">{agent.idle_runs_used} of {agent.idle_run_budget} idle runs used · type the budget again to start the count again</p>
-          {ruleIncomplete ? <p className="dfConsoleSidebar__inherit">a standing instruction needs at least a minute, text and a budget of one run</p> : null}
+          {supervising ? <p className="dfConsoleSidebar__inherit">initial inspection, then worker events</p> : null}
+          {ruleIncomplete ? <p className="dfConsoleSidebar__inherit">a standing instruction needs at least a second, text and a budget of one run</p> : null}
         </>
       ) : null}
       <button type="submit" disabled={pending || !ready || ruleIncomplete}>{pending ? "SAVING" : "SAVE"}</button>
