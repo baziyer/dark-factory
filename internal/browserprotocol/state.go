@@ -248,7 +248,7 @@ func validateBoundedText(value string, minimum, maximum int) error {
 }
 
 func validateFactoryItem(value FactoryItem) error {
-	if value.Capacity < 1 || value.Capacity > MaxFactoryCapacity || value.ActiveRuns > MaxFactoryCapacity || value.ActiveRuns > value.Capacity || value.Revision == 0 {
+	if value.Capacity < 1 || value.Capacity > MaxFactoryCapacity || value.ActiveRuns > MaxFactoryCapacity+1 || value.ActiveRuns > value.Capacity+1 || value.Revision == 0 {
 		return fmt.Errorf("%w: factory item", ErrMalformed)
 	}
 	return nil

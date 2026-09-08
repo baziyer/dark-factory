@@ -36,6 +36,17 @@ type TaskPatch struct {
 // validation CreateAgent uses, so the wire cannot widen what a provider may
 // be launched with.
 func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revision, patch AgentPatch, at UnixMillis) (Agent, error) {
+	return store.updateAgent(ctx, nil, id, expected, patch, at)
+}
+
+// UpdateAgentForOverseer applies a worker pause/resume inside the running
+// orchestrator's project. Authorization and the exact revision update share
+// one write transaction.
+func (store *Store) UpdateAgentForOverseer(ctx context.Context, digest AttemptDigest, id AgentID, expected Revision, patch AgentPatch, at UnixMillis) (Agent, error) {
+	return store.updateAgent(ctx, &digest, id, expected, patch, at)
+}
+
+func (store *Store) updateAgent(ctx context.Context, digest *AttemptDigest, id AgentID, expected Revision, patch AgentPatch, at UnixMillis) (Agent, error) {
 	if id.zero() || expected.Int64() < 1 {
 		return Agent{}, fmt.Errorf("%w: invalid agent update", ErrInvalidValue)
 	}
@@ -44,12 +55,22 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 		return Agent{}, err
 	}
 	defer tx.Close()
+	var overseer Run
+	if digest != nil {
+		overseer, err = overseerRun(ctx, tx.connection, *digest)
+		if err != nil {
+			return Agent{}, tx.Rollback(err)
+		}
+	}
 	agent, found, err := agentByID(ctx, tx.connection, id)
 	if err != nil {
 		return Agent{}, tx.Rollback(err)
 	}
 	if !found {
 		return Agent{}, tx.Rollback(ErrNotFound)
+	}
+	if digest != nil && (agent.ProjectID != overseer.ProjectID || agent.Role != RoleWorker) {
+		return Agent{}, tx.Rollback(ErrUnauthorized)
 	}
 	if agent.Revision != expected || at.Int64() < agent.UpdatedAt.Int64() {
 		return Agent{}, tx.Rollback(ErrRevisionConflict)
@@ -119,6 +140,16 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 // queue is a conflict, not a not-found: the console observed it while it was
 // still editable and lost the race with the supervisor.
 func (store *Store) UpdateTask(ctx context.Context, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
+	return store.updateTask(ctx, nil, id, expected, patch, at)
+}
+
+// UpdateTaskForOverseer edits only a queued worker task in the running
+// orchestrator's project, with authorization checked in the update transaction.
+func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
+	return store.updateTask(ctx, &digest, id, expected, patch, at)
+}
+
+func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
 	if id.zero() || expected.Int64() < 1 {
 		return Task{}, fmt.Errorf("%w: invalid task update", ErrInvalidValue)
 	}
@@ -127,12 +158,22 @@ func (store *Store) UpdateTask(ctx context.Context, id TaskID, expected Revision
 		return Task{}, err
 	}
 	defer tx.Close()
+	var overseer Run
+	if digest != nil {
+		overseer, err = overseerRun(ctx, tx.connection, *digest)
+		if err != nil {
+			return Task{}, tx.Rollback(err)
+		}
+	}
 	task, found, err := taskByID(ctx, tx.connection, id)
 	if err != nil {
 		return Task{}, tx.Rollback(err)
 	}
 	if !found {
 		return Task{}, tx.Rollback(ErrNotFound)
+	}
+	if digest != nil && task.ProjectID != overseer.ProjectID {
+		return Task{}, tx.Rollback(ErrUnauthorized)
 	}
 	if task.Status != TaskQueued {
 		return Task{}, tx.Rollback(ErrConflict)
@@ -155,6 +196,9 @@ func (store *Store) UpdateTask(ctx context.Context, id TaskID, expected Revision
 		// across projects would be a corrupt row rather than a rejected edit.
 		if !found || agent.ProjectID != task.ProjectID {
 			return Task{}, tx.Rollback(ErrConflict)
+		}
+		if digest != nil && agent.Role != RoleWorker {
+			return Task{}, tx.Rollback(ErrUnauthorized)
 		}
 		task.AssignedAgentID = agent.ID
 	}

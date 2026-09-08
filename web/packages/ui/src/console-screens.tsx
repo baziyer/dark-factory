@@ -1,7 +1,7 @@
 import type { AgentItem, StateView, TopologyView } from "@dark-factory/client";
 import {
   STAGE_SEQUENCE,
-  agentActivity,
+  agentStatus,
   agentCurrentTask,
   agentGlyph,
   factoryCounters,
@@ -42,10 +42,10 @@ export function AgentStrip({
           <li className="dfConsoleStrip__empty">no agents</li>
         ) : (
           [...state.agents.values()].map((agent) => {
-            const activity = agentActivity(agent, state);
+            const activity = agentStatus(agent, state);
             const task = agentCurrentTask(agent, state);
             const phase =
-              activity === "busy" && task !== undefined ? stageOfTask(task) : activity;
+              activity === "working" && task !== undefined ? stageOfTask(task) : activity;
             const cell = (
               <>
                 <span className="dfConsoleStrip__glyph" aria-hidden="true">
@@ -209,7 +209,7 @@ function AgentRow({
   ready: boolean;
   onSelectAgent?: (agent: AgentItem) => void;
 }) {
-  const activity = agentActivity(agent, state);
+  const activity = agentStatus(agent, state);
   const task = agentCurrentTask(agent, state);
   let queued = 0;
   for (const item of state.tasks.values()) if (item.assigned_agent_id === agent.id && item.status === "queued") queued += 1;

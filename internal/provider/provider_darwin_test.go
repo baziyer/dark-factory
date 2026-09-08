@@ -623,3 +623,30 @@ func TestTrustClaudeDirectoryRecordsOnlyTheWorkingDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexOverseerDiscoversScopedControlsWithoutChangingWorkerTask(t *testing.T) {
+	installation, runtime, _ := nativeFixture(t, kernel.ProviderCodex)
+	request := requestFor(t, kernel.ProviderCodex, installation, runtime, "gpt-5.6-sol", "high")
+	worker, err := Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.role = kernel.RoleOrchestrator
+	overseer, err := Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerArgs, overseerArgs := worker.Argv(), overseer.Argv()
+	if strings.Contains(workerArgs[len(workerArgs)-1], "overseer status") {
+		t.Fatal("worker was given overseer authority instructions")
+	}
+	prompt := overseerArgs[len(overseerArgs)-1]
+	for _, command := range []string{"attempt task", "overseer status", "worker interrupt", "worker replace", "Maintainer App"} {
+		if !strings.Contains(prompt, command) {
+			t.Fatalf("overseer cannot discover %q", command)
+		}
+	}
+	if overseer.TaskDelivery() != TaskDeliveryAttemptAPI {
+		t.Fatal("overseer stopped reading the exact durable task")
+	}
+}

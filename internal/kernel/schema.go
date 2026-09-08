@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 5
+	userVersion   = 6
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -319,6 +319,41 @@ var schemaStatements = []string{
     CHECK (status NOT IN ('resolved', 'stale') OR closed_at_ms = updated_at_ms)
 ) STRICT, WITHOUT ROWID`,
 	`CREATE UNIQUE INDEX human_requests_one_unresolved_per_run ON human_requests(run_id) WHERE status IN ('open', 'delivering', 'delivery_unknown')`,
+	`CREATE TABLE task_interventions (
+    operation_id BLOB PRIMARY KEY CHECK (length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16) REFERENCES projects(id),
+    task_id BLOB NOT NULL CHECK (length(task_id) = 16),
+    run_id BLOB NOT NULL CHECK (length(run_id) = 16),
+    expected_task_revision INTEGER NOT NULL CHECK (expected_task_revision >= 1),
+    expected_run_revision INTEGER NOT NULL CHECK (expected_run_revision >= 1),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('operator', 'orchestrator')),
+    actor_run_id BLOB CHECK (actor_run_id IS NULL OR length(actor_run_id) = 16),
+    actor_browser_client_id BLOB CHECK (actor_browser_client_id IS NULL OR length(actor_browser_client_id) = 16),
+    kind TEXT NOT NULL CHECK (kind IN ('message', 'interrupt', 'stop', 'replace')),
+    payload TEXT NOT NULL CHECK (length(CAST(payload AS BLOB)) <= 8192),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    successor_task_id BLOB CHECK (successor_task_id IS NULL OR length(successor_task_id) = 16),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'unknown', 'rejected')),
+    result_detail TEXT CHECK (result_detail IS NULL OR length(CAST(result_detail AS BLOB)) BETWEEN 1 AND 4096),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    terminal_at_ms INTEGER CHECK (terminal_at_ms IS NULL OR terminal_at_ms = updated_at_ms),
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (actor_run_id) REFERENCES runs(id),
+    FOREIGN KEY (actor_browser_client_id) REFERENCES browser_clients(id),
+    FOREIGN KEY (successor_task_id) REFERENCES tasks(id),
+    CHECK ((actor_kind = 'operator' AND actor_run_id IS NULL) OR (actor_kind = 'orchestrator' AND actor_run_id IS NOT NULL AND actor_browser_client_id IS NULL)),
+    CHECK ((kind = 'message' AND length(CAST(payload AS BLOB)) BETWEEN 1 AND 8192 AND successor_task_id IS NULL) OR (kind IN ('interrupt', 'stop') AND payload = '' AND successor_task_id IS NULL) OR (kind = 'replace' AND length(CAST(payload AS BLOB)) BETWEEN 1 AND 8192 AND successor_task_id IS NOT NULL)),
+    CHECK ((state = 'pending' AND result_detail IS NULL AND terminal_at_ms IS NULL) OR (state IN ('delivered', 'unknown', 'rejected') AND terminal_at_ms IS NOT NULL))
+) STRICT, WITHOUT ROWID`,
+	`CREATE INDEX task_interventions_project_task ON task_interventions(project_id, task_id, created_at_ms, operation_id)`,
+	`CREATE TABLE overseer_wake_cursors (
+    agent_id BLOB PRIMARY KEY CHECK (length(agent_id) = 16),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16),
+    invalidation_sequence INTEGER NOT NULL CHECK (invalidation_sequence >= 0),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+) STRICT, WITHOUT ROWID`,
 	`CREATE TABLE invalidations (
     sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),

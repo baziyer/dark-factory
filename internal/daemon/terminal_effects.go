@@ -42,6 +42,7 @@ const (
 	terminalEffectInput
 	terminalEffectResize
 	terminalEffectHumanReply
+	terminalEffectIntervention
 	terminalEffectRevokeClient
 	terminalEffectRevokeCurrentBinding
 )
@@ -360,9 +361,13 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 	if delivery.RequestID != requestID || delivery.DeliveryID != deliveryID {
 		return 0, kernel.ErrCorruptState
 	}
+	return daemon.deliverHumanReply(ctx, delivery)
+}
+
+func (daemon *Daemon) deliverHumanReply(ctx context.Context, delivery kernel.HumanDelivery) (uint32, error) {
 	attempt, err := daemon.liveTerminalAttempt(delivery.RunID, kernel.TerminalSessionID{})
 	if err != nil {
-		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
+		unknownErr := daemon.markHumanReplyUnknown(delivery.RequestID, delivery.DeliveryID, delivery.Revision)
 		if unknownErr == nil {
 			return 0, errors.Join(err, ErrTerminalEffectUncertain)
 		}
@@ -372,7 +377,7 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 	result := attempt.submitEffect(ctx, terminalEffect{kind: terminalEffectHumanReply, payload: payload, submit: delivery.Provider == kernel.ProviderCodex})
 	effectErr := result.effectError(len(payload))
 	if effectErr != nil {
-		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
+		unknownErr := daemon.markHumanReplyUnknown(delivery.RequestID, delivery.DeliveryID, delivery.Revision)
 		if unknownErr == nil {
 			return result.count, errors.Join(effectErr, ErrTerminalEffectUncertain)
 		}
@@ -381,14 +386,135 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 	ackAt, err := daemon.timestamp()
 	if err == nil {
 		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
-		err = daemon.store.AcknowledgeHumanReply(storeCtx, requestID, deliveryID, delivery.Revision, ackAt)
+		err = daemon.store.AcknowledgeHumanReply(storeCtx, delivery.RequestID, delivery.DeliveryID, delivery.Revision, ackAt)
 		cancel()
 	}
 	if err != nil {
-		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
+		unknownErr := daemon.markHumanReplyUnknown(delivery.RequestID, delivery.DeliveryID, delivery.Revision)
 		return result.count, errors.Join(ErrTerminalEffectUncertain, err, unknownErr)
 	}
 	return result.count, nil
+}
+
+// humanReplyOutcome rereads a delivery only after the owner accepted an effect
+// or returned an explicit terminal verdict. The caller's request context may
+// have expired while a deferred Codex submit completed, so this read is always
+// independently bounded.
+func (daemon *Daemon) humanReplyOutcome(requestID kernel.HumanRequestID, effectErr error) (kernel.HumanRequestProjection, error) {
+	if effectErr != nil && !terminalEffectVerdict(effectErr) {
+		return kernel.HumanRequestProjection{}, effectErr
+	}
+	readCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	defer cancel()
+	projection, found, readErr := daemon.store.HumanRequest(readCtx, requestID)
+	if effectErr != nil {
+		if readErr == nil && found && projection.Status == kernel.HumanRequestDeliveryUnknown {
+			return projection, nil
+		}
+		return kernel.HumanRequestProjection{}, effectErr
+	}
+	if readErr != nil {
+		return kernel.HumanRequestProjection{}, readErr
+	}
+	if !found {
+		return kernel.HumanRequestProjection{}, kernel.ErrNotFound
+	}
+	return projection, nil
+}
+
+// browserIntervention reserves an explicit browser intervention before it
+// reaches a provider. Holding the browser-client gate makes the terminal
+// capability check and the receipt reservation race-free with revocation.
+func (daemon *Daemon) browserIntervention(ctx context.Context, principal browser.Principal, request kernel.TaskInterventionRequest) (kernel.TaskIntervention, error) {
+	clientID, releaseClient, err := daemon.authorizeEffectPrincipal(ctx, principal, kernel.BrowserCapabilityHumanActions)
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	defer releaseClient()
+	client, found, err := daemon.store.BrowserClient(ctx, clientID)
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	if !found || client.RevokedAt != nil || !client.CapabilityMask.Has(kernel.BrowserCapabilityTerminalInput) {
+		return kernel.TaskIntervention{}, kernel.ErrUnauthorized
+	}
+	if !terminalEffectsSupported {
+		return kernel.TaskIntervention{}, ErrTerminalEffectsUnsupported
+	}
+	daemon.operationMu.Lock()
+	defer daemon.operationMu.Unlock()
+	at, err := daemon.timestamp()
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	receipt, newlyReserved, err := daemon.store.ReserveTaskInterventionForBrowser(ctx, clientID, request, at)
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	return daemon.deliverIntervention(ctx, receipt, newlyReserved)
+}
+
+func (daemon *Daemon) overseerIntervention(ctx context.Context, digest kernel.AttemptDigest, request kernel.TaskInterventionRequest) (kernel.TaskIntervention, error) {
+	if !terminalEffectsSupported {
+		return kernel.TaskIntervention{}, ErrTerminalEffectsUnsupported
+	}
+	daemon.operationMu.Lock()
+	defer daemon.operationMu.Unlock()
+	at, err := daemon.timestamp()
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	receipt, newlyReserved, err := daemon.store.ReserveTaskInterventionForAttempt(ctx, digest, request, at)
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	return daemon.deliverIntervention(ctx, receipt, newlyReserved)
+}
+
+// deliverIntervention performs the one PTY action owned by a freshly reserved
+// receipt. A replay never writes again: a pending receipt is durably marked
+// unknown while operationMu proves no live delivery is still in flight.
+func (daemon *Daemon) deliverIntervention(ctx context.Context, receipt kernel.TaskIntervention, newlyReserved bool) (kernel.TaskIntervention, error) {
+	if receipt.State != kernel.TaskInterventionPending {
+		return receipt, nil
+	}
+	if !newlyReserved {
+		return daemon.resolveIntervention(receipt, kernel.TaskInterventionUnknown, "terminal delivery outcome is unknown")
+	}
+	run, found, err := daemon.store.Run(ctx, receipt.RunID)
+	if err != nil || !found || run.Provider == kernel.ProviderShell || receipt.Kind == kernel.TaskInterventionInterrupt && run.Provider != kernel.ProviderCodex {
+		return daemon.resolveIntervention(receipt, kernel.TaskInterventionRejected, "terminal intervention is unavailable")
+	}
+	attempt, err := daemon.liveTerminalAttempt(receipt.RunID, kernel.TerminalSessionID{})
+	if err != nil {
+		return daemon.resolveIntervention(receipt, kernel.TaskInterventionRejected, "terminal intervention is unavailable")
+	}
+	payload, submit := []byte(receipt.Payload), run.Provider == kernel.ProviderCodex
+	if receipt.Kind == kernel.TaskInterventionInterrupt {
+		payload, submit = []byte{0x1b}, false
+	}
+	result := attempt.submitEffect(ctx, terminalEffect{kind: terminalEffectIntervention, payload: payload, submit: submit})
+	if err := result.effectError(len(payload)); err != nil {
+		if errors.Is(err, ErrTerminalEffectRejected) {
+			return daemon.resolveIntervention(receipt, kernel.TaskInterventionRejected, "terminal intervention was rejected")
+		}
+		return daemon.resolveIntervention(receipt, kernel.TaskInterventionUnknown, "terminal delivery outcome is unknown")
+	}
+	return daemon.resolveIntervention(receipt, kernel.TaskInterventionDelivered, "")
+}
+
+func (daemon *Daemon) resolveIntervention(receipt kernel.TaskIntervention, state kernel.TaskInterventionState, detail string) (kernel.TaskIntervention, error) {
+	at, err := daemon.timestamp()
+	if err != nil {
+		return kernel.TaskIntervention{}, err
+	}
+	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	defer cancel()
+	resolved, err := daemon.store.ResolveTaskIntervention(storeCtx, receipt.OperationID, state, detail, at)
+	if err != nil {
+		return kernel.TaskIntervention{}, errors.Join(ErrTerminalEffectUncertain, err)
+	}
+	return resolved, nil
 }
 
 func (daemon *Daemon) authorizeEffectPrincipal(ctx context.Context, principal browser.Principal, capability kernel.BrowserCapabilityMask) (kernel.BrowserClientID, func(), error) {

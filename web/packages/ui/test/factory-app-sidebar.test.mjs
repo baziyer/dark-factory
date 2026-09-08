@@ -16,6 +16,7 @@ function terminalView(overrides = {}) {
     paused: false,
     instructionPending: false,
     queued: false,
+    hasOutputSurface: false,
     resets: 0,
     finishing: false,
     surfaceVersion: 0,
@@ -98,6 +99,15 @@ test("paused agents remain identifiable without a false input", () => {
     onSubmit: async () => true,
   }));
   assert.match(markup, />PAUSED<\/p>/);
+  assert.equal(markup.includes("textarea"), false);
+});
+
+test("queued instructions state their capacity wait", () => {
+  const markup = renderToStaticMarkup(createElement(AgentInstruction, {
+    terminal: terminalView({ phase: "idle", writable: false, queued: true }),
+    onSubmit: async () => true,
+  }));
+  assert.match(markup, /QUEUED · WAITING FOR CAPACITY/);
   assert.equal(markup.includes("textarea"), false);
 });
 

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "rea
 import type { AccountItem, AgentItem, StateView, TaskItem } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
-import { agentActivity, agentCurrentTask } from "./console-view.js";
+import { agentStatus, agentCurrentTask } from "./console-view.js";
 
 /** Only the controls the operator actually changed; the rest are left alone. */
 export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: "wait" | "standing_instruction"; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }>;
@@ -59,13 +59,18 @@ export function AgentPanel({
   /** The instruction composer the terminal view owns for an idle agent. */
   children?: ReactNode;
 }) {
-  const activity = state === undefined ? "idle" : agentActivity(agent, state);
+  const activity = state === undefined ? "ready" : agentStatus(agent, state);
   const current = state === undefined ? undefined : agentCurrentTask(agent, state);
   const queued = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
     .sort((left, right) => right.priority - left.priority);
   const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
   const errorCopy = editErrorCopy(edit);
+  const queueHint = current !== undefined && agent.paused
+    ? "QUEUE PAUSED"
+    : current === undefined && queued.length > 0
+      ? "QUEUED · WAITING FOR CAPACITY"
+      : undefined;
   // A form remounts when the served value moves under it and when its own
   // edit is refused, so a rejected change reverts instead of being resent on
   // the next blur. A refusal never changes the revision, so it needs its own
@@ -84,10 +89,11 @@ export function AgentPanel({
       </div>
 
       <p className="dfConsoleSidebar__status">{activity === "needs-you" ? "! needs you" : activity}</p>
+      {queueHint === undefined ? null : <p className="dfConsoleSidebar__inherit">{queueHint}</p>}
 
       <div className="dfConsoleSidebar__section" aria-label="NOW">
         <h3>NOW</h3>
-        <p className="dfConsoleSidebar__now">{current?.title ?? "idle"}</p>
+        <p className="dfConsoleSidebar__now">{current?.title ?? "ready for work"}</p>
       </div>
 
       {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
@@ -335,8 +341,8 @@ export function SettingsDialog({
           {state === undefined ? <p className="dfFactoryConsole__empty">BUILDING STATE UNAVAILABLE</p> : (
             <dl className="dfFactoryConsole__metrics">
               <div><dt>DISPATCH</dt><dd>{state.factory.dispatch_enabled ? "ENABLED" : "PAUSED"}</dd></div>
-              <div><dt>CAPACITY</dt><dd>{String(state.factory.capacity)}</dd></div>
-              <div><dt>ACTIVE RUNS</dt><dd>{String(state.factory.active_runs)}</dd></div>
+              <div><dt>WORKER SLOTS</dt><dd>{String(state.factory.capacity)}</dd></div>
+              <div><dt>ACTIVE RUNS</dt><dd>{`${state.factory.active_runs} TOTAL`}</dd></div>
               <div><dt>REVISION</dt><dd>{state.factory.revision.toString()}</dd></div>
             </dl>
           )}

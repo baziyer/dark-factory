@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
 import { FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
 import { FactoryConsole, type ConsoleView } from "./factory-console.js";
+import { primaryAgent } from "./console-view.js";
 import { XtermTerminal } from "./xterm-terminal.js";
 
 const INITIAL_SNAPSHOT: FactoryAppSnapshot = { status: "idle" };
@@ -19,6 +20,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const owner = useRef<FactoryAppController | undefined>(undefined);
+  const defaultedController = useRef<FactoryAppController | undefined>(undefined);
   const statusChange = useRef(onStatusChange);
   statusChange.current = onStatusChange;
 
@@ -37,6 +39,17 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       controller.close();
     };
   }, []);
+
+  // The primary overseer is useful immediately, but only once per owned
+  // controller: closing a pane remains the operator's choice.
+  useEffect(() => {
+    const controller = owner.current;
+    if (controller === undefined || defaultedController.current === controller || snapshot.status !== "ready" || snapshot.selectedAgent !== undefined || snapshot.state === undefined) return;
+    const agent = primaryAgent(snapshot.state);
+    if (agent === undefined) return;
+    defaultedController.current = controller;
+    controller.selectAgent(agent);
+  }, [snapshot]);
 
   // The floor's rooms are regenerable, so they are fetched when the floor is
   // shown, whenever a fresh session becomes ready, and whenever the set of
@@ -65,10 +78,12 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       <TerminalContent terminal={agentTerminal} controller={controller} />
     </TerminalPanel>
   );
-  // An agent with no running task has no terminal to show, only the composer
-  // that gives it its next task; the sidebar puts that under its queue.
-  const instruction = agentTerminal === undefined || controller === undefined || agentTerminal.taskTitle !== undefined ? undefined : (
-    <TerminalContent terminal={agentTerminal} controller={controller} />
+  // The sidebar always owns a durable task composer. While a run is live its
+  // explicit action is queueing follow-up work; terminal keystrokes stay raw.
+  const instruction = agentTerminal === undefined || controller === undefined ? undefined : (
+    agentTerminal.taskTitle === undefined ? (
+      <AgentIdleTools terminal={agentTerminal} controller={controller} />
+    ) : <AgentTaskTools terminal={agentTerminal} controller={controller} />
   );
 
   const openSidebar = (open: () => void) => {
@@ -141,6 +156,7 @@ export function TerminalPanel({
           Earlier output is no longer retained; showing new output.
         </p>
       )}
+      {terminal.taskTitle !== undefined && terminal.paused ? <p className="dfFactoryConsole__instructionState">QUEUE PAUSED</p> : null}
       {children}
     </section>
   );
@@ -154,61 +170,124 @@ export function TerminalContent({
   terminal: FactoryTerminalView;
   controller: FactoryAppController;
 }) {
-  if (terminal.taskTitle === undefined) {
-    return (
-      <AgentInstruction
-        key={terminal.agentId}
-        terminal={terminal}
-        onSubmit={(instruction) => controller.enqueueAgentInstruction(instruction)}
-      />
-    );
-  }
-  if (terminal.finishing) return <p className="dfFactoryConsole__instructionState">FINISHING</p>;
-  return <TerminalHost key={`${terminal.agentId}:${terminal.surfaceVersion}`} controller={controller} surfaceVersion={terminal.surfaceVersion} />;
+  const terminalHost = terminal.hasOutputSurface || (terminal.taskTitle !== undefined && !terminal.finishing)
+    ? <TerminalHost key={`${terminal.agentId}:${terminal.surfaceVersion}`} controller={controller} surfaceVersion={terminal.surfaceVersion} />
+    : undefined;
+  if (terminal.finishing) return <>{terminalHost}<p className="dfFactoryConsole__instructionState">FINISHING</p></>;
+  if (terminal.taskTitle !== undefined) return <>{terminalHost}<AgentTaskTools terminal={terminal} controller={controller} /></>;
+  return <>{terminalHost}<AgentIdleTools terminal={terminal} controller={controller} /></>;
+}
+
+function AgentTaskTools({ terminal, controller }: { terminal: FactoryTerminalView; controller: FactoryAppController }) {
+  return (
+    <>
+      <AgentSteering terminal={terminal} controller={controller} />
+      <AgentInstruction terminal={terminal} mode="queue" onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
+    </>
+  );
+}
+
+function AgentIdleTools({ terminal, controller }: { terminal: FactoryTerminalView; controller: FactoryAppController }) {
+  return (
+    <>
+      <AgentInstruction terminal={terminal} mode="now" onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
+      {terminal.history === undefined && !terminal.historyPending ? null : <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />}
+    </>
+  );
+}
+
+function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView; controller: FactoryAppController }) {
+  const [instruction, setInstruction] = useState("");
+  const pending = terminal.controlPending !== undefined;
+  const submit = async (action: "message" | "replace") => {
+    if (pending || !terminal.controlReady || instruction.trim() === "") return;
+    if (await controller.controlAgent(action, instruction)) setInstruction("");
+  };
+  const unknown = terminal.controlStatus === "delivery_unknown" || terminal.controlError?.code === "connection";
+  const status = terminal.controlStatus === "stopping"
+    ? "STOPPING CURRENT WORK"
+    : terminal.controlStatus === "queued"
+      ? "REPLACEMENT QUEUED"
+      : terminal.controlStatus === "rejected"
+        ? "CONTROL REJECTED"
+        : unknown
+          ? "DELIVERY COULD NOT BE CONFIRMED — CHECK TERMINAL/HISTORY BEFORE SENDING AGAIN"
+          : undefined;
+  if (!terminal.controlReady) return <p className="dfFactoryConsole__instructionState">{terminal.finishing ? "FINISHING" : "STARTING"}</p>;
+  return (
+    <section className="dfFactoryConsole__steering" aria-label={`Controls for ${terminal.agentName}`}>
+      <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-steer-${terminal.agentId}`}>Message the current session for {terminal.agentName}</label>
+      <textarea id={`df-steer-${terminal.agentId}`} rows={2} value={instruction} disabled={pending} placeholder="Message the current session…" onChange={(event) => setInstruction(event.target.value)} />
+      <div className="dfFactoryConsole__instructionActions">
+        {status === undefined ? null : <span role={unknown || terminal.controlStatus === "rejected" ? "alert" : "status"}>{status}</span>}
+        <button type="button" disabled={pending || instruction.trim() === ""} onClick={() => { void submit("message"); }}>{pending ? "SENDING" : "MESSAGE"}</button>
+        <button type="button" disabled={pending} onClick={() => { void controller.controlAgent("interrupt"); }}>INTERRUPT</button>
+        <button type="button" disabled={pending} onClick={() => { void controller.controlAgent("stop"); }}>STOP CURRENT</button>
+        <button type="button" disabled={pending || instruction.trim() === ""} onClick={() => { void submit("replace"); }}>STOP CURRENT / START NEW</button>
+      </div>
+      <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />
+    </section>
+  );
+}
+
+function TaskHistory({ terminal, onRefresh }: { terminal: FactoryTerminalView; onRefresh: () => void }) {
+  const history = terminal.history;
+  return (
+    <section className="dfFactoryConsole__history" aria-label="Task control history">
+      <div className="dfFactoryConsole__historyHeading"><h3>HISTORY</h3><button type="button" disabled={terminal.historyPending} onClick={onRefresh}>{terminal.historyPending ? "LOADING" : "REFRESH"}</button></div>
+      {history === undefined || history.entries.length === 0 ? <p className="dfFactoryConsole__instructionState">{terminal.historyPending ? "LOADING RECEIPTS" : "NO DURABLE CONTROLS YET"}</p> : (
+        <ol>
+          {history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span></li>)}
+        </ol>
+      )}
+    </section>
+  );
 }
 
 export function AgentInstruction({
   terminal,
+  mode = "now",
   onSubmit,
 }: {
   terminal: FactoryTerminalView;
-  onSubmit: (instruction: string) => Promise<boolean>;
+  mode?: "now" | "queue";
+  onSubmit: (instruction: string, mode?: "now" | "queue") => Promise<boolean>;
 }) {
   const [instruction, setInstruction] = useState("");
   const submit = async (event?: SyntheticEvent) => {
     event?.preventDefault();
-    if (terminal.paused || terminal.instructionPending || instruction.trim().length === 0) return;
-    if (await onSubmit(instruction)) setInstruction("");
+    if ((mode === "now" && terminal.paused) || terminal.instructionPending || instruction.trim().length === 0) return;
+    if (await onSubmit(instruction, mode)) setInstruction("");
   };
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void submit(event);
   };
-  if (terminal.paused) return <p className="dfFactoryConsole__instructionState">PAUSED</p>;
-  if (terminal.queued) return <p className="dfFactoryConsole__instructionState">QUEUED</p>;
+  if (mode === "now" && terminal.paused) return <p className="dfFactoryConsole__instructionState">PAUSED</p>;
+  if (mode === "now" && terminal.queued) return <p className="dfFactoryConsole__instructionState">QUEUED · WAITING FOR CAPACITY</p>;
   const errorCopy = terminal.instructionError === undefined
     ? undefined
     : ["invalid_request", "unauthorized", "stale", "too_large", "rate_limited", "not_found", "crypto_unavailable", "unsupported"].includes(terminal.instructionError.code)
       ? "NOT SENT"
       : "SEND NOT CONFIRMED — CHECK TASKS BEFORE RETRYING";
   return (
-    <form className="dfFactoryConsole__instruction" onSubmit={(event) => { void submit(event); }}>
+    <form className={`dfFactoryConsole__instruction${mode === "queue" ? " dfFactoryConsole__instruction--queue" : ""}`} onSubmit={(event) => { void submit(event); }}>
       <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-instruction-${terminal.agentId}`}>
-        Instruction for {terminal.agentName}
+        {mode === "queue" ? `Queue follow-up work for ${terminal.agentName}` : `Instruction for ${terminal.agentName}`}
       </label>
       <textarea
-        id={`df-instruction-${terminal.agentId}`}
+        id={`df-instruction-${terminal.agentId}-${mode}`}
         value={instruction}
         rows={3}
-        autoFocus
+        autoFocus={mode === "now"}
         disabled={terminal.instructionPending}
-        placeholder="Add an instruction…"
+        placeholder={mode === "queue" ? "Add follow-up work…" : "Add an instruction…"}
         onChange={(event) => setInstruction(event.target.value)}
         onKeyDown={onKeyDown}
       />
       <div className="dfFactoryConsole__instructionActions">
         {errorCopy === undefined ? null : <span role="alert">{errorCopy}</span>}
         <button type="submit" disabled={terminal.instructionPending || instruction.trim().length === 0}>
-          {terminal.instructionPending ? "SENDING" : "SEND"}
+          {terminal.instructionPending ? "SENDING" : mode === "queue" ? "ADD TO QUEUE" : "START"}
         </button>
       </div>
     </form>

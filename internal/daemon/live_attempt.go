@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxLiveAttempts       = 1024
+	maxLiveAttempts       = kernel.MaxFactoryCapacity + 1
 	liveAttemptMailboxCap = 64
 	// Sixteen observers covers several tabs/devices while keeping the fixed
 	// per-run queue budget small and auditable.

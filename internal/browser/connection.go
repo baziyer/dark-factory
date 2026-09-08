@@ -421,6 +421,38 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
 			return false
 		}
+	case browserprotocol.AgentControl:
+		backend, ok := current.server.backend.(AgentControlBackend)
+		if !ok {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := backend.ControlAgent(ctx, current.principal, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.OperationID != body.OperationID || result.TaskID != body.TaskID || result.RunID != body.RunID || result.SuccessorTaskID != body.SuccessorTaskID {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeAgentControlResult(frame.ID, result)
+	case browserprotocol.TaskHistoryGet:
+		backend, ok := current.server.backend.(AgentControlBackend)
+		if !ok {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := backend.TaskHistory(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.TaskID != body.TaskID {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeTaskHistory(frame.ID, result)
 	case browserprotocol.TaskEnqueue:
 		if current.server.taskBackend == nil {
 			err = ErrUnauthorized

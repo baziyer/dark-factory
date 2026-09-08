@@ -170,6 +170,24 @@ func (daemon *Daemon) dispatch(ctx context.Context, call api.Call) api.Reply {
 		return daemon.requestHuman(ctx, call)
 	case api.CallSendBack, api.CallSendBackTask:
 		return daemon.sendBack(ctx, call)
+	case api.CallOverseerSnapshot:
+		return daemon.overseerSnapshot(ctx, call)
+	case api.CallOverseerEnqueueTask:
+		return daemon.overseerEnqueueTask(ctx, call)
+	case api.CallOverseerUpdateTask:
+		return daemon.overseerUpdateTask(ctx, call)
+	case api.CallOverseerUpdateAgent:
+		return daemon.overseerUpdateAgent(ctx, call)
+	case api.CallOverseerStopRun:
+		return daemon.overseerStopRun(ctx, call)
+	case api.CallOverseerReplaceRun:
+		return daemon.overseerReplaceRun(ctx, call)
+	case api.CallOverseerMessageWorker:
+		return daemon.overseerMessageWorker(ctx, call)
+	case api.CallOverseerInterruptWorker:
+		return daemon.overseerInterruptWorker(ctx, call)
+	case api.CallOverseerReplyHuman:
+		return daemon.overseerReplyHuman(ctx, call)
 	case api.CallWebStatus:
 		status, err := daemon.WebStatus(ctx)
 		if err != nil {
@@ -562,6 +580,392 @@ func (daemon *Daemon) requestHuman(ctx context.Context, call api.Call) api.Reply
 		return newErrorReply(remoteErrorCode(err))
 	}
 	return daemon.mutation(ctx, request.Revision)
+}
+
+func (daemon *Daemon) overseerDigest(ctx context.Context, call api.Call) (kernel.AttemptAuthority, kernel.AttemptDigest, *api.Reply) {
+	raw, ok := call.AttemptDigest()
+	if !ok {
+		failure := newErrorReply(api.RemoteInvalidRequest)
+		return kernel.AttemptAuthority{}, kernel.AttemptDigest{}, &failure
+	}
+	digest, err := attemptDigest(raw)
+	if err != nil {
+		failure := newErrorReply(api.RemoteInvalidRequest)
+		return kernel.AttemptAuthority{}, kernel.AttemptDigest{}, &failure
+	}
+	authority, err := daemon.store.AuthenticateAttempt(ctx, digest)
+	if err != nil || authority.Role != kernel.RoleOrchestrator {
+		if err == nil {
+			err = kernel.ErrUnauthorized
+		}
+		failure := newErrorReply(remoteErrorCode(err))
+		return kernel.AttemptAuthority{}, kernel.AttemptDigest{}, &failure
+	}
+	return authority, digest, nil
+}
+
+func (daemon *Daemon) overseerSnapshot(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerSnapshotInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	var selected *kernel.TaskID
+	if input.TaskID != "" {
+		id, err := parseTaskID(input.TaskID)
+		if err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		selected = &id
+	}
+	snapshot, err := daemon.store.OverseerSnapshotForAttempt(ctx, digest, selected)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	reply, err := api.NewOverseerSnapshotReply(projectOverseerSnapshot(snapshot))
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	return reply
+}
+
+func (daemon *Daemon) overseerEnqueueTask(ctx context.Context, call api.Call) api.Reply {
+	authority, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerTaskCreateInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	id, err := parseTaskID(input.ID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	agentID, err := parseAgentID(input.AssignedAgentID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	incarnationID, err := parseIncarnationID(input.IncarnationID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	task, err := daemon.store.EnqueueTaskForOverseer(ctx, digest, kernel.NewTask{ID: id, ProjectID: authority.ProjectID, AssignedAgentID: agentID, IncarnationID: incarnationID, Title: input.Title, Body: input.Body, Priority: input.Priority}, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	daemon.notifyScheduler()
+	return daemon.mutation(ctx, task.Revision)
+}
+
+func (daemon *Daemon) overseerUpdateTask(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerTaskUpdateInput()
+	if !ok || input.ExpectedRevision > uint64(^uint64(0)>>1) {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	id, err := parseTaskID(input.TaskID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	expected, err := kernel.NewRevision(int64(input.ExpectedRevision))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	patch := kernel.TaskPatch{Priority: input.Priority, Cancel: input.Cancel}
+	if input.AssignedAgentID != nil {
+		agentID, err := parseAgentID(*input.AssignedAgentID)
+		if err != nil {
+			return newErrorReply(api.RemoteInvalidRequest)
+		}
+		patch.AssignedAgentID = &agentID
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	task, err := daemon.store.UpdateTaskForOverseer(ctx, digest, id, expected, patch, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	daemon.notifyScheduler()
+	return daemon.mutation(ctx, task.Revision)
+}
+
+func (daemon *Daemon) overseerUpdateAgent(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerAgentUpdateInput()
+	if !ok || input.ExpectedRevision > uint64(^uint64(0)>>1) {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	id, err := parseAgentID(input.AgentID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	expected, err := kernel.NewRevision(int64(input.ExpectedRevision))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	paused := input.Paused
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	agent, err := daemon.store.UpdateAgentForOverseer(ctx, digest, id, expected, kernel.AgentPatch{Paused: &paused}, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	daemon.notifyScheduler()
+	return daemon.mutation(ctx, agent.Revision)
+}
+
+func (daemon *Daemon) overseerStopRun(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerRunStopInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	request, err := overseerInterventionRequest(input.OperationID, input.TaskID, input.ExpectedTaskRevision, input.RunID, input.ExpectedRunRevision, kernel.TaskInterventionStop, "")
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	receipt, err := daemon.store.StopRunForAttempt(ctx, digest, request, nil, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	daemon.notifyScheduler()
+	return daemon.interventionMutation(ctx, receipt)
+}
+
+func (daemon *Daemon) overseerReplaceRun(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerRunReplaceInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	request, err := overseerInterventionRequest(input.OperationID, input.TaskID, input.ExpectedTaskRevision, input.RunID, input.ExpectedRunRevision, kernel.TaskInterventionReplace, "")
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	successorID, err := parseTaskID(input.SuccessorTaskID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	incarnationID, err := parseIncarnationID(input.SuccessorIncarnationID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	if err := daemon.prepareOverseerReplacement(ctx, request.TaskID, input.Instruction); err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	receipt, err := daemon.store.StopRunForAttempt(ctx, digest, request, &kernel.NewTask{ID: successorID, IncarnationID: incarnationID, Body: input.Instruction}, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	daemon.notifyScheduler()
+	return daemon.interventionMutation(ctx, receipt)
+}
+
+func (daemon *Daemon) overseerMessageWorker(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerWorkerMessageInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	request, err := overseerInterventionRequest(input.OperationID, input.TaskID, input.ExpectedTaskRevision, input.RunID, input.ExpectedRunRevision, kernel.TaskInterventionMessage, input.Message)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	receipt, err := daemon.overseerIntervention(ctx, digest, request)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.interventionMutation(ctx, receipt)
+}
+
+func (daemon *Daemon) overseerInterruptWorker(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerWorkerInterruptInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	request, err := overseerInterventionRequest(input.OperationID, input.TaskID, input.ExpectedTaskRevision, input.RunID, input.ExpectedRunRevision, kernel.TaskInterventionInterrupt, "")
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	receipt, err := daemon.overseerIntervention(ctx, digest, request)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.interventionMutation(ctx, receipt)
+}
+
+func (daemon *Daemon) overseerReplyHuman(ctx context.Context, call api.Call) api.Reply {
+	_, digest, failure := daemon.overseerDigest(ctx, call)
+	if failure != nil {
+		return *failure
+	}
+	input, ok := call.OverseerHumanReplyInput()
+	if !ok || input.ExpectedRevision > uint64(^uint64(0)>>1) {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	requestID, err := parseHumanRequestID(input.RequestID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	deliveryID, err := parseHumanDeliveryID(input.OperationID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	expected, err := kernel.NewRevision(int64(input.ExpectedRevision))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	if !terminalEffectsSupported {
+		return newErrorReply(api.RemoteUnavailable)
+	}
+	daemon.operationMu.Lock()
+	defer daemon.operationMu.Unlock()
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	delivery, err := daemon.store.BeginHumanReplyForAttempt(ctx, digest, requestID, expected, deliveryID, input.Reply, at)
+	if err != nil {
+		if terminalStoreOutcomeUnknown(err) {
+			deliveryRevision, revisionErr := kernel.NewRevision(expected.Int64() + 1)
+			var unknownErr error
+			if revisionErr == nil {
+				unknownErr = daemon.markHumanReplyUnknown(requestID, deliveryID, deliveryRevision)
+			}
+			return newErrorReply(remoteErrorCode(errors.Join(err, revisionErr, unknownErr)))
+		}
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if delivery.RequestID != requestID || delivery.DeliveryID != deliveryID {
+		return newErrorReply(api.RemoteInternal)
+	}
+	_, effectErr := daemon.deliverHumanReply(ctx, delivery)
+	projection, err := daemon.humanReplyOutcome(requestID, effectErr)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.overseerHumanReplyMutation(projection)
+}
+
+func (daemon *Daemon) overseerHumanReplyMutation(projection kernel.HumanRequestProjection) api.Reply {
+	readCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	defer cancel()
+	state, err := daemon.store.Factory(readCtx)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	reply, err := api.NewMutationReply(api.MutationResult{Head: uint64(state.Head.Int64()), Revision: uint64(projection.Revision.Int64()), HumanReply: &api.OverseerHumanReplyResult{RequestID: projection.ID.String(), State: projection.Status.String()}})
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	return reply
+}
+
+func overseerInterventionRequest(operationText, taskText string, taskRevision uint64, runText string, runRevision uint64, kind kernel.TaskInterventionKind, payload string) (kernel.TaskInterventionRequest, error) {
+	operation, err := parseTaskInterventionID(operationText)
+	if err != nil {
+		return kernel.TaskInterventionRequest{}, err
+	}
+	task, err := parseTaskID(taskText)
+	if err != nil {
+		return kernel.TaskInterventionRequest{}, err
+	}
+	run, err := parseRunID(runText)
+	if err != nil || taskRevision > uint64(^uint64(0)>>1) || runRevision > uint64(^uint64(0)>>1) {
+		return kernel.TaskInterventionRequest{}, kernel.ErrInvalidValue
+	}
+	expectedTask, err := kernel.NewRevision(int64(taskRevision))
+	if err != nil {
+		return kernel.TaskInterventionRequest{}, err
+	}
+	expectedRun, err := kernel.NewRevision(int64(runRevision))
+	if err != nil {
+		return kernel.TaskInterventionRequest{}, err
+	}
+	return kernel.TaskInterventionRequest{OperationID: operation, TaskID: task, RunID: run, ExpectedTaskRevision: expectedTask, ExpectedRunRevision: expectedRun, Kind: kind, Payload: payload}, nil
+}
+
+func (daemon *Daemon) interventionMutation(_ context.Context, receipt kernel.TaskIntervention) api.Reply {
+	readCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	defer cancel()
+	task, found, err := daemon.store.Task(readCtx, receipt.TaskID)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if !found {
+		return newErrorReply(api.RemoteInternal)
+	}
+	state, err := daemon.store.Factory(readCtx)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	detail := ""
+	if receipt.ResultDetail != nil {
+		detail = *receipt.ResultDetail
+	}
+	reply, err := api.NewMutationReply(api.MutationResult{Head: uint64(state.Head.Int64()), Revision: uint64(task.Revision.Int64()), Intervention: &api.OverseerInterventionResult{OperationID: receipt.OperationID.String(), State: receipt.State.String(), Detail: detail}})
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	return reply
+}
+
+func (daemon *Daemon) prepareOverseerReplacement(ctx context.Context, taskID kernel.TaskID, instruction string) error {
+	task, found, err := daemon.store.Task(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return kernel.ErrNotFound
+	}
+	agent, found, err := daemon.store.Agent(ctx, task.AssignedAgentID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return kernel.ErrCorruptState
+	}
+	_, _, err = provider.PrepareTask(agent.Provider, []byte(instruction))
+	return err
 }
 
 func proposalForCall(call api.Call) (kernel.Proposal, error) {

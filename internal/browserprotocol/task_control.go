@@ -13,6 +13,7 @@ type TaskEnqueue struct {
 	AgentID               string  `json:"agent_id"`
 	ExpectedAgentRevision Decimal `json:"expected_agent_revision"`
 	Instruction           string  `json:"instruction"`
+	Mode                  string  `json:"mode,omitempty"`
 }
 
 type TaskEnqueueResult struct {
@@ -52,7 +53,7 @@ func validTaskControl(kind MessageType, body any) error {
 	positive := func(value Decimal) bool { return value > 0 }
 	switch value := body.(type) {
 	case TaskEnqueue:
-		if !id(value.TaskID) || !id(value.IncarnationID) || !id(value.AgentID) || !positive(value.ExpectedAgentRevision) || !utf8.ValidString(value.Instruction) || len(value.Instruction) == 0 || len([]byte(value.Instruction)) > MaxTaskInstructionBytes {
+		if value.Mode != "" && value.Mode != "now" && value.Mode != "queue" || !id(value.TaskID) || !id(value.IncarnationID) || !id(value.AgentID) || !positive(value.ExpectedAgentRevision) || !utf8.ValidString(value.Instruction) || len(value.Instruction) == 0 || len([]byte(value.Instruction)) > MaxTaskInstructionBytes {
 			return bad()
 		}
 	case TaskEnqueueResult:

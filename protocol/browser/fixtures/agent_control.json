@@ -1,0 +1,1 @@
+{"type":"AGENT_CONTROL","id":"control-1","body":{"operation_id":"01010101010101010101010101010101","task_id":"02020202020202020202020202020202","run_id":"03030303030303030303030303030303","expected_task_revision":"1","expected_run_revision":"2","action":"interrupt","instruction":"","successor_task_id":"","successor_incarnation_id":""}}

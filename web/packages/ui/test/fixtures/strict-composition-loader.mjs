@@ -8,6 +8,7 @@ export const MAX_TERMINAL_ROWS = 4096;
 export const MAX_TERMINAL_COLS = 4096;
 export const MAX_TASK_INSTRUCTION_BYTES = 32768;
 export const CAPABILITIES = { observe: 1, private_human_request_detail: 2, human_actions: 4, terminal_input: 8 };
+export function randomOperationID() { return "41".repeat(16); }
 export function consumePairingChallenge() { return null; }
 // The public barrel also carries the remote console. This probe never mounts
 // it, so these exist only so the module graph resolves.

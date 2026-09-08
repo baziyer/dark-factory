@@ -56,9 +56,10 @@ unsupported before a provider runs.
    the fresh schema image and one SQL integrity predicate before reconciliation,
    capacity, or selection. No caller supplies an agent, task, observation, or
    cursor. Corrupt durable control is corruption, never queue ineligibility.
-   Capacity counts admitted, running, and finalizing runs together; fresh
-   no-admission precedence is `dispatch_disabled`, `at_capacity`,
-   `queue_empty`, then `no_eligible_work`.
+   Capacity counts admitted, running, and finalizing worker runs together.
+   One additional factory-wide orchestrator slot keeps supervision available.
+   Role capacity participates in task selection, so a blocked role cannot hide
+   eligible work in the other. Dispatch still gates all new admission.
 5. The Store selects the canonical eligible task and agent globally by priority
    descending, creation time ascending, and exact 16-byte task-ID BLOB bytes
    ascending. It validates the selected Change and binds the task incarnation,
@@ -76,11 +77,19 @@ unsupported before a provider runs.
 ## Browser authority
 
 The paired browser is a client of the local API, not a second scheduler. It
-may submit a bounded instruction to a configured idle agent. The daemon creates
-the same durable task used by `factoryctl`, and the browser renders its
-canonical queued, running, or terminal state. An idle configured agent remains
-selectable so the operator can add work; no provider process or terminal is
-created until admission starts a run.
+may submit a bounded instruction to a ready agent or queue later work while it
+is busy or paused. The daemon creates the same durable task used by `factoryctl`.
+No provider process is created until admission starts a run. Raw terminal input
+remains opaque; explicit message/interrupt controls reserve durable receipts
+before a PTY write. An uncertain receipt is never written again. Stop/replacement
+commits its receipt, optional successor and run finalization atomically.
+
+An orchestrator's attempt credential also grants project-scoped supervision
+commands. Every control revalidates its live authority and target inside the
+mutation transaction. Worker invalidations trigger bounded standing tasks for
+the overseer. Its durable sequence cursor advances with enqueue; events arriving
+while it is busy stay pending. Cursor lag behind the retained journal wakes a
+conservative inspection. No model runs merely to poll an idle project.
 
 ## Browser state
 

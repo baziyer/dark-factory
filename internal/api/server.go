@@ -36,6 +36,15 @@ const (
 	CallWebListClients
 	CallWebRevokeClient
 	CallRemoteStatus
+	CallOverseerSnapshot
+	CallOverseerEnqueueTask
+	CallOverseerUpdateTask
+	CallOverseerUpdateAgent
+	CallOverseerStopRun
+	CallOverseerReplaceRun
+	CallOverseerMessageWorker
+	CallOverseerInterruptWorker
+	CallOverseerReplyHuman
 )
 
 // AttemptDigest is the SHA-256 digest of one raw attempt bearer. The bearer is
@@ -53,18 +62,27 @@ func digestAttemptCredential(bearer credential) AttemptDigest {
 // Call is an immutable decoded request. Only the accessor matching Kind
 // returns true.
 type Call struct {
-	kind             CallKind
-	digest           AttemptDigest
-	project          CreateProjectInput
-	agent            CreateAgentInput
-	task             EnqueueTaskInput
-	humanQuestion    HumanQuestionInput
-	sendBack         SendBackInput
-	webClient        WebClientRevocationInput
-	webAfter         string
-	expectedRevision uint64
-	enabled          bool
-	text             string
+	kind              CallKind
+	digest            AttemptDigest
+	project           CreateProjectInput
+	agent             CreateAgentInput
+	task              EnqueueTaskInput
+	humanQuestion     HumanQuestionInput
+	sendBack          SendBackInput
+	overseerTask      OverseerTaskCreateInput
+	overseerSnapshot  OverseerSnapshotInput
+	overseerTaskEdit  OverseerTaskUpdateInput
+	overseerAgent     OverseerAgentUpdateInput
+	overseerRun       OverseerRunStopInput
+	overseerReplace   OverseerRunReplaceInput
+	overseerMessage   OverseerWorkerMessageInput
+	overseerInterrupt OverseerWorkerInterruptInput
+	overseerReply     OverseerHumanReplyInput
+	webClient         WebClientRevocationInput
+	webAfter          string
+	expectedRevision  uint64
+	enabled           bool
+	text              string
 }
 
 func (call Call) Kind() CallKind { return call.kind }
@@ -75,11 +93,47 @@ func (call Call) GoString() string {
 
 func (call Call) AttemptDigest() (AttemptDigest, bool) {
 	switch call.kind {
-	case CallAttemptTask, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack:
+	case CallAttemptTask, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack, CallOverseerSnapshot, CallOverseerEnqueueTask, CallOverseerUpdateTask, CallOverseerUpdateAgent, CallOverseerStopRun, CallOverseerReplaceRun, CallOverseerMessageWorker, CallOverseerInterruptWorker, CallOverseerReplyHuman:
 		return call.digest, true
 	default:
 		return AttemptDigest{}, false
 	}
+}
+
+func (call Call) OverseerTaskCreateInput() (OverseerTaskCreateInput, bool) {
+	return call.overseerTask, call.kind == CallOverseerEnqueueTask
+}
+
+func (call Call) OverseerSnapshotInput() (OverseerSnapshotInput, bool) {
+	return call.overseerSnapshot, call.kind == CallOverseerSnapshot
+}
+
+func (call Call) OverseerTaskUpdateInput() (OverseerTaskUpdateInput, bool) {
+	return call.overseerTaskEdit, call.kind == CallOverseerUpdateTask
+}
+
+func (call Call) OverseerAgentUpdateInput() (OverseerAgentUpdateInput, bool) {
+	return call.overseerAgent, call.kind == CallOverseerUpdateAgent
+}
+
+func (call Call) OverseerRunStopInput() (OverseerRunStopInput, bool) {
+	return call.overseerRun, call.kind == CallOverseerStopRun
+}
+
+func (call Call) OverseerRunReplaceInput() (OverseerRunReplaceInput, bool) {
+	return call.overseerReplace, call.kind == CallOverseerReplaceRun
+}
+
+func (call Call) OverseerWorkerMessageInput() (OverseerWorkerMessageInput, bool) {
+	return call.overseerMessage, call.kind == CallOverseerMessageWorker
+}
+
+func (call Call) OverseerWorkerInterruptInput() (OverseerWorkerInterruptInput, bool) {
+	return call.overseerInterrupt, call.kind == CallOverseerInterruptWorker
+}
+
+func (call Call) OverseerHumanReplyInput() (OverseerHumanReplyInput, bool) {
+	return call.overseerReply, call.kind == CallOverseerReplyHuman
 }
 
 func (call Call) CreateProjectInput() (CreateProjectInput, bool) {
@@ -135,6 +189,7 @@ const (
 	replyWebClients
 	replyWebRevoke
 	replyRemoteStatus
+	replyOverseerSnapshot
 	replyError
 )
 
@@ -149,6 +204,7 @@ type Reply struct {
 	webClients  WebClientPage
 	webRevoke   WebRevokeResult
 	remote      RemoteStatus
+	overseer    OverseerSnapshot
 	code        RemoteErrorCode
 }
 
@@ -175,8 +231,20 @@ func NewSnapshotReply(snapshot DashboardSnapshot) (Reply, error) {
 	return Reply{kind: replySnapshot, snapshot: snapshot}, nil
 }
 
+func NewOverseerSnapshotReply(snapshot OverseerSnapshot) (Reply, error) {
+	if !validOverseerSnapshot(snapshot) {
+		return Reply{}, ErrInvalidInput
+	}
+	snapshot.Agents = append([]AgentSummary(nil), snapshot.Agents...)
+	snapshot.Tasks = append([]OverseerTask(nil), snapshot.Tasks...)
+	snapshot.Runs = append([]OverseerRun(nil), snapshot.Runs...)
+	snapshot.Questions = append([]OverseerQuestion(nil), snapshot.Questions...)
+	snapshot.History = append([]OverseerIntervention(nil), snapshot.History...)
+	return Reply{kind: replyOverseerSnapshot, overseer: snapshot}, nil
+}
+
 func NewMutationReply(result MutationResult) (Reply, error) {
-	if result.Revision == 0 {
+	if !validMutation(result) {
 		return Reply{}, ErrInvalidInput
 	}
 	return Reply{kind: replyMutation, mutation: result}, nil
@@ -447,6 +515,10 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		if err := decodeExact(request.Params, &struct{}{}); err != nil {
 			return Call{}, RemoteInvalidRequest
 		}
+	case CallOverseerSnapshot:
+		if err := decodeExact(request.Params, &call.overseerSnapshot); err != nil || call.overseerSnapshot.TaskID != "" && !validID(call.overseerSnapshot.TaskID) {
+			return Call{}, RemoteInvalidRequest
+		}
 	case CallWebListClients:
 		var input struct {
 			After string `json:"after"`
@@ -502,6 +574,38 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		}
 	case CallSendBack, CallSendBackTask:
 		if err := decodeExact(request.Params, &call.sendBack); err != nil || !validID(call.sendBack.TaskID) || !validText(call.sendBack.Note, 1, 8192) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerEnqueueTask:
+		if err := decodeExact(request.Params, &call.overseerTask); err != nil || !validOverseerTaskCreateInput(call.overseerTask) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerUpdateTask:
+		if err := decodeExact(request.Params, &call.overseerTaskEdit); err != nil || !validOverseerTaskUpdateInput(call.overseerTaskEdit) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerUpdateAgent:
+		if err := decodeExact(request.Params, &call.overseerAgent); err != nil || !validID(call.overseerAgent.AgentID) || call.overseerAgent.ExpectedRevision == 0 {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerStopRun:
+		if err := decodeExact(request.Params, &call.overseerRun); err != nil || !validOverseerRunStopInput(call.overseerRun) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerReplaceRun:
+		if err := decodeExact(request.Params, &call.overseerReplace); err != nil || !validOverseerRunReplaceInput(call.overseerReplace) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerMessageWorker:
+		if err := decodeExact(request.Params, &call.overseerMessage); err != nil || !validOverseerWorkerMessageInput(call.overseerMessage) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerInterruptWorker:
+		if err := decodeExact(request.Params, &call.overseerInterrupt); err != nil || !validOverseerWorkerInterruptInput(call.overseerInterrupt) {
+			return Call{}, RemoteInvalidRequest
+		}
+	case CallOverseerReplyHuman:
+		if err := decodeExact(request.Params, &call.overseerReply); err != nil || !validID(call.overseerReply.OperationID) || !validID(call.overseerReply.RequestID) || call.overseerReply.ExpectedRevision == 0 || !validText(call.overseerReply.Reply, 1, 8192) {
 			return Call{}, RemoteInvalidRequest
 		}
 	case CallWebRevokeClient:
@@ -563,6 +667,24 @@ func methodKind(method string) (CallKind, byte) {
 		return CallWebRevokeClient, operatorDomain
 	case "remote_status":
 		return CallRemoteStatus, operatorDomain
+	case "overseer_snapshot":
+		return CallOverseerSnapshot, attemptDomain
+	case "overseer_enqueue_task":
+		return CallOverseerEnqueueTask, attemptDomain
+	case "overseer_update_task":
+		return CallOverseerUpdateTask, attemptDomain
+	case "overseer_update_agent":
+		return CallOverseerUpdateAgent, attemptDomain
+	case "overseer_stop_run":
+		return CallOverseerStopRun, attemptDomain
+	case "overseer_replace_run":
+		return CallOverseerReplaceRun, attemptDomain
+	case "overseer_message_worker":
+		return CallOverseerMessageWorker, attemptDomain
+	case "overseer_interrupt_worker":
+		return CallOverseerInterruptWorker, attemptDomain
+	case "overseer_reply_human":
+		return CallOverseerReplyHuman, attemptDomain
 	default:
 		return 0, 0
 	}
@@ -629,7 +751,9 @@ func replyMatches(kind CallKind, reply replyKind) bool {
 		return reply == replySnapshot
 	case CallAttemptTask:
 		return reply == replyAttemptTask
-	case CallCreateProject, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack, CallSendBackTask:
+	case CallOverseerSnapshot:
+		return reply == replyOverseerSnapshot
+	case CallCreateProject, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallSendBack, CallSendBackTask, CallOverseerEnqueueTask, CallOverseerUpdateTask, CallOverseerUpdateAgent, CallOverseerStopRun, CallOverseerReplaceRun, CallOverseerMessageWorker, CallOverseerInterruptWorker, CallOverseerReplyHuman:
 		return reply == replyMutation
 	case CallWebStatus:
 		return reply == replyWebStatus
@@ -677,6 +801,8 @@ func (connection *Connection) writeReply(reply Reply) error {
 		data, err = json.Marshal(reply.webRevoke)
 	case replyRemoteStatus:
 		data, err = json.Marshal(reply.remote)
+	case replyOverseerSnapshot:
+		data, err = json.Marshal(reply.overseer)
 	case replyError:
 	default:
 		return ErrProtocol

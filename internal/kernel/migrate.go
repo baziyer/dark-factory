@@ -28,6 +28,7 @@ const (
 	previousUserVersion = 2
 	priorUserVersion    = 3
 	v4UserVersion       = 4
+	v5UserVersion       = 5
 
 	legacyAgents = `CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -137,8 +138,26 @@ const (
 func v4SchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
 	for _, statement := range schemaStatements {
-		if _, name := schemaObjectIdentity(statement); name == "tasks" {
+		_, name := schemaObjectIdentity(statement)
+		if name == "task_interventions" || name == "task_interventions_project_task" || name == "overseer_wake_cursors" {
+			continue
+		}
+		if name == "tasks" {
 			statement = v4Tasks
+		}
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// v5SchemaStatements is the exact schema before durable operator
+// interventions and overseer wake cursors were added.
+func v5SchemaStatements() []string {
+	statements := make([]string, 0, len(schemaStatements))
+	for _, statement := range schemaStatements {
+		_, name := schemaObjectIdentity(statement)
+		if name == "task_interventions" || name == "task_interventions_project_task" || name == "overseer_wake_cursors" {
+			continue
 		}
 		statements = append(statements, statement)
 	}
@@ -227,6 +246,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return priorSchemaStatements(), true
 	case v4UserVersion:
 		return v4SchemaStatements(), true
+	case v5UserVersion:
+		return v5SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -252,7 +273,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -263,6 +284,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[2:]
 	case v4UserVersion:
 		steps = all[3:]
+	case v5UserVersion:
+		steps = all[4:]
 	default:
 		return connection.Close()
 	}
@@ -396,6 +419,24 @@ func migrateV4Transaction(ctx context.Context, connection *sql.Conn) error {
 	target := expectedSchemaOf(schemaStatements)
 	if err := rebuildTable(ctx, connection, target, "tasks", v4TaskColumns, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "sent_back_instruction_bytes", "NULL"); err != nil {
 		return err
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v5UserVersion)); err != nil {
+		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, v5UserVersion, v5SchemaStatements())
+}
+
+// migrateV5Transaction adds independent receipt and cursor tables. Existing
+// task, run, and invalidation history stays byte-for-byte intact.
+func migrateV5Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v5UserVersion, v5SchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	for _, name := range []string{"task_interventions", "task_interventions_project_task", "overseer_wake_cursors"} {
+		if _, err := connection.ExecContext(ctx, target[name].sql); err != nil {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
 	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
 		return fmt.Errorf("set sqlite user version: %w", err)

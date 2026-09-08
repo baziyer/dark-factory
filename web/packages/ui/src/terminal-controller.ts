@@ -46,6 +46,8 @@ type TerminalControllerOptions = Readonly<{
   onChange: (snapshot: TerminalControllerSnapshot) => void;
   /** Server session and cursor from a previous replay reset. */
   resume?: Pick<TerminalReset, "sessionId" | "head">;
+  /** Keep a cleanly ended provider's display for its owner to reuse. */
+  retainOnCleanClose?: boolean;
   /** Test seam: awaited between retryable attach attempts. */
   attachRetryDelay?: (attempt: number) => Promise<void>;
 }>;
@@ -385,7 +387,7 @@ class TerminalController {
     this.#pendingResize = undefined;
     this.#retryDiscovery = retryDiscovery;
     ++this.#generation;
-    if (!this.#detachRequested) this.#abortSurface();
+    if (!this.#detachRequested && (error.code !== "closed" || !this.#options.retainOnCleanClose)) this.#abortSurface();
     if (!this.#closing && this.#phase !== "closed") {
       this.#error = error;
       this.#phase = "closed";

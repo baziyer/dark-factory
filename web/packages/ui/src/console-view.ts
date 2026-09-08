@@ -7,6 +7,8 @@ export type TaskStage = "queued" | "building" | "blocked" | "done" | "failed";
 export const STAGE_SEQUENCE: readonly TaskStage[] = ["queued", "building"];
 
 export type AgentActivity = "busy" | "waiting" | "needs-you" | "idle";
+/** The operator-facing state has one name for each actionable condition. */
+export type AgentStatus = "working" | "ready" | "needs-you" | "paused";
 
 /** The durable task status projected into the console stage vocabulary. */
 export function stageOfTask(task: TaskItem): TaskStage {
@@ -52,6 +54,22 @@ export function agentActivity(agent: AgentItem, state: StateView): AgentActivity
   }
   if (agentCurrentTask(agent, state) !== undefined) return "busy";
   return agent.paused ? "idle" : "waiting";
+}
+
+/** The console's words are smaller than the sprite vocabulary. */
+export function agentStatus(agent: AgentItem, state: StateView): AgentStatus {
+  for (const request of state.humanRequests.values()) {
+    if (request.agent_id === agent.id) return "needs-you";
+  }
+  if (agentCurrentTask(agent, state) !== undefined) return "working";
+  if (agent.paused) return "paused";
+  return "ready";
+}
+
+/** The overseer is the console's entry point; a worker is a usable fallback. */
+export function primaryAgent(state: StateView): AgentItem | undefined {
+  return [...state.agents.values()]
+    .sort((left, right) => (left.role === right.role ? 0 : left.role === "orchestrator" ? -1 : 1) || compareText(left.name, right.name) || compareText(left.id, right.id))[0];
 }
 
 /**

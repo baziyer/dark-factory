@@ -290,7 +290,10 @@ func (backend *browserBackend) EnqueueTask(ctx context.Context, rawClient [brows
 	if err != nil {
 		return browserprotocol.TaskEnqueueResult{}, mapBrowserError(err)
 	}
-	result, err := backend.store.EnqueueTaskForBrowserAgent(ctx, clientID, taskID, incarnationID, agentID, expectedAgentRevision, request.Instruction, at)
+	if err := backend.prepareAgentInstruction(ctx, agentID, request.Instruction); err != nil {
+		return browserprotocol.TaskEnqueueResult{}, err
+	}
+	result, err := backend.store.EnqueueTaskForBrowserAgentMode(ctx, clientID, taskID, incarnationID, agentID, expectedAgentRevision, request.Instruction, request.Mode == "queue", at)
 	if err != nil {
 		return browserprotocol.TaskEnqueueResult{}, mapBrowserError(err)
 	}

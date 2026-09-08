@@ -142,25 +142,15 @@ func (backend *browserBackend) ReplyHumanRequest(ctx context.Context, principal 
 		return browserprotocol.HumanRequestReplyResult{}, browser.ErrStale
 	}
 	_, effectErr := backend.owner.humanReply(ctx, principal, requestID, expected, request.Reply)
-	if effectErr != nil && !terminalEffectVerdict(effectErr) {
-		return browserprotocol.HumanRequestReplyResult{}, mapBrowserError(effectErr)
+	projection, err := backend.owner.humanReplyOutcome(requestID, effectErr)
+	if err != nil {
+		return browserprotocol.HumanRequestReplyResult{}, mapBrowserError(err)
 	}
-	readCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
-	defer cancel()
-	projection, found, readErr := backend.store.HumanRequest(readCtx, requestID)
-	if effectErr != nil {
-		if readErr == nil && found && projection.Status == kernel.HumanRequestDeliveryUnknown {
-			return browserprotocol.HumanRequestReplyResult{RequestID: request.RequestID, Revision: decimalRevision(projection.Revision), Status: "delivery_unknown"}, nil
-		}
-		return browserprotocol.HumanRequestReplyResult{}, mapBrowserError(effectErr)
+	status := "resolved"
+	if projection.Status == kernel.HumanRequestDeliveryUnknown {
+		status = "delivery_unknown"
 	}
-	if readErr != nil {
-		return browserprotocol.HumanRequestReplyResult{}, mapBrowserError(readErr)
-	}
-	if !found {
-		return browserprotocol.HumanRequestReplyResult{}, browser.ErrNotFound
-	}
-	return browserprotocol.HumanRequestReplyResult{RequestID: request.RequestID, Revision: decimalRevision(projection.Revision), Status: "resolved"}, nil
+	return browserprotocol.HumanRequestReplyResult{RequestID: request.RequestID, Revision: decimalRevision(projection.Revision), Status: status}, nil
 }
 
 func (backend *browserBackend) CancelHumanRequestRun(ctx context.Context, principal browser.Principal, request browserprotocol.HumanRequestCancelRun) (browserprotocol.HumanRequestCancelRunResult, error) {

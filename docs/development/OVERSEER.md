@@ -1,8 +1,39 @@
 # Overseer runbook
 
-An overseer is an agent with `--role orchestrator`. Its job is publication: it
-takes what a worker finished and gets it merged, through the Maintainer App,
-and asks a human only when it cannot decide alone. It never writes code.
+An overseer is an agent with `--role orchestrator`. It turns an operator's
+objective into worker tasks, supervises them, and publishes their finished
+changes through its Maintainer App. Delegate implementation to workers and
+ask the operator only for decisions you cannot make from the task and state.
+
+Start every task with `$DARK_FACTORY_FACTORYCTL overseer status`. This private,
+project-scoped view contains workers, task objective and result excerpts, active runs,
+questions and explicit intervention history. Use `overseer status --task ID`
+for one task's complete objective and result. Use the `overseer` commands to
+assign or reorder queued work, message or interrupt a worker, answer its
+question, stop or replace its objective, send work back, and pause or resume
+future admission. These commands use your attempt credential; an operator
+credential is neither available nor required. Run a command with `--help` for
+its exact flags. All targets must remain in your project.
+For `factoryctl` controls, mint a 32-hex operation ID once (for example,
+`python3 -c 'import uuid; print(uuid.uuid4().hex)'`) and keep it when observing or
+retrying that operation. Supply `--task-id` and `--incarnation-id` when creating
+worker tasks so a lost response cannot turn a retry into a second task. These
+local control IDs are separate from the Maintainer App operation IDs below.
+
+Message steers the current session. Codex Interrupt sends the provider's native
+interrupt while leaving its task and session alive. Stop ends the task; replace
+atomically stops it and creates a successor. Pause affects future work, so
+message/interrupt/stop are the controls for a worker already running. Respect
+operator interventions as changes in direction: read their history before
+issuing conflicting instructions. Raw terminal keystrokes are not recorded as
+messages; only explicit controls enter this history.
+
+After delegating or handling the current events, report your durable outcome
+and exit. Do not poll a worker until it finishes. With a standing instruction
+and remaining run budget configured, worker completion, questions, and explicit
+interventions wake you again. Events received while you are queued or running
+remain pending for the next supervision task. A factory-wide overseer slot lets
+you supervise alongside workers even when worker capacity is one.
 
 The overseer's standing instruction (CONFIG → RULES → WHEN IDLE → run a
 standing instruction) is short, because a native-provider launch delivers the
@@ -12,7 +43,7 @@ task through the terminal and that prepared prompt is capped at 8 KiB:
 > `git clone --filter=blob:none https://github.com/OWNER/REPO repo`, read
 > repo/docs/development/OVERSEER.md, and follow it exactly. Before exiting,
 > report the durable outcome with `$DARK_FACTORY_FACTORYCTL attempt succeed
-> --result` (one line per change you handled, or "nothing to publish"), or
+> --result` (one line per action or change you handled, or "nothing to do"), or
 > with `attempt block --detail` for an ordinary failure. If you raise a human
 > request, keep the attempt running for the reply.
 

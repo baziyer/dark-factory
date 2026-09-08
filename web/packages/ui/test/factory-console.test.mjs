@@ -65,7 +65,7 @@ test("one screen shows the floor, the counters, and what needs you at once", () 
     assert.match(markup, new RegExp(`aria-label="${label}"`));
   }
   // Counters read the served factory, not a second count of it.
-  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2\/8<\/dd>/);
+  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2 \/ 8 WORKERS \+ 1 OVERSEER<\/dd>/);
   assert.match(markup, /<dt>QUEUED<\/dt><dd>1<\/dd>/);
   assert.match(markup, /<dt>NEEDS YOU<\/dt><dd>1<\/dd>/);
   assert.match(markup, /Builder One asks/);
@@ -442,7 +442,7 @@ test("a terminal blocked task is neither building nor current agent work", () =>
     humanRequests: new Map(),
   });
   const markup = render({ state, view: "agents" });
-  assert.match(markup, /aria-label="Builder One: waiting"/);
+  assert.match(markup, /aria-label="Builder One: ready"/);
   assert.equal(markup.includes('aria-label="Builder One: busy"'), false);
 });
 

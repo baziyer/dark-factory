@@ -122,3 +122,140 @@ func TestStandingInstructionWaitsForTheRunAndThenItsQuietSpell(t *testing.T) {
 		t.Fatalf("round after the quiet spell = %+v, %v", tasks, err)
 	}
 }
+
+func TestOverseerWakeupConsumesWorkerEventsAndLeavesEventsDuringItsRunPending(t *testing.T) {
+	ctx := context.Background()
+	store, err := createTestStore(ctx, t.TempDir()+"/kernel.db", FactoryConfig{DispatchEnabled: true, Capacity: 1}, mustTime(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 80), Name: "p", Root: "/p"}, mustTime(t, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	overseer, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 81), ProjectID: project.ID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 8}, mustTime(t, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, budget, instruction := IdleStandingInstruction, uint32(60), uint32(3), "Inspect worker progress."
+	overseer, err = store.UpdateAgent(ctx, overseer.ID, overseer.Revision, AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleRunBudget: &budget, IdleInstruction: &instruction}, mustTime(t, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tasks, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 5)); err != nil || len(tasks) != 0 {
+		t.Fatalf("overseer ignored its initial cooldown: %+v, %v", tasks, err)
+	}
+	// Enabling a standing overseer gets exactly one initial inspection; the
+	// ordinary idle timer no longer polls orchestrators.
+	initial, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 64_000))
+	if err != nil || len(initial) != 1 || initial[0].AssignedAgentID != overseer.ID {
+		t.Fatalf("initial wake = %+v, %v", initial, err)
+	}
+	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 1_000_000)); err != nil || len(tasks) != 0 {
+		t.Fatalf("ordinary idle polled overseer: %+v, %v", tasks, err)
+	}
+	if _, err := store.UpdateTask(ctx, initial[0].ID, initial[0].Revision, TaskPatch{Cancel: true}, mustTime(t, 64_001)); err != nil {
+		t.Fatal(err)
+	}
+	if tasks, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 124_000)); err != nil || len(tasks) != 0 {
+		t.Fatalf("wake without worker activity = %+v, %v", tasks, err)
+	}
+	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 82), ProjectID: project.ID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 8}, mustTime(t, 124_001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 83), ProjectID: project.ID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 84), Title: "worker event", Priority: -1}, mustTime(t, 124_002)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 124_003))
+	if err != nil || len(first) != 1 {
+		t.Fatalf("worker wake = %+v, %v", first, err)
+	}
+	keys := admissionKeys(t, 85, nil)
+	admission, err := store.AdmitNext(ctx, keys, mustTime(t, 124_004))
+	if err != nil || !admission.Admitted() || admission.Run == nil || admission.Run.TaskID != first[0].ID {
+		t.Fatalf("overseer admission = %+v, %v", admission, err)
+	}
+	_, running := activateAllResources(t, store, *admission.Run, keys, 124_005)
+	session := terminalSessionForRunTest(t, store, running.ID)
+	running, err = store.ActivateRun(ctx, running.ID, session.ID, running.Revision, session.Revision, mustTime(t, 124_009))
+	if err != nil || running.Phase != RunRunning {
+		t.Fatalf("overseer running = %+v, %v", running, err)
+	}
+	priority := int64(1)
+	if _, err := store.UpdateTask(ctx, taskID(t, 83), mustRevision(t, 1), TaskPatch{Priority: &priority}, mustTime(t, 124_010)); err != nil {
+		t.Fatalf("worker event during overseer: %v", err)
+	}
+	if tasks, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 124_011)); err != nil || len(tasks) != 0 {
+		t.Fatalf("wake stacked during running overseer: %+v, %v", tasks, err)
+	}
+	proposal, err := NewSuccessProposal("done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ProposeAttemptOutcome(ctx, keys.AttemptDigest, proposal, mustTime(t, 124_012)); err != nil {
+		t.Fatal(err)
+	}
+	observeMissingProcessExits(t, store, running.ID, 124_013)
+	releaseAllRunResources(t, store, running.ID, 124_016)
+	closed := closeTerminalSessionAtCurrent(t, store, running.ID, 124_020)
+	if _, err := store.FinalizeRun(ctx, closed.ID, closed.Revision, mustTime(t, 124_021)); err != nil {
+		t.Fatal(err)
+	}
+	followup, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 184_021))
+	if err != nil || len(followup) != 1 {
+		t.Fatalf("worker event during overseer was lost: %+v, %v", followup, err)
+	}
+}
+
+func TestOverseerWakeupRecoversOneInspectionAfterCursorPruning(t *testing.T) {
+	ctx := context.Background()
+	store, err := createTestStore(ctx, t.TempDir()+"/kernel.db", FactoryConfig{DispatchEnabled: true, Capacity: 1}, mustTime(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	project, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 100), Name: "p", Root: "/p"}, mustTime(t, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 101), ProjectID: project.ID, Name: "overseer", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, budget, instruction := IdleStandingInstruction, uint32(1), uint32(2), "Inspect worker progress."
+	agent, err = store.UpdateAgent(ctx, agent.ID, agent.Revision, AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleRunBudget: &budget, IdleInstruction: &instruction}, mustTime(t, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is the same coherent state appendInvalidations leaves after pruning:
+	// the first retained entry is two, while a stale cursor remains at zero.
+	if _, err := store.writer.Exec(`DELETE FROM invalidations WHERE sequence = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`UPDATE factory SET invalidation_floor = 2 WHERE singleton = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.writer.Exec(`INSERT INTO overseer_wake_cursors(agent_id, project_id, invalidation_sequence) VALUES(?, ?, 0)`, agent.ID.Bytes(), project.ID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 1_004))
+	if err != nil || len(tasks) != 1 || tasks[0].AssignedAgentID != agent.ID {
+		t.Fatalf("pruned cursor wake = %+v, %v", tasks, err)
+	}
+	if _, err := store.UpdateTask(ctx, tasks[0].ID, tasks[0].Revision, TaskPatch{Cancel: true}, mustTime(t, 1_005)); err != nil {
+		t.Fatal(err)
+	}
+	if tasks, err := store.EnqueueOverseerWakeups(ctx, mustTime(t, 2_005)); err != nil || len(tasks) != 0 {
+		t.Fatalf("pruned cursor repeated without worker activity: %+v, %v", tasks, err)
+	}
+	factory, err := store.Factory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cursor int64
+	if err := store.readers.QueryRow(`SELECT invalidation_sequence FROM overseer_wake_cursors WHERE agent_id = ?`, agent.ID.Bytes()).Scan(&cursor); err != nil || cursor != factory.Head.Int64() {
+		t.Fatalf("no-activity cursor = %d, head = %d, err = %v", cursor, factory.Head.Int64(), err)
+	}
+}

@@ -9,16 +9,19 @@ export type { RemoteAppProps } from "./remote/remote-app.js";
 export {
   STAGE_SEQUENCE,
   agentActivity,
+  agentStatus,
   agentCurrentTask,
   agentGlyph,
   factoryCounters,
   floorScene,
   orderTasksForHome,
+  primaryAgent,
   stageMeterFill,
   stageOfTask,
 } from "./console-view.js";
 export type {
   AgentActivity,
+  AgentStatus,
   FactoryCounters,
   FloorScene,
   TaskStage,

@@ -222,3 +222,11 @@ type TerminalBackend interface {
 	ReplyHumanRequest(context.Context, Principal, browserprotocol.HumanRequestReply) (browserprotocol.HumanRequestReplyResult, error)
 	CancelHumanRequestRun(context.Context, Principal, browserprotocol.HumanRequestCancelRun) (browserprotocol.HumanRequestCancelRunResult, error)
 }
+
+// AgentControlBackend holds explicit interventions apart from raw terminal
+// keystrokes. Only these bounded controls enter durable task history.
+type AgentControlBackend interface {
+	Backend
+	ControlAgent(context.Context, Principal, browserprotocol.AgentControl) (browserprotocol.AgentControlResult, error)
+	TaskHistory(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskHistoryGet) (browserprotocol.TaskHistory, error)
+}
