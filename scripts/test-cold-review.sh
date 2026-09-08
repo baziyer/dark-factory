@@ -114,7 +114,7 @@ review() {
         PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" "$@" >/dev/null 2>&1)
 }
 
-unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL DARK_FACTORY_REVIEW_CLAUDE_MODEL
 printf 'Findings.\nVERDICT: ALLOW\n' >"$reply"
 DARK_FACTORY_REVIEW_OPERATION_ID=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f \
     review owner/repo 7 "$head" "$base" "$body" "the focus sentinel" || fail "ALLOW did not exit 0"
@@ -179,6 +179,12 @@ DARK_FACTORY_REVIEW_PROVIDER=claude DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra \
     review owner/repo 7 "$head" "$base" "$body" || fail "Claude fallback rejected the Codex model override"
 grep -Fxq 'opus' "$args" || fail "Claude fallback inherited the Codex model override"
 unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL
+# Claude's own override remains available without inheriting Codex's model.
+: >"$args"
+DARK_FACTORY_REVIEW_PROVIDER=claude DARK_FACTORY_REVIEW_CLAUDE_MODEL=sonnet \
+    review owner/repo 7 "$head" "$base" "$body" || fail "Claude model selection did not exit 0"
+grep -Fxq 'sonnet' "$args" || fail "Claude model selection did not reach the session"
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_CLAUDE_MODEL
 # A caller may choose the cheaper Codex model explicitly.
 : >"$args"
 DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra review owner/repo 7 "$head" "$base" "$body" || fail "Codex model selection did not exit 0"
