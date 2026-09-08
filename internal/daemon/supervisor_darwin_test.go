@@ -1153,23 +1153,43 @@ func TestSupervisorCleanupUncertaintyBlocksTerminal(t *testing.T) {
 		t.Fatalf("runtime cleanup state = %s", state.String())
 	}
 	// The startup sweep tries the cleanup again. While the name is still
-	// refused the run stays as it is; once a person has made it removable,
-	// the sweep removes the runtime, releases it and settles the run.
-	unsafe := filepath.Join(fixture.runtimeParentPath, run.ID.String(), "tmp", "unsafe")
-	sweep := func() {
+	// refused the run stays as it is, and while something alive holds the
+	// runtime's lifetime lease the sweep concludes nothing; once a person
+	// has made the name removable, the sweep removes the runtime, releases
+	// it and settles the run.
+	runtimePath := filepath.Join(fixture.runtimeParentPath, run.ID.String())
+	unsafe := filepath.Join(runtimePath, "tmp", "unsafe")
+	sweep := func(want RecoveredRunAction) {
 		t.Helper()
-		if _, sweepErr := fixture.daemon.RecoverAbandonedRuns(context.Background(), fixture.runtimeParent, fixture.changeParent); sweepErr != nil {
-			t.Fatalf("sweep: %v", sweepErr)
+		dispositions, sweepErr := fixture.daemon.RecoverAbandonedRuns(context.Background(), fixture.runtimeParent, fixture.changeParent)
+		if sweepErr != nil || len(dispositions) != 1 || dispositions[0].Action != want {
+			t.Fatalf("sweep = %+v, %v; want %s", dispositions, sweepErr, want)
 		}
 	}
-	sweep()
-	if current, _, _ := fixture.store.Run(context.Background(), run.ID); current.Phase != kernel.RunFinalizing || runtimeRoot().State != kernel.ResourceUnresolved {
-		t.Fatalf("sweep settled a run whose runtime is still refused: %+v", current)
+	unchanged := func() {
+		t.Helper()
+		if current, _, _ := fixture.store.Run(context.Background(), run.ID); current.Phase != kernel.RunFinalizing || runtimeRoot().State != kernel.ResourceUnresolved {
+			t.Fatalf("sweep settled a run whose runtime is still refused or held: %+v", current)
+		}
+	}
+	sweep(RecoveredUncertain)
+	unchanged()
+	lease, err := os.OpenFile(filepath.Join(runtimePath, runner.RuntimeLifetimeLeaseName), os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lease.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Chmod(unsafe, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sweep()
+	sweep(RecoveredLiveHolder)
+	unchanged()
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sweep(RecoveredConverged)
 	current, _, err := fixture.store.Run(context.Background(), run.ID)
 	if err != nil {
 		t.Fatal(err)

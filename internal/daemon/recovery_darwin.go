@@ -167,8 +167,13 @@ func (daemon *Daemon) recoverRun(ctx context.Context, parent *RuntimeParent, cha
 		recoverable.TerminalSession.State == kernel.TerminalSessionClosed {
 		// The supervisor consumed and removed the result, then could not
 		// remove the runtime: what is left is a partly removed tree, which
-		// cannot speak and may not open as a runtime. Try the removal again;
-		// what refused it may be gone, or removable under a later rule.
+		// cannot speak and may not open as a runtime. A held lifetime lease
+		// still concludes nothing: something alive inherited it. Otherwise
+		// try the removal again; what refused it may be gone, or removable
+		// under a later rule.
+		if presence, observeErr := ObserveRuntimeLifetime(parent, run.ID.String(), fileIdentity); observeErr == nil && presence == RuntimeLeaseHeld {
+			return RecoveredLiveHolder, nil
+		}
 		if removeErr := daemon.removeRecordedRuntime(parent, run.ID, fileIdentity); removeErr != nil {
 			return RecoveredUncertain, removeErr
 		}

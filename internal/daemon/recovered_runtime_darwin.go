@@ -324,7 +324,7 @@ func hasRecoveredFile(files map[string]unix.Stat_t, name string) bool {
 }
 
 func validRecoveredRuntimeFile(name string, stat unix.Stat_t, device uint64) bool {
-	if stat.Dev == 0 || stat.Ino == 0 || !validRuntimeOrdinaryFile(stat, device, true) {
+	if stat.Dev == 0 || stat.Ino == 0 || !validRuntimeOrdinaryFile(stat, device) {
 		return false
 	}
 	switch name {

@@ -142,7 +142,7 @@ func removeRecordedRuntimeWithHook(ctx context.Context, parent *RuntimeParent, b
 		var stat unix.Stat_t
 		if err := unix.Fstatat(fd, name, &stat, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
 			continue
-		} else if err != nil || !validRuntimeOrdinaryFile(stat, rootIdentity.device, true) {
+		} else if err != nil || !validRuntimeOrdinaryFile(stat, rootIdentity.device) {
 			return false, invalidContract(err)
 		}
 		if err := unix.Unlinkat(fd, name, 0); err != nil {
@@ -337,20 +337,19 @@ func validRuntimeOrdinaryDirectory(stat unix.Stat_t, device uint64, exactMode bo
 }
 
 // validRuntimeOrdinaryName is the bound on a non-directory name inside a
-// runtime's home or temp tree: on the runtime's device, owned by this user,
-// with no special bits. Its kind and link count are the provider's business.
+// runtime's home or temp tree, whose kind the caller has already matched: on
+// the runtime's device, owned by this user, with no special bits. Its link
+// count is the provider's business.
+// ponytail: a special bit on a provider's own file still refuses the cleanup
+// for good (a name confers nothing when unlinked, so this keeps evidence, not
+// safety); unlink those too if a provider ever leaves one.
 func validRuntimeOrdinaryName(stat unix.Stat_t, device uint64) bool {
-	switch stat.Mode & unix.S_IFMT {
-	case unix.S_IFREG, unix.S_IFLNK, unix.S_IFSOCK, unix.S_IFIFO:
-	default:
-		return false
-	}
 	return uint64(stat.Dev) == device && stat.Uid == uint32(os.Geteuid()) && stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) == 0
 }
 
-func validRuntimeOrdinaryFile(stat unix.Stat_t, device uint64, exactMode bool) bool {
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || uint64(stat.Dev) != device || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0 {
-		return false
-	}
-	return !exactMode || stat.Mode&0o7777 == 0o600
+// validRuntimeOrdinaryFile is the bound on one of the runtime's own files at
+// its root: a single-link regular file of this user's on the runtime's device
+// at exactly 0600.
+func validRuntimeOrdinaryFile(stat unix.Stat_t, device uint64) bool {
+	return stat.Mode&unix.S_IFMT == unix.S_IFREG && uint64(stat.Dev) == device && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == 1 && stat.Mode&0o7777 == 0o600
 }
