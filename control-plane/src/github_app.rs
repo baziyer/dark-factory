@@ -2791,10 +2791,10 @@ impl AppAuthority {
             return Err(OperationError::Unavailable);
         }
         if pull.merged {
-            let merge_commit_sha = pull
-                .merge_commit_sha
-                .filter(|sha| valid_sha(sha).is_ok())
-                .ok_or(OperationError::Indeterminate)?;
+            let merge_commit_sha = self
+                .0
+                .merged_pull_commit(&token, request.pull_number, &request.head_sha)
+                .await?;
             return Ok(PullRequestMergeResult {
                 pull_number: request.pull_number,
                 head_sha: request.head_sha,
@@ -4859,6 +4859,28 @@ impl Authority {
         }
     }
 
+    async fn merged_pull_commit(
+        &self,
+        token: &RepositoryToken,
+        pull_number: i64,
+        expected_head: &str,
+    ) -> Result<String, OperationError> {
+        let variables = serde_json::json!({
+            "owner": token.repository.owner,
+            "name": token.repository.name,
+            "number": pull_number,
+        });
+        let (data, failure): (Option<serde_json::Value>, Option<GraphQlFailure>) = github_graphql(
+            &token.token,
+            "query($owner:String!,$name:String!,$number:Int!){\
+             repository(owner:$owner,name:$name){pullRequest(number:$number){\
+             headRefOid merged mergeCommit{oid}}}}",
+            &variables,
+        )
+        .await?;
+        merged_pull_commit_response(data, failure, expected_head)
+    }
+
     async fn reconcile_merge(
         &self,
         token: &RepositoryToken,
@@ -4879,8 +4901,9 @@ impl Authority {
         {
             return Ok(None);
         }
-        let merge_commit_sha = pull.merge_commit_sha.ok_or(OperationError::Indeterminate)?;
-        valid_sha(&merge_commit_sha)?;
+        let merge_commit_sha = self
+            .merged_pull_commit(token, request.pull_number, &request.head_sha)
+            .await?;
         self.verify_merge_commit_trailer(token, request, &merge_commit_sha)
             .await?;
         Ok(Some(MergePullRequestAtHeadResult {
@@ -6046,6 +6069,38 @@ struct GitObject {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+fn merged_pull_commit_response(
+    data: Option<serde_json::Value>,
+    failure: Option<GraphQlFailure>,
+    expected_head: &str,
+) -> Result<String, OperationError> {
+    if failure.is_some() {
+        return Err(OperationError::Indeterminate);
+    }
+    let Some(pull) = data
+        .as_ref()
+        .and_then(|data| data.get("repository"))
+        .and_then(|repository| repository.get("pullRequest"))
+    else {
+        return Err(OperationError::Indeterminate);
+    };
+    let Some(head_sha) = pull.get("headRefOid").and_then(serde_json::Value::as_str) else {
+        return Err(OperationError::Indeterminate);
+    };
+    if head_sha != expected_head {
+        return Err(OperationError::Conflict);
+    }
+    (pull.get("merged").and_then(serde_json::Value::as_bool) == Some(true))
+        .then(|| pull.get("mergeCommit"))
+        .flatten()
+        .and_then(|commit| commit.get("oid"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| valid_sha(sha).is_ok())
+        .map(str::to_owned)
+        .ok_or(OperationError::Indeterminate)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 #[derive(Deserialize)]
 struct PullRequest {
     number: i64,
@@ -6059,8 +6114,6 @@ struct PullRequest {
     state: String,
     #[serde(default)]
     merged: bool,
-    #[serde(default)]
-    merge_commit_sha: Option<String>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -9161,7 +9214,6 @@ mod tests {
             },
             state: state.into(),
             merged,
-            merge_commit_sha: None,
         };
         assert!(
             pull("open", false, close.head_sha.clone())
@@ -9311,7 +9363,6 @@ mod tests {
             },
             state: "open".into(),
             merged: false,
-            merge_commit_sha: None,
         };
         assert_eq!(
             updated_pull.body_result(&update).unwrap().unwrap().head_sha,
@@ -9931,6 +9982,58 @@ mod tests {
             "bypass_actors": [{"actor_id": 9, "actor_type": "User", "bypass_mode": "always", "new": true}]
         }))
         .is_err());
+    }
+
+    #[test]
+    fn merged_pull_graphql_recovers_the_api_versioned_rest_field() {
+        assert_eq!(GITHUB_API_VERSION, "2026-03-10");
+        let rest = serde_json::json!({
+            "number": 1,
+            "node_id": "PR_example",
+            "html_url": "https://example.invalid/pull/1",
+            "title": "Merged change",
+            "body": null,
+            "draft": false,
+            "head": {"ref": "change", "sha": "a".repeat(40)},
+            "base": {"ref": "main", "sha": "b".repeat(40)},
+            "state": "closed",
+            "merged": true
+        });
+        assert!(rest.get("merge_commit_sha").is_none());
+        let rest: PullRequest = serde_json::from_value(rest).unwrap();
+        let response = serde_json::json!({
+            "repository": {"pullRequest": {
+                "headRefOid": "a".repeat(40),
+                "merged": true,
+                "mergeCommit": {"oid": "c".repeat(40)}
+            }}
+        });
+        assert_eq!(
+            merged_pull_commit_response(Some(response), None, &rest.head.sha).as_deref(),
+            Ok("cccccccccccccccccccccccccccccccccccccccc")
+        );
+        let wrong_head = serde_json::json!({
+            "repository": {"pullRequest": {
+                "headRefOid": "d".repeat(40),
+                "merged": true,
+                "mergeCommit": {"oid": "c".repeat(40)}
+            }}
+        });
+        assert!(matches!(
+            merged_pull_commit_response(Some(wrong_head), None, &rest.head.sha),
+            Err(OperationError::Conflict)
+        ));
+        let missing_commit = serde_json::json!({
+            "repository": {"pullRequest": {
+                "headRefOid": "a".repeat(40),
+                "merged": true,
+                "mergeCommit": null
+            }}
+        });
+        assert!(matches!(
+            merged_pull_commit_response(Some(missing_commit), None, &rest.head.sha),
+            Err(OperationError::Indeterminate)
+        ));
     }
 
     #[test]
