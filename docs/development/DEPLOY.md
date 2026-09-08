@@ -14,8 +14,10 @@ worktree of the site repository (`$DARK_FACTORY_SITE`, default
 for `https://app.darkfactory.build`.
 
 `reinstall-service.sh` builds `factoryctl`, `factoryd` and `factory-runner`
-from a detached worktree of this repository at that commit, verifies
-`go version -m` reports the same `vcs.revision` and `vcs.modified=false`, backs
+from a detached worktree of this repository at that commit with `GOTOOLCHAIN`
+pinned to the Go version that worktree's `go.mod` declares (as the release
+workflow pins it), verifies `go version -m` reports the same `vcs.revision`
+and `vcs.modified=false`, backs
 up `$HOME/.dark-factory/factory.sqlite3` to
 `$HOME/.dark-factory-backups/<utc-timestamp>-<sha>/`, then runs
 `factoryctl service uninstall` and `service install` with the new binaries,

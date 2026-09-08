@@ -27,7 +27,8 @@ git -C "$test_repository" init -q -b main
 git -C "$test_repository" config user.name fixture
 git -C "$test_repository" config user.email fixture@example.invalid
 printf 'fixture\n' >"$test_repository/README.md"
-git -C "$test_repository" add README.md
+printf 'module fixture\n\ngo 1.2.3\n' >"$test_repository/go.mod"
+git -C "$test_repository" add README.md go.mod
 git -C "$test_repository" commit -q -m fixture
 git clone -q --bare "$test_repository" "$temporary/origin.git"
 git -C "$test_repository" remote add origin "$temporary/origin.git"
@@ -37,8 +38,9 @@ printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '0\n' >"$temporary/active-runs"
 : >"$temporary/pids"
 
-# go build writes a stub that records the build tree's HEAD and execs the fake
-# factoryctl; go version -m prints the stub so the vcs.* checks see it. With
+# go build writes a stub that records the build tree's HEAD and the toolchain
+# pins it was given, and execs the fake factoryctl; go version -m prints the
+# stub so the vcs.* checks see it. With
 # DARK_FACTORY_TEST_ADMIT_DURING_BUILD set, the build also admits a run, the
 # way the supervisor can while a real build takes minutes.
 cat >"$fake_bin/go" <<'FAKE'
@@ -51,7 +53,8 @@ case "$1" in
             [ "$1" = -o ] && out=$2
             shift
         done
-        printf '#!/bin/sh\n# vcs.revision=%s\n# vcs.modified=false\nexec factoryctl "$@"\n' "$(git rev-parse HEAD)" >"$out"
+        printf '#!/bin/sh\n# vcs.revision=%s\n# vcs.modified=false\n# pins GOTOOLCHAIN=%s GOENV=%s GOAUTH=%s\nexec factoryctl "$@"\n' \
+            "$(git rev-parse HEAD)" "${GOTOOLCHAIN-unset}" "${GOENV-unset}" "${GOAUTH-unset}" >"$out"
         chmod 755 "$out"
         [ -z "${DARK_FACTORY_TEST_ADMIT_DURING_BUILD-}" ] || printf '1\n' >"$DARK_FACTORY_TEST_ACTIVE_RUNS"
         ;;
@@ -171,6 +174,8 @@ cmp -s "$backup" "$fake_home/.dark-factory/factory.sqlite3" || fail "backup cont
 [ "$(stat -f %Lp "$backup")" = 600 ] || fail "backup file mode"
 for cmd in factoryctl factoryd factory-runner; do
     [ -x "$test_repository/.worktrees/bin-$sha/$cmd" ] || fail "$cmd not built"
+    grep -q '^# pins GOTOOLCHAIN=go1.2.3 GOENV=off GOAUTH=off$' "$test_repository/.worktrees/bin-$sha/$cmd" \
+        || fail "$cmd not built with the go.mod toolchain pinned: $(grep '^# pins' "$test_repository/.worktrees/bin-$sha/$cmd")"
 done
 printf '%s\n' \
     "service uninstall --home $fake_home/.dark-factory" \

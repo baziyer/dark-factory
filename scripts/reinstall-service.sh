@@ -83,6 +83,15 @@ git -C "$repository_root" fetch -q origin
 [ "$(git -C "$worktree" rev-parse HEAD)" = "$sha" ] \
     || { echo "worktree not at $sha: $worktree" >&2; exit 1; }
 
+# The compiler pinned the way the release workflow pins it, from the go.mod
+# being built: the vcs.* checks below prove the source, not the toolchain.
+go_version=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$worktree/go.mod")
+case "$go_version" in
+    *.*.*) ;;
+    *) echo "could not read the exact Go version from $worktree/go.mod" >&2; exit 1 ;;
+esac
+export GOTOOLCHAIN="go$go_version" GOENV=off GOAUTH=off
+
 mkdir -p "$bin"
 for cmd in factoryctl factoryd factory-runner; do
     (cd "$worktree" && go build -trimpath -o "$bin/$cmd" "./cmd/$cmd")
