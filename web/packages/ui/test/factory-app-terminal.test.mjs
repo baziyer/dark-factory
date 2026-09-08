@@ -1121,6 +1121,7 @@ test("a server replay reset resumes at its head after the retained floor advance
   assert.equal(context.calls.filter((call) => call.kind === "open").at(-1).afterSequence, 9n, "the reset head stays inside the later retained range");
   assert.equal(context.calls.filter((call) => call.kind === "open").at(-1).afterSessionId, "31".repeat(16), "the retry binds the cursor to its reset session");
   await context.handleOptions().onOutput({ sequence: 9n, payload: new TextEncoder().encode("new output") });
+  context.handleOptions().onOutputComplete?.();
   assert.equal(new TextDecoder().decode(resumed.writes[0]), "new output");
   context.controller.sendTerminalText(resumed.token, "next");
   await flush();

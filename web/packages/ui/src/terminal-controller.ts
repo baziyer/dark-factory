@@ -313,7 +313,7 @@ class TerminalController {
   }
 
   #pumpEffects(): void {
-    if (this.#effectTask !== undefined || this.#outputPending || !this.#writable || !this.#liveHandle()) return;
+    if (this.#effectTask !== undefined || this.#outputPending || !this.#writable || !this.#liveHandle() || (this.#inputBuffer.length === 0 && this.#pendingResize === undefined)) return;
     const task = this.#runEffects();
     this.#effectTask = task;
     void task.then(() => this.#effectFinished(task), () => this.#effectFinished(task));
