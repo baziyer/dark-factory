@@ -23,6 +23,9 @@ type Daemon struct {
 	// settleRetained is a package-test-only seam for an inspection that races a
 	// durable update. Production settlement always uses retainedSettlement.
 	settleRetained func(context.Context, string, kernel.Change) (kernel.ChangeSettlement, error)
+	// scheduledRun is a package-test-only seam for the scheduler's terminal
+	// completion reread. Production reads from the concrete Store.
+	scheduledRun func(context.Context, kernel.RunID) (kernel.Run, bool, error)
 
 	browserMu          sync.Mutex
 	browserLifecycleMu sync.Mutex
