@@ -40,16 +40,14 @@ refuse_active_runs() {
 listening() {
     perl -MIO::Socket::UNIX -e 'exit !IO::Socket::UNIX->new(Peer => shift)' "$socket" 2>/dev/null
 }
-# The service e2e's census: launchd forgetting the job and the listener closing
-# do not prove factoryd has released the home, so nothing naming the home may
-# survive before a second owner starts. This script's own argv may name it.
-# ponytail: pgrep -f also matches an operator's own tail -f on a home file;
-# the timeout lists the survivors and a rerun recovers.
-survivors() {
-    pgrep -fl "$home" | grep -v "^$$ "
+# factoryd holds an exclusive flock on home.lock until its store is closed.
+# Unlike an argv census, the lock answers whether the previous owner left.
+home_released() {
+    perl -MFcntl=:flock -e 'open my $lock, "+<", shift or exit 1; flock $lock, LOCK_EX | LOCK_NB or exit 1' \
+        "$home/home.lock"
 }
 previous_left() {
-    ! listening && ! survivors >/dev/null
+    ! listening && home_released
 }
 # Polls the predicate for up to 60 x 1s, then hands over to the timeout handler.
 await() {
@@ -62,8 +60,9 @@ await() {
 }
 uninstall_stalled() {
     echo "the previous factoryd has not left $home within 60s; the service is uninstalled" >&2
-    survivors >&2 || echo "$socket still accepts connections" >&2
-    echo "rerun once it has exited" >&2
+    listening && echo "$socket still accepts connections" >&2
+    home_released || echo "$home/home.lock remains held" >&2
+    echo "rerun once the previous daemon has exited" >&2
     exit 1
 }
 install_stalled() {
@@ -100,7 +99,7 @@ export GOTOOLCHAIN="go$go_version" GOENV=off GOAUTH=off
 
 mkdir -p "$bin"
 for cmd in factoryctl factoryd factory-runner; do
-    (cd "$worktree" && go build -trimpath -o "$bin/$cmd" "./cmd/$cmd")
+    (cd "$worktree" && go build -trimpath -buildvcs=true -o "$bin/$cmd" "./cmd/$cmd")
     go version -m "$bin/$cmd" | grep -q "vcs.revision=$sha" \
         || { echo "$cmd not built from $sha" >&2; exit 1; }
     go version -m "$bin/$cmd" | grep -q "vcs.modified=false" \

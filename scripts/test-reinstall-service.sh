@@ -44,6 +44,7 @@ chmod 700 "$temporary/configured-hooks/post-checkout"
 git -C "$test_repository" config core.hooksPath "$temporary/configured-hooks"
 
 printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
+printf '\n' >"$fake_home/.dark-factory/home.lock"
 printf '0\n' >"$temporary/active-runs"
 : >"$temporary/pids"
 
@@ -57,6 +58,7 @@ cat >"$fake_bin/go" <<'FAKE'
 set -eu
 case "$1" in
     build)
+        printf '%s\n' "$*" >>"$DARK_FACTORY_TEST_GO_LOG"
         out=""
         while [ $# -gt 0 ]; do
             [ "$1" = -o ] && out=$2
@@ -88,12 +90,12 @@ esac
 FAKE
 # The daemon's socket lifetime: service install returns at once, and only
 # after a real /bin/sleep (the store opening and migrating) does the listener
-# remove a stale socket and bind, the way launchd returns before factoryd
-# does; service uninstall stops it and removes the socket. web status and remote
-# status dial the socket the real client is pointed at. Two knobs select an
-# unclean exit: DARK_FACTORY_TEST_UNINSTALL_LEAVES=stale keeps the socket file
-# with nothing answering (a SIGKILLed daemon), =listening keeps the listener
-# itself, =process replaces it with a tail -f naming the home;
+# remove a stale socket, take the home lock and bind, the way launchd returns
+# before factoryd does; service uninstall stops it and removes the socket. web
+# status and remote status dial the socket the real client is pointed at. Two
+# knobs select an unclean exit: DARK_FACTORY_TEST_UNINSTALL_LEAVES=stale keeps
+# the socket file with nothing answering (a SIGKILLed daemon), =listening keeps
+# the listener itself, =lock keeps just the lifetime home lock;
 # DARK_FACTORY_TEST_INSTALL_DEAD installs a daemon that never listens.
 cat >"$fake_bin/factoryctl" <<'FAKE'
 #!/bin/sh
@@ -109,10 +111,11 @@ case "$1 $2" in
         case "${DARK_FACTORY_TEST_UNINSTALL_LEAVES-}" in
             stale) stop ;;
             listening) ;;
-            process)
+            lock)
                 stop
                 rm -f "$runtimes/factory.sock"
-                tail -f "$HOME/.dark-factory/factory.sqlite3" >/dev/null 2>&1 &
+                perl -MFcntl=:flock -e 'open my $lock, "+<", shift or die "$!\\n"; flock $lock, LOCK_EX or die "$!\\n"; sleep 1000' \
+                    "$HOME/.dark-factory/home.lock" &
                 echo $! >>"$DARK_FACTORY_TEST_PIDS"
                 ;;
             *) stop; rm -f "$runtimes/factory.sock" ;;
@@ -121,7 +124,7 @@ case "$1 $2" in
     "service install")
         mkdir -p "$runtimes"
         [ -n "${DARK_FACTORY_TEST_INSTALL_DEAD-}" ] || {
-            (cd "$runtimes" && /bin/sleep 0.2 && rm -f factory.sock && exec perl -MSocket -MIO::Socket::UNIX -e 'my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\n"; while (my $c = $s->accept) { close $c }') &
+            (cd "$runtimes" && /bin/sleep 0.2 && rm -f factory.sock && exec perl -MFcntl=:flock -MSocket -MIO::Socket::UNIX -e 'open my $lock, "+<", shift or die "$!\\n"; flock $lock, LOCK_EX or die "$!\\n"; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\\n"; while (my $c = $s->accept) { close $c }' "$HOME/.dark-factory/home.lock") &
             echo $! >>"$DARK_FACTORY_TEST_PIDS"
         }
         ;;
@@ -140,6 +143,7 @@ export PATH="$fake_bin:$PATH" HOME="$fake_home"
 export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
 export DARK_FACTORY_TEST_BACKUP_MODES="$temporary/backup-modes"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
+export DARK_FACTORY_TEST_GO_LOG="$temporary/go.log"
 export DARK_FACTORY_TEST_PIDS="$temporary/pids"
 script=$test_repository/scripts/reinstall-service.sh
 
@@ -192,6 +196,9 @@ for cmd in factoryctl factoryd factory-runner; do
     grep -q '^# pins GOTOOLCHAIN=go1.2.3 GOENV=off GOAUTH=off$' "$test_repository/.worktrees/bin-$sha/$cmd" \
         || fail "$cmd not built with the go.mod toolchain pinned: $(grep '^# pins' "$test_repository/.worktrees/bin-$sha/$cmd")"
 done
+builds=$(wc -l <"$DARK_FACTORY_TEST_GO_LOG" | tr -d ' ')
+[ "$builds" -gt 0 ] && [ "$(grep -F -c -- '-buildvcs=true' "$DARK_FACTORY_TEST_GO_LOG")" = "$builds" ] \
+    || fail "builds did not require VCS metadata: $(tr '\n' ';' <"$DARK_FACTORY_TEST_GO_LOG")"
 printf '%s\n' \
     "service uninstall --home $fake_home/.dark-factory" \
     "service install --home $fake_home/.dark-factory --relay-origin wss://relay.darkfactory.build" \
@@ -217,12 +224,12 @@ grep -q 'has not left' "$temporary/stderr" || fail "accepting socket: wrong refu
 grep -q 'still accepts' "$temporary/stderr" || fail "accepting socket: socket not named"
 not_installed "accepting socket"
 
-# So is any process naming the home, socket or not.
-DARK_FACTORY_TEST_UNINSTALL_LEAVES=process "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
-    && fail "process naming the home after uninstall accepted"
-grep -q 'has not left' "$temporary/stderr" || fail "surviving process: wrong refusal"
-grep -q 'tail -f' "$temporary/stderr" || fail "surviving process: not listed"
-not_installed "surviving process"
+# So is a previous daemon that has closed its listener but still owns the home.
+DARK_FACTORY_TEST_UNINSTALL_LEAVES=lock "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "held home lock after uninstall accepted"
+grep -q 'has not left' "$temporary/stderr" || fail "held home lock: wrong refusal"
+grep -q 'home.lock remains held' "$temporary/stderr" || fail "held home lock: lock not named"
+not_installed "held home lock"
 
 # A daemon that dies before listening (a failed migration) must time out with
 # the restore instruction, not report success.
