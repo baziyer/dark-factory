@@ -144,7 +144,7 @@ cd "$work"
 case "$provider" in
     codex)
         model=${DARK_FACTORY_REVIEW_MODEL:-gpt-5.6-sol}
-        DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" codex exec --ephemeral --ignore-user-config --strict-config -c 'approval_policy="on-request"' -c 'approvals_reviewer="auto_review"' --sandbox read-only --ignore-rules --skip-git-repo-check --model "$model" \
+        DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" codex exec --ephemeral --ignore-user-config --strict-config -c 'approval_policy={ granular={sandbox_approval=false,rules=false,mcp_elicitations=true,request_permissions=false,skill_approval=false}}' -c 'approvals_reviewer="auto_review"' --sandbox read-only --ignore-rules --skip-git-repo-check --model "$model" \
             -c "mcp_servers.dark_factory_maintainer.command=\"$bridge\"" \
             -c 'mcp_servers.dark_factory_maintainer.enabled=true' \
             -c 'mcp_servers.dark_factory_maintainer.required=true' \
@@ -152,7 +152,7 @@ case "$provider" in
             --output-last-message "$out" "$prompt" > "$events" 2>&1 || true
         ;;
     claude)
-        model=${DARK_FACTORY_REVIEW_MODEL:-opus}
+        model=${DARK_FACTORY_REVIEW_CLAUDE_MODEL:-opus}
         DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" claude -p "$prompt" --model "$model" \
             --strict-mcp-config --mcp-config "{\"mcpServers\":{\"maintainer\":{\"command\":\"$bridge\"}}}" \
             --allowedTools "mcp__maintainer__maintainer_status,mcp__maintainer__observe_operation,mcp__maintainer__submit_pull_request_review,Bash(git -C $work/repo:*),Read,Grep,Glob" \

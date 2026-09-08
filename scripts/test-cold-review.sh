@@ -141,7 +141,8 @@ grep -q '^exec$' "$args" || fail "default reviewer is not Codex exec"
 grep -q -- '--ephemeral' "$args" || fail "Codex review persists a session"
 grep -q -- '--ignore-user-config' "$args" || fail "Codex review inherits user MCP configuration"
 grep -q -- '--strict-config' "$args" || fail "Codex review permits an unsupported Maintainer allowlist"
-grep -Fxq 'approval_policy="on-request"' "$args" || fail "Codex review does not request approval through its configured reviewer"
+approval_policy='approval_policy={ granular={sandbox_approval=false,rules=false,mcp_elicitations=true,request_permissions=false,skill_approval=false}}'
+grep -Fxq "$approval_policy" "$args" || fail "Codex review does not reject non-MCP escalation"
 grep -Fxq 'approvals_reviewer="auto_review"' "$args" || fail "Codex review does not route configured approvals automatically"
 grep -q -- '--sandbox' "$args" || fail "Codex review does not select a sandbox"
 grep -q '^read-only$' "$args" || fail "Codex review sandbox is not read-only"
@@ -172,6 +173,12 @@ grep -q -- '--strict-mcp-config' "$args" || fail "Claude selection lost its stri
 grep -Fq 'mcp__maintainer__maintainer_status,mcp__maintainer__observe_operation,mcp__maintainer__submit_pull_request_review,' "$args" \
     || fail "Claude review cannot make its required read observations"
 unset DARK_FACTORY_REVIEW_PROVIDER
+# Codex's lower-cost model override cannot name Claude's fallback model.
+: >"$args"
+DARK_FACTORY_REVIEW_PROVIDER=claude DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra \
+    review owner/repo 7 "$head" "$base" "$body" || fail "Claude fallback rejected the Codex model override"
+grep -Fxq 'opus' "$args" || fail "Claude fallback inherited the Codex model override"
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL
 # A caller may choose the cheaper Codex model explicitly.
 : >"$args"
 DARK_FACTORY_REVIEW_MODEL=gpt-5.6-terra review owner/repo 7 "$head" "$base" "$body" || fail "Codex model selection did not exit 0"
