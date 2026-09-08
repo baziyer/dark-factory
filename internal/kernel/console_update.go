@@ -41,9 +41,10 @@ func (store *Store) UpdateAgent(ctx context.Context, id AgentID, expected Revisi
 
 // UpdateAgentForOverseer applies a worker pause/resume inside the running
 // orchestrator's project. Authorization and the exact revision update share
-// one write transaction.
-func (store *Store) UpdateAgentForOverseer(ctx context.Context, digest AttemptDigest, id AgentID, expected Revision, patch AgentPatch, at UnixMillis) (Agent, error) {
-	return store.updateAgent(ctx, &digest, id, expected, patch, at)
+// one write transaction. Keeping the authority's input to this one field
+// prevents it from acquiring console configuration controls.
+func (store *Store) UpdateAgentForOverseer(ctx context.Context, digest AttemptDigest, id AgentID, expected Revision, paused bool, at UnixMillis) (Agent, error) {
+	return store.updateAgent(ctx, &digest, id, expected, AgentPatch{Paused: &paused}, at)
 }
 
 func (store *Store) updateAgent(ctx context.Context, digest *AttemptDigest, id AgentID, expected Revision, patch AgentPatch, at UnixMillis) (Agent, error) {
@@ -143,10 +144,11 @@ func (store *Store) UpdateTask(ctx context.Context, id TaskID, expected Revision
 	return store.updateTask(ctx, nil, id, expected, patch, at)
 }
 
-// UpdateTaskForOverseer edits only a queued worker task in the running
-// orchestrator's project, with authorization checked in the update transaction.
-func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
-	return store.updateTask(ctx, &digest, id, expected, patch, at)
+// UpdateTaskForOverseer edits the dispatch controls of a queued worker task
+// in the running orchestrator's project, with authorization checked in the
+// update transaction. It deliberately cannot edit the task's title or body.
+func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID, expected Revision, priority *int64, assignedAgentID *AgentID, cancel bool, at UnixMillis) (Task, error) {
+	return store.updateTask(ctx, &digest, id, expected, TaskPatch{Priority: priority, AssignedAgentID: assignedAgentID, Cancel: cancel}, at)
 }
 
 func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {

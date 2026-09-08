@@ -136,8 +136,11 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	priority := int64(1)
-	for _, patch := range []TaskPatch{{Priority: &priority}, {Cancel: true}} {
-		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, patch, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
+	for _, update := range []struct {
+		priority *int64
+		cancel   bool
+	}{{priority: &priority}, {cancel: true}} {
+		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, update.priority, nil, update.cancel, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("orchestrator task patch = %v", err)
 		}
 	}
@@ -149,9 +152,32 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, TaskPatch{Priority: &priority}, mustTime(t, 45))
-	if err != nil || updated.Priority != priority {
+	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, &priority, nil, false, mustTime(t, 45))
+	if err != nil || updated.Priority != priority || updated.Title != workerTask.Title {
 		t.Fatalf("worker task patch = %+v, %v", updated, err)
+	}
+}
+
+func TestUpdateAgentForOverseerOnlyPausesWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, run, keys := runningOrchestratorRun(t)
+	defer store.Close()
+	account, err := store.LinkAccount(ctx, NewAccount{ID: accountID(t, 236), Provider: ProviderCodex, Home: "/Users/operator/.codex-overseer", Label: "overseer"}, mustTime(t, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 237), ProjectID: run.ProjectID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, Model: "gpt-5-codex", ReasoningEffort: "high", AccountID: account.ID, ToolBudgetLimit: 1}, mustTime(t, 41))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, after, instruction, budget := IdleStandingInstruction, uint32(1), "inspect worker work", uint32(2)
+	configured, err := store.UpdateAgent(ctx, worker.ID, worker.Revision, AgentPatch{IdlePolicy: &policy, IdleAfterSeconds: &after, IdleInstruction: &instruction, IdleRunBudget: &budget}, mustTime(t, 42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateAgentForOverseer(ctx, keys.AttemptDigest, configured.ID, configured.Revision, true, mustTime(t, 43))
+	if err != nil || !updated.Paused || updated.Model != configured.Model || updated.ReasoningEffort != configured.ReasoningEffort || updated.AccountID != configured.AccountID || updated.Idle != configured.Idle {
+		t.Fatalf("overseer pause = %+v, %v", updated, err)
 	}
 }
 

@@ -687,19 +687,19 @@ func (daemon *Daemon) overseerUpdateTask(ctx context.Context, call api.Call) api
 	if err != nil {
 		return newErrorReply(api.RemoteInvalidRequest)
 	}
-	patch := kernel.TaskPatch{Priority: input.Priority, Cancel: input.Cancel}
+	var assignedAgentID *kernel.AgentID
 	if input.AssignedAgentID != nil {
 		agentID, err := parseAgentID(*input.AssignedAgentID)
 		if err != nil {
 			return newErrorReply(api.RemoteInvalidRequest)
 		}
-		patch.AssignedAgentID = &agentID
+		assignedAgentID = &agentID
 	}
 	at, err := daemon.timestamp()
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
-	task, err := daemon.store.UpdateTaskForOverseer(ctx, digest, id, expected, patch, at)
+	task, err := daemon.store.UpdateTaskForOverseer(ctx, digest, id, expected, input.Priority, assignedAgentID, input.Cancel, at)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
@@ -729,7 +729,7 @@ func (daemon *Daemon) overseerUpdateAgent(ctx context.Context, call api.Call) ap
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
-	agent, err := daemon.store.UpdateAgentForOverseer(ctx, digest, id, expected, kernel.AgentPatch{Paused: &paused}, at)
+	agent, err := daemon.store.UpdateAgentForOverseer(ctx, digest, id, expected, paused, at)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
