@@ -228,8 +228,19 @@ func removeRuntimeTree(ctx context.Context, parentFD int, name string, device ui
 	}
 	directory := os.NewFile(uintptr(fd), "runtime-tree-removal")
 	defer directory.Close()
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil || !sameFileObject(named, opened) || !validRuntimeOrdinaryDirectory(opened, device, exactLayout) {
+		return false, errInvalidContract
+	}
 	if *budget == 0 {
 		return false, nil
+	}
+	// Removal needs write and search permission on the exact directory, even
+	// when a provider leaves its private module cache owner-readable only.
+	if opened.Mode&0o300 != 0o300 {
+		if err := unix.Fchmod(fd, uint32(opened.Mode&0o7777|0o300)); err != nil {
+			return false, err
+		}
 	}
 	entries, more, err := readRuntimeEntries(fd, *budget)
 	if err != nil {

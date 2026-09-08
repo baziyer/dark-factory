@@ -814,6 +814,8 @@ type Run struct {
 	UpdatedAt                UnixMillis
 }
 
+func (run Run) ResultProofDigest() ResultProofDigest { return run.resultProofDigest }
+
 type Resource struct {
 	ID               ResourceID
 	RunID            RunID
