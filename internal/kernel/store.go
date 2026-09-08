@@ -167,9 +167,10 @@ func taskCreationReplay(ctx context.Context, connection *sql.Conn, spec NewTask)
 func insertTaskOnConnection(ctx context.Context, connection *sql.Conn, spec NewTask, at UnixMillis) (Task, error) {
 	if _, err := connection.ExecContext(ctx, `INSERT INTO tasks(
         id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body,
+		sent_back_instruction_bytes,
         status, priority, blocked_reason, result, completed_at_ms, revision,
-        created_at_ms, updated_at_ms
-	    ) VALUES(?, ?, ?, ?, 1, ?, ?, 'queued', ?, NULL, NULL, NULL, 1, ?, ?)`,
+		created_at_ms, updated_at_ms
+	    ) VALUES(?, ?, ?, ?, 1, ?, ?, NULL, 'queued', ?, NULL, NULL, NULL, 1, ?, ?)`,
 		spec.ID.Bytes(), spec.ProjectID.Bytes(), spec.AssignedAgentID.Bytes(), spec.IncarnationID.Bytes(), spec.Title, spec.Body, spec.Priority, at.Int64(), at.Int64()); err != nil {
 		return Task{}, err
 	}

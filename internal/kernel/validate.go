@@ -1032,7 +1032,7 @@ func validateAgents(ctx context.Context, connection *sql.Conn) error {
 }
 
 func validateTasks(ctx context.Context, connection *sql.Conn) error {
-	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms FROM tasks`)
+	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, sent_back_instruction_bytes, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms FROM tasks`)
 	if err != nil {
 		return err
 	}

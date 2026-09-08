@@ -299,17 +299,20 @@ and 5 when it could not prepare the checkout, and leaves
   other row is another task. The first run to reach this step sent back the
   task of a different row.
 
-  The note is appended to the task's body, which the worker's provider
-  receives whole; the daemon refuses a send-back the provider could not be
-  handed (`too_large`), so keep the note to that shape: a pointer, never the
+  The note goes at the end of the task's body, replacing the note of any
+  earlier send-back, and the worker's provider receives that body whole;
+  the daemon refuses a send-back the provider could not be handed
+  (`too_large`), so keep the note to that shape: a pointer, never the
   findings pasted. A shell agent's task is a program and cannot be sent
-  back at all (`invalid_request`); that is a human request. A `too_large` even so means the task's own body is at
-  the provider's bound and no note fits: raise a human request naming the
-  pull request and the task, and end the run with `attempt block`, since the
-  change would otherwise come around again to the same refusal. The task is queued again and the worker's next run
-  continues from the retained tree; a later run of yours finds the same
-  change id at the next work revision and publishes the new tree on top of
-  the branch (section 3). Stop handling this change for now.
+  back at all (`invalid_request`); that is a human request. A `too_large`
+  for a note of that shape means the task's own instruction is at the
+  provider's bound and no note fits: raise a human request naming the pull
+  request and the task, and end the run with `attempt block`, since the
+  change would otherwise come around again to the same refusal. The task
+  is queued again and the worker's next run continues from the retained
+  tree; a later run of yours finds the same change id at the next work
+  revision and publishes the new tree on top of the branch (section 3).
+  Stop handling this change for now.
 - Exit 4: the pull request is no longer at the head you published, which
   only a person can have done; raise a human request.
 - Exit 2 or 5: the script refused its arguments or could not prepare the

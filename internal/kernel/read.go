@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -169,16 +170,17 @@ func taskByID(ctx context.Context, connection *sql.Conn, id TaskID) (Task, bool,
 	if id.zero() {
 		return Task{}, false, fmt.Errorf("%w: zero task identifier", ErrInvalidValue)
 	}
-	return scanTask(connection.QueryRowContext(ctx, `SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms FROM tasks WHERE id = ?`, id.Bytes()))
+	return scanTask(connection.QueryRowContext(ctx, `SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, sent_back_instruction_bytes, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms FROM tasks WHERE id = ?`, id.Bytes()))
 }
 
 func scanTask(scanner rowScanner) (Task, bool, error) {
 	var rawID, rawProjectID, rawAgentID, rawIncarnationID []byte
 	var workRevision, priority, revision, createdAt, updatedAt int64
 	var title, body, rawStatus string
-	var blockedReason, result sql.NullString
+	var sentBackInstructionBytes sql.NullInt64
+	var blockedReasonText, resultText sql.NullString
 	var completedAt sql.NullInt64
-	if err := scanner.Scan(&rawID, &rawProjectID, &rawAgentID, &rawIncarnationID, &workRevision, &title, &body, &rawStatus, &priority, &blockedReason, &result, &completedAt, &revision, &createdAt, &updatedAt); err != nil {
+	if err := scanner.Scan(&rawID, &rawProjectID, &rawAgentID, &rawIncarnationID, &workRevision, &title, &body, &sentBackInstructionBytes, &rawStatus, &priority, &blockedReasonText, &resultText, &completedAt, &revision, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Task{}, false, nil
 		}
@@ -196,19 +198,22 @@ func scanTask(scanner rowScanner) (Task, bool, error) {
 	if idErr != nil || projectErr != nil || agentErr != nil || incarnationErr != nil || workRevisionErr != nil || statusErr != nil || revisionErr != nil || createdErr != nil || updatedErr != nil || byteLen(title) < 1 || byteLen(title) > 1024 || byteLen(body) > 131072 || priority < -1_000_000 || priority > 1_000_000 || updatedAt < createdAt {
 		return Task{}, false, fmt.Errorf("%w: invalid task row", ErrCorruptState)
 	}
-	if blockedReason.Valid && (byteLen(blockedReason.String) < 1 || byteLen(blockedReason.String) > 4096) || result.Valid && byteLen(result.String) > 131072 {
+	if sentBackInstructionBytes.Valid && (sentBackInstructionBytes.Int64 < 0 || sentBackInstructionBytes.Int64 > int64(byteLen(body)) || !strings.HasPrefix(body[sentBackInstructionBytes.Int64:], sentBackMarker)) {
+		return Task{}, false, fmt.Errorf("%w: invalid sent-back instruction boundary", ErrCorruptState)
+	}
+	if blockedReasonText.Valid && (byteLen(blockedReasonText.String) < 1 || byteLen(blockedReasonText.String) > 4096) || resultText.Valid && byteLen(resultText.String) > 131072 {
 		return Task{}, false, fmt.Errorf("%w: invalid task result fields", ErrCorruptState)
 	}
 	validState := false
 	switch status {
 	case TaskQueued, TaskRunning:
-		validState = !blockedReason.Valid && !result.Valid && !completedAt.Valid
+		validState = !blockedReasonText.Valid && !resultText.Valid && !completedAt.Valid
 	case TaskBlocked:
-		validState = blockedReason.Valid && !result.Valid && !completedAt.Valid
+		validState = blockedReasonText.Valid && !resultText.Valid && !completedAt.Valid
 	case TaskSucceeded:
-		validState = !blockedReason.Valid && completedAt.Valid
+		validState = !blockedReasonText.Valid && completedAt.Valid
 	case TaskFailed, TaskCancelled:
-		validState = !blockedReason.Valid && !result.Valid && completedAt.Valid
+		validState = !blockedReasonText.Valid && !resultText.Valid && completedAt.Valid
 	}
 	if !validState || completedAt.Valid && (completedAt.Int64 < 0 || completedAt.Int64 != updatedAt) {
 		return Task{}, false, fmt.Errorf("%w: inconsistent task state", ErrCorruptState)
@@ -221,10 +226,15 @@ func scanTask(scanner rowScanner) (Task, bool, error) {
 		}
 		completed = &value
 	}
+	var sentBack *int64
+	if sentBackInstructionBytes.Valid {
+		value := sentBackInstructionBytes.Int64
+		sentBack = &value
+	}
 	return Task{
 		ID: id, ProjectID: projectID, AssignedAgentID: agentID, IncarnationID: incarnationID,
-		WorkRevision: workRev, Title: title, Body: body, Status: status, Priority: priority,
-		BlockedReason: nullStringValue(blockedReason), Result: nullStringValue(result), CompletedAt: completed,
+		WorkRevision: workRev, Title: title, Body: body, SentBackInstructionBytes: sentBack, Status: status, Priority: priority,
+		BlockedReason: nullStringValue(blockedReasonText), Result: nullStringValue(resultText), CompletedAt: completed,
 		Revision: rev, CreatedAt: created, UpdatedAt: updated,
 	}, true, nil
 }

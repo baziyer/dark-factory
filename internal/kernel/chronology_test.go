@@ -212,6 +212,10 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	success, _ := NewSuccessProposal("finished")
 	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, success)
 	defer store.Close()
+	legacyInstruction := "read this:" + sentBackMarker + "1\n\nand fix it"
+	if _, err := store.writer.Exec(`UPDATE tasks SET body = ? WHERE id = ?`, legacyInstruction, finalizing.TaskID.Bytes()); err != nil {
+		t.Fatal(err)
+	}
 	terminal, err := finalizeTestRun(t, store, finalizing, 80)
 	if err != nil {
 		t.Fatal(err)
@@ -230,18 +234,29 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	if _, err := store.SendBackTask(ctx, task.ID, task.Revision, "later", mustTime(t, task.UpdatedAt.Int64()-1)); !errors.Is(err, ErrRevisionConflict) {
 		t.Fatalf("send-back before the terminal run = %v", err)
 	}
-	// The fixture's task has a title and no body, which a run receives as
-	// the title; the send-back must keep that instruction.
-	if task.Body != "" || task.Title == "" {
+	// A v4 task may quote the heading in its instruction. Its NULL boundary
+	// means the first send-back keeps the whole instruction.
+	if task.Body != legacyInstruction || task.SentBackInstructionBytes != nil {
 		t.Fatalf("fixture task = %+v", task)
 	}
 	sent, err := store.SendBackTask(ctx, task.ID, task.Revision, "the review wants a test", mustTime(t, 90))
 	if err != nil || sent.Status != TaskQueued || sent.WorkRevision.Int64() != task.WorkRevision.Int64()+1 || sent.Result != "" || sent.CompletedAt != nil || sent.BlockedReason != "" ||
-		sent.Body != task.Title+"\n\n## Sent back for work revision 2\n\nthe review wants a test" || sent.Body != SentBackBody(task, "the review wants a test") {
+		sent.Body != legacyInstruction+"\n\n## Sent back for work revision 2\n\nthe review wants a test" || sent.Body != SentBackBody(task, "the review wants a test") || sent.SentBackInstructionBytes == nil || *sent.SentBackInstructionBytes != int64(byteLen(legacyInstruction)) {
 		t.Fatalf("sent back task = %+v, %v", sent, err)
 	}
 	if body := SentBackBody(Task{Title: "titled", Body: "the body", WorkRevision: mustRevision(t, 1)}, "n"); !strings.HasPrefix(body, "the body\n\n") {
 		t.Fatalf("body with a body = %q", body)
+	}
+	if body := SentBackBody(sent, "the second note"); body != legacyInstruction+"\n\n## Sent back for work revision 3\n\nthe second note" {
+		t.Fatalf("second send-back kept the first note: %q", body)
+	}
+	legacy := NewTask{ID: taskID(t, 62), ProjectID: terminal.ProjectID, AssignedAgentID: terminal.AgentID, IncarnationID: incarnationID(t, 63), Title: "quotes a send-back", Body: legacyInstruction}
+	legacyTask, err := store.EnqueueTask(ctx, legacy, mustTime(t, 91))
+	if err != nil || legacyTask.SentBackInstructionBytes != nil || SentBackBody(legacyTask, "later") != legacy.Body+sentBackMarker+"2\n\nlater" {
+		t.Fatalf("legacy heading task = %+v, %v", legacyTask, err)
+	}
+	if replayed, err := store.EnqueueTask(ctx, legacy, mustTime(t, 92)); err != nil || replayed != legacyTask {
+		t.Fatalf("legacy heading replay = %+v, %v", replayed, err)
 	}
 	if _, _, err := store.Run(ctx, terminal.ID); err != nil {
 		t.Fatalf("store after send-back = %v", err)
@@ -257,6 +272,38 @@ func TestSuccessfulTerminalCanBeSentBackAndRetried(t *testing.T) {
 	result, err := store.AdmitNext(ctx, keys, mustTime(t, 100))
 	if err != nil || !result.Admitted() || result.Run.AdmittedTaskWorkRevision.Int64() != 2 || result.Run.ChangeID == nil || *result.Run.ChangeID != *terminal.ChangeID {
 		t.Fatalf("retry admission = %+v, %v", result, err)
+	}
+	activated := activateAllResourcesUnique(t, store, *result.Run, 110, 300)
+	session := terminalSessionForRunTest(t, store, result.Run.ID)
+	running, err := store.ActivateRun(ctx, result.Run.ID, session.ID, activated.Revision, session.Revision, mustTime(t, 120))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizing, err = store.ProposeAttemptOutcome(ctx, keys.AttemptDigest, success, mustTime(t, 130))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizing = observeMissingProcessExits(t, store, running.ID, 131)
+	for index, resource := range resourcesForRunTest(t, store, running.ID) {
+		if resource.State == ResourceReleased {
+			continue
+		}
+		if _, err := store.ReleaseResource(ctx, running.ID, resource.ID, resource.Revision, resource.Identity, mustTime(t, int64(140+index))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finalizing = closeTerminalSessionAtCurrent(t, store, running.ID, 145)
+	terminal, err = finalizeTestRun(t, store, finalizing, 150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, found, err := store.Task(ctx, terminal.TaskID)
+	if err != nil || !found {
+		t.Fatalf("second terminal task = %+v, found=%v, %v", retried, found, err)
+	}
+	second, err := store.SendBackTask(ctx, retried.ID, retried.Revision, "the second note", mustTime(t, 160))
+	if err != nil || second.Body != legacyInstruction+"\n\n## Sent back for work revision 3\n\nthe second note" || second.SentBackInstructionBytes == nil || *second.SentBackInstructionBytes != int64(byteLen(legacyInstruction)) {
+		t.Fatalf("second send-back = %+v, %v", second, err)
 	}
 }
 

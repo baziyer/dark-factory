@@ -566,21 +566,22 @@ type Agent struct {
 }
 
 type Task struct {
-	ID              TaskID
-	ProjectID       ProjectID
-	AssignedAgentID AgentID
-	IncarnationID   IncarnationID
-	WorkRevision    Revision
-	Title           string
-	Body            string
-	Status          TaskStatus
-	Priority        int64
-	BlockedReason   string
-	Result          string
-	CompletedAt     *UnixMillis
-	Revision        Revision
-	CreatedAt       UnixMillis
-	UpdatedAt       UnixMillis
+	ID                       TaskID
+	ProjectID                ProjectID
+	AssignedAgentID          AgentID
+	IncarnationID            IncarnationID
+	WorkRevision             Revision
+	Title                    string
+	Body                     string
+	SentBackInstructionBytes *int64
+	Status                   TaskStatus
+	Priority                 int64
+	BlockedReason            string
+	Result                   string
+	CompletedAt              *UnixMillis
+	Revision                 Revision
+	CreatedAt                UnixMillis
+	UpdatedAt                UnixMillis
 }
 
 type ProjectSummary struct {
