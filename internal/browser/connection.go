@@ -301,6 +301,15 @@ func (current *connection) serve() {
 			return
 		case event, ok := <-terminalEvents:
 			if !ok {
+				if current.attachment != nil && current.attachment.ResetRequired() {
+					// The daemon deliberately bounded this observer. Resume from the
+					// browser-confirmed cursor; the runner remains authoritative and
+					// will return its own reset if that cursor was pruned.
+					if !current.sendTerminalEvent(TerminalEvent{Kind: TerminalEventReset, Floor: current.terminalAck, Head: current.terminalAck}) {
+						return
+					}
+					continue
+				}
 				if err := current.closeTerminal(); err != nil {
 					current.recordCleanup(err)
 					return

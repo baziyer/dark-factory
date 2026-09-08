@@ -442,12 +442,20 @@ func TestLiveAttemptSlowSubscriberIsDroppedExactlyOnce(t *testing.T) {
 	attempt := newLiveAttempt(nil, runID, sessionID, nil)
 	attachment := &TerminalAttachment{queue: make(chan TerminalEvent, terminalSubscriberCap), correlation: 1, expected: 0}
 	for range terminalSubscriberCap {
-		attachment.queue <- TerminalEvent{Kind: TerminalEventOutput}
+		// The cap is sized from maximum payloads, but native spinners can emit
+		// far more tiny frames while still far below the one-megabyte credit.
+		attachment.queue <- TerminalEvent{Kind: TerminalEventOutput, Payload: []byte{'x'}}
+	}
+	if queuedBytes := len(attachment.queue); uint64(queuedBytes) >= liveAttemptCredit {
+		t.Fatalf("tiny queued output reached credit: %d >= %d", queuedBytes, liveAttemptCredit)
 	}
 	attempt.subs[attachment] = struct{}{}
 	attempt.routeLive(attachment, runner.TerminalFrame{Kind: runner.TerminalOutput, Start: 0, End: 1, Payload: []byte{'x'}})
 	if _, present := attempt.subs[attachment]; present || !attachment.finished {
 		t.Fatalf("slow subscriber remained registered: present=%v finished=%v", present, attachment.finished)
+	}
+	if !attachment.ResetRequired() {
+		t.Fatal("slow subscriber did not require a terminal reset")
 	}
 	// A stale delivery path must be harmless after the queue has been closed;
 	// the owner removes the subscriber before any later correlated frame can

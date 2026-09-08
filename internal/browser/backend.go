@@ -120,6 +120,10 @@ const (
 // is synchronous: it does not return until the owner has joined the detach.
 type TerminalAttachment interface {
 	Events() <-chan TerminalEvent
+	// ResetRequired reports that the owner dropped this bounded observer and
+	// the browser must establish a fresh attachment rather than treating the
+	// closed event stream as a connection failure.
+	ResetRequired() bool
 	Close() error
 }
 
