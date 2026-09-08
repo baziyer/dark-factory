@@ -251,8 +251,14 @@ func removeRuntimeTree(ctx context.Context, parentFD int, name string, device ui
 				return false, err
 			}
 			mutated = true
-		case unix.S_IFREG:
-			if !validRuntimeOrdinaryFile(stat, device, false) {
+		case unix.S_IFREG, unix.S_IFLNK, unix.S_IFSOCK, unix.S_IFIFO:
+			// A provider's home and temp directory hold whatever it made: a
+			// module cache of hard links, a socket a test listened on, a
+			// symlink into node_modules. Unlinking a name never follows it
+			// and never touches what another name shares, so every name on
+			// this device owned by this user goes; a name on another device
+			// or another owner is not this runtime's to remove.
+			if !validRuntimeOrdinaryName(stat, device) {
 				return false, errInvalidContract
 			}
 			if *budget == 0 {
@@ -328,6 +334,18 @@ func validRuntimeOrdinaryDirectory(stat unix.Stat_t, device uint64, exactMode bo
 		return false
 	}
 	return !exactMode || stat.Mode&0o7777 == 0o700
+}
+
+// validRuntimeOrdinaryName is the bound on a non-directory name inside a
+// runtime's home or temp tree: on the runtime's device, owned by this user,
+// with no special bits. Its kind and link count are the provider's business.
+func validRuntimeOrdinaryName(stat unix.Stat_t, device uint64) bool {
+	switch stat.Mode & unix.S_IFMT {
+	case unix.S_IFREG, unix.S_IFLNK, unix.S_IFSOCK, unix.S_IFIFO:
+	default:
+		return false
+	}
+	return uint64(stat.Dev) == device && stat.Uid == uint32(os.Geteuid()) && stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) == 0
 }
 
 func validRuntimeOrdinaryFile(stat unix.Stat_t, device uint64, exactMode bool) bool {

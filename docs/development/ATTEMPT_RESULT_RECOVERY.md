@@ -135,7 +135,11 @@ state.
   released runner, deliberately not terminal), F (held lease concludes
   nothing). Census admits attempt-result.json with outer-marker + token
   provenance; recovered runtime exposes marker facts, notice-less
-  authentication, and exact removal.
+  authentication, and exact removal. A runtime root left unresolved by
+  a refused cleanup (result already consumed and removed) is tried again
+  by the sweep, without opening the part-removed tree as a runtime: a
+  removal that now succeeds releases the root and settles the run; one
+  still refused leaves the run finalizing, as the supervisor left it.
 - Spec corrections from building it: cell D needs no new session-close
   edge — the run deliberately remains finalizing with unresolved residue
   (finalizeRun refuses unresolved footprints), which is the intended
