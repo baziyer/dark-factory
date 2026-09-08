@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dark-factory-build/dark-factory/internal/change"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
@@ -54,6 +56,141 @@ func TestSettleRunFinalizesOrchestratorAndReplaysTerminal(t *testing.T) {
 	replay, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
 	if err != nil || replay.Phase != kernel.RunTerminal || replay.Revision != settled.Revision {
 		t.Fatalf("terminal replay = %+v, %v", replay, err)
+	}
+}
+
+func TestSettleRunAllowsAFullRetainedTreeScan(t *testing.T) {
+	fixture := newRecoveryFixtureWithRole(t, 0x68, kernel.RoleWorker)
+	ctx := context.Background()
+	changeState, found, err := fixture.store.Change(ctx, *fixture.run.ChangeID)
+	if err != nil || !found {
+		t.Fatalf("change: found=%v err=%v", found, err)
+	}
+	format, err := change.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := change.NewObjectID(format, bytes.Repeat([]byte{0x55}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("right\n")
+	sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(content))), content...))
+	oid, err := change.NewObjectID(format, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := change.NewEntry([]byte("nested/a"), "100644", uint64(len(content)), oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := change.NewManifest(format, base, []change.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := change.Prepare(ctx, fixture.changeParent, changeState.ID.String(), changeState.ID.String()+".stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := prepared.PopulateAndPublish(ctx, manifest, func(context.Context, change.ObjectID) ([]byte, error) { return bytes.Clone(content), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(published.Path()); err != nil {
+		t.Fatalf("published tree: %v", err)
+	}
+	facts := published.Facts()
+	large := filepath.Join(published.Path(), "generated.bin")
+	largeFile, err := os.OpenFile(large, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := largeFile.Truncate(1 << 30); err != nil {
+		_ = largeFile.Close()
+		t.Fatal(err)
+	}
+	if err := largeFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := kernelStageIdentity(prepared.Identity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernelFormat, err := kernel.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := kernel.NewCommitID(kernelFormat, base.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := kernel.TreeDigestFromBytes(facts.Commitment().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := kernel.NewFileIdentity(7, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := kernel.NewChangeSelection(kernelFormat, commit, digest, uint32(facts.EntryCount()), facts.BlobBytes(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := fixture.store.RecordChangePrepared(ctx, changeState.ID, changeState.Revision, selection, tree, mustKernelTime(t, 300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, err := kernelAvailability(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.MarkChangeAvailable(ctx, changeState.ID, recorded.Revision, availability, mustKernelTime(t, 310)); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.failBeforeRuntime(t)
+	// Hold the retained inspection while an independent durable update advances
+	// the factory clock. The settlement timestamp must be read after that
+	// inspection, or the kernel rejects its stale finalization.
+	var clock atomic.Int64
+	clock.Store(500)
+	fixture.daemon.now = func() time.Time { return time.UnixMilli(clock.Load()) }
+	inspectionHeld := make(chan struct{})
+	continueInspection := make(chan struct{})
+	fixture.daemon.settleRetained = func(ctx context.Context, parent string, state kernel.Change) (kernel.ChangeSettlement, error) {
+		close(inspectionHeld)
+		<-continueInspection
+		return retainedSettlement(ctx, parent, state)
+	}
+	type settlementResult struct {
+		run kernel.Run
+		err error
+	}
+	settledResult := make(chan settlementResult, 1)
+	go func() {
+		run, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+		settledResult <- settlementResult{run, err}
+	}()
+	select {
+	case <-inspectionHeld:
+	case <-time.After(time.Second):
+		t.Fatal("settlement did not reach retained inspection")
+	}
+	factory, err := fixture.store.Factory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.SetDispatch(ctx, factory.Revision, false, mustKernelTime(t, 600)); err != nil {
+		t.Fatalf("concurrent dispatch update: %v", err)
+	}
+	clock.Store(700)
+	close(continueInspection)
+	result := <-settledResult
+	settled, err := result.run, result.err
+	if err != nil || settled.Phase != kernel.RunTerminal || settled.Terminal == nil {
+		t.Fatalf("large retained settlement = %+v, %v", settled, err)
 	}
 }
 
