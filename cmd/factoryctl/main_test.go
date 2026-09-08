@@ -200,6 +200,26 @@ func TestParseExactAttemptCommands(t *testing.T) {
 	}
 }
 
+func TestParseOverseerTaskUpdateKeepsPriority(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	for _, test := range []struct {
+		name     string
+		args     []string
+		priority int64
+		agent    string
+	}{
+		{name: "priority only", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "-5"}, priority: -5},
+		{name: "priority and agent", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "5", "--agent", id}, priority: 5, agent: id},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command, help, ok := parse(test.args)
+			if !ok || help || command.kind != commandOverseerTaskUpdate || !command.prioritySet || command.priority != test.priority || command.agent != test.agent {
+				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
+			}
+		})
+	}
+}
+
 func TestParseExplicitHomeCommands(t *testing.T) {
 	for _, test := range []struct {
 		args []string

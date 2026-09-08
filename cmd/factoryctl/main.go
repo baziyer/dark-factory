@@ -842,6 +842,7 @@ func parseOverseer(args []string) (attemptCommand, bool, bool) {
 				return attemptCommand{}, false, false
 			}
 			command.priority = priority
+			command.prioritySet = true
 		case "--revision":
 			revision, ok := parseRevision(value)
 			if !ok {
