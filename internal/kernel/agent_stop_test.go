@@ -104,4 +104,12 @@ func TestStopRunForAttemptTargetsOnlyWorkers(t *testing.T) {
 	if err != nil || receipt.State != TaskInterventionDelivered {
 		t.Fatalf("worker stop = %+v, %v", receipt, err)
 	}
+	stopped, found, err := store.Run(ctx, worker.ID)
+	if err != nil || !found || stopped.Phase != RunFinalizing || stopped.CredentialRevokedAt == nil {
+		t.Fatalf("durable worker stop = %+v, found=%v, err=%v", stopped, found, err)
+	}
+	history, err := store.TaskInterventions(ctx, task.ProjectID, task.ID)
+	if err != nil || len(history) != 1 || history[0].OperationID != operation || history[0].State != TaskInterventionDelivered {
+		t.Fatalf("durable worker stop history = %+v, %v", history, err)
+	}
 }
