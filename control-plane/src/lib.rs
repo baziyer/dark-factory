@@ -401,7 +401,7 @@ mod tests {
                 4_673_420,
                 [
                     Some(private_key),
-                    Some("maintainer-operations-v5".into()),
+                    Some("maintainer-operations-v6".into()),
                     Some(hex::encode(sha2::Sha256::digest(b"operator@example.com"))),
                     Some("https://dark-factory.cloudflareaccess.com".into()),
                     Some("a".repeat(64)),
