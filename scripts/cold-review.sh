@@ -144,10 +144,11 @@ cd "$work"
 case "$provider" in
     codex)
         model=${DARK_FACTORY_REVIEW_MODEL:-gpt-5.6-sol}
-        DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" codex exec --ephemeral --sandbox read-only --ignore-rules --skip-git-repo-check --model "$model" \
+        DARK_FACTORY_REVIEW_CHECKOUT="$work/repo" codex exec --ephemeral --ignore-user-config --sandbox read-only --ignore-rules --skip-git-repo-check --model "$model" \
             -c "mcp_servers.dark_factory_maintainer.command=\"$bridge\"" \
             -c 'mcp_servers.dark_factory_maintainer.enabled=true' \
             -c 'mcp_servers.dark_factory_maintainer.required=true' \
+            -c 'mcp_servers.dark_factory_maintainer.enabled_tools=["maintainer_status","observe_operation","submit_pull_request_review"]' \
             --output-last-message "$out" "$prompt" > "$events" 2>&1 || true
         ;;
     claude)
