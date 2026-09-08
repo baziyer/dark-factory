@@ -75,7 +75,7 @@ uninstall_stalled() {
 install_stalled() {
     echo "factoryd did not listen on $socket within 60s" >&2
     echo "check 'factoryctl service status --home $home' and the daemon log; after a failed migration" >&2
-    echo "restore $backup/factory.sqlite3 over $db, remove $db-wal and $db-shm, and reinstall the previous bin-*" >&2
+    echo "run 'factoryctl service uninstall --home $home', confirm $home/home.lock is free, then restore $backup/factory.sqlite3 over $db, remove $db-wal and $db-shm, and reinstall the previous bin-*" >&2
     exit 1
 }
 

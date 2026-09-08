@@ -271,6 +271,8 @@ not_installed "held home lock"
 DARK_FACTORY_TEST_INSTALL_DEAD=1 "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
     && fail "daemon that never listens accepted"
 grep -q 'did not listen' "$temporary/stderr" || fail "daemon that never listens: wrong refusal"
+grep -q "service uninstall --home $fake_home/.dark-factory.*home.lock is free" "$temporary/stderr" \
+    || fail "daemon that never listens: safe stop instruction not printed"
 grep -q "restore $fake_home/.dark-factory-backups/.*/factory.sqlite3 over .*factory.sqlite3-shm" "$temporary/stderr" \
     || fail "daemon that never listens: restore instruction not printed"
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
