@@ -48,5 +48,6 @@ temporary-home, test, and deterministic shell-provider helpers.
 - [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Development workflow](docs/development/WORKFLOW.md)
+- [Deploying the site and the live service](docs/development/DEPLOY.md)
 
 Dark Factory is MIT licensed.

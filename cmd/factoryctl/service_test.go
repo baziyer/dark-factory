@@ -57,7 +57,7 @@ func TestParseServiceStatusIsOneExplicitCommand(t *testing.T) {
 
 func TestParseServiceInstallRelayOriginIsInstallOnlyAndExact(t *testing.T) {
 	home := "/private/tmp/factory"
-	const origin = "wss://relay.darkfactory.build"
+	const origin = "wss://relay&.example"
 	command, help, ok := parse([]string{"service", "install", "--home", home, "--relay-origin", origin})
 	if !ok || help || command != (attemptCommand{kind: commandServiceInstall, home: home, relayOrigin: origin}) {
 		t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
