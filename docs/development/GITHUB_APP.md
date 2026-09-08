@@ -149,7 +149,7 @@ The live maintainer broker exposes only these repository-scoped operations:
 - publish one exact independently reviewed tree as an App-authored commit to a
   generated branch;
 - create one PR for that exact branch and base;
-- replace one open PR body only while it still names the caller's exact head;
+- replace one open PR body and return its observed head;
 - close one PR only while it still names the caller's exact head;
 - submit one bounded exact-head review verdict through the Pull Request Review
   API;
@@ -181,7 +181,7 @@ actors from callers without ruleset-write access; that operation uses it only
 for fixed `GET` requests for the active rulesets and exposes no administration
 mutation. Issues write exists only for bounded issue creation and
 evidence-backed terminal state. Pull requests
-write authorizes PR creation, the bounded exact-head body replacement, formal review, the bounded close operation, and
+write authorizes PR creation, the bounded body replacement, formal review, the bounded close operation, and
 the exact-head enqueue, which mutates the pull request's queue state; a PR
 review is not an Issues API comment. Merge queues write authorizes only the
 typed exact-head enqueue and
@@ -400,12 +400,13 @@ authority.
 `maintainer-operations-v5` granted. It adds one bounded
 `update_pull_request_body` operation, so the revision changes as the surface's
 fail-closed handshake even though no GitHub permission expands. The request
-binds the pull-request number, exact head, and replacement body in the durable
-digest, re-reads that head before the fixed body replacement, and accepts or
-reconciles only the App-marked replacement at that head. Caller text cannot
-carry an App operation marker or review-verdict marker. GitHub's body API does
-not offer the merge API's atomic `expectedHeadOid`; a moved or uncertain
-response is therefore indeterminate rather than reported as success. Rotate
+binds the pull-request number and replacement body in the durable digest, and
+accepts or reconciles only the App-marked replacement on that open pull
+request. Caller text cannot carry an App operation marker or review-verdict
+marker. GitHub's body API does not offer the merge API's atomic
+`expectedHeadOid`, so this metadata write returns the head it observed rather
+than claiming an exact-head condition. Exact-head review and merge operations
+remain separate. Rotate
 the `DARK_FACTORY_MAINTAINER_PERMISSION_REVISION` secret before promoting a v6
 build.
 

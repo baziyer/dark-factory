@@ -250,16 +250,14 @@ pub(crate) struct CreatePullRequest {
     pub(crate) draft: bool,
 }
 
-/// Replace an open pull request's body only while it still names the exact
-/// head the caller reviewed. The App adds its own operation marker so a lost
-/// response can be reconciled without adopting a different edit.
+/// Replace an open pull request's body. The App adds its own operation marker
+/// so a lost response can be reconciled without adopting a different edit.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdatePullRequestBody {
     pub(crate) repository: String,
     pub(crate) operation_id: String,
     pub(crate) pull_number: i64,
-    pub(crate) head_sha: String,
     pub(crate) body: String,
 }
 
@@ -2892,7 +2890,6 @@ impl UpdatePullRequestBody {
     fn validate(&mut self) -> Result<(), OperationError> {
         canonical_operation_id(&mut self.operation_id)?;
         valid_exact_integer(self.pull_number)?;
-        valid_sha(&self.head_sha)?;
         valid_text(&self.body, 0, 30_000, true)?;
         free_of_operation_marker(&self.body)?;
         free_of_review_verdict(&self.body)
@@ -5087,9 +5084,15 @@ impl Authority {
         token: &RepositoryToken,
         request: &UpdatePullRequestBody,
     ) -> Result<Option<PullRequestResult>, OperationError> {
-        self.verify_pull_request_head(token, request.pull_number, &request.head_sha)
-            .await?
-            .body_result(request)
+        let pull: PullRequest = github_json(
+            &format!(
+                "https://api.github.com/repos/{}/{}/pulls/{}",
+                token.repository.owner, token.repository.name, request.pull_number
+            ),
+            token.as_str(),
+        )
+        .await?;
+        pull.body_result(request)
     }
 
     async fn update_pull_request_body(
@@ -6300,7 +6303,7 @@ impl PullRequest {
         valid_github_url(&self.html_url)?;
         valid_sha(&self.head.sha)?;
         valid_sha(&self.base.sha)?;
-        if self.number != request.pull_number || self.head.sha != request.head_sha {
+        if self.number != request.pull_number {
             return Err(OperationError::Conflict);
         }
         if self.state != "open" || self.merged {
@@ -9267,7 +9270,6 @@ mod tests {
             repository: "dark-factory-build/dark-factory".into(),
             operation_id: "1c8a5c44-7f1f-11f0-952e-acde48001122".into(),
             pull_number: 407,
-            head_sha: "a".repeat(40),
             body: "Updated cumulative production-line delta.".into(),
         };
         assert!(update.validate().is_ok());
@@ -9292,7 +9294,7 @@ mod tests {
                 "pull request body accepts a bot marker: {forged}"
             );
         }
-        let updated_pull = PullRequest {
+        let mut updated_pull = PullRequest {
             number: update.pull_number,
             node_id: "PR_node".into(),
             html_url: "https://github.com/dark-factory-build/dark-factory/pull/407".into(),
@@ -9301,7 +9303,7 @@ mod tests {
             draft: false,
             head: PullReference {
                 name: "simplify-ci".into(),
-                sha: update.head_sha.clone(),
+                sha: "a".repeat(40),
             },
             base: PullReference {
                 name: "main".into(),
@@ -9313,13 +9315,14 @@ mod tests {
         };
         assert_eq!(
             updated_pull.body_result(&update).unwrap().unwrap().head_sha,
-            update.head_sha
+            "a".repeat(40)
         );
-        update.head_sha = "b".repeat(40);
-        assert!(matches!(
-            updated_pull.body_result(&update),
-            Err(OperationError::Conflict)
-        ));
+        updated_pull.head.sha = "b".repeat(40);
+        assert_eq!(
+            updated_pull.body_result(&update).unwrap().unwrap().head_sha,
+            "b".repeat(40),
+            "the body operation reports its observed head; it does not claim a head condition GitHub cannot enforce"
+        );
 
         let mut review: SubmitPullRequestReview = serde_json::from_value(serde_json::json!({
             "repository": "dark-factory-build/dark-factory",

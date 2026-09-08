@@ -207,9 +207,12 @@ git -C repo diff --numstat "$review_base" "$HEAD_SHA"
 The supplied body must be the fresh text only: do not copy an App operation
 marker or a `Dark-Factory-Review:` line from the old body. Write it to
 `body.md`, call `observe_operation` for `body-HEAD8`, and if it is not
-completed call `update_pull_request_body` with the PR number, `HEAD_SHA`, and
-the contents of `body.md`. The App adds its own marker. Then fetch the
-rendered body for the cold review:
+completed call `update_pull_request_body` with the PR number and the contents
+of `body.md`. The App adds its own marker and returns the head it observed
+with the replacement; this metadata write has no atomic expected-head
+condition. If that head differs from `HEAD_SHA`, rebuild the cumulative body
+from the returned head under its own `body-HEAD8` operation before review.
+Then fetch the rendered body for the cold review:
 
 ```sh
 curl -s "https://api.github.com/repos/OWNER/REPO/pulls/$PR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"])' > body.md

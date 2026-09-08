@@ -110,7 +110,7 @@ async fn dispatch(request: Value, mcp: &McpState) -> Response {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "dark-factory-maintainer", "version": "0.1.0"},
-                "instructions": "Every tool names its `owner/name` repository, and acts only on repositories this App is installed on. Read status before a write. Every write is exact-head bound and may fail closed."
+                "instructions": "Every tool names its `owner/name` repository, and acts only on repositories this App is installed on. Read status before a write. Every write is operation-bound and may fail closed."
             }),
         ),
         "tools/list" => json_rpc_result(id, tools()),
@@ -499,18 +499,17 @@ fn tools() -> Value {
         "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
     }, {
         "name": "update_pull_request_body",
-        "title": "Replace an exact-head pull request body",
-        "description": "Replace one open pull request body only while it still names the stated head commit. The App renders its operation marker; the supplied body cannot contain an App operation or review verdict marker. Replays require the same operation UUID and request.",
+        "title": "Replace an open pull request body",
+        "description": "Replace one open pull request body and return the head observed with the replacement. GitHub has no atomic expected-head condition for this metadata write. The App renders its operation marker; the supplied body cannot contain an App operation or review verdict marker. Replays require the same operation UUID and request.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repository": {"type": "string", "pattern": "^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$"},
                 "operation_id": {"type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"},
                 "pull_number": {"type": "integer", "minimum": 1},
-                "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
                 "body": {"type": "string", "maxLength": 30000}
             },
-            "required": ["repository", "operation_id", "pull_number", "head_sha", "body"],
+            "required": ["repository", "operation_id", "pull_number", "body"],
             "additionalProperties": false
         },
         "outputSchema": {

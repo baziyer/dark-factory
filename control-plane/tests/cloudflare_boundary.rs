@@ -518,13 +518,7 @@ fn every_repository_tool_requires_the_repository_it_acts_on() {
         ),
         (
             "update_pull_request_body",
-            &[
-                "repository",
-                "operation_id",
-                "pull_number",
-                "head_sha",
-                "body",
-            ][..],
+            &["repository", "operation_id", "pull_number", "body"][..],
         ),
         (
             "merge_pull_request_at_head",
