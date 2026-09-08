@@ -363,6 +363,9 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 	attempt, err := daemon.liveTerminalAttempt(delivery.RunID, kernel.TerminalSessionID{})
 	if err != nil {
 		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
+		if unknownErr == nil {
+			return 0, errors.Join(err, ErrTerminalEffectUncertain)
+		}
 		return 0, errors.Join(err, unknownErr)
 	}
 	payload := append([]byte(nil), delivery.Reply...)
@@ -370,6 +373,9 @@ func (daemon *Daemon) humanReply(ctx context.Context, principal browser.Principa
 	effectErr := result.effectError(len(payload))
 	if effectErr != nil {
 		unknownErr := daemon.markHumanReplyUnknown(requestID, deliveryID, delivery.Revision)
+		if unknownErr == nil {
+			return result.count, errors.Join(effectErr, ErrTerminalEffectUncertain)
+		}
 		return result.count, errors.Join(effectErr, unknownErr)
 	}
 	ackAt, err := daemon.timestamp()

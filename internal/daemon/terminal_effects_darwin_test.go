@@ -932,6 +932,95 @@ func TestHumanReplyUsesExactRunAndResolvesOnlyAfterFullDelivery(t *testing.T) {
 	}
 }
 
+func TestBrowserHumanReplyReadsPostEffectDeliveryAfterCallerCancellation(t *testing.T) {
+	for index, test := range []struct {
+		name   string
+		status runner.TerminalResultStatus
+	}{
+		{name: "resolved", status: runner.TerminalResultOK},
+		{name: "delivery unknown", status: runner.TerminalResultUncertain},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTerminalEffectFixture(t)
+			var key [kernel.IDBytes]byte
+			copy(key[:], adapterID(t, byte(212+index)))
+			request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{
+				IdempotencyKey: key, QuestionText: "question",
+			}, adapterTime(t, 400))
+			if err != nil {
+				t.Fatal(err)
+			}
+			type replyResult struct {
+				result browserprotocol.HumanRequestReplyResult
+				err    error
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan replyResult, 1)
+			go func() {
+				result, err := fixture.adapter.backend.ReplyHumanRequest(ctx, fixture.principal, browserprotocol.HumanRequestReply{
+					RequestID: request.ID.String(), ExpectedRevision: decimalRevision(request.Revision), Reply: "reply",
+				})
+				done <- replyResult{result: result, err: err}
+			}()
+			command := readTerminalEffectWire(t, fixture.peer)
+			if command.Kind != string(runner.TerminalHumanReply) || string(command.Payload) != "reply" || !command.Submit {
+				t.Fatalf("human reply command = %+v", command)
+			}
+			cancel()
+			count := uint32(len("reply"))
+			if test.status == runner.TerminalResultUncertain {
+				count = 0
+			}
+			replyTerminalEffect(t, fixture.peer, command, test.status, count)
+			got := <-done
+			wantStatus := "resolved"
+			if test.status == runner.TerminalResultUncertain {
+				wantStatus = "delivery_unknown"
+			}
+			if got.err != nil || got.result.RequestID != request.ID.String() || got.result.Revision != decimalRevision(request.Revision)+2 || got.result.Status != wantStatus {
+				t.Fatalf("reply after caller cancellation = %+v, %v", got.result, got.err)
+			}
+		})
+	}
+}
+
+func TestBrowserHumanReplyDoesNotReconcileUnknownBeforeEffect(t *testing.T) {
+	fixture := newTerminalEffectFixture(t)
+	var key [kernel.IDBytes]byte
+	copy(key[:], adapterID(t, 214))
+	request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{
+		IdempotencyKey: key, QuestionText: "question",
+	}, adapterTime(t, 400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := kernel.HumanRequestDeliveryIDFromBytes(adapterID(t, 215))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := fixture.adapter.store.BeginHumanReply(context.Background(), fixture.adapter.client.ID, request.ID, request.Revision, deliveryID, "earlier reply", adapterTime(t, 401))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.adapter.store.MarkHumanDeliveryUnknown(context.Background(), request.ID, delivery.DeliveryID, delivery.Revision, adapterTime(t, 402)); err != nil {
+		t.Fatal(err)
+	}
+	release, err := fixture.adapter.daemon.browserClientGates.acquire(context.Background(), fixture.adapter.client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := fixture.adapter.backend.ReplyHumanRequest(ctx, fixture.principal, browserprotocol.HumanRequestReply{
+		RequestID: request.ID.String(), ExpectedRevision: decimalRevision(request.Revision), Reply: "reply",
+	})
+	if result != (browserprotocol.HumanRequestReplyResult{}) || !errors.Is(err, browser.ErrRateLimited) {
+		t.Fatalf("cancelled reply = %+v, %v", result, err)
+	}
+	expectNoTerminalEffectWire(t, fixture.peer)
+}
+
 func TestHumanReplyKeepsShellPayloadRaw(t *testing.T) {
 	fixture := newTerminalEffectFixtureWithProvider(t, kernel.ProviderShell)
 	var key [kernel.IDBytes]byte
@@ -1024,7 +1113,7 @@ func TestHumanReplyReservesDerivedRunBeforeLiveOwnerLookup(t *testing.T) {
 	}
 	fixture.adapter.daemon.unregisterLiveAttempt(fixture.run.ID, fixture.attempt)
 	count, err := fixture.adapter.daemon.humanReply(context.Background(), fixture.principal, request.ID, request.Revision, "one shot")
-	if count != 0 || !errors.Is(err, kernel.ErrNotFound) {
+	if count != 0 || !errors.Is(err, kernel.ErrNotFound) || !errors.Is(err, ErrTerminalEffectUncertain) {
 		t.Fatalf("missing owner reply = count %d, err %v", count, err)
 	}
 	expectNoTerminalEffectWire(t, fixture.peer)
