@@ -999,7 +999,7 @@ test("a pending same-agent rebind follows the latest canonical revision", async 
   assert.equal(context.sessionCloses(), 0);
 });
 
-test("output failure during replacement closes the session and never installs the queued agent", async () => {
+test("output arriving during replacement detach does not close the session", async () => {
   const detachGate = deferred();
   const context = terminalHarness({ detachImpl: () => detachGate.promise, fail: "surface" });
   context.controller.start();
@@ -1007,16 +1007,16 @@ test("output failure during replacement closes the session and never installs th
   const first = await openTerminal(context, agent);
 
   context.controller.selectAgent(secondAgent);
-  await assert.rejects(first.options.onOutput({ sequence: 0n, payload: new Uint8Array([1]) }), (error) => error.code === "closed");
-  first.options.onClose(new SessionError("connection"));
+  await first.options.onOutput({ sequence: 0n, payload: new Uint8Array([1]) });
   await flush();
-  assert.equal(context.sessionCloses(), 1);
-  assert.equal(context.latest().selectedAgent, undefined);
-  assert.equal(context.targetGates.length, 1, "replacement discovery never started");
+  assert.equal(context.sessionCloses(), 0);
+  assert.equal(context.targetGates.length, 1, "replacement waits for detach");
 
   detachGate.resolve();
   await flush();
-  assert.equal(context.targetGates.length, 1, "late detach completion stays fenced");
+  assert.equal(context.sessionCloses(), 0);
+  assert.equal(context.latest().selectedAgent.id, secondAgent.id);
+  assert.equal(context.targetGates.length, 1, "paused replacement does not open a terminal");
 });
 
 test("a prior lease refusal does not turn a clean terminal switch into session failure", async () => {
