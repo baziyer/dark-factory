@@ -986,6 +986,7 @@ export class FactoryAppController {
     if (this.#state !== undefined) this.#refreshTerminalTask(selected, this.#state);
     selected.head = this.#state?.head ?? selected.head;
     this.#terminal = undefined;
+    this.#dropPendingTerminalInput();
     ++this.#terminalGeneration;
     this.#terminalRetry = undefined;
     this.#terminalSurface = undefined;

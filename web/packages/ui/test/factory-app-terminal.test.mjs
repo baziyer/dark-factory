@@ -1147,23 +1147,31 @@ test("a reset while holding control recovers and re-acquires through the normal 
   assert.equal(view.terminal.resets, 1);
 });
 
-test("a reset racing buffered input drops the input without replay or error", async () => {
+test("a reset during attachment drops buffered input before the replacement becomes writable", async () => {
   const context = terminalHarness();
+  context.setAttachReset(true);
   context.controller.start();
   context.ready();
-  const live = await openTerminal(context);
-  context.controller.sendTerminalText(live.token, "racing");
-  context.handleOptions().onReset({ sessionId: "31".repeat(16), floor: 5n, head: 9n });
+  context.controller.selectAgent(agent);
+  const token = {};
+  context.controller.beginTerminalSurface(token);
+  context.controller.sendTerminalText(token, "stale");
+  context.controller.setTerminalSurface(token, { write: async () => {}, abort: () => {} });
+  await flush();
+  context.targetGates.at(-1).resolve(target);
   await flush();
   assert.equal(context.latest().error, undefined);
-  const inputsBeforeRemount = context.calls.filter((call) => call.kind === "input").length;
+  assert.equal(context.calls.some((call) => call.kind === "input"), false, "reset arrives before buffered input can flush");
 
-  await remountSurface(context);
+  context.setAttachReset(false);
+  const resumed = await remountSurface(context);
   context.targetGates.at(-1).resolve(target);
   await flush();
   assert.equal(context.latest().terminal.phase, "ready");
-  const inputsAfter = context.calls.filter((call) => call.kind === "input").length;
-  assert.equal(inputsAfter, inputsBeforeRemount, "recovery never replays input the reset dropped");
+  assert.equal(context.calls.some((call) => call.kind === "input"), false, "recovery never flushes input queued before its reset");
+  context.controller.sendTerminalText(resumed.token, "fresh");
+  await flush();
+  assert.deepEqual(context.calls.filter((call) => call.kind === "input").map((call) => new TextDecoder().decode(call.bytes)), ["fresh"]);
 });
 
 test("a reset storm is bounded: past three recoveries the stale teardown stands", async () => {
