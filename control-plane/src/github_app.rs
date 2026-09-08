@@ -5479,11 +5479,6 @@ impl Authority {
         branch: &str,
         inputs: serde_json::Value,
     ) -> Result<WorkflowDispatchResponse, OperationError> {
-        #[derive(Serialize)]
-        struct Body {
-            r#ref: String,
-            inputs: serde_json::Value,
-        }
         let response: WorkflowDispatchResponse = github_json_request(
             worker::Method::Post,
             &workflow_api_url(
@@ -5493,10 +5488,7 @@ impl Authority {
                 "dispatches",
             ),
             token.as_str(),
-            Some(&Body {
-                r#ref: branch.to_owned(),
-                inputs,
-            }),
+            Some(&workflow_dispatch_body(branch, inputs)),
         )
         .await
         .map_err(OperationError::from)?;
@@ -6687,6 +6679,11 @@ impl TryFrom<CheckRun> for CheckResult {
 struct WorkflowRuns {
     total_count: i64,
     workflow_runs: Vec<WorkflowRun>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn workflow_dispatch_body(branch: &str, inputs: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"ref": branch, "inputs": inputs, "return_run_details": true})
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8975,6 +8972,19 @@ mod tests {
             ),
             pull_requests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn workflow_dispatch_requests_the_typed_run_response() {
+        let body = workflow_dispatch_body("main", serde_json::json!({"operation_id": "operation"}));
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            serde_json::json!({
+                "ref": "main",
+                "inputs": {"operation_id": "operation"},
+                "return_run_details": true,
+            })
+        );
     }
 
     #[test]
