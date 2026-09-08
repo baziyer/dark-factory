@@ -27,6 +27,7 @@ const (
 	legacyUserVersion   = 1
 	previousUserVersion = 2
 	priorUserVersion    = 3
+	v4UserVersion       = 4
 
 	legacyAgents = `CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -99,21 +100,61 @@ const (
     CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL))
 ) STRICT, WITHOUT ROWID`
 
+	v4Tasks = `CREATE TABLE tasks (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16),
+    assigned_agent_id BLOB NOT NULL CHECK (length(assigned_agent_id) = 16),
+    incarnation_id BLOB NOT NULL CHECK (length(incarnation_id) = 16),
+    work_revision INTEGER NOT NULL CHECK (work_revision >= 1),
+    title TEXT NOT NULL CHECK (length(CAST(title AS BLOB)) BETWEEN 1 AND 1024),
+    body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) <= 131072),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'blocked', 'succeeded', 'failed', 'cancelled')),
+    priority INTEGER NOT NULL CHECK (priority BETWEEN -1000000 AND 1000000),
+    blocked_reason TEXT CHECK (blocked_reason IS NULL OR length(CAST(blocked_reason AS BLOB)) BETWEEN 1 AND 4096),
+    result TEXT CHECK (result IS NULL OR length(CAST(result AS BLOB)) <= 131072),
+    completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= 0),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    FOREIGN KEY (assigned_agent_id, project_id) REFERENCES agents(id, project_id),
+    CHECK (
+        (status IN ('queued', 'running') AND blocked_reason IS NULL AND result IS NULL AND completed_at_ms IS NULL) OR
+        (status = 'blocked' AND blocked_reason IS NOT NULL AND result IS NULL AND completed_at_ms IS NULL) OR
+        (status = 'succeeded' AND blocked_reason IS NULL AND completed_at_ms IS NOT NULL) OR
+        (status IN ('failed', 'cancelled') AND blocked_reason IS NULL AND result IS NULL AND completed_at_ms IS NOT NULL)
+    ),
+    CHECK (completed_at_ms IS NULL OR completed_at_ms = updated_at_ms)
+) STRICT, WITHOUT ROWID`
+
 	priorAgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
+	v4TaskColumns     = `id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms`
 	idleColumns       = `idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used`
 	idleDefaults      = `'wait', 0, '', 0, 0`
 )
 
-// priorSchemaStatements is the exact v3 schema: the current one with the
-// frozen agents definition substituted. Every other statement is read live
-// from schemaStatements, so editing any of them silently changes what this
-// claims v3 was and stops recognising real v3 homes. The next schema change
-// has to freeze the text it replaces here and extend the migration, in the
-// same change; TestSchemaDigestsArePinned pins every set and fails until it
-// does.
-func priorSchemaStatements() []string {
+// v4SchemaStatements is the exact v4 schema: the current one with the frozen
+// tasks definition substituted.
+func v4SchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
 	for _, statement := range schemaStatements {
+		if _, name := schemaObjectIdentity(statement); name == "tasks" {
+			statement = v4Tasks
+		}
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// priorSchemaStatements is the exact v3 schema: v4 with the frozen agents
+// definition substituted. Every other statement is read live from
+// schemaStatements, so editing any of them silently changes what this claims
+// an earlier home was and stops recognising it. The next schema change has to
+// freeze the text it replaces here and extend the migration, in the same
+// change; TestSchemaDigestsArePinned pins every set and fails until it does.
+func priorSchemaStatements() []string {
+	v4 := v4SchemaStatements()
+	statements := make([]string, 0, len(v4))
+	for _, statement := range v4 {
 		if _, name := schemaObjectIdentity(statement); name == "agents" {
 			statement = priorAgents
 		}
@@ -184,6 +225,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return previousSchemaStatements(), true
 	case priorUserVersion:
 		return priorSchemaStatements(), true
+	case v4UserVersion:
+		return v4SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -209,7 +252,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -218,6 +261,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[1:]
 	case priorUserVersion:
 		steps = all[2:]
+	case v4UserVersion:
+		steps = all[3:]
 	default:
 		return connection.Close()
 	}
@@ -332,8 +377,24 @@ func migratePriorTransaction(ctx context.Context, connection *sql.Conn) error {
 	if err := validateSchemaVersion(ctx, connection, priorUserVersion, priorSchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
+	target := expectedSchemaOf(v4SchemaStatements())
 	if err := rebuildTable(ctx, connection, target, "agents", priorAgentColumns, "agents_id_project_unique", idleColumns, idleDefaults); err != nil {
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v4UserVersion)); err != nil {
+		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, v4UserVersion, v4SchemaStatements())
+}
+
+// migrateV4Transaction takes an exact v4 home to v5. A NULL boundary keeps
+// every legacy task body opaque; the first new send-back records its own.
+func migrateV4Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v4UserVersion, v4SchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	if err := rebuildTable(ctx, connection, target, "tasks", v4TaskColumns, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "sent_back_instruction_bytes", "NULL"); err != nil {
 		return err
 	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
@@ -347,10 +408,14 @@ func migratePriorTransaction(ctx context.Context, connection *sql.Conn) error {
 // table keeps its old text, while the exact-schema check compares that text
 // byte for byte. So the target statement is executed verbatim under the real
 // name and the rows wait in a scratch table for the moment the real one is
-// absent. index names the table's separate index statement, if it has one;
+// absent. indexes names the table's separate index statements, if it has any;
 // added and values name columns the target has and the rows do not, with the
 // constant each row gets.
-func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns, index, added, values string) error {
+func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]schemaObject, table, columns string, indexes ...string) error {
+	if len(indexes) < 2 {
+		return fmt.Errorf("rebuild %s: missing added columns and values", table)
+	}
+	added, values := indexes[len(indexes)-2], indexes[len(indexes)-1]
 	scratch := table + "_pre_migration"
 	into, from := columns, columns
 	if added != "" {
@@ -363,8 +428,10 @@ func rebuildTable(ctx context.Context, connection *sql.Conn, target map[string]s
 		"INSERT INTO " + table + "(" + into + ") SELECT " + from + " FROM " + scratch,
 		"DROP TABLE " + scratch,
 	}
-	if index != "" {
-		statements = append(statements, target[index].sql)
+	for _, index := range indexes[:len(indexes)-2] {
+		if index != "" {
+			statements = append(statements, target[index].sql)
+		}
 	}
 	for _, statement := range statements {
 		if _, err := connection.ExecContext(ctx, statement); err != nil {

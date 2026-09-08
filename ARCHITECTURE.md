@@ -19,7 +19,7 @@ Run:  admitted -> running -> finalizing -> terminal
           |          +-- exact attempt bearer authorizes bounded effects
           +-- child may be prepared but cannot exec
 
-Send-back: terminal result -> queued at the next work revision, note appended
+Send-back: terminal result -> queued at the next work revision, the note replacing an earlier one
 
 Resource: declared -> active -> releasing -> released
                                       \----> unresolved

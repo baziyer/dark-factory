@@ -17,7 +17,7 @@ import (
 )
 
 func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion} {
 		for _, persistWAL := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d/wal=%v", version, persistWAL), func(t *testing.T) {
 				testLegacyHomeMigratesAndKeepsEveryRow(t, version, persistWAL)
@@ -69,6 +69,13 @@ func testLegacyHomeMigratesAndKeepsEveryRow(t *testing.T, version int, persistWA
 	}
 	if ruled != 0 {
 		t.Fatalf("migration invented an idle rule on %d agents", ruled)
+	}
+	var marked int
+	if err := connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE sent_back_instruction_bytes IS NOT NULL`).Scan(&marked); err != nil {
+		t.Fatal(err)
+	}
+	if marked != 0 {
+		t.Fatalf("migration invented %d sent-back boundaries", marked)
 	}
 	// Loopback pairings (the ones with terminal_input) gained
 	// administration; the relay pairing did not. Every pending
@@ -186,15 +193,19 @@ func requireUnmigrated(t *testing.T, path string, wantVersion int) {
 		(SELECT COUNT(*) FROM sqlite_schema WHERE name = 'agents' AND sql LIKE '%idle_policy%')`).Scan(&stale, &accounts, &ruled); err != nil {
 		t.Fatal(err)
 	}
-	if ruled != 0 {
-		t.Fatalf("refused open rewrote agents with the idle rule for v%d", wantVersion)
+	wantRuled := 0
+	if wantVersion >= v4UserVersion {
+		wantRuled = 1
+	}
+	if ruled != wantRuled {
+		t.Fatalf("refused open rewrote agents with the idle rule for v%d: got %d, want %d", wantVersion, ruled, wantRuled)
 	}
 	wantAccounts := 2 // the table and its unique index, absent from a v1 home
 	if wantVersion == legacyUserVersion {
 		wantAccounts = 0
 	}
 	wantStale := 2 // both browser tables still bound at 15, until v3
-	if wantVersion == priorUserVersion {
+	if wantVersion >= priorUserVersion {
 		wantStale = 0
 	}
 	if stale != wantStale || accounts != wantAccounts {
@@ -289,8 +300,13 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	agentColumnsFor := testAgentColumnsV3
 	if version == legacyUserVersion {
 		agentColumnsFor = testAgentColumns
+	} else if version == v4UserVersion {
+		agentColumnsFor = testAgentColumnsV4
 	}
 	if err := rebuildTable(ctx, connection, legacy, "agents", agentColumnsFor, "agents_id_project_unique", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rebuildTable(ctx, connection, legacy, "tasks", testTaskColumns, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if version < priorUserVersion {
@@ -370,6 +386,11 @@ const testAgentColumns = `id, project_id, name, role, provider, model, reasoning
 // testAgentColumnsV3 is the v2/v3 agent row: v1 plus account_id, before the idle rule.
 const testAgentColumnsV3 = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 
+const testAgentColumnsV4 = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used`
+
+// testTaskColumns is the v4 task row, before a send-back boundary was stored.
+const testTaskColumns = `id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms`
+
 // testInvalidationColumns is the invalidation row every version has had,
 // spelled here so the fixture cannot lose a column with the migration's list.
 const testInvalidationColumns = `sequence, occurred_at_ms, entity_kind, entity_id, revision, deleted`
@@ -392,6 +413,8 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 		switch name {
 		case "agents":
 			columns = testAgentColumns
+		case "tasks":
+			columns = testTaskColumns
 		case "browser_pairing_challenges", "browser_clients":
 			// The v3 migration rewrites masks on purpose; the migration test
 			// asserts them separately.
@@ -459,7 +482,8 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
+		{"current", schemaStatements, "0d02a088772394ffc0c819bd6cbf7ab081acea36c98c49926babe5a511a77f27"},
+		{"v4", v4SchemaStatements(), "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
 		{"v3", priorSchemaStatements(), "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
 		{"v2", previousSchemaStatements(), "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
 		{"v1", legacySchemaStatements(), "63a444a2fe57a994b712bfe5b56764d684b2cb3ed73d7324465d894107f96f33"},
@@ -475,7 +499,7 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 // that reaches inside the migration transaction: the two above are rejected by
 // the preflight, on its disposable copy, before any pool exists.
 func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t, version)
 		})

@@ -6,29 +6,46 @@ import (
 	"fmt"
 )
 
-// MaxSendBackNoteBytes bounds the note a send-back appends to a task's body.
+// MaxSendBackNoteBytes bounds the note a send-back leaves at the end of a
+// task's body.
 const MaxSendBackNoteBytes = 8192
+
+// sentBackMarker opens the section a send-back leaves. Its byte offset is
+// stored with the task, so operator text that happens to quote this heading
+// is never mistaken for a prior send-back.
+const sentBackMarker = "\n\n## Sent back for work revision "
 
 // SentBackBody is the body a send-back leaves: the task's instruction as a
 // run receives it (the body, or the title when the body is empty) with the
-// note under a heading that names the work revision it opens. The daemon
-// checks it against the provider that will receive it before the send-back
-// is made.
+// note under a heading that names the work revision it opens. An earlier
+// send-back's section is replaced, not kept: the body a worker receives is
+// its instruction and the latest note, bounded however many times the task
+// comes back, and the findings an earlier note pointed at stay where they
+// were. The daemon checks the body against the provider that will receive
+// it before the send-back is made.
 func SentBackBody(task Task, note string) string {
+	instruction := sentBackInstruction(task)
+	return fmt.Sprintf("%s%s%d\n\n%s", instruction, sentBackMarker, task.WorkRevision.Int64()+1, note)
+}
+
+func sentBackInstruction(task Task) string {
 	instruction := task.Body
+	if task.SentBackInstructionBytes != nil {
+		instruction = instruction[:*task.SentBackInstructionBytes]
+	}
 	if instruction == "" {
 		instruction = task.Title
 	}
-	return fmt.Sprintf("%s\n\n## Sent back for work revision %d\n\n%s", instruction, task.WorkRevision.Int64()+1, note)
+	return instruction
 }
 
 // SendBackTask returns a finished task to its queue at the next work revision
-// with a note appended to its body, so the worker's next run reopens the
+// with the note at the end of its body, so the worker's next run reopens the
 // retained Change and continues from the tree it left. Any terminal outcome
 // may be sent back, a success included: the reviewer, not the worker, decides
 // when work is done; a cancelled task comes back the same way. A task that
 // never ran has nothing to go back to, and a shell agent's task is a
-// program, which no note can be appended to.
+// program, which no note can be added to.
 func (store *Store) SendBackTask(ctx context.Context, id TaskID, expected Revision, note string, at UnixMillis) (Task, error) {
 	if id.zero() || expected.Int64() < 1 {
 		return Task{}, fmt.Errorf("%w: invalid task send-back", ErrInvalidValue)
@@ -146,8 +163,8 @@ func sendBackTask(ctx context.Context, connection *sql.Conn, task Task, note str
 	if byteLen(body) > 131072 {
 		return Task{}, fmt.Errorf("%w: send-back note does not fit the task body", ErrInvalidValue)
 	}
-	result, err := connection.ExecContext(ctx, `UPDATE tasks SET status = 'queued', work_revision = ?, body = ?, blocked_reason = NULL, result = NULL, completed_at_ms = NULL, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
-		next, body, at.Int64(), task.ID.Bytes(), task.Revision.Int64())
+	result, err := connection.ExecContext(ctx, `UPDATE tasks SET status = 'queued', work_revision = ?, body = ?, sent_back_instruction_bytes = ?, blocked_reason = NULL, result = NULL, completed_at_ms = NULL, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`,
+		next, body, byteLen(sentBackInstruction(task)), at.Int64(), task.ID.Bytes(), task.Revision.Int64())
 	if err := requireOneRow(result, err); err != nil {
 		return Task{}, err
 	}

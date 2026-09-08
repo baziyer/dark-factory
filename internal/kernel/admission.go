@@ -47,7 +47,7 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		return rollbackNoAdmission(tx, NoAdmissionAtCapacity)
 	}
 
-	task, found, err := scanTask(tx.connection.QueryRowContext(ctx, `SELECT t.id, t.project_id, t.assigned_agent_id, t.incarnation_id, t.work_revision, t.title, t.body, t.status, t.priority, t.blocked_reason, t.result, t.completed_at_ms, t.revision, t.created_at_ms, t.updated_at_ms
+	task, found, err := scanTask(tx.connection.QueryRowContext(ctx, `SELECT t.id, t.project_id, t.assigned_agent_id, t.incarnation_id, t.work_revision, t.title, t.body, t.sent_back_instruction_bytes, t.status, t.priority, t.blocked_reason, t.result, t.completed_at_ms, t.revision, t.created_at_ms, t.updated_at_ms
 		FROM tasks AS t
 		JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
 		WHERE t.status = 'queued'
