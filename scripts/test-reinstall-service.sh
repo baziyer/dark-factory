@@ -48,9 +48,9 @@ printf '\n' >"$fake_home/.dark-factory/home.lock"
 printf '0\n' >"$temporary/active-runs"
 : >"$temporary/pids"
 
-# go build writes a stub that records the build tree's HEAD and the toolchain
-# pins it was given, and execs the fake factoryctl; go version -m prints the
-# stub so the vcs.* checks see it. With
+# go build writes a stub that records the build tree's HEAD, its supplied VCS
+# metadata and the toolchain pins it was given, and execs the fake factoryctl;
+# go version -m prints the stub so the vcs.* checks see it. With
 # DARK_FACTORY_TEST_ADMIT_DURING_BUILD set, the build also admits a run, the
 # way the supervisor can while a real build takes minutes.
 cat >"$fake_bin/go" <<'FAKE'
@@ -64,8 +64,9 @@ case "$1" in
             [ "$1" = -o ] && out=$2
             shift
         done
-        printf '#!/bin/sh\n# vcs.revision=%s\n# vcs.modified=false\n# pins GOTOOLCHAIN=%s GOENV=%s GOAUTH=%s\nexec factoryctl "$@"\n' \
-            "$(git rev-parse HEAD)" "${GOTOOLCHAIN-unset}" "${GOENV-unset}" "${GOAUTH-unset}" >"$out"
+        printf '#!/bin/sh\n# vcs.revision=%s\n# vcs.modified=%s\n# pins GOTOOLCHAIN=%s GOENV=%s GOAUTH=%s\nexec factoryctl "$@"\n' \
+            "${DARK_FACTORY_TEST_VCS_REVISION-$(git rev-parse HEAD)}" "${DARK_FACTORY_TEST_VCS_MODIFIED-false}" \
+            "${GOTOOLCHAIN-unset}" "${GOENV-unset}" "${GOAUTH-unset}" >"$out"
         chmod 755 "$out"
         [ -z "${DARK_FACTORY_TEST_ADMIT_DURING_BUILD-}" ] || printf '1\n' >"$DARK_FACTORY_TEST_ACTIVE_RUNS"
         ;;
@@ -159,6 +160,9 @@ not_installed() {
     grep -q '^service install' "$DARK_FACTORY_TEST_FACTORYCTL_LOG" && fail "$1: service installed anyway"
     rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
 }
+no_service_change() {
+    [ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "$1: factoryctl invoked"
+}
 
 "$script" >/dev/null 2>"$temporary/stderr" && fail "no argument accepted"
 grep -q '^usage:' "$temporary/stderr" || fail "no argument: usage not printed"
@@ -209,6 +213,20 @@ cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
     || fail "factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
 grep -q '^user_version now: 7$' "$temporary/stdout" || fail "user_version not printed"
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+
+# VCS metadata is provenance, not just a build option: both refusal paths must
+# stop before the backup or service change.
+rm -rf "$fake_home/.dark-factory-backups"
+DARK_FACTORY_TEST_VCS_REVISION=0000000000000000000000000000000000000000 "$script" "$sha" \
+    >/dev/null 2>"$temporary/stderr" && fail "wrong VCS revision accepted"
+grep -q "factoryctl not built from $sha" "$temporary/stderr" || fail "wrong VCS revision: wrong refusal"
+untouched "wrong VCS revision"
+no_service_change "wrong VCS revision"
+DARK_FACTORY_TEST_VCS_MODIFIED=true "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "modified VCS build accepted"
+grep -q 'factoryctl built from a modified tree' "$temporary/stderr" || fail "modified VCS build: wrong refusal"
+untouched "modified VCS build"
+no_service_change "modified VCS build"
 
 # A socket file nothing answers on is stale, not a reason to stay uninstalled.
 DARK_FACTORY_TEST_UNINSTALL_LEAVES=stale "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
