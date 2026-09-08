@@ -270,9 +270,15 @@ and 5 when it could not prepare the checkout, and leaves
   the pull request number and head:
 
   ```sh
+  task_id=$(sqlite3 -readonly "file:$home/factory.sqlite3?mode=ro" "SELECT lower(hex(task_id)) FROM changes WHERE lower(hex(id)) = '$change_id'")
   note="Pull request https://github.com/OWNER/REPO/pull/$PR (head $HEAD_SHA) was blocked by its cold review with must-change findings. Read them with: curl -s https://api.github.com/repos/OWNER/REPO/pulls/$PR/reviews | python3 -c 'import json,sys; [print(r[\"body\"]) for r in json.load(sys.stdin)]' and fix each in the tree you left; the pull request stays open."
   "$DARK_FACTORY_FACTORYCTL" attempt send-back --task "$task_id" --note "$note"
   ```
+
+  Read the task id from the change row, as above, immediately before the
+  call: section 1 returns one row per finished change, and the task on any
+  other row is another task. The first run to reach this step sent back the
+  task of a different row.
 
   The note is appended to the task's body, which the worker's provider
   receives whole; the daemon refuses a send-back the provider could not be
