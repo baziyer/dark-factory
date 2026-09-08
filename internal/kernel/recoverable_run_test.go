@@ -59,7 +59,7 @@ func TestRecoverableRunExactLookupValidatesExactRelationships(t *testing.T) {
 }
 
 func TestRecoverableRunExactLookupRejectsUnrelatedOwnershipCorruption(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
 	if _, err := store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 180), ProjectID: project.ID, AssignedAgentID: firstAgent.ID, IncarnationID: incarnationID(t, 181), Title: "first"}, mustTime(t, 5)); err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestRecoverableRunExactLookupRejectsUnrelatedOwnershipCorruption(t *testing
 	if err != nil || !first.Admitted() {
 		t.Fatalf("first admission = %+v, %v", first, err)
 	}
-	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 183), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
+	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 183), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestRecoverableRunExactLookupRejectsUnrelatedOwnershipCorruption(t *testing
 }
 
 func TestRecoverableRunExactLookupRejectsUnrelatedIdentityCollision(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
 	if _, err := store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 190), ProjectID: project.ID, AssignedAgentID: firstAgent.ID, IncarnationID: incarnationID(t, 191), Title: "first"}, mustTime(t, 5)); err != nil {
 		t.Fatal(err)
@@ -98,7 +98,7 @@ func TestRecoverableRunExactLookupRejectsUnrelatedIdentityCollision(t *testing.T
 	if err != nil || !first.Admitted() {
 		t.Fatalf("first admission = %+v, %v", first, err)
 	}
-	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 193), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
+	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 193), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 11))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +109,8 @@ func TestRecoverableRunExactLookupRejectsUnrelatedIdentityCollision(t *testing.T
 	if err != nil || !second.Admitted() {
 		t.Fatalf("second admission = %+v, %v", second, err)
 	}
+	materializeAdmittedWorkerChange(t, store, *first.Run, 14)
+	materializeAdmittedWorkerChange(t, store, *second.Run, 17)
 	activateRunnerForRun := func(run Run, pathSeed, identitySeed, at int64) Resource {
 		t.Helper()
 		runtime := resourceOfKind(t, resourcesForRunTest(t, store, run.ID), ResourceRuntimeRoot)

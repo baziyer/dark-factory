@@ -155,11 +155,11 @@ func TestAdmitNextSkipsCapacityBlockedRoleBeforePriority(t *testing.T) {
 }
 
 func TestAdmitNextSkipsIneligibleGlobalHead(t *testing.T) {
-	store, _, project, busyAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, busyAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
 	ctx := context.Background()
 	eligibleAgent, err := store.CreateAgent(ctx, NewAgent{
-		ID: agentID(t, 32), ProjectID: project.ID, Name: "eligible", Role: RoleOrchestrator,
+		ID: agentID(t, 32), ProjectID: project.ID, Name: "eligible", Role: RoleWorker,
 		Provider: ProviderCodex, ToolBudgetLimit: 5,
 	}, mustTime(t, 4))
 	if err != nil {

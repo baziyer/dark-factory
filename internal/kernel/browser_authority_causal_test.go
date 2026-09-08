@@ -908,7 +908,7 @@ func addRunningRunOnStore(t *testing.T, store *Store, seed byte) Run {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	agent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, seed+1), ProjectID: project.ID, Name: fmt.Sprintf("browser-agent-%d", seed), Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 101+int64(seed)))
+	agent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, seed+1), ProjectID: project.ID, Name: fmt.Sprintf("browser-agent-%d", seed), Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 101+int64(seed)))
 	if err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
@@ -926,6 +926,9 @@ func addRunningRunOnStore(t *testing.T, store *Store, seed byte) Run {
 	}
 	if result.Run.TaskID != task.ID {
 		t.Fatalf("admitted wrong task = %+v", result.Run)
+	}
+	if result.Run.Role == RoleWorker {
+		materializeAdmittedWorkerChange(t, store, *result.Run, 300+int64(seed))
 	}
 	activatedRun := activateAllResourcesUnique(t, store, *result.Run, 300+int64(seed), int64(seed)*10)
 	session := terminalSessionForRunTest(t, store, result.Run.ID)

@@ -31,7 +31,7 @@ func TestPublicSnapshotKeepsEveryKindInRawIDOrder(t *testing.T) {
 	}
 	for index := 9; index >= 1; index-- {
 		id := publicAgentID(t, index)
-		if _, err := store.CreateAgent(ctx, NewAgent{ID: id, ProjectID: project.ID, Name: fmt.Sprintf("agent-%d", index), Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, int64(500+index))); err != nil {
+		if _, err := store.CreateAgent(ctx, NewAgent{ID: id, ProjectID: project.ID, Name: fmt.Sprintf("agent-%d", index), Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, int64(500+index))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -49,6 +49,7 @@ func TestPublicSnapshotKeepsEveryKindInRawIDOrder(t *testing.T) {
 		if err != nil || !admission.Admitted() || admission.Run == nil {
 			t.Fatalf("admit run %d = %+v, %v", index, admission, err)
 		}
+		materializeAdmittedWorkerChange(t, store, *admission.Run, int64(900+index*10))
 		activatedRun := activateAllResourcesUnique(t, store, *admission.Run, int64(900+index*10), int64(5000+index*100))
 		session := terminalSessionForRunTest(t, store, admission.Run.ID)
 		running, err := store.ActivateRun(ctx, admission.Run.ID, session.ID, activatedRun.Revision, session.Revision, mustTime(t, int64(909+index*10)))

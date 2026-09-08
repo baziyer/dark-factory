@@ -97,7 +97,7 @@ func TestStandingInstructionEnqueuesItselfWithinItsBudget(t *testing.T) {
 func TestStandingInstructionWaitsForTheRunAndThenItsQuietSpell(t *testing.T) {
 	ctx := context.Background()
 	proposal, _ := NewSuccessProposal("done")
-	store, finalizing := finalizingReleasedRun(t, RoleOrchestrator, VerificationNone, proposal)
+	store, finalizing := finalizingReleasedRun(t, RoleWorker, VerificationNone, proposal)
 	defer store.Close()
 	agent, _, err := store.Agent(ctx, finalizing.AgentID)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestStandingInstructionWaitsForTheRunAndThenItsQuietSpell(t *testing.T) {
 	if tasks, err := store.EnqueueIdleInstructions(ctx, mustTime(t, 100+600_000)); err != nil || len(tasks) != 0 {
 		t.Fatalf("round during a run enqueued %d tasks, err=%v", len(tasks), err)
 	}
-	if _, err := store.FinalizeRun(ctx, finalizing.ID, finalizing.Revision, mustTime(t, 1_000_000)); err != nil {
+	if _, err := finalizeTestRun(t, store, finalizing, 1_000_000); err != nil {
 		t.Fatal(err)
 	}
 	// The clock starts at the run's end: 59 s after it is too soon, 60 s is due.

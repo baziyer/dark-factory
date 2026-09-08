@@ -506,13 +506,13 @@ func TestFailRunRacesAttemptSuccessAndCancellationWithoutOverwrite(t *testing.T)
 }
 
 func TestResourceIdentityCannotBeReusedAcrossRuns(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
-	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 211), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 4))
+	secondAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 211), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
-	thirdAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 216), ProjectID: project.ID, Name: "third", Role: RoleOrchestrator, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 4))
+	thirdAgent, err := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 216), ProjectID: project.ID, Name: "third", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 2}, mustTime(t, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -817,9 +817,9 @@ func TestConcurrentCompletionAndExitHaveOneImmutableWinner(t *testing.T) {
 }
 
 func TestRecoverableRunsAreCanonicalOrderedAndPrivateStateStaysOutOfPublicProjection(t *testing.T) {
-	store, _, project, firstAgent := newAdmissionStore(t, RoleOrchestrator, 4)
+	store, _, project, firstAgent := newAdmissionStore(t, RoleWorker, 4)
 	defer store.Close()
-	secondAgent, _ := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 141), ProjectID: project.ID, Name: "second", Role: RoleOrchestrator, Provider: ProviderCodex, Model: "MODEL_SENTINEL", ToolBudgetLimit: 2}, mustTime(t, 4))
+	secondAgent, _ := store.CreateAgent(context.Background(), NewAgent{ID: agentID(t, 141), ProjectID: project.ID, Name: "second", Role: RoleWorker, Provider: ProviderCodex, Model: "MODEL_SENTINEL", ToolBudgetLimit: 2}, mustTime(t, 4))
 	_, _ = store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 142), ProjectID: project.ID, AssignedAgentID: secondAgent.ID, IncarnationID: incarnationID(t, 143), Title: "second", Body: "BODY_SENTINEL"}, mustTime(t, 5))
 	_, _ = store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 144), ProjectID: project.ID, AssignedAgentID: firstAgent.ID, IncarnationID: incarnationID(t, 145), Title: "first"}, mustTime(t, 5))
 	first, err := store.AdmitNext(context.Background(), admissionKeys(t, 170, nil), mustTime(t, 10))
