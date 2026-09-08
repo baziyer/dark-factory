@@ -139,6 +139,7 @@ grep -q "diff $base $head" "$args" || fail "the diff does not run from the merge
 grep -q '^exec$' "$args" || fail "default reviewer is not Codex exec"
 grep -q -- '--ephemeral' "$args" || fail "Codex review persists a session"
 grep -q -- '--ignore-user-config' "$args" || fail "Codex review inherits user MCP configuration"
+grep -q -- '--strict-config' "$args" || fail "Codex review permits an unsupported Maintainer allowlist"
 grep -Fxq 'approval_policy="on-request"' "$args" || fail "Codex review does not request approval through its configured reviewer"
 grep -Fxq 'approvals_reviewer="auto_review"' "$args" || fail "Codex review does not route configured approvals automatically"
 grep -q -- '--sandbox' "$args" || fail "Codex review does not select a sandbox"
@@ -167,6 +168,8 @@ grep -q "git -C .* diff $base $head" "$args" || fail "Codex prompt does not scop
 : >"$args"
 DARK_FACTORY_REVIEW_PROVIDER=claude review owner/repo 7 "$head" "$base" "$body" || fail "Claude review did not exit 0"
 grep -q -- '--strict-mcp-config' "$args" || fail "Claude selection lost its strict MCP configuration"
+grep -Fq 'mcp__maintainer__maintainer_status,mcp__maintainer__observe_operation,mcp__maintainer__submit_pull_request_review,' "$args" \
+    || fail "Claude review cannot make its required read observations"
 unset DARK_FACTORY_REVIEW_PROVIDER
 # A caller may choose the cheaper Codex model explicitly.
 : >"$args"
