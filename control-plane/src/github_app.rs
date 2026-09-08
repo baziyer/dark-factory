@@ -9267,7 +9267,7 @@ mod tests {
         );
 
         let mut update = UpdatePullRequestBody {
-            repository: "dark-factory-build/dark-factory".into(),
+            repository: "example-owner/example-repository".into(),
             operation_id: "1c8a5c44-7f1f-11f0-952e-acde48001122".into(),
             pull_number: 407,
             body: "Updated cumulative production-line delta.".into(),
@@ -9285,7 +9285,7 @@ mod tests {
         ] {
             assert!(
                 UpdatePullRequestBody {
-                    repository: "dark-factory-build/dark-factory".into(),
+                    repository: "example-owner/example-repository".into(),
                     body: forged.into(),
                     ..update.clone()
                 }
@@ -9297,7 +9297,7 @@ mod tests {
         let mut updated_pull = PullRequest {
             number: update.pull_number,
             node_id: "PR_node".into(),
-            html_url: "https://github.com/dark-factory-build/dark-factory/pull/407".into(),
+            html_url: "https://github.com/example-owner/example-repository/pull/407".into(),
             title: "Superseded gate".into(),
             body: Some(update.marked_body().unwrap()),
             draft: false,
