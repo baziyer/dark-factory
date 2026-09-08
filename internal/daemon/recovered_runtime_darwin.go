@@ -15,6 +15,8 @@ import (
 
 const recoveredTerminalLimit = 32 << 10
 
+var errRecoveredRuntimeLayout = errors.New("daemon: recovered runtime layout unavailable")
+
 // RecoveredRuntime is a read-only capability for one exact populated runtime
 // whose live owner no longer holds the lifetime lease. It deliberately exposes
 // none of Runtime's publish, bind, activation, or runner descriptor methods.
@@ -91,7 +93,7 @@ func openRecoveredRuntime(ctx context.Context, parent *RuntimeParent, basename s
 	}()
 	home, temp, err := inspectRuntimeLayout(fd, opened)
 	if err != nil {
-		return nil, invalidContract(err)
+		return nil, errors.Join(invalidContract(err), errRecoveredRuntimeLayout)
 	}
 	files, err := inspectRecoveredRuntimeCensus(fd, opened.device)
 	if err != nil {

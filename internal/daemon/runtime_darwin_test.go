@@ -1524,6 +1524,37 @@ func TestRemoveRecordedRuntimeUsesFixedBoundedGrammar(t *testing.T) {
 		}
 		t.Fatal("bounded removal did not converge")
 	})
+
+	t.Run("bounded readonly nested directory", func(t *testing.T) {
+		parent, runtime, path, identity := removableRuntimeFixture(t)
+		defer parent.Close()
+		cache := filepath.Join(path, runtimeHomeName, "module-cache")
+		if err := os.Mkdir(cache, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cache, "module"), []byte("cached"), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Chmod(cache, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for attempts := 0; attempts < 8; attempts++ {
+			done, err := removeRecordedRuntime(context.Background(), parent, runtimeTestName, identity, 2, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if done {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("readonly runtime remains: %v", err)
+				}
+				return
+			}
+		}
+		t.Fatal("readonly bounded removal did not converge")
+	})
 }
 
 func TestRemoveRecordedRuntimeUnlinksAnyNameAndRejectsAuthorityChanges(t *testing.T) {

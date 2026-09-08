@@ -185,6 +185,20 @@ func (daemon *Daemon) recoverRun(ctx context.Context, parent *RuntimeParent, cha
 		if errors.Is(err, errRuntimeBusy) {
 			return RecoveredLiveHolder, nil
 		}
+		if runtimeRoot.State == kernel.ResourceReleasing && errors.Is(err, errRecoveredRuntimeLayout) {
+			if result, resultErr := recoveredConsumedAttemptResult(run, runtimeRoot, providerProcess); resultErr == nil {
+				storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+				_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
+				cancel()
+				if authorizeErr == nil {
+					if removeErr := daemon.removeRecordedRuntime(parent, run.ID, fileIdentity); removeErr != nil {
+						return RecoveredUncertain, removeErr
+					}
+					_, settleErr := daemon.settleRun(changeParent, run.ID)
+					return RecoveredConverged, settleErr
+				}
+			}
+		}
 		return RecoveredUncertain, err
 	}
 	defer func() { _ = recovered.Close() }()
@@ -498,6 +512,28 @@ func (daemon *Daemon) removeRecoveredRuntime(ctx context.Context, parent *Runtim
 		return err
 	}
 	return daemon.removeRecordedRuntime(parent, runID, fileIdentity)
+}
+
+func recoveredConsumedAttemptResult(run kernel.Run, runtimeRoot, providerProcess kernel.Resource) (kernel.AttemptResult, error) {
+	if run.ProviderExit == nil {
+		return kernel.NewInnerUnregisteredConvergedAttemptResult(run.ID, run.CredentialDigest, run.ResultProofDigest(), runtimeRoot.Identity)
+	}
+	if code, ok := run.ProviderExit.Code(); ok {
+		exit, err := kernel.NewAttemptResultExitCode(code)
+		if err != nil {
+			return kernel.AttemptResult{}, err
+		}
+		return kernel.NewInnerConvergedAttemptResult(run.ID, run.CredentialDigest, run.ResultProofDigest(), runtimeRoot.Identity, providerProcess.Identity, exit)
+	}
+	signal, ok := run.ProviderExit.Signal()
+	if !ok {
+		return kernel.AttemptResult{}, errInvalidContract
+	}
+	exit, err := kernel.NewAttemptResultExitSignal(signal)
+	if err != nil {
+		return kernel.AttemptResult{}, err
+	}
+	return kernel.NewInnerConvergedAttemptResult(run.ID, run.CredentialDigest, run.ResultProofDigest(), runtimeRoot.Identity, providerProcess.Identity, exit)
 }
 
 func (daemon *Daemon) removeRecordedRuntime(parent *RuntimeParent, runID kernel.RunID, fileIdentity runner.FileIdentity) error {

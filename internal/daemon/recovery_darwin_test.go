@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -478,6 +479,100 @@ func TestRecoverySweepConsumesAuthenticResultBeforeAnyAbsenceEdge(t *testing.T) 
 	if again.Action != RecoveredRunAction("") || again.Err != nil {
 		t.Fatalf("second sweep = %+v", again)
 	}
+}
+
+func TestRecoverySweepConvergesPartialReleasingRuntimeOnlyAfterResultConsumption(t *testing.T) {
+	t.Run("consumed result", func(t *testing.T) {
+		fixture := newRecoveryFixture(t, 0x48)
+		fixture.stageRuntime(t)
+		fixture.beginRunnerStart(t)
+		fixture.activateRunner(t)
+		fixture.writeMarker(t, runner.OuterActivationMarkerName)
+		body, err := json.Marshal(forgedResultWire{Version: 1, AttemptID: fixture.run.ID.String(), Kind: "inner_unregistered_converged", Proof: hex.EncodeToString(fixture.proof[:])})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.writeArtifact(t, body)
+		unsafe := filepath.Join(fixture.parentPath, fixture.run.ID.String(), runtimeTempName, "unsafe")
+		if err := os.WriteFile(unsafe, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Chmod(unsafe, 0o4600); err != nil {
+			t.Fatal(err)
+		}
+		first := fixture.sweep(t)
+		if first.Action != RecoveredResultConsumed || !errors.Is(first.Err, errInvalidContract) {
+			t.Fatalf("first sweep = %+v", first)
+		}
+		if _, err := os.Stat(filepath.Join(fixture.parentPath, fixture.run.ID.String(), runtimeHomeName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("home remains after partial cleanup: %v", err)
+		}
+		if states := fixture.resourceStates(t); states[kernel.ResourceRuntimeRoot].State != kernel.ResourceReleasing {
+			t.Fatalf("runtime after refusal = %+v", states[kernel.ResourceRuntimeRoot])
+		}
+		if _, err := os.Stat(filepath.Join(fixture.parentPath, fixture.run.ID.String(), runner.AttemptResultSpoolName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("consumed artifact remains: %v", err)
+		}
+		if err := unix.Chmod(unsafe, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		second := fixture.sweep(t)
+		if second.Action != RecoveredConverged || second.Err != nil {
+			t.Fatalf("second sweep = %+v", second)
+		}
+		if states := fixture.resourceStates(t); states[kernel.ResourceRuntimeRoot].State != kernel.ResourceReleased {
+			t.Fatalf("runtime after recovery = %+v", states[kernel.ResourceRuntimeRoot])
+		}
+		if _, err := os.Stat(filepath.Join(fixture.parentPath, fixture.run.ID.String())); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("recovered runtime directory persists: %v", err)
+		}
+	})
+
+	t.Run("unconsumed artifact", func(t *testing.T) {
+		fixture := newRecoveryFixture(t, 0x49)
+		fixture.stageRuntime(t)
+		fixture.beginRunnerStart(t)
+		fixture.activateRunner(t)
+		fixture.writeMarker(t, runner.OuterActivationMarkerName)
+		providerIdentity, err := processResourceIdentity(runner.Identity{PID: 99996, PGID: 99996, Birth: runner.Birth{Seconds: 1700, Microseconds: 3}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		states := fixture.resourceStates(t)
+		process, group := states[kernel.ResourceProviderProcess], states[kernel.ResourceProviderGroup]
+		if _, _, err := fixture.store.ActivateProviderResources(context.Background(), fixture.run.ID, process.ID, process.Revision, group.ID, group.Revision, providerIdentity, mustKernelTime(t, 240)); err != nil {
+			t.Fatal(err)
+		}
+		session, found, err := fixture.store.TerminalSessionForRun(context.Background(), fixture.run.ID)
+		if err != nil || !found {
+			t.Fatalf("session: found=%v err=%v", found, err)
+		}
+		if fixture.run, err = fixture.store.ActivateRun(context.Background(), fixture.run.ID, session.ID, fixture.currentRun(t).Revision, session.Revision, mustKernelTime(t, 250)); err != nil {
+			t.Fatal(err)
+		}
+		failure, err := kernel.NewFailureProposal(kernel.FailureInternal, "recovery fixture refusal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fixture.run, err = fixture.store.FailRun(context.Background(), fixture.run.ID, fixture.currentRun(t).Revision, failure, mustKernelTime(t, 260)); err != nil {
+			t.Fatal(err)
+		}
+		body := []byte(fmt.Sprintf(`{"version":1,"attempt_id":%q,"kind":"inner_converged","proof":%q,"process":{"pid":99996,"pgid":99996,"birth":{"seconds":1700,"microseconds":3}},"exit":{"code":0}}`, fixture.run.ID.String(), hex.EncodeToString(fixture.proof[:])))
+		fixture.writeArtifact(t, body)
+		if err := os.Remove(filepath.Join(fixture.parentPath, fixture.run.ID.String(), runtimeHomeName)); err != nil {
+			t.Fatal(err)
+		}
+		disposition := fixture.sweep(t)
+		if disposition.Action != RecoveredUncertain || disposition.Err == nil {
+			t.Fatalf("sweep = %+v", disposition)
+		}
+		if _, err := os.Stat(filepath.Join(fixture.parentPath, fixture.run.ID.String(), runner.AttemptResultSpoolName)); err != nil {
+			t.Fatalf("unconsumed artifact was discarded: %v", err)
+		}
+		if states := fixture.resourceStates(t); states[kernel.ResourceRuntimeRoot].State != kernel.ResourceReleasing {
+			t.Fatalf("unconsumed runtime = %+v", states[kernel.ResourceRuntimeRoot])
+		}
+	})
 }
 
 func TestRecoverySweepRetainsTornArtifactAndConcludesNothing(t *testing.T) {

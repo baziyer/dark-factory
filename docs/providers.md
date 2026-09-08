@@ -120,7 +120,9 @@ serves it only while that exact run is `running`.
 
 Subsequent browser terminal input goes directly to the same PTY. The provider
 reports its durable outcome through the attempt-scoped `factoryctl` supplied by
-the daemon.
+the daemon. Before reporting success, a worker removes only generated
+dependencies, build output, caches, and temporary metadata it created, then
+checks that none remain in its Change.
 
 Provider changes must preserve admission-time selection, daemon-owned process
 lifecycle, exact task delivery, and deterministic failure when a required
