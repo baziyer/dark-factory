@@ -32,9 +32,14 @@ type terminalEffectWireFrame struct {
 	Correlation  uint64               `json:"correlation,omitempty"`
 	Generation   uint64               `json:"generation,omitempty"`
 	Sequence     uint64               `json:"sequence,omitempty"`
+	Start        uint64               `json:"start,omitempty"`
+	End          uint64               `json:"end,omitempty"`
+	Floor        uint64               `json:"floor,omitempty"`
+	Head         uint64               `json:"head,omitempty"`
 	Count        uint32               `json:"count,omitempty"`
 	Rows         uint16               `json:"rows,omitempty"`
 	Cols         uint16               `json:"cols,omitempty"`
+	Credit       uint32               `json:"credit,omitempty"`
 	Status       string               `json:"status,omitempty"`
 	Payload      []byte               `json:"payload,omitempty"`
 	FileIdentity *runner.FileIdentity `json:"file_identity,omitempty"`

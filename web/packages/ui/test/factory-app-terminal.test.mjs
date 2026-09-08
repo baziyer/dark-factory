@@ -57,16 +57,16 @@ function terminalHarness({ closeStatus = false, fail, failError = new SessionErr
       targetGates.push(gate);
       return gate.promise;
     },
-    openTerminal: (value, callbacks) => {
-      calls.push({ kind: "open", value });
+    openTerminal: (value, options) => {
+      calls.push({ kind: "open", value, afterSequence: options.afterSequence, afterSessionId: options.afterSessionId });
       if (fail === "open") throw failError;
-      handleOptions = callbacks;
+      handleOptions = options;
       const handle = {
-        attach: async () => { calls.push({ kind: "attach" }); if (fail === "attach") throw failError; if (attachReset) return { kind: "reset", freshAttachRequired: true, sessionId: "31".repeat(16), floor: 5n, head: 9n }; return { sessionId: "31".repeat(16), floor: 0n, head: 0n, acknowledgedSequence: 0n, maxUnackedBytes: 65536n }; },
+        attach: async () => { calls.push({ kind: "attach" }); if (fail === "attach") throw failError; if (attachReset) return { kind: "reset", freshAttachRequired: true, sessionId: "31".repeat(16), floor: 5n, head: 9n }; return options.afterSequence === 9n ? { sessionId: "31".repeat(16), floor: 8n, head: 12n, acknowledgedSequence: 9n, maxUnackedBytes: 65536n } : { sessionId: "31".repeat(16), floor: 0n, head: 0n, acknowledgedSequence: 0n, maxUnackedBytes: 65536n }; },
         acquireInput: async () => { calls.push({ kind: "acquire" }); if (acquireImpl !== undefined) return acquireImpl(); if (fail === "acquire") throw failError; return { generation: 1n }; },
         sendInput: async (bytes) => { calls.push({ kind: "input", bytes }); if (fail === "input") throw failError; return { status: "accepted", accepted_bytes: BigInt(bytes.length) }; },
         resize: async (rows, cols) => { calls.push({ kind: "resize", rows, cols }); if (fail === "resize") throw failError; return { rows, cols }; },
-        detach: async () => { calls.push({ kind: "detach" }); await detachImpl?.(); callbacks.onClose?.(); },
+        detach: async () => { calls.push({ kind: "detach" }); await detachImpl?.(); options.onClose?.(); },
         get writable() { return true; },
       };
       handles.push(handle);
@@ -1140,7 +1140,7 @@ async function remountSurface(context) {
   return { token, writes };
 }
 
-test("a server replay reset recovers in place instead of surfacing an error", async () => {
+test("a server replay reset resumes at its head after the retained floor advances", async () => {
   const context = terminalHarness();
   context.controller.start();
   context.ready();
@@ -1158,13 +1158,21 @@ test("a server replay reset recovers in place instead of surfacing an error", as
   assert.equal(view.terminal.surfaceVersion, versionBefore + 1, "display remounts to clear the stale scrollback");
   assert.equal(context.sessionCloses(), 0);
 
-  await remountSurface(context);
+  const resumed = await remountSurface(context);
   assert.equal(context.targetGates.length, resolvesBefore + 1, "a fresh controller re-resolves the target");
   context.targetGates.at(-1).resolve(target);
   await flush();
   view = context.latest();
   assert.equal(view.terminal.phase, "ready");
   assert.equal(view.terminal.resets, 1, "the banner state survives the successful re-replay");
+  assert.equal(context.calls.filter((call) => call.kind === "open").at(-1).afterSequence, 9n, "the reset head stays inside the later retained range");
+  assert.equal(context.calls.filter((call) => call.kind === "open").at(-1).afterSessionId, "31".repeat(16), "the retry binds the cursor to its reset session");
+  await context.handleOptions().onOutput({ sequence: 9n, payload: new TextEncoder().encode("new output") });
+  context.handleOptions().onOutputComplete?.();
+  assert.equal(new TextDecoder().decode(resumed.writes[0]), "new output");
+  context.controller.sendTerminalText(resumed.token, "next");
+  await flush();
+  assert.deepEqual(context.calls.filter((call) => call.kind === "input").map((call) => new TextDecoder().decode(call.bytes)), ["next"]);
 });
 
 test("a reset while holding control recovers and re-acquires through the normal path", async () => {
@@ -1187,23 +1195,31 @@ test("a reset while holding control recovers and re-acquires through the normal 
   assert.equal(view.terminal.resets, 1);
 });
 
-test("a reset racing buffered input drops the input without replay or error", async () => {
+test("a reset during attachment drops buffered input before the replacement becomes writable", async () => {
   const context = terminalHarness();
+  context.setAttachReset(true);
   context.controller.start();
   context.ready();
-  const live = await openTerminal(context);
-  context.controller.sendTerminalText(live.token, "racing");
-  context.handleOptions().onReset({ sessionId: "31".repeat(16), floor: 5n, head: 9n });
+  context.controller.selectAgent(agent);
+  const token = {};
+  context.controller.beginTerminalSurface(token);
+  context.controller.sendTerminalText(token, "stale");
+  context.controller.setTerminalSurface(token, { write: async () => {}, abort: () => {} });
+  await flush();
+  context.targetGates.at(-1).resolve(target);
   await flush();
   assert.equal(context.latest().error, undefined);
-  const inputsBeforeRemount = context.calls.filter((call) => call.kind === "input").length;
+  assert.equal(context.calls.some((call) => call.kind === "input"), false, "reset arrives before buffered input can flush");
 
-  await remountSurface(context);
+  context.setAttachReset(false);
+  const resumed = await remountSurface(context);
   context.targetGates.at(-1).resolve(target);
   await flush();
   assert.equal(context.latest().terminal.phase, "ready");
-  const inputsAfter = context.calls.filter((call) => call.kind === "input").length;
-  assert.equal(inputsAfter, inputsBeforeRemount, "recovery never replays input the reset dropped");
+  assert.equal(context.calls.some((call) => call.kind === "input"), false, "recovery never flushes input queued before its reset");
+  context.controller.sendTerminalText(resumed.token, "fresh");
+  await flush();
+  assert.deepEqual(context.calls.filter((call) => call.kind === "input").map((call) => new TextDecoder().decode(call.bytes)), ["fresh"]);
 });
 
 test("a reset storm is bounded: past three recoveries the stale teardown stands", async () => {

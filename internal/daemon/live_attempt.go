@@ -17,13 +17,18 @@ const (
 	liveAttemptMailboxCap = 64
 	// Sixteen observers covers several tabs/devices while keeping the fixed
 	// per-run queue budget small and auditable.
-	terminalSubscriberCap   = 16
-	terminalPendingCap      = 64
-	terminalPayloadCap      = 8 << 10
-	terminalPendingBytesCap = 256 << 10
-	liveAttemptCredit       = 1 << 20
-	liveAttemptStoreTimeout = 2 * time.Second
-	liveAttemptEffectLimit  = 4 * time.Second
+	terminalSubscriberCap = 16
+	// One credited replay can fill 128 terminal payload frames before the
+	// browser's smaller ACK window resumes its attachment reader. Keep that
+	// bounded replay plus its attach control event instead of treating it as a
+	// slow observer.
+	terminalSubscriberEventCap = liveAttemptCredit/terminalPayloadCap + 1
+	terminalPendingCap         = 64
+	terminalPayloadCap         = 8 << 10
+	terminalPendingBytesCap    = 256 << 10
+	liveAttemptCredit          = 1 << 20
+	liveAttemptStoreTimeout    = 2 * time.Second
+	liveAttemptEffectLimit     = 4 * time.Second
 )
 
 var (
@@ -457,7 +462,7 @@ func (attempt *liveAttempt) attach(ctx context.Context, sessionID kernel.Termina
 	if attempt == nil || ctx == nil {
 		return nil, ErrTerminalClosed
 	}
-	attachment := &TerminalAttachment{owner: attempt, queue: make(chan TerminalEvent, terminalSubscriberCap)}
+	attachment := &TerminalAttachment{owner: attempt, queue: make(chan TerminalEvent, terminalSubscriberEventCap)}
 	command := liveAttemptCommand{kind: liveCommandAttach, attachment: attachment, session: sessionID, expectedRun: expectedRun, expectedSession: expectedSession, sequence: sequence, result: make(chan error, 1)}
 	if err := attempt.submit(ctx, command); err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import {
   type BrowserSession,
   type TerminalHandle,
   type TerminalInputResult,
+  type TerminalReset,
   type TerminalTarget,
 } from "@dark-factory/client";
 
@@ -29,7 +30,7 @@ export type TerminalControllerSnapshot = Readonly<{
    * the handle on reset, so the controller still ends; the owner may open
    * a fresh controller against current state instead of surfacing an error.
    */
-  reset: boolean;
+  reset?: TerminalReset;
   /** This controller ended before minting a target and may retry on new state. */
   retryDiscovery: boolean;
 }>;
@@ -43,6 +44,8 @@ type TerminalControllerOptions = Readonly<{
   expectedHead: bigint;
   surface: TerminalSurface;
   onChange: (snapshot: TerminalControllerSnapshot) => void;
+  /** Server session and cursor from a previous replay reset. */
+  resume?: Pick<TerminalReset, "sessionId" | "head">;
   /** Test seam: awaited between retryable attach attempts. */
   attachRetryDelay?: (attempt: number) => Promise<void>;
 }>;
@@ -74,7 +77,7 @@ class TerminalController {
   #started = false;
   #closing = false;
   #generation = 0;
-  #reset = false;
+  #reset: TerminalReset | undefined;
   #retryDiscovery = false;
   #surfaceAborted = false;
   #inputBuffer: Input = new Uint8Array(0);
@@ -82,6 +85,7 @@ class TerminalController {
   #pendingResize: Resize | undefined;
   #effectTask: Promise<void> | undefined;
   #outputTask: Promise<void> | undefined;
+  #outputPending = false;
   #closePromise: Promise<void> | undefined;
   #detachPromise: Promise<void> | undefined;
 
@@ -214,15 +218,21 @@ class TerminalController {
         return;
       }
       const handle = this.#options.session.openTerminal(target as TerminalTarget, {
+        ...(this.#options.resume === undefined ? {} : { afterSequence: this.#options.resume.head, afterSessionId: this.#options.resume.sessionId }),
         onOutput: (output) => {
+          this.#outputPending = true;
           const task = this.#writeOutput(generation, output.payload);
           this.#outputTask = task;
           void task.then(() => this.#outputFinished(task), () => this.#outputFinished(task));
           return task;
         },
+        onOutputComplete: () => {
+          this.#outputPending = false;
+          this.#pumpEffects();
+        },
         onExit: () => this.#handleEnded(new SessionError("closed")),
-        onReset: () => {
-          if (!this.#detachRequested) this.#reset = true;
+        onReset: (event) => {
+          if (!this.#detachRequested) this.#reset = event;
           this.#handleEnded(new SessionError(this.#detachRequested ? "closed" : "stale"));
         },
         onClose: (error) => {
@@ -254,7 +264,7 @@ class TerminalController {
       }
       if (!this.#current(generation)) return;
       if ("kind" in attached) {
-        this.#reset = true;
+        this.#reset = attached;
         this.#fail(new SessionError("stale"));
         return;
       }
@@ -303,7 +313,7 @@ class TerminalController {
   }
 
   #pumpEffects(): void {
-    if (this.#effectTask !== undefined || !this.#writable || !this.#liveHandle()) return;
+    if (this.#effectTask !== undefined || this.#outputPending || !this.#writable || !this.#liveHandle() || (this.#inputBuffer.length === 0 && this.#pendingResize === undefined)) return;
     const task = this.#runEffects();
     this.#effectTask = task;
     void task.then(() => this.#effectFinished(task), () => this.#effectFinished(task));

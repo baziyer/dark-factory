@@ -5,7 +5,9 @@ import {
   decodeServerControl,
   encodeTerminalAttached,
   encodeTerminalDetached,
+  encodeTerminalInputResult,
   encodeTerminalLeaseResult,
+  encodeTerminalResized,
   SessionError,
 } from "@dark-factory/client";
 import { createTerminalHandle } from "../../client/dist/src/terminal_session.js";
@@ -197,7 +199,7 @@ test("handle end aborts a pending display and fences a post-await output", async
     await ready(context);
     const pending = context.callbacks().onOutput({ sequence: 0n, payload: new Uint8Array([1]) });
     await tick();
-    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : undefined);
+    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : event === "onReset" ? { sessionId: "22".repeat(16), floor: 1n, head: 2n } : undefined);
     await assert.rejects(pending, (error) => error.code === "closed");
     assert.equal(context.surfaceAborts(), 1, event);
     await assert.rejects(context.callbacks().onOutput({ sequence: 1n, payload: new Uint8Array([2]) }), (error) => error.code === "closed");
@@ -208,7 +210,7 @@ test("handle end aborts a pending display and fences a post-await output", async
   const output = postAwait.callbacks().onOutput({ sequence: 0n, payload: new Uint8Array([3]) });
   await tick();
   postAwait.surfaceGate.resolve();
-  postAwait.callbacks().onReset();
+  postAwait.callbacks().onReset({ sessionId: "22".repeat(16), floor: 1n, head: 2n });
   await assert.rejects(output, (error) => error.code === "closed");
   assert.equal(postAwait.surfaceAborts(), 1);
 });
@@ -274,6 +276,82 @@ test("real TerminalHandle sends no ACK when controller closes during display out
   await controller.close();
   assert.equal(await receiving, true);
   assert.equal(sent.filter(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_ACK").length, 0);
+});
+
+test("real TerminalHandle queues synchronous display input and resize until output finishes", async () => {
+  const sent = [];
+  const outputGate = deferred();
+  let handle;
+  let controller;
+  let responseNumber = 0;
+  const session = {
+    resolveAgentTerminal: async () => target,
+    openTerminal: (_target, options) => {
+      handle = createTerminalHandle(
+        { runId: "ab".repeat(16), sessionId: "bc".repeat(16), runRevision: 1n, sessionRevision: 1n },
+        options,
+        (requestId, payload) => sent.push({ requestId, payload }),
+        () => `${String(++responseNumber).padStart(2, "0")}`.repeat(16),
+        () => {},
+        { now: 100_000, setTimeout: () => 1, clearTimeout: () => {} },
+        true,
+      );
+      return handle;
+    },
+    close: () => handle?.terminate(new SessionError("closed")),
+  };
+  controller = new TerminalController({
+    session,
+    agentId: "cd".repeat(16),
+    expectedAgentRevision: 1n,
+    expectedHead: 1n,
+    surface: {
+      write: () => {
+        assert.equal(controller.sendInput(new Uint8Array([1])), true);
+        assert.equal(controller.resize(24, 80), true);
+        return outputGate.promise;
+      },
+      abort: () => outputGate.reject(new Error("surface disposed")),
+    },
+    onChange: () => {},
+  });
+  controller.start();
+  await tick();
+  let request = decodeClientControl(sent.at(-1).payload);
+  const attachmentID = request.id;
+  handle.receive(decodeServerControl(encodeTerminalAttached(attachmentID, {
+    session_id: "bc".repeat(16), floor: 0n, head: 0n, acknowledged_sequence: 0n, max_unacked_bytes: 65536n,
+  })));
+  await tick();
+  request = decodeClientControl(sent.at(-1).payload);
+  handle.receive(decodeServerControl(encodeTerminalLeaseResult(request.id, {
+    operation: "acquired", run_id: "ab".repeat(16), session_id: "bc".repeat(16), generation: 1n,
+    expires_at_ms: 200_000n, last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  })));
+  await tick();
+  const receiving = handle.receiveBinary({ direction: "output", sessionId: new Uint8Array(16).fill(0xbc), sequence: 0n, leaseGeneration: 0n, payload: new Uint8Array([2]) });
+  await tick();
+  assert.equal(controller.snapshot.phase, "ready");
+  assert.equal(sent.filter(({ payload }) => payload instanceof Uint8Array).length, 0);
+  assert.equal(sent.filter(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_RESIZE").length, 0);
+
+  outputGate.resolve();
+  assert.equal(await receiving, true);
+  await tick();
+  assert.equal(sent.filter(({ payload }) => payload instanceof Uint8Array).length, 1);
+  handle.receive(decodeServerControl(encodeTerminalInputResult(attachmentID, {
+    session_id: "bc".repeat(16), generation: 1n, sequence: 1n, status: "accepted", accepted_bytes: 1n,
+  })));
+  await tick();
+  request = decodeClientControl(sent.at(-1).payload);
+  assert.equal(request.type, "TERMINAL_RESIZE");
+  handle.receive(decodeServerControl(encodeTerminalResized(request.id, {
+    session_id: "bc".repeat(16), generation: 1n, rows: 24, cols: 80,
+  })));
+  await tick();
+  assert.equal(controller.snapshot.phase, "ready");
+  assert.equal(controller.snapshot.writable, true);
+  await controller.close();
 });
 
 test("real TerminalHandle close during display output aborts without closing the session or ACKing", async () => {
@@ -528,7 +606,7 @@ test("reset, exit and handle close revoke writable authority", async () => {
   for (const event of ["onReset", "onExit", "onClose"]) {
     const context = harness();
     await ready(context);
-    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : undefined);
+    context.callbacks()[event]?.(event === "onClose" ? new SessionError("connection") : event === "onReset" ? { sessionId: "22".repeat(16), floor: 1n, head: 2n } : undefined);
     assert.equal(context.controller.snapshot.phase, "closed", event);
     assert.equal(context.controller.snapshot.writable, false, event);
     assert.equal(context.controller.sendInput(new Uint8Array([1])), false, event);
