@@ -39,9 +39,10 @@ interventions wake you again. Events received while you are queued or running
 remain pending for the next supervision task. A factory-wide overseer slot lets
 you supervise alongside workers even when worker capacity is one.
 
-The overseer's standing instruction (CONFIG → RULES → WHEN IDLE → run a
-standing instruction) is short, because a native-provider launch delivers the
-task through the terminal and that prepared prompt is capped at 8 KiB:
+Set the overseer's standing instruction through SUPERVISION → WHEN WORK
+CHANGES → supervise worker activity. The instruction is short, because a
+native-provider launch delivers the task through the terminal and that
+prepared prompt is capped at 8 KiB:
 
 > You are the overseer of the project named PROJECT. Run
 > `git clone --filter=blob:none https://github.com/OWNER/REPO repo`, read
@@ -159,8 +160,9 @@ Set `from` to `base_commit` or `branch_head` accordingly.
 
 Compute the diff against `from` without a checkout: the clone's object
 store, its index filled from `from`, and the retained tree as the work tree.
-`git add -A` respects the tree's own `.gitignore`, so build output the
-worker left behind is not published.
+`git add -A` respects the tree's own `.gitignore`, but that does not relax
+the worker cleanup requirement: generated dependencies, build output, caches,
+and temporary metadata must be removed before settlement.
 
 ```sh
 export GIT_DIR=$PWD/repo/.git GIT_WORK_TREE=$home/changes/$change_id GIT_INDEX_FILE=$PWD/change.index

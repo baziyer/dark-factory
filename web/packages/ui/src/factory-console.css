@@ -360,23 +360,11 @@
 }
 
 .dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction {
-  flex: 1 1 auto;
-  min-height: 0;
-  margin-top: 0;
-}
-
-.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction textarea {
-  flex: 1 1 auto;
-  min-height: 12rem;
-  resize: none;
-}
-
-.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction--queue {
   flex: 0 0 auto;
   margin-top: 0.75rem;
 }
 
-.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction--queue textarea {
+.dfFactoryConsole__terminalPanel .dfFactoryConsole__instruction textarea {
   flex: 0 0 auto;
   min-height: 4.5rem;
   resize: vertical;

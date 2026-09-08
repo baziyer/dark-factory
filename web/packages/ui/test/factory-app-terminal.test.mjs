@@ -25,7 +25,7 @@ function stateAt(head, overrides = {}) {
   return { ...fixtureState, head: BigInt(head), ...overrides };
 }
 
-function terminalHarness({ closeStatus = false, fail, failError = new SessionError("connection"), detachImpl, acquireImpl, enqueueImpl, controlImpl, historyImpl } = {}) {
+function terminalHarness({ closeStatus = false, fail, failError = new SessionError("connection"), detachImpl, acquireImpl, enqueueImpl, controlImpl, historyImpl, updateAgentImpl } = {}) {
   let attachReset = false;
   const snapshots = [];
   const calls = [];
@@ -50,6 +50,11 @@ function terminalHarness({ closeStatus = false, fail, failError = new SessionErr
       calls.push({ kind: "enqueue", value });
       if (enqueueImpl !== undefined) return enqueueImpl(value);
       return { taskId: "51".repeat(16), revision: 1n };
+    },
+    updateAgent: async (value) => {
+      calls.push({ kind: "update-agent", value });
+      if (updateAgentImpl !== undefined) return updateAgentImpl(value);
+      return { agentId: value.agentId, revision: value.expectedRevision + 1n };
     },
     controlAgent: async (value) => {
       calls.push({ kind: "control", value });
@@ -263,6 +268,79 @@ test("a paused agent refuses immediate work but accepts a queued follow-up", asy
     kind: "enqueue",
     value: { agentId: paused.id, expectedAgentRevision: paused.revision, instruction: "Queue this for later", mode: "queue" },
   });
+});
+
+test("a config save fences immediate START and keeps its draft visible through standing admission", async () => {
+  const configReply = deferred();
+  const context = terminalHarness({ updateAgentImpl: () => configReply.promise });
+  context.controller.start();
+  const initialTasks = new Map(fixtureState.tasks);
+  for (const [id, task] of initialTasks) if (task.assigned_agent_id === thirdAgent.id && task.status === "queued") initialTasks.delete(id);
+  context.ready(stateAt(42, { tasks: initialTasks }));
+  context.controller.selectAgent(thirdAgent);
+  context.controller.setAgentInstructionDraft("Keep this task");
+
+  const saving = context.controller.updateAgentConfig({ idlePolicy: "standing_instruction", idleAfterSeconds: 1, idleInstruction: "Inspect the queue", idleRunBudget: 1 });
+  assert.equal(context.latest().edit.pending, true);
+  assert.equal(await context.controller.enqueueAgentInstruction("Keep this task"), false);
+  assert.equal(context.calls.some((call) => call.kind === "enqueue"), false, "the stale revision is never sent");
+  assert.equal(context.latest().terminal.instructionDraft, "Keep this task");
+  assert.equal(context.latest().terminal.instructionError.code, "stale");
+
+  const revised = { ...thirdAgent, revision: thirdAgent.revision + 1n, idle_policy: "standing_instruction", idle_after_seconds: 1, idle_instruction: "Inspect the queue", idle_run_budget: 1 };
+  const agents = new Map(fixtureState.agents);
+  agents.set(revised.id, revised);
+  const admitted = new Map(initialTasks);
+  admitted.set("73".repeat(16), {
+    id: "73".repeat(16), project_id: revised.project_id, assigned_agent_id: revised.id,
+    title: "Standing inspection", status: "running", priority: 0, revision: 1n,
+  });
+  context.clientOptions().onState(stateAt(43, { agents, tasks: admitted }));
+  assert.equal(context.latest().selectedAgent.revision, revised.revision);
+  assert.equal(context.latest().terminal.taskTitle, "Standing inspection");
+  assert.equal(context.latest().terminal.instructionDraft, "Keep this task");
+  assert.equal(context.latest().terminal.instructionError.code, "stale");
+
+  configReply.resolve({ agentId: revised.id, revision: revised.revision });
+  await saving;
+  assert.equal(context.latest().edit, undefined);
+  assert.equal(context.calls.some((call) => call.kind === "enqueue"), false, "the controller never retries task creation");
+});
+
+test("an older config completion cannot clear a newer selected agent edit", async () => {
+  const first = deferred();
+  const second = deferred();
+  const context = terminalHarness({ updateAgentImpl: (value) => value.agentId === thirdAgent.id ? first.promise : second.promise });
+  context.controller.start();
+  context.ready();
+  context.controller.selectAgent(thirdAgent);
+  const savingA = context.controller.updateAgentConfig({ idlePolicy: "standing_instruction", idleAfterSeconds: 1, idleInstruction: "A", idleRunBudget: 1 });
+  context.controller.selectAgent(secondAgent);
+  const savingB = context.controller.updateAgentConfig({ idlePolicy: "standing_instruction", idleAfterSeconds: 1, idleInstruction: "B", idleRunBudget: 1 });
+  assert.deepEqual(context.latest().edit, { target: secondAgent.id, pending: true });
+
+  first.resolve({ agentId: thirdAgent.id, revision: thirdAgent.revision + 1n });
+  await savingA;
+  assert.deepEqual(context.latest().edit, { target: secondAgent.id, pending: true });
+  second.resolve({ agentId: secondAgent.id, revision: secondAgent.revision + 1n });
+  await savingB;
+  assert.equal(context.latest().edit, undefined);
+});
+
+test("a same-agent terminal replacement retains an unsent draft and refusal", async () => {
+  const save = deferred();
+  const context = terminalHarness({ updateAgentImpl: () => save.promise });
+  context.controller.start();
+  const tasks = new Map(fixtureState.tasks);
+  for (const [id, task] of tasks) if (task.assigned_agent_id === thirdAgent.id && task.status === "queued") tasks.delete(id);
+  context.ready(stateAt(42, { tasks }));
+  context.controller.selectAgent(thirdAgent);
+  context.controller.setAgentInstructionDraft("Keep this task");
+  void context.controller.updateAgentConfig({ idlePolicy: "standing_instruction", idleAfterSeconds: 1, idleInstruction: "Inspect", idleRunBudget: 1 });
+  assert.equal(await context.controller.enqueueAgentInstruction("Keep this task"), false);
+  context.controller.closeAgentTerminal();
+  assert.equal(context.latest().terminal.instructionDraft, "Keep this task");
+  assert.equal(context.latest().terminal.instructionError.code, "stale");
 });
 
 test("a newly running instruction turns the same idle sidebar into the real terminal", async () => {

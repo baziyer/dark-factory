@@ -69,7 +69,11 @@ export function agentStatus(agent: AgentItem, state: StateView): AgentStatus {
 /** The overseer is the console's entry point; a worker is a usable fallback. */
 export function primaryAgent(state: StateView): AgentItem | undefined {
   return [...state.agents.values()]
-    .sort((left, right) => (left.role === right.role ? 0 : left.role === "orchestrator" ? -1 : 1) || compareText(left.name, right.name) || compareText(left.id, right.id))[0];
+    .sort((left, right) =>
+      (left.role === right.role ? 0 : left.role === "orchestrator" ? -1 : 1)
+      || (left.role === "orchestrator" && left.paused !== right.paused ? left.paused ? 1 : -1 : 0)
+      || compareText(left.name, right.name)
+      || compareText(left.id, right.id))[0];
 }
 
 /**

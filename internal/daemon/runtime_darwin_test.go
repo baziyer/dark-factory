@@ -331,11 +331,22 @@ func TestRuntimeParentSerializesNamespaceOperationsAndRevokesClosedHandles(t *te
 		t.Fatal(err)
 	}
 	defer first.Close()
-	if second, err := parent.begin(); !errors.Is(err, errRuntimeBusy) || second != nil {
-		if second != nil {
-			_ = second.Close()
+	type beginResult struct {
+		operation *runtimeParentOperation
+		err       error
+	}
+	secondDone := make(chan beginResult, 1)
+	go func() {
+		operation, err := parent.begin()
+		secondDone <- beginResult{operation: operation, err: err}
+	}()
+	select {
+	case second := <-secondDone:
+		if second.operation != nil {
+			_ = second.operation.Close()
 		}
-		t.Fatalf("concurrent namespace operation = %v, %v", second, err)
+		t.Fatalf("concurrent namespace operation returned before release: %v, %v", second.operation, second.err)
+	case <-time.After(50 * time.Millisecond):
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -349,10 +360,11 @@ func TestRuntimeParentSerializesNamespaceOperationsAndRevokesClosedHandles(t *te
 	if err := first.Close(); err != nil {
 		t.Fatalf("duplicate operation close = %v", err)
 	}
-	second, err := parent.begin()
-	if err != nil {
-		t.Fatalf("operation gate did not reopen: %v", err)
+	secondResult := <-secondDone
+	if secondResult.err != nil || secondResult.operation == nil {
+		t.Fatalf("operation gate did not reopen: %v, %v", secondResult.operation, secondResult.err)
 	}
+	second := secondResult.operation
 	child, err := second.transfer()
 	if err != nil {
 		t.Fatal(err)
@@ -371,6 +383,99 @@ func TestRuntimeParentSerializesNamespaceOperationsAndRevokesClosedHandles(t *te
 	}
 	if _, err := child.directory(); !errors.Is(err, errInvalidContract) {
 		t.Fatalf("closed child directory = %v", err)
+	}
+}
+
+func TestCreateRuntimeWaitsForParentNamespaceOperation(t *testing.T) {
+	parentPath := filepath.Join(runtimeTempDir(t), "private")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := createManagedParent(t, parentPath)
+	defer parent.Close()
+	held, err := parent.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	type createResult struct {
+		runtime *Runtime
+		err     error
+	}
+	done := make(chan createResult, 1)
+	go func() {
+		runtime, err := CreateRuntime(parent, runtimeTestName)
+		done <- createResult{runtime: runtime, err: err}
+	}()
+	select {
+	case result := <-done:
+		if result.runtime != nil {
+			_ = result.runtime.Close()
+		}
+		t.Fatalf("CreateRuntime returned before namespace release: %v, %v", result.runtime, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if result.err != nil || result.runtime == nil {
+		t.Fatalf("CreateRuntime after namespace release = %v, %v", result.runtime, result.err)
+	}
+	if err := result.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeParentCloseRejectsQueuedNamespaceOperation(t *testing.T) {
+	parentPath := filepath.Join(runtimeTempDir(t), "private")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := createManagedParent(t, parentPath)
+	defer parent.Close()
+	held, err := parent.begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	beginDone := make(chan error, 1)
+	go func() {
+		operation, err := parent.begin()
+		if operation != nil {
+			_ = operation.Close()
+		}
+		beginDone <- err
+	}()
+	select {
+	case err := <-beginDone:
+		t.Fatalf("queued begin returned before close: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- parent.Close() }()
+	deadline := time.After(time.Second)
+	for {
+		parent.mu.Lock()
+		closing := parent.closing
+		parent.mu.Unlock()
+		if closing {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Close did not claim the parent")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-beginDone; !errors.Is(err, errInvalidContract) {
+		t.Fatalf("queued begin after Close = %v", err)
 	}
 }
 

@@ -397,6 +397,7 @@ func TestAttemptClientHasExactScopedOutcomesAndNoOperatorFallback(t *testing.T) 
 	}
 
 	t.Run("missing attempt environment", func(t *testing.T) {
+		t.Setenv(attemptTokenFileEnv, "")
 		directory := privateTestDirectory(t)
 		listener, socket := testListener(t, directory)
 		defer listener.Close()

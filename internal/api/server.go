@@ -235,11 +235,11 @@ func NewOverseerSnapshotReply(snapshot OverseerSnapshot) (Reply, error) {
 	if !validOverseerSnapshot(snapshot) {
 		return Reply{}, ErrInvalidInput
 	}
-	snapshot.Agents = append([]AgentSummary(nil), snapshot.Agents...)
-	snapshot.Tasks = append([]OverseerTask(nil), snapshot.Tasks...)
-	snapshot.Runs = append([]OverseerRun(nil), snapshot.Runs...)
-	snapshot.Questions = append([]OverseerQuestion(nil), snapshot.Questions...)
-	snapshot.History = append([]OverseerIntervention(nil), snapshot.History...)
+	snapshot.Agents = append([]AgentSummary{}, snapshot.Agents...)
+	snapshot.Tasks = append([]OverseerTask{}, snapshot.Tasks...)
+	snapshot.Runs = append([]OverseerRun{}, snapshot.Runs...)
+	snapshot.Questions = append([]OverseerQuestion{}, snapshot.Questions...)
+	snapshot.History = append([]OverseerIntervention{}, snapshot.History...)
 	return Reply{kind: replyOverseerSnapshot, overseer: snapshot}, nil
 }
 
