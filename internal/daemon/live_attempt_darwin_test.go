@@ -465,6 +465,28 @@ func TestLiveAttemptSlowSubscriberIsDroppedExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestLiveAttemptCreditedReplayDoesNotOverflowBrowserAttachment(t *testing.T) {
+	runID, sessionID := liveTestIDs(t, 10013)
+	attempt := newLiveAttempt(nil, runID, sessionID, nil)
+	attachment := &TerminalAttachment{
+		queue:       make(chan TerminalEvent, terminalSubscriberEventCap),
+		correlation: 1,
+	}
+	attempt.subs[attachment] = struct{}{}
+	attempt.correlations[attachment.correlation] = attachment
+	attempt.routeAttached(runner.TerminalFrame{Kind: runner.TerminalAttached, Correlation: attachment.correlation, Sequence: 0, Floor: 0, Head: liveAttemptCredit, Status: runner.TerminalResultOK})
+	for range liveAttemptCredit / terminalPayloadCap {
+		start := attachment.expected
+		attempt.routeReplay(attachment, runner.TerminalFrame{Kind: runner.TerminalOutput, Correlation: 1, Start: start, End: start + terminalPayloadCap, Payload: make([]byte, terminalPayloadCap)})
+	}
+	if _, present := attempt.subs[attachment]; !present || attachment.finished {
+		t.Fatalf("credited replay dropped browser attachment: present=%v finished=%v", present, attachment.finished)
+	}
+	if got := len(attachment.queue); got != terminalSubscriberEventCap {
+		t.Fatalf("queued replay events = %d, want %d", got, terminalSubscriberEventCap)
+	}
+}
+
 func TestLiveAttemptReplayPendingBytesAreBounded(t *testing.T) {
 	runID, sessionID := liveTestIDs(t, 10008)
 	attempt := newLiveAttempt(nil, runID, sessionID, nil)
