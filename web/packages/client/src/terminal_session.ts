@@ -32,6 +32,8 @@ export type TerminalOptions = Readonly<{
   /** Optional session fence for a replay cursor carried from an earlier handle. */
   afterSessionId?: string;
   onOutput?: (output: TerminalOutput) => void | Promise<void>;
+  /** Runs after the output callback, ACK, and output fence have all settled. */
+  onOutputComplete?: () => void;
   onEOF?: (event: { sessionId: string }) => void | Promise<void>;
   onExit?: (event: TerminalExit) => void | Promise<void>;
   onReset?: (event: TerminalReset) => void | Promise<void>;
@@ -314,6 +316,7 @@ class TerminalHandleImpl implements InternalTerminalHandle {
     } finally {
       if (this.#outputCloseResolve === closeResolve) this.#outputCloseResolve = undefined;
       this.#outputInFlight = false;
+      try { this.#options.onOutputComplete?.(); } catch { /* output completion never owns the session */ }
       this.#advanceDetach();
     }
   }

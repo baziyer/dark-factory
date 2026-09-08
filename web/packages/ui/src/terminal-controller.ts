@@ -85,6 +85,7 @@ class TerminalController {
   #pendingResize: Resize | undefined;
   #effectTask: Promise<void> | undefined;
   #outputTask: Promise<void> | undefined;
+  #outputPending = false;
   #closePromise: Promise<void> | undefined;
   #detachPromise: Promise<void> | undefined;
 
@@ -219,11 +220,13 @@ class TerminalController {
       const handle = this.#options.session.openTerminal(target as TerminalTarget, {
         ...(this.#options.resume === undefined ? {} : { afterSequence: this.#options.resume.head, afterSessionId: this.#options.resume.sessionId }),
         onOutput: (output) => {
+          this.#outputPending = true;
           const task = this.#writeOutput(generation, output.payload);
           this.#outputTask = task;
           void task.then(() => this.#outputFinished(task), () => this.#outputFinished(task));
           return task;
         },
+        onOutputComplete: () => this.#pumpEffects(),
         onExit: () => this.#handleEnded(new SessionError("closed")),
         onReset: (event) => {
           if (!this.#detachRequested) this.#reset = event;
@@ -307,7 +310,7 @@ class TerminalController {
   }
 
   #pumpEffects(): void {
-    if (this.#effectTask !== undefined || !this.#writable || !this.#liveHandle()) return;
+    if (this.#effectTask !== undefined || this.#outputPending || !this.#writable || !this.#liveHandle()) return;
     const task = this.#runEffects();
     this.#effectTask = task;
     void task.then(() => this.#effectFinished(task), () => this.#effectFinished(task));
@@ -368,7 +371,9 @@ class TerminalController {
   }
 
   #outputFinished(task: Promise<void>): void {
-    if (this.#outputTask === task) this.#outputTask = undefined;
+    if (this.#outputTask !== task) return;
+    this.#outputTask = undefined;
+    this.#outputPending = false;
   }
   #handleEnded(error: SessionError | ProtocolError, retryDiscovery = false): void {
     if (this.#handleClosed) return;
