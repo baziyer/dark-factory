@@ -452,7 +452,7 @@ func (attempt *liveAttempt) handleTerminalEffect(effect terminalEffect) (termina
 			Kind: runner.TerminalResize, Generation: effect.generation, Rows: effect.rows, Cols: effect.cols,
 		})
 	case terminalEffectHumanReply:
-		return attempt.runTerminalEffect(runner.TerminalCommand{Kind: runner.TerminalHumanReply, Payload: append([]byte(nil), effect.payload...)})
+		return attempt.runTerminalEffect(runner.TerminalCommand{Kind: runner.TerminalHumanReply, Payload: append([]byte(nil), effect.payload...), Submit: effect.submit})
 	case terminalEffectRevokeClient:
 		if attempt.binding == (terminalBinding{}) || attempt.binding.client != effect.client {
 			return terminalEffectResult{status: runner.TerminalResultOK}, nil

@@ -104,10 +104,12 @@ type terminalOwner struct {
 	observerAttached bool
 	replay           []terminalReplay
 
-	// enterAfter and enterBy bound the startup CR still owed to the provider;
+	// enterAfter and enterBy bound the one pending CR owed to the provider;
 	// lastOutput is when the provider last wrote, so the CR follows a quiet
 	// prompt rather than a banner still being drawn.
 	enterAfter, enterBy, lastOutput time.Time
+	humanReplyCorrelation           uint64
+	humanReplyCount                 uint32
 }
 
 // ponytail: the provider's output is opaque to the runner, so its readiness
@@ -153,17 +155,16 @@ func (o *terminalOwner) awaitRawMode(stagePTY *ptyStageSink, ceiling time.Durati
 	}
 }
 
-// submitStartup writes the owed CR once the provider's output has been quiet
+// submitPending writes the owed CR once the provider's output has been quiet
 // for a spell after the floor (a provider that never wrote is quiet), or at
 // the ceiling regardless. A provider that has exited or closed its terminal
 // is owed nothing.
-func (o *terminalOwner) submitStartup() error {
+func (o *terminalOwner) submitPending() error {
 	if o.enterBy.IsZero() {
 		return nil
 	}
 	if o.child.exitObserved {
-		o.enterAfter, o.enterBy = time.Time{}, time.Time{}
-		return nil
+		return o.rejectHumanReply()
 	}
 	now := time.Now()
 	quiet := o.lastOutput.IsZero() || now.Sub(o.lastOutput) >= startupEnterQuiet
@@ -171,12 +172,29 @@ func (o *terminalOwner) submitStartup() error {
 		return nil
 	}
 	o.enterAfter, o.enterBy = time.Time{}, time.Time{}
-	switch _, status := o.writeTerminalPayload([]byte{'\r'}); status {
+	_, status := o.writeTerminalPayload([]byte{'\r'})
+	if o.humanReplyCorrelation != 0 {
+		correlation, count := o.humanReplyCorrelation, o.humanReplyCount
+		o.humanReplyCorrelation, o.humanReplyCount = 0, 0
+		return o.send(TerminalFrame{Kind: TerminalHumanReplyResult, Correlation: correlation, Count: count, Status: status})
+	}
+	switch status {
 	case TerminalResultOK, TerminalResultRejected:
 		return nil
 	default:
 		return fmt.Errorf("runner: provider startup submit %s", status)
 	}
+}
+
+func (o *terminalOwner) rejectHumanReply() error {
+	if o.humanReplyCorrelation == 0 {
+		o.enterAfter, o.enterBy = time.Time{}, time.Time{}
+		return nil
+	}
+	correlation, count := o.humanReplyCorrelation, o.humanReplyCount
+	o.humanReplyCorrelation, o.humanReplyCount = 0, 0
+	o.enterAfter, o.enterBy = time.Time{}, time.Time{}
+	return o.send(TerminalFrame{Kind: TerminalHumanReplyResult, Correlation: correlation, Count: count, Status: TerminalResultRejected})
 }
 
 type terminalReplay struct {
@@ -247,10 +265,13 @@ func (o *terminalOwner) serve() (bool, error) {
 		}
 		switch ev.source {
 		case sourceTick:
-			if err := o.submitStartup(); err != nil {
+			if err := o.submitPending(); err != nil {
 				return o.daemonOpen, err
 			}
 		case sourceChild:
+			if err := o.rejectHumanReply(); err != nil {
+				return o.daemonOpen, err
+			}
 			// First converge the exact process group and perform the sole Wait;
 			// only then is PTY tail output drained. PTY EOF is emitted exclusively
 			// from an actual EOF/EIO read, never from child exit.
@@ -266,7 +287,7 @@ func (o *terminalOwner) serve() (bool, error) {
 			if err := o.consumePTY(ev.bytes, ev.err); err != nil {
 				return o.daemonOpen, err
 			}
-			if err := o.submitStartup(); err != nil {
+			if err := o.submitPending(); err != nil {
 				return o.daemonOpen, err
 			}
 		case sourceDaemon:
@@ -465,7 +486,7 @@ func (o *terminalOwner) revoke(c TerminalCommand) error {
 func (o *terminalOwner) input(c TerminalCommand) error {
 	status := TerminalResultOK
 	count := uint32(0)
-	if !o.inputActive || c.Generation != o.generation || c.Sequence != o.nextInput {
+	if o.humanReplyCorrelation != 0 || !o.inputActive || c.Generation != o.generation || c.Sequence != o.nextInput {
 		status = TerminalResultRejected
 	} else {
 		count, status = o.writeTerminalPayload(c.Payload)
@@ -481,10 +502,20 @@ func (o *terminalOwner) input(c TerminalCommand) error {
 // humanReply is a daemon-authorized one-shot write for an exact durable
 // HumanRequest. It intentionally bypasses browser generation/sequence checks,
 // but shares the sole owner-only PTY write primitive and its fail-closed
-// result mapping with terminal input. The payload is written byte-for-byte;
-// this path never appends a newline or retries a partial write.
+// result mapping with terminal input. A requested submit is delayed like the
+// startup submit so the provider receives the answer as a paste and CR as its
+// own keystroke.
 func (o *terminalOwner) humanReply(c TerminalCommand) error {
+	if !o.enterBy.IsZero() || o.humanReplyCorrelation != 0 {
+		return o.send(TerminalFrame{Kind: TerminalHumanReplyResult, Correlation: c.Correlation, Status: TerminalResultRejected})
+	}
 	count, status := o.writeTerminalPayload(c.Payload)
+	if status == TerminalResultOK && c.Submit {
+		now := time.Now()
+		o.humanReplyCorrelation, o.humanReplyCount = c.Correlation, count
+		o.enterAfter, o.enterBy = now.Add(startupEnterFloor), now.Add(startupEnterCeiling)
+		return nil
+	}
 	return o.send(TerminalFrame{Kind: TerminalHumanReplyResult, Correlation: c.Correlation, Count: count, Status: status})
 }
 

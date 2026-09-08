@@ -40,6 +40,7 @@ type terminalEffectWireFrame struct {
 	Rows         uint16               `json:"rows,omitempty"`
 	Cols         uint16               `json:"cols,omitempty"`
 	Credit       uint32               `json:"credit,omitempty"`
+	Submit       bool                 `json:"submit,omitempty"`
 	Status       string               `json:"status,omitempty"`
 	Payload      []byte               `json:"payload,omitempty"`
 	FileIdentity *runner.FileIdentity `json:"file_identity,omitempty"`
@@ -57,14 +58,22 @@ type terminalEffectFixture struct {
 }
 
 func newTerminalEffectFixture(t *testing.T) *terminalEffectFixture {
-	return newTerminalEffectFixtureConfigured(t, nil)
+	return newTerminalEffectFixtureWithProvider(t, kernel.ProviderCodex)
 }
 
 func newTerminalEffectFixtureConfigured(t *testing.T, configure func(*liveAttempt)) *terminalEffectFixture {
+	return newTerminalEffectFixtureConfiguredWithProvider(t, kernel.ProviderCodex, configure)
+}
+
+func newTerminalEffectFixtureWithProvider(t *testing.T, provider kernel.Provider) *terminalEffectFixture {
+	return newTerminalEffectFixtureConfiguredWithProvider(t, provider, nil)
+}
+
+func newTerminalEffectFixtureConfiguredWithProvider(t *testing.T, provider kernel.Provider, configure func(*liveAttempt)) *terminalEffectFixture {
 	t.Helper()
 	adapter := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityTerminalInput|kernel.BrowserCapabilityHumanActions)
 	adapter.pair(t)
-	run := adapterRunningRun(t, adapter.store, 170)
+	run := adapterRunningRoleProviderRun(t, adapter.store, 170, kernel.RoleOrchestrator, provider)
 	session, found, err := adapter.store.TerminalSessionForRun(context.Background(), run.ID)
 	if err != nil || !found {
 		t.Fatalf("terminal session = %+v, found=%v, err=%v", session, found, err)
@@ -822,7 +831,7 @@ func TestHumanReplyUsesExactRunAndResolvesOnlyAfterFullDelivery(t *testing.T) {
 		done <- replyResult{count: count, err: err}
 	}()
 	command := readTerminalEffectWire(t, fixture.peer)
-	if command.Kind != string(runner.TerminalHumanReply) || string(command.Payload) != "exact reply" || command.Generation != 0 || command.Sequence != 0 {
+	if command.Kind != string(runner.TerminalHumanReply) || string(command.Payload) != "exact reply" || !command.Submit || command.Generation != 0 || command.Sequence != 0 {
 		t.Fatalf("human reply command = %+v", command)
 	}
 	delivering, found, err := fixture.adapter.store.HumanRequest(context.Background(), request.ID)
@@ -854,6 +863,9 @@ func TestHumanReplyUsesExactRunAndResolvesOnlyAfterFullDelivery(t *testing.T) {
 		partialDone <- replyResult{count: count, err: err}
 	}()
 	partial := readTerminalEffectWire(t, fixture.peer)
+	if string(partial.Payload) != "partial reply" || !partial.Submit {
+		t.Fatalf("partial codex reply = %+v", partial)
+	}
 	replyTerminalEffect(t, fixture.peer, partial, runner.TerminalResultPartial, 3)
 	partialResult := <-partialDone
 	if partialResult.count != 3 || !errors.Is(partialResult.err, ErrTerminalEffectPartial) {
@@ -865,6 +877,53 @@ func TestHumanReplyUsesExactRunAndResolvesOnlyAfterFullDelivery(t *testing.T) {
 	}
 	if _, err := fixture.adapter.daemon.humanReply(context.Background(), fixture.principal, second.ID, unknown.Revision, "stale"); !errors.Is(err, kernel.ErrRevisionConflict) {
 		t.Fatalf("uncertain request reply = %v", err)
+	}
+}
+
+func TestHumanReplyKeepsShellPayloadRaw(t *testing.T) {
+	fixture := newTerminalEffectFixtureWithProvider(t, kernel.ProviderShell)
+	var key [kernel.IDBytes]byte
+	copy(key[:], adapterID(t, 214))
+	request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{IdempotencyKey: key, QuestionText: "question"}, adapterTime(t, 400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := fixture.adapter.daemon.humanReply(context.Background(), fixture.principal, request.ID, request.Revision, "exact reply")
+		done <- err
+	}()
+	command := readTerminalEffectWire(t, fixture.peer)
+	if command.Kind != string(runner.TerminalHumanReply) || string(command.Payload) != "exact reply" || command.Submit {
+		t.Fatalf("shell human reply command = %+v", command)
+	}
+	replyTerminalEffect(t, fixture.peer, command, runner.TerminalResultOK, uint32(len(command.Payload)))
+	if err := <-done; err != nil {
+		t.Fatalf("shell human reply = %v", err)
+	}
+}
+
+func TestCodexHumanReplyDefersSubmitForMaximumReply(t *testing.T) {
+	fixture := newTerminalEffectFixture(t)
+	var key [kernel.IDBytes]byte
+	copy(key[:], adapterID(t, 215))
+	request, err := fixture.adapter.store.CreateHumanQuestionForAttempt(context.Background(), fixture.run.CredentialDigest, kernel.NewHumanQuestion{IdempotencyKey: key, QuestionText: "question"}, adapterTime(t, 400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := strings.Repeat("x", kernel.MaxHumanRequestReplyBytes)
+	done := make(chan error, 1)
+	go func() {
+		_, err := fixture.adapter.daemon.humanReply(context.Background(), fixture.principal, request.ID, request.Revision, reply)
+		done <- err
+	}()
+	answer := readTerminalEffectWire(t, fixture.peer)
+	if len(answer.Payload) != kernel.MaxHumanRequestReplyBytes || string(answer.Payload) != reply || !answer.Submit {
+		t.Fatalf("maximum codex reply = %d bytes", len(answer.Payload))
+	}
+	replyTerminalEffect(t, fixture.peer, answer, runner.TerminalResultOK, uint32(len(answer.Payload)))
+	if err := <-done; err != nil {
+		t.Fatalf("maximum codex human reply = %v", err)
 	}
 }
 
@@ -886,6 +945,9 @@ func TestUncertainHumanReplyRemainsDurablyVisibleWithoutReplay(t *testing.T) {
 		done <- result{count: count, err: err}
 	}()
 	command := readTerminalEffectWire(t, fixture.peer)
+	if string(command.Payload) != "one shot" || !command.Submit {
+		t.Fatalf("uncertain codex reply = %+v", command)
+	}
 	replyTerminalEffect(t, fixture.peer, command, runner.TerminalResultUncertain, 0)
 	got := <-done
 	if got.count != 0 || !errors.Is(got.err, ErrTerminalEffectUncertain) {

@@ -13,7 +13,8 @@ task through the terminal and that prepared prompt is capped at 8 KiB:
 > repo/docs/development/OVERSEER.md, and follow it exactly. Before exiting,
 > report the durable outcome with `$DARK_FACTORY_FACTORYCTL attempt succeed
 > --result` (one line per change you handled, or "nothing to publish"), or
-> with `attempt block --detail` if you raised a human request.
+> with `attempt block --detail` for an ordinary failure. If you raise a human
+> request, keep the attempt running for the reply.
 
 Every command below runs from the directory the session starts in, its
 private runtime home, with the clone at `repo` inside it.
@@ -37,10 +38,9 @@ without any remote credential, and the Maintainer App as the one MCP server
   back to its worker with the findings (`attempt send-back`, section 5) and
   the worker's next run continues from the tree it left.
 - When a step needs a decision you are not sure of, or a publication is
-  blocked twice, raise it with `attempt request-human` and end the run with
-  `attempt block` carrying the same text (section 6). The request is the
-  NEEDS YOU card on the operator's console while the run lives; the blocked
-  task keeps the reason after it ends.
+  blocked twice, raise it with `attempt request-human` and keep the native
+  attempt alive for the reply (section 6). The request is the NEEDS YOU card
+  on the operator's console while the run lives.
 
 ## 1. Find what a worker finished
 
@@ -136,6 +136,9 @@ git diff --cached --no-renames --numstat "$from"                     # for the d
 git ls-files --stage                                                 # mode and blob per path
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 ```
+
+If `changed.txt` is empty, report `nothing to publish` for that change and
+continue; do not build entries or create an issue or pull request.
 
 `--no-renames` matters: a rename would otherwise arrive as one `R` line
 with two paths, and the old path's deletion would never reach the App.
@@ -339,7 +342,8 @@ itself runs only in the merge queue, so it is never the signal here.
 
 If a merged PR touched `cmd/` or `internal/`, the live service needs a
 reinstall, and if it touched `web/`, the site needs a re-vendor; raise one
-human request naming the merge commit and which of the two applies. A
+human request naming the merge commit and which of the two applies, then wait
+as below. A
 worker run whose tree the daemon refused ends failed with the reason and
 leaves the tree at `$home/changes/<change_id>.refused-<run8>` for a person
 to read and remove; it is never yours to publish. Then report, one line
@@ -348,14 +352,14 @@ stopped.
 
 ```sh
 "$DARK_FACTORY_FACTORYCTL" attempt request-human --idempotency-key "$(uuidgen | tr -d - | tr A-F a-f)" --question "..."
-"$DARK_FACTORY_FACTORYCTL" attempt block --detail "..."      # when a human request was raised
-"$DARK_FACTORY_FACTORYCTL" attempt succeed --result "..."    # otherwise
+"$DARK_FACTORY_FACTORYCTL" attempt succeed --result "..."    # after the reply resolves the work
 ```
 
-A request-human does not wait for the answer, and the request goes stale
-the moment the run ends, so a run that raised one ends with `attempt block`
-carrying the same text (cut to 4 KiB, the detail's bound; the question
-allows 8 KiB): the blocked task keeps the reason on the console until a
-person sends it back or queues a new instruction. A run that raised
-none ends with `attempt succeed`. The next standing-instruction run picks
-up where the journal says you stopped.
+After `request-human`, leave the native attempt running at its prompt; do not
+call `attempt block` or `attempt succeed` until the answer arrives. The
+console delivers and submits a Codex answer, then you continue from it. The
+operator can cancel the existing NEEDS YOU card if waiting is no longer useful.
+Once the reply resolves the work, end with `attempt succeed` or, for an
+ordinary non-human failure, `attempt block` (detail cut to its 4 KiB bound;
+the question allows 8 KiB). The next standing-instruction run picks up where
+the journal says you stopped.
