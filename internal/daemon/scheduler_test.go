@@ -177,6 +177,38 @@ func TestSchedulerStopsAndJoinsAfterNonterminalCompletion(t *testing.T) {
 	}
 }
 
+func TestSchedulerStopsAfterPersistentUncertainCompletionRead(t *testing.T) {
+	daemon := newSchedulerTestDaemon(t)
+	sentinel := errors.New("durable completion unreadable")
+	var attempts atomic.Int64
+	var completionReads atomic.Int64
+	daemon.scheduledRun = func(context.Context, kernel.RunID) (kernel.Run, bool, error) {
+		completionReads.Add(1)
+		return kernel.Run{}, false, kernel.NewOutcomeUnknownError(sentinel)
+	}
+	joined := make(chan struct{})
+	spec := SupervisorSpec{
+		scheduledAttempt: func(ctx context.Context, spec SupervisorSpec) (kernel.Run, error) {
+			if attempts.Add(1) == 1 {
+				spec.admissionObserved(true)
+				return kernel.Run{ID: schedulerRunID(t, 1)}, nil
+			}
+			<-ctx.Done()
+			close(joined)
+			return kernel.Run{}, ctx.Err()
+		},
+	}
+	err := daemon.RunScheduler(context.Background(), spec)
+	if !errors.Is(err, sentinel) || completionReads.Load() != supervisorReconcileAttempts {
+		t.Fatalf("persistent completion = %v after %d reads", err, completionReads.Load())
+	}
+	select {
+	case <-joined:
+	default:
+		t.Fatal("scheduler returned before joining its next probe")
+	}
+}
+
 func TestSchedulerHasOneProcessOwner(t *testing.T) {
 	daemon := newSchedulerTestDaemon(t)
 	ctx, cancel := context.WithCancel(context.Background())

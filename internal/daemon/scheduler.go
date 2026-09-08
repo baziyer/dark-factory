@@ -192,9 +192,21 @@ func (daemon *Daemon) validateScheduledCompletion(changeParent string, unsettled
 	if observed.ID == (kernel.RunID{}) {
 		return kernel.NewOutcomeUnknownError(fmt.Errorf("%w: admitted attempt returned no run", kernel.ErrCorruptState))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
-	defer cancel()
-	current, found, err := daemon.store.Run(ctx, observed.ID)
+	readRun := daemon.store.Run
+	if daemon.scheduledRun != nil {
+		readRun = daemon.scheduledRun
+	}
+	var current kernel.Run
+	var found bool
+	var err error
+	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		current, found, err = readRun(ctx, observed.ID)
+		cancel()
+		if err == nil || found || errors.Is(err, kernel.ErrCorruptState) {
+			break
+		}
+	}
 	if err != nil || !found {
 		if err == nil {
 			err = kernel.ErrCorruptState
