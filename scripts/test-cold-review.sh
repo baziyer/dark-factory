@@ -114,6 +114,7 @@ review() {
         PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" "$@" >/dev/null 2>&1)
 }
 
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL
 printf 'Findings.\nVERDICT: ALLOW\n' >"$reply"
 DARK_FACTORY_REVIEW_OPERATION_ID=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f \
     review owner/repo 7 "$head" "$base" "$body" "the focus sentinel" || fail "ALLOW did not exit 0"
