@@ -737,6 +737,27 @@ func writeTestBytes(connection net.Conn, encoded []byte) error {
 	return nil
 }
 
+func TestOverseerReplyHonorsCallerDeadline(t *testing.T) {
+	bearer := testCredential('O')
+	fixture := newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {
+		time.Sleep(requestTimeout + 100*time.Millisecond)
+		return writeTestResponse(connection, wireAttemptDomain, mutationResponse())
+	})
+	base, err := newClient(fixture.socket, fixture.token, attemptDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &AttemptClient{client: base}
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout+time.Second)
+	defer cancel()
+	result, err := client.OverseerReplyHuman(ctx, OverseerHumanReplyInput{OperationID: id('1'), RequestID: id('2'), ExpectedRevision: 1, Reply: "reply"})
+	if err != nil || result.Revision != 4 {
+		t.Fatalf("overseer reply = %+v, %v", result, err)
+	}
+	<-fixture.request
+	fixture.wait(t)
+}
+
 func TestDeadlineClosesOneShotConnectionPromptly(t *testing.T) {
 	bearer := testCredential('D')
 	release := make(chan struct{})

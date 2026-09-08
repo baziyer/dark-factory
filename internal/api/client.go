@@ -379,7 +379,13 @@ func (client client) call(ctx context.Context, method string, params, output any
 		return ErrInvalidInput
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	// Callers with an explicit deadline own their complete operation budget.
+	// The default still bounds background callers, while an overseer mutation can
+	// wait for its bounded native terminal effect instead of being cut off at 5s.
+	cancel := func() {}
+	if _, bounded := ctx.Deadline(); !bounded {
+		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
+	}
 	defer cancel()
 	before, err := inspectSocket(client.socketPath)
 	if err != nil || !before.same(client.socket) {
