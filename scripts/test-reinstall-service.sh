@@ -1,9 +1,14 @@
 #!/bin/sh
 set -eu
 
+# The reinstall script replaces the live service. Everything here runs against
+# a fixture repository, a temporary HOME and fake go, sqlite3 and factoryctl
+# binaries, so no case builds, backs up, or touches launchd.
+
 repository_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-reinstall-service-test.XXXXXX")
-trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+trap 'rm -rf "$temporary"' EXIT
+trap 'exit 1' HUP INT TERM
 
 fail() {
     echo "reinstall-service test failed: $*" >&2
@@ -30,7 +35,9 @@ printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '0\n' >"$temporary/active-runs"
 
 # go build writes a stub that records the build tree's HEAD and execs the fake
-# factoryctl; go version -m prints the stub so the vcs.* checks see it.
+# factoryctl; go version -m prints the stub so the vcs.* checks see it. With
+# DARK_FACTORY_TEST_ADMIT_DURING_BUILD set, the build also admits a run, the
+# way the supervisor can while a real build takes minutes.
 cat >"$fake_bin/go" <<'FAKE'
 #!/bin/sh
 set -eu
@@ -43,6 +50,7 @@ case "$1" in
         done
         printf '#!/bin/sh\n# vcs.revision=%s\n# vcs.modified=false\nexec factoryctl "$@"\n' "$(git rev-parse HEAD)" >"$out"
         chmod 755 "$out"
+        [ -z "${DARK_FACTORY_TEST_ADMIT_DURING_BUILD-}" ] || printf '1\n' >"$DARK_FACTORY_TEST_ACTIVE_RUNS"
         ;;
     version) cat "$3" ;;
     *) exit 1 ;;
@@ -58,9 +66,21 @@ case "$2" in
     *) exit 1 ;;
 esac
 FAKE
+# service install leaves a real socket behind the way factoryd does once its
+# store is open; service uninstall removes it the way the daemon's close does.
 cat >"$fake_bin/factoryctl" <<'FAKE'
 #!/bin/sh
+set -eu
 echo "$*" >>"$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+sock=$HOME/.dark-factory/runtimes/factory.sock
+case "$1 $2" in
+    "service uninstall") rm -f "$sock" ;;
+    "service install")
+        mkdir -p "$(dirname "$sock")"
+        cd "$(dirname "$sock")"
+        perl -MSocket -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\n"'
+        ;;
+esac
 FAKE
 chmod 755 "$fake_bin"/*
 export PATH="$fake_bin:$PATH" HOME="$fake_home"
@@ -68,8 +88,12 @@ export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
 script=$test_repository/scripts/reinstall-service.sh
 
+backups() {
+    [ -d "$fake_home/.dark-factory-backups" ] || { echo 0; return; }
+    find "$fake_home/.dark-factory-backups" -name factory.sqlite3 | wc -l | tr -d ' '
+}
 untouched() {
-    [ ! -e "$fake_home/.dark-factory-backups" ] || fail "$1: backup directory created"
+    [ "$(backups)" = 0 ] || fail "$1: backup taken"
     [ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "$1: factoryctl invoked"
 }
 
@@ -86,6 +110,13 @@ grep -q 'non-terminal run' "$temporary/stderr" || fail "active run: wrong refusa
 [ ! -e "$test_repository/.worktrees" ] || fail "active run created a worktree"
 untouched "active run"
 printf '0\n' >"$temporary/active-runs"
+
+DARK_FACTORY_TEST_ADMIT_DURING_BUILD=1 "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "run admitted during the build accepted"
+grep -q 'non-terminal run' "$temporary/stderr" || fail "run admitted during the build: wrong refusal"
+[ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "run admitted during the build: service uninstalled"
+printf '0\n' >"$temporary/active-runs"
+rm -rf "$fake_home/.dark-factory-backups"
 
 "$script" "$sha" >"$temporary/stdout" || fail "clean reinstall exited non-zero"
 backup=$(find "$fake_home/.dark-factory-backups" -name factory.sqlite3)
@@ -115,7 +146,6 @@ printf 'stray\n' >"$test_repository/.worktrees/build-$sha/stray"
 "$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "dirty worktree accepted"
 grep -q 'worktree not clean' "$temporary/stderr" || fail "dirty worktree: wrong refusal"
 [ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "dirty worktree: factoryctl invoked"
-[ "$(find "$fake_home/.dark-factory-backups" -name factory.sqlite3 | wc -l | tr -d ' ')" = 1 ] \
-    || fail "dirty worktree: backup taken"
+[ "$(backups)" = 1 ] || fail "dirty worktree: backup taken"
 
 echo "reinstall-service tests passed"

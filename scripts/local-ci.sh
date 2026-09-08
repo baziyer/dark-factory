@@ -12,6 +12,8 @@ echo "local-ci: repository contract fixtures"
 ./scripts/check-toolchain-pins.sh
 ./scripts/test-local-ci-environment.sh
 ./scripts/test-new-worktree.sh
+./scripts/test-reinstall-service.sh
+./scripts/test-deploy-site.sh
 ./scripts/test-github-step-summary.sh
 ./scripts/test-verify-adversarial-review.sh
 ./scripts/test-cloudflare-env.sh

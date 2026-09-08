@@ -24,13 +24,20 @@ esac
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 home="$HOME/.dark-factory"
 db="$home/factory.sqlite3"
+socket="$home/runtimes/factory.sock"
 worktree="$repository_root/.worktrees/build-$sha"
 bin="$repository_root/.worktrees/bin-$sha"
 relay_origin=wss://relay.darkfactory.build
 
+# Checked before the build and again right before the uninstall that would
+# kill a run the supervisor admitted while the build was running.
+refuse_active_runs() {
+    active=$(sqlite3 "$db" "SELECT count(*) FROM runs WHERE phase <> 'terminal'")
+    [ "$active" = 0 ] || { echo "refusing: $active non-terminal run(s) in $db" >&2; exit 1; }
+}
+
 [ -f "$db" ] || { echo "no store at $db" >&2; exit 1; }
-active=$(sqlite3 "$db" "SELECT count(*) FROM runs WHERE phase <> 'terminal'")
-[ "$active" = 0 ] || { echo "refusing: $active non-terminal run(s) in $db" >&2; exit 1; }
+refuse_active_runs
 
 git -C "$repository_root" fetch -q origin
 [ -d "$worktree" ] || git -C "$repository_root" worktree add -q --detach "$worktree" "$sha"
@@ -56,11 +63,26 @@ sqlite3 "$db" ".backup $backup/factory.sqlite3"
 chmod 600 "$backup/factory.sqlite3"
 echo "backup: $backup (user_version $(sqlite3 "$backup/factory.sqlite3" 'PRAGMA user_version'))"
 
+refuse_active_runs
 "$bin/factoryctl" service uninstall --home "$home"
+[ ! -e "$socket" ] || { echo "socket still present after uninstall: $socket" >&2; exit 1; }
 "$bin/factoryctl" service install --home "$home" --relay-origin "$relay_origin"
-sleep 3
+# launchd returns from bootstrap before factoryd listens, and factoryd opens
+# (and migrates) the store before it listens, so the socket appearing means
+# the migration finished. Bounded: a daemon that dies on a failed migration
+# never listens.
+waited=0
+until [ -S "$socket" ]; do
+    [ "$waited" -lt 300 ] || {
+        echo "factoryd did not listen on $socket within 60s" >&2
+        echo "check 'factoryctl service status --home $home' and the daemon log before restoring $backup" >&2
+        exit 1
+    }
+    sleep 0.2
+    waited=$((waited + 1))
+done
 "$bin/factoryctl" service status --home "$home"
-export DARK_FACTORY_SOCKET="$home/runtimes/factory.sock"
+export DARK_FACTORY_SOCKET="$socket"
 export DARK_FACTORY_OPERATOR_TOKEN_FILE="$home/operator.token"
 "$bin/factoryctl" web status
 "$bin/factoryctl" remote status

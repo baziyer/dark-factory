@@ -322,6 +322,7 @@ EOF
     "$local_fixture/scripts/go-check.sh"
 for local_child in \
     check-toolchain-pins.sh test-local-ci-environment.sh test-new-worktree.sh \
+    test-reinstall-service.sh test-deploy-site.sh \
     test-github-step-summary.sh test-verify-adversarial-review.sh \
     test-cloudflare-env.sh test-bootstrap-maintainer-v2.sh test-repository-settings.sh \
     test-local-ci-mode.sh test-go-gates.sh test-go-e2e-tools.sh go-ci-owned.sh \
