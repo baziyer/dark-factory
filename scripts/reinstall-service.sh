@@ -28,8 +28,13 @@ socket="$home/runtimes/factory.sock"
 worktree="$repository_root/.worktrees/build-$sha"
 bin="$repository_root/.worktrees/bin-$sha"
 # The receipt is the service manager's durable record of the exact plist it
-# installed. An absent member means the local-only service had no relay.
-relay_origin=$(sed -n 's/.*"relay_origin":"\([^"]*\)".*/\1/p' "$home.service/receipt" 2>/dev/null || :)
+# installed. Decode its JSON string before passing it back to factoryctl: Go's
+# encoder escapes HTML-significant bytes in a valid custom origin.
+relay_origin=$(perl -MJSON::PP -0777 -e '
+    my $receipt = eval { JSON::PP::decode_json(<>) };
+    exit unless ref $receipt eq "HASH" && defined $receipt->{relay_origin} && !ref $receipt->{relay_origin};
+    print $receipt->{relay_origin};
+' "$home.service/receipt" 2>/dev/null || :)
 
 # Dispatch must stay off while the script builds and replaces the service, so
 # the supervisor cannot admit work after this count is read.

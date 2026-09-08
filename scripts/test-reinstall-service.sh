@@ -253,6 +253,19 @@ printf '%s\n' \
 cmp -s "$temporary/expected-local.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
     || fail "local-only relay: factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+# The receipt comes from Go's JSON encoder, which escapes HTML-significant
+# bytes. Reinstall must restore the decoded, valid custom origin.
+printf '%s\n' '{"relay_origin":"wss://relay\u0026.example"}' >"$fake_home/.dark-factory.service/receipt"
+"$script" "$sha" >"$temporary/stdout" || fail "escaped relay origin reinstall exited non-zero"
+printf '%s\n' \
+    "service uninstall --home $fake_home/.dark-factory" \
+    "service install --home $fake_home/.dark-factory --relay-origin wss://relay&.example" \
+    "service status --home $fake_home/.dark-factory" \
+    "web status" \
+    "remote status" >"$temporary/expected-escaped.log"
+cmp -s "$temporary/expected-escaped.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
+    || fail "escaped relay origin: factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
 printf '{"relay_origin":"wss://relay.example"}\n' >"$fake_home/.dark-factory.service/receipt"
 
 # VCS metadata is provenance, not just a build option: both refusal paths must
