@@ -129,7 +129,11 @@ refuse_active_runs
 # before it closes the store and releases the home flock. A socket file that
 # nothing answers on is stale, and factoryd removes it on its next start.
 await previous_left uninstall_stalled
-"$bin/factoryctl" service install --home "$home" --relay-origin "$relay_origin"
+if [ -n "$relay_origin" ]; then
+    "$bin/factoryctl" service install --home "$home" --relay-origin "$relay_origin"
+else
+    "$bin/factoryctl" service install --home "$home"
+fi
 # launchd returns from bootstrap before factoryd listens, and factoryd opens
 # (and migrates) the store before it listens, so the socket accepting means
 # the migration finished. Bounded: a daemon that dies on a failed migration

@@ -128,6 +128,13 @@ case "$1 $2" in
         esac
         ;;
     "service install")
+        previous=""
+        for argument in "$@"; do
+            if [ "$previous" = "--relay-origin" ] && [ -z "$argument" ]; then
+                exit 64
+            fi
+            previous=$argument
+        done
         mkdir -p "$runtimes"
         [ -n "${DARK_FACTORY_TEST_INSTALL_DEAD-}" ] || {
             (cd "$runtimes" && /bin/sleep 0.2 && rm -f factory.sock && exec perl -MFcntl=:flock -MSocket -MIO::Socket::UNIX -e 'open my $lock, "+<", shift or die "$!\\n"; flock $lock, LOCK_EX or die "$!\\n"; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\\n"; while (my $c = $s->accept) { close $c }' "$HOME/.dark-factory/home.lock") &
@@ -232,6 +239,21 @@ cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
     || fail "factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
 grep -q '^user_version now: 7$' "$temporary/stdout" || fail "user_version not printed"
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+
+# An absent receipt member is a local-only install: factoryctl rejects an
+# empty relay argument, so reinstall must omit the flag rather than pass "".
+printf '{}\n' >"$fake_home/.dark-factory.service/receipt"
+"$script" "$sha" >"$temporary/stdout" || fail "local-only reinstall exited non-zero"
+printf '%s\n' \
+    "service uninstall --home $fake_home/.dark-factory" \
+    "service install --home $fake_home/.dark-factory" \
+    "service status --home $fake_home/.dark-factory" \
+    "web status" \
+    "remote status" >"$temporary/expected-local.log"
+cmp -s "$temporary/expected-local.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
+    || fail "local-only relay: factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+printf '{"relay_origin":"wss://relay.example"}\n' >"$fake_home/.dark-factory.service/receipt"
 
 # VCS metadata is provenance, not just a build option: both refusal paths must
 # stop before the backup or service change.
