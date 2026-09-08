@@ -6,13 +6,23 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 )
 
 type rowScanner interface {
 	Scan(...any) error
+}
+
+func activeRunCount(ctx context.Context, connection *sql.Conn, capacity uint16) (uint16, error) {
+	var count int64
+	if err := connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count active runs: %w", err)
+	}
+	if count < 0 || count > int64(capacity)+1 {
+		return 0, fmt.Errorf("%w: invalid active run count", ErrCorruptState)
+	}
+	return uint16(count), nil
 }
 
 // nullableBlob preserves SQL NULL separately from a present zero-length BLOB
@@ -352,16 +362,13 @@ func (store *Store) Snapshot(ctx context.Context) (DashboardSnapshot, error) {
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
-	var activeRuns int64
-	if err := tx.connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'`).Scan(&activeRuns); err != nil {
-		return DashboardSnapshot{}, fmt.Errorf("count active runs: %w", err)
-	}
-	if activeRuns < 0 || activeRuns > math.MaxUint16 {
-		return DashboardSnapshot{}, fmt.Errorf("%w: invalid active run count", ErrCorruptState)
+	activeRuns, err := activeRunCount(ctx, tx.connection, state.Capacity)
+	if err != nil {
+		return DashboardSnapshot{}, err
 	}
 	snapshot := DashboardSnapshot{
 		Head:    state.Head,
-		Factory: FactorySummary{DispatchEnabled: state.DispatchEnabled, Capacity: state.Capacity, ActiveRuns: uint16(activeRuns), Revision: state.Revision},
+		Factory: FactorySummary{DispatchEnabled: state.DispatchEnabled, Capacity: state.Capacity, ActiveRuns: activeRuns, Revision: state.Revision},
 	}
 	count := 0
 	projectRows, err := tx.connection.QueryContext(ctx, `SELECT id, name, revision FROM projects ORDER BY id LIMIT ?`, SnapshotEntityLimit+1)

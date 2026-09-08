@@ -234,6 +234,18 @@ func (store *Store) setFactory(ctx context.Context, expected Revision, at UnixMi
 	if at.Int64() < state.updatedAt.Int64() {
 		return FactoryState{}, tx.Rollback(ErrRevisionConflict)
 	}
+	if capacity < int64(state.Capacity) {
+		var activeWorkers int64
+		if err := tx.connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE phase <> 'terminal' AND role = 'worker'`).Scan(&activeWorkers); err != nil {
+			return FactoryState{}, tx.Rollback(fmt.Errorf("count active workers: %w", err))
+		}
+		if activeWorkers < 0 {
+			return FactoryState{}, tx.Rollback(fmt.Errorf("%w: invalid active worker count", ErrCorruptState))
+		}
+		if activeWorkers > capacity {
+			return FactoryState{}, tx.Rollback(ErrConflict)
+		}
+	}
 	result, err := tx.connection.ExecContext(ctx, `UPDATE factory SET dispatch_enabled = ?, capacity = ?, revision = revision + 1, updated_at_ms = ? WHERE singleton = 1 AND revision = ?`, dispatch, capacity, at.Int64(), expected.Int64())
 	if err != nil {
 		return FactoryState{}, tx.Rollback(err)

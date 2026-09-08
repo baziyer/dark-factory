@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math"
 )
 
 // PublicStateEntityLimit bounds one complete public read. It is a fail-closed
@@ -47,16 +46,13 @@ func (store *Store) ReadPublicSnapshot(ctx context.Context) (PublicSnapshot, err
 	if err := enforcePublicStateCount(ctx, tx.connection); err != nil {
 		return PublicSnapshot{}, err
 	}
-	var activeRuns int64
-	if err := tx.connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'`).Scan(&activeRuns); err != nil {
-		return PublicSnapshot{}, fmt.Errorf("count active runs: %w", err)
-	}
-	if activeRuns < 0 || activeRuns > math.MaxUint16 {
-		return PublicSnapshot{}, fmt.Errorf("%w: invalid active run count", ErrCorruptState)
+	activeRuns, err := activeRunCount(ctx, tx.connection, state.Capacity)
+	if err != nil {
+		return PublicSnapshot{}, err
 	}
 	snapshot := PublicSnapshot{
 		Head:    state.Head,
-		Factory: FactorySummary{DispatchEnabled: state.DispatchEnabled, Capacity: state.Capacity, ActiveRuns: uint16(activeRuns), Revision: state.Revision},
+		Factory: FactorySummary{DispatchEnabled: state.DispatchEnabled, Capacity: state.Capacity, ActiveRuns: activeRuns, Revision: state.Revision},
 	}
 	if snapshot.Projects, err = readPublicProjects(ctx, tx.connection); err != nil {
 		return PublicSnapshot{}, err

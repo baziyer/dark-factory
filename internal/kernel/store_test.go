@@ -679,6 +679,51 @@ func TestSnapshotAndPublicReadRejectHiddenControlsInPinnedSnapshot(t *testing.T)
 	}
 }
 
+func TestCapacityAllowsOneOverseerBeyondWorkersAndRejectsExcessSnapshots(t *testing.T) {
+	ctx := context.Background()
+	store, _, _ := runningOrchestratorRun(t)
+	defer store.Close()
+	addRunningRunOnStore(t, store, 180)
+	addRunningRunOnStore(t, store, 190)
+	state, err := store.Factory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.SetCapacity(ctx, state.Revision, 2, mustTime(t, 600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := []struct {
+		name string
+		read func() (FactorySummary, error)
+	}{
+		{"dashboard", func() (FactorySummary, error) { snapshot, err := store.Snapshot(ctx); return snapshot.Factory, err }},
+		{"public", func() (FactorySummary, error) {
+			snapshot, err := store.ReadPublicSnapshot(ctx)
+			return snapshot.Factory, err
+		}},
+	}
+	for _, read := range reads {
+		summary, err := read.read()
+		if err != nil || summary.Capacity != 2 || summary.ActiveRuns != 3 {
+			t.Fatalf("%s valid worker slots plus overseer = %+v, %v", read.name, summary, err)
+		}
+	}
+	before := captureWriteFootprint(t, store)
+	if _, err := store.SetCapacity(ctx, state.Revision, 1, mustTime(t, 601)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reduce below active workers = %v", err)
+	}
+	if after := captureWriteFootprint(t, store); after != before {
+		t.Fatalf("rejected capacity reduction changed footprint: before=%+v after=%+v", before, after)
+	}
+	corruptSQL(t, store, `UPDATE factory SET capacity = 1`)
+	for _, read := range reads {
+		if _, err := read.read(); !errors.Is(err, ErrCorruptState) {
+			t.Fatalf("%s excess active runs = %v", read.name, err)
+		}
+	}
+}
+
 func TestConcurrentOpenAndValidWriterReturnsBoundedSnapshotFailure(t *testing.T) {
 	// This is an intentionally large filesystem/SQLite continuity stress. The
 	// routine gate keeps deterministic snapshot checks; run this exact test
