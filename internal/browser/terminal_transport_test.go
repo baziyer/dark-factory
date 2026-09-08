@@ -620,6 +620,35 @@ func TestTerminalTransportACKProgressExtendsTimeoutWhileOutputRemains(t *testing
 	}
 }
 
+func TestTerminalACKAfterExpiredDeadlineCannotReviveTimer(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		sent, next uint64
+	}{
+		{name: "partial progress", sent: 2, next: 1},
+		{name: "caught up", sent: 1, next: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			timer := time.NewTimer(time.Hour)
+			t.Cleanup(func() { timer.Stop() })
+			current := &connection{
+				server:            &Server{terminalAckTimeout: time.Hour},
+				attachment:        &terminalTestAttachment{},
+				terminalAttach:    browserprotocol.TerminalAttach{SessionID: projectID},
+				terminalSent:      test.sent,
+				terminalAckTimer:  timer,
+				terminalAckExpiry: time.Now().Add(-time.Nanosecond),
+			}
+			if current.handleTerminalAck(browserprotocol.TerminalAck{SessionID: projectID, NextSequence: browserprotocol.Decimal(test.next)}) {
+				t.Fatal("late ACK revived an expired timer")
+			}
+			if current.terminalAck != 0 || current.terminalAckTimer != timer {
+				t.Fatalf("late ACK changed terminal state: ack=%d timer=%p", current.terminalAck, current.terminalAckTimer)
+			}
+		})
+	}
+}
+
 func TestTerminalTransportResetAndDetachJoinAttachment(t *testing.T) {
 	backend := newTerminalTestBackend()
 	backend.authentication.Capabilities = browserprotocol.CapabilityObserve | browserprotocol.CapabilityTerminalInput
