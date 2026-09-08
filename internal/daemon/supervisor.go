@@ -12,6 +12,11 @@ import (
 const (
 	supervisorReconcileAttempts  = 3
 	supervisorStoreAttemptWindow = 250 * time.Millisecond
+	// ponytail: 8 seconds is the retained-tree scan ceiling for 1 GiB of worker
+	// output; replace it with a measured per-byte deadline if valid trees need
+	// longer. It stays separate from one SQLite operation so a large change can
+	// reach its visible settlement.
+	supervisorInspectionWindow = 8 * time.Second
 )
 
 // SupervisorSpec supplies the external installation and filesystem

@@ -57,6 +57,104 @@ func TestSettleRunFinalizesOrchestratorAndReplaysTerminal(t *testing.T) {
 	}
 }
 
+func TestSettleRunAllowsAFullRetainedTreeScan(t *testing.T) {
+	fixture := newRecoveryFixtureWithRole(t, 0x68, kernel.RoleWorker)
+	ctx := context.Background()
+	changeState, found, err := fixture.store.Change(ctx, *fixture.run.ChangeID)
+	if err != nil || !found {
+		t.Fatalf("change: found=%v err=%v", found, err)
+	}
+	format, err := change.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := change.NewObjectID(format, bytes.Repeat([]byte{0x55}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("right\n")
+	sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(content))), content...))
+	oid, err := change.NewObjectID(format, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := change.NewEntry([]byte("nested/a"), "100644", uint64(len(content)), oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := change.NewManifest(format, base, []change.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := change.Prepare(ctx, fixture.changeParent, changeState.ID.String(), changeState.ID.String()+".stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := prepared.PopulateAndPublish(ctx, manifest, func(context.Context, change.ObjectID) ([]byte, error) { return bytes.Clone(content), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(published.Path()); err != nil {
+		t.Fatalf("published tree: %v", err)
+	}
+	facts := published.Facts()
+	large := filepath.Join(published.Path(), "generated.bin")
+	largeFile, err := os.OpenFile(large, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := largeFile.Truncate(1 << 30); err != nil {
+		_ = largeFile.Close()
+		t.Fatal(err)
+	}
+	if err := largeFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := kernelStageIdentity(prepared.Identity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernelFormat, err := kernel.NewObjectFormat("sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := kernel.NewCommitID(kernelFormat, base.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := kernel.TreeDigestFromBytes(facts.Commitment().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := kernel.NewFileIdentity(7, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := kernel.NewChangeSelection(kernelFormat, commit, digest, uint32(facts.EntryCount()), facts.BlobBytes(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := fixture.store.RecordChangePrepared(ctx, changeState.ID, changeState.Revision, selection, tree, mustKernelTime(t, 300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	availability, err := kernelAvailability(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.MarkChangeAvailable(ctx, changeState.ID, recorded.Revision, availability, mustKernelTime(t, 310)); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.failBeforeRuntime(t)
+	settled, err := fixture.daemon.settleRun(fixture.changeParent, fixture.run.ID)
+	if err != nil || settled.Phase != kernel.RunTerminal || settled.Terminal == nil {
+		t.Fatalf("large retained settlement = %+v, %v", settled, err)
+	}
+}
+
 func TestSettleRunAbandonsUnpublishedWorkerChange(t *testing.T) {
 	fixture := newRecoveryFixtureWithRole(t, 0x70, kernel.RoleWorker)
 	fixture.failBeforeRuntime(t)
