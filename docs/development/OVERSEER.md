@@ -340,9 +340,17 @@ itself runs only in the merge queue, so it is never the signal here.
 
 ## 6. Hand off and finish
 
-If a merged PR touched `cmd/` or `internal/`, the live service needs a
-reinstall, and if it touched `web/`, the site needs a re-vendor; raise one
-human request naming the merge commit and which of the two applies, then wait
+If a merged PR touched `cmd/` or `internal/`, it may need a live-service
+reinstall, and if it touched `web/`, it may need a site re-vendor. Before a
+runtime reinstall request, inspect `go version -m "$DARK_FACTORY_FACTORYCTL"`.
+With its exact `vcs.revision` as `installed`, run `git -C repo fetch origin "$installed" "<merge-commit>"`, then verify each with `git -C repo rev-parse --verify "<revision>^{commit}"`. Run `git -C repo merge-base --is-ancestor
+<merge-commit> "$installed"`: status 0 means that merge is already installed,
+so skip that request and never recommend an older merge; only status 1 says it
+is absent. Require `vcs.modified=false`; missing, malformed, or modified
+metadata, a fetch or verification failure, or any other ancestry error warrants
+a human request to verify the installed source, not a claim that the merge is
+absent. If the runtime merge is absent, or the site needs a re-vendor, raise
+one human request naming the merge commit and applicable deployment, then wait
 as below. A
 worker run whose tree the daemon refused ends failed with the reason and
 leaves the tree at `$home/changes/<change_id>.refused-<run8>` for a person
