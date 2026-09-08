@@ -36,6 +36,43 @@ refuse_active_runs() {
     [ "$active" = 0 ] || { echo "refusing: $active non-terminal run(s) in $db" >&2; exit 1; }
 }
 
+# A connect, as the service e2e probes: nc -z cannot scan Unix sockets on macOS.
+listening() {
+    perl -MIO::Socket::UNIX -e 'exit !IO::Socket::UNIX->new(Peer => shift)' "$socket" 2>/dev/null
+}
+# The service e2e's census: launchd forgetting the job and the listener closing
+# do not prove factoryd has released the home, so nothing naming the home may
+# survive before a second owner starts. This script's own argv may name it.
+# ponytail: pgrep -f also matches an operator's own tail -f on a home file;
+# the timeout lists the survivors and a rerun recovers.
+survivors() {
+    pgrep -fl "$home" | grep -v "^$$ "
+}
+previous_left() {
+    ! listening && ! survivors >/dev/null
+}
+# Polls the predicate for up to 60 x 1s, then hands over to the timeout handler.
+await() {
+    waited=0
+    until "$1"; do
+        [ "$waited" -lt 60 ] || "$2"
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+uninstall_stalled() {
+    echo "the previous factoryd has not left $home within 60s; the service is uninstalled" >&2
+    survivors >&2 || echo "$socket still accepts connections" >&2
+    echo "rerun once it has exited" >&2
+    exit 1
+}
+install_stalled() {
+    echo "factoryd did not listen on $socket within 60s" >&2
+    echo "check 'factoryctl service status --home $home' and the daemon log; after a failed migration" >&2
+    echo "restore $backup/factory.sqlite3 over $db, remove $db-wal and $db-shm, and reinstall the previous bin-*" >&2
+    exit 1
+}
+
 [ -f "$db" ] || { echo "no store at $db" >&2; exit 1; }
 refuse_active_runs
 
@@ -65,26 +102,20 @@ echo "backup: $backup (user_version $(sqlite3 "$backup/factory.sqlite3" 'PRAGMA 
 
 refuse_active_runs
 "$bin/factoryctl" service uninstall --home "$home"
-[ ! -e "$socket" ] || { echo "socket still present after uninstall: $socket" >&2; exit 1; }
+# bootout returns once launchd forgets the job; factoryd unlinks its socket
+# before it closes the store and releases the home flock. A socket file that
+# nothing answers on is stale, and factoryd removes it on its next start.
+await previous_left uninstall_stalled
 "$bin/factoryctl" service install --home "$home" --relay-origin "$relay_origin"
 # launchd returns from bootstrap before factoryd listens, and factoryd opens
-# (and migrates) the store before it listens, so the socket appearing means
+# (and migrates) the store before it listens, so the socket accepting means
 # the migration finished. Bounded: a daemon that dies on a failed migration
 # never listens.
-waited=0
-until [ -S "$socket" ]; do
-    [ "$waited" -lt 300 ] || {
-        echo "factoryd did not listen on $socket within 60s" >&2
-        echo "check 'factoryctl service status --home $home' and the daemon log before restoring $backup" >&2
-        exit 1
-    }
-    sleep 0.2
-    waited=$((waited + 1))
-done
+await listening install_stalled
 "$bin/factoryctl" service status --home "$home"
 export DARK_FACTORY_SOCKET="$socket"
 export DARK_FACTORY_OPERATOR_TOKEN_FILE="$home/operator.token"
 "$bin/factoryctl" web status
 "$bin/factoryctl" remote status
 echo "user_version now: $(sqlite3 "$db" 'PRAGMA user_version')"
-echo "binaries: $bin (keep the previous bin-* for rollback; after a failed migration restore $backup)"
+echo "binaries: $bin (keep the previous bin-* for rollback; after a failed migration restore $backup/factory.sqlite3 over $db and remove $db-wal and $db-shm)"

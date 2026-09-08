@@ -7,6 +7,9 @@ set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-deploy-site-test.XXXXXX")
+# macOS sets TMPDIR with a trailing slash; the fakes record $PWD, which cd
+# canonicalizes, so the expected paths must be canonical too.
+temporary=$(cd "$temporary" && pwd)
 trap 'rm -rf "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM
 

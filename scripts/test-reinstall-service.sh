@@ -6,8 +6,10 @@ set -eu
 # binaries, so no case builds, backs up, or touches launchd.
 
 repository_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
-temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-reinstall-service-test.XXXXXX")
-trap 'rm -rf "$temporary"' EXIT
+# Under /private/tmp like the package smoke: the fake daemon's socket path
+# must fit a Unix socket address, which a deep TMPDIR does not.
+temporary=$(mktemp -d /private/tmp/dark-factory-reinstall-service-test.XXXXXX)
+trap 'kill $(cat "$temporary/pids" 2>/dev/null) 2>/dev/null || true; rm -rf "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM
 
 fail() {
@@ -33,6 +35,7 @@ sha=$(git -C "$test_repository" rev-parse HEAD)
 
 printf 'live store\n' >"$fake_home/.dark-factory/factory.sqlite3"
 printf '0\n' >"$temporary/active-runs"
+: >"$temporary/pids"
 
 # go build writes a stub that records the build tree's HEAD and execs the fake
 # factoryctl; go version -m prints the stub so the vcs.* checks see it. With
@@ -66,26 +69,60 @@ case "$2" in
     *) exit 1 ;;
 esac
 FAKE
-# service install leaves a real socket behind the way factoryd does once its
-# store is open; service uninstall removes it the way the daemon's close does.
+# The daemon's socket lifetime: service install returns at once, and only
+# after a real /bin/sleep (the store opening and migrating) does the listener
+# remove a stale socket and bind, the way launchd returns before factoryd
+# does; service uninstall stops it and removes the socket. web status and remote
+# status dial the socket the real client is pointed at. Two knobs select an
+# unclean exit: DARK_FACTORY_TEST_UNINSTALL_LEAVES=stale keeps the socket file
+# with nothing answering (a SIGKILLed daemon), =listening keeps the listener
+# itself, =process replaces it with a tail -f naming the home;
+# DARK_FACTORY_TEST_INSTALL_DEAD installs a daemon that never listens.
 cat >"$fake_bin/factoryctl" <<'FAKE'
 #!/bin/sh
 set -eu
 echo "$*" >>"$DARK_FACTORY_TEST_FACTORYCTL_LOG"
-sock=$HOME/.dark-factory/runtimes/factory.sock
+runtimes=$HOME/.dark-factory/runtimes
+stop() {
+    kill $(cat "$DARK_FACTORY_TEST_PIDS") 2>/dev/null || true
+    : >"$DARK_FACTORY_TEST_PIDS"
+}
 case "$1 $2" in
-    "service uninstall") rm -f "$sock" ;;
+    "service uninstall")
+        case "${DARK_FACTORY_TEST_UNINSTALL_LEAVES-}" in
+            stale) stop ;;
+            listening) ;;
+            process)
+                stop
+                rm -f "$runtimes/factory.sock"
+                tail -f "$HOME/.dark-factory/factory.sqlite3" >/dev/null 2>&1 &
+                echo $! >>"$DARK_FACTORY_TEST_PIDS"
+                ;;
+            *) stop; rm -f "$runtimes/factory.sock" ;;
+        esac
+        ;;
     "service install")
-        mkdir -p "$(dirname "$sock")"
-        cd "$(dirname "$sock")"
-        perl -MSocket -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\n"'
+        mkdir -p "$runtimes"
+        [ -n "${DARK_FACTORY_TEST_INSTALL_DEAD-}" ] || {
+            (cd "$runtimes" && /bin/sleep 0.2 && rm -f factory.sock && exec perl -MSocket -MIO::Socket::UNIX -e 'my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => "factory.sock", Listen => 1) or die "$!\n"; while (my $c = $s->accept) { close $c }') &
+            echo $! >>"$DARK_FACTORY_TEST_PIDS"
+        }
+        ;;
+    "web status" | "remote status")
+        perl -MIO::Socket::UNIX -e 'exit !IO::Socket::UNIX->new(Peer => shift)' "$DARK_FACTORY_SOCKET"
         ;;
 esac
 FAKE
+# The script's bounded waits poll 60 times with sleep between. A no-op sleep
+# makes a timeout case take about a second (macOS stretches short real sleeps
+# to well over 100 ms), and the probe each poll spawns still outlasts the fake
+# listener's 200 ms of startup.
+printf '#!/bin/sh\n' >"$fake_bin/sleep"
 chmod 755 "$fake_bin"/*
 export PATH="$fake_bin:$PATH" HOME="$fake_home"
 export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
+export DARK_FACTORY_TEST_PIDS="$temporary/pids"
 script=$test_repository/scripts/reinstall-service.sh
 
 backups() {
@@ -95,6 +132,10 @@ backups() {
 untouched() {
     [ "$(backups)" = 0 ] || fail "$1: backup taken"
     [ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "$1: factoryctl invoked"
+}
+not_installed() {
+    grep -q '^service install' "$DARK_FACTORY_TEST_FACTORYCTL_LOG" && fail "$1: service installed anyway"
+    rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
 }
 
 "$script" >/dev/null 2>"$temporary/stderr" && fail "no argument accepted"
@@ -140,12 +181,42 @@ printf '%s\n' \
 cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
     || fail "factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
 grep -q '^user_version now: 7$' "$temporary/stdout" || fail "user_version not printed"
-
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+
+# A socket file nothing answers on is stale, not a reason to stay uninstalled.
+DARK_FACTORY_TEST_UNINSTALL_LEAVES=stale "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    || fail "stale socket after uninstall refused: $(cat "$temporary/stderr")"
+cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
+    || fail "stale socket: factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+
+# A listener still accepting is the previous daemon still owning the home.
+DARK_FACTORY_TEST_UNINSTALL_LEAVES=listening "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "accepting socket after uninstall accepted"
+grep -q 'has not left' "$temporary/stderr" || fail "accepting socket: wrong refusal"
+grep -q 'still accepts' "$temporary/stderr" || fail "accepting socket: socket not named"
+not_installed "accepting socket"
+
+# So is any process naming the home, socket or not.
+DARK_FACTORY_TEST_UNINSTALL_LEAVES=process "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "process naming the home after uninstall accepted"
+grep -q 'has not left' "$temporary/stderr" || fail "surviving process: wrong refusal"
+grep -q 'tail -f' "$temporary/stderr" || fail "surviving process: not listed"
+not_installed "surviving process"
+
+# A daemon that dies before listening (a failed migration) must time out with
+# the restore instruction, not report success.
+DARK_FACTORY_TEST_INSTALL_DEAD=1 "$script" "$sha" >/dev/null 2>"$temporary/stderr" \
+    && fail "daemon that never listens accepted"
+grep -q 'did not listen' "$temporary/stderr" || fail "daemon that never listens: wrong refusal"
+grep -q "restore $fake_home/.dark-factory-backups/.*/factory.sqlite3 over .*factory.sqlite3-shm" "$temporary/stderr" \
+    || fail "daemon that never listens: restore instruction not printed"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+
+rm -rf "$fake_home/.dark-factory-backups"
 printf 'stray\n' >"$test_repository/.worktrees/build-$sha/stray"
 "$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "dirty worktree accepted"
 grep -q 'worktree not clean' "$temporary/stderr" || fail "dirty worktree: wrong refusal"
-[ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "dirty worktree: factoryctl invoked"
-[ "$(backups)" = 1 ] || fail "dirty worktree: backup taken"
+untouched "dirty worktree"
 
 echo "reinstall-service tests passed"
