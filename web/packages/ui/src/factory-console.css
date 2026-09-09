@@ -772,9 +772,14 @@
   position: static;
   flex: none;
   width: auto;
-  height: min(34rem, 52svh);
-  min-height: 22rem;
+  height: auto;
+  min-height: 0;
   margin: 0;
+}
+
+.dfCompactConsole .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal {
+  flex: 0 0 auto;
+  min-height: clamp(12rem, 30svh, 22rem);
 }
 
 .dfCompactConsole .dfConsoleSidebar__section { margin-top: 0.75rem; padding-top: 0.75rem; }
