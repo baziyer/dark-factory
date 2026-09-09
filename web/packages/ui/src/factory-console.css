@@ -40,7 +40,7 @@
 .dfConsoleDialog *,
 .dfConsoleDialog *::before,
 .dfConsoleDialog *::after {
-  box-sizing: inherit;
+  box-sizing: border-box;
 }
 
 .dfFactoryConsole__visuallyHidden {
