@@ -223,8 +223,9 @@ function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView
 function TaskHistory({ terminal, onRefresh, onLoadConversation, onLoadOlderConversation }: { terminal: FactoryTerminalView; onRefresh: () => void; onLoadConversation: () => void; onLoadOlderConversation: () => void }) {
   const history = terminal.history;
   return (
-    <section className="dfFactoryConsole__history" aria-label="Task control history">
-      <div className="dfFactoryConsole__historyHeading"><h3>HISTORY</h3><button type="button" disabled={terminal.historyPending} onClick={onRefresh}>{terminal.historyPending ? "LOADING" : "REFRESH"}</button><button type="button" disabled={terminal.taskDetailPending} onClick={onLoadConversation}>{terminal.taskDetailPending ? "LOADING" : "VIEW CONVERSATION"}</button></div>
+    <details className="dfFactoryConsole__history" aria-label="Task control history">
+      <summary>HISTORY</summary>
+      <div className="dfFactoryConsole__historyHeading"><button type="button" disabled={terminal.historyPending} onClick={onRefresh}>{terminal.historyPending ? "LOADING" : "REFRESH"}</button><button type="button" disabled={terminal.taskDetailPending} onClick={onLoadConversation}>{terminal.taskDetailPending ? "LOADING" : "VIEW CONVERSATION"}</button></div>
       {history === undefined || history.entries.length === 0 ? <p className="dfFactoryConsole__instructionState">{terminal.historyPending ? "LOADING RECEIPTS" : "NO DURABLE CONTROLS YET"}</p> : (
         <ol>
           {history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span></li>)}
@@ -232,7 +233,7 @@ function TaskHistory({ terminal, onRefresh, onLoadConversation, onLoadOlderConve
       )}
 		{terminal.taskDetailError === undefined ? null : <p role="alert">THE FACTORY REFUSED THIS HISTORY</p>}
 		{terminal.taskDetail === undefined ? null : <TaskConversation brief={terminal.taskDetail} pending={terminal.taskDetailPending} onOlder={terminal.taskDetail.nextPeerOffset === undefined ? undefined : onLoadOlderConversation} />}
-    </section>
+    </details>
   );
 }
 

@@ -125,6 +125,16 @@ test("a definite steering refusal is visible", () => {
   assert.match(markup, />CONTROL NOT SENT</);
 });
 
+test("active task control history stays mounted in a native disclosure", () => {
+  const markup = renderToStaticMarkup(createElement(TerminalContent, {
+    terminal: terminalView({ taskTitle: "Standing inspection", controlReady: true }),
+    controller: {},
+  }));
+  assert.match(markup, /<details class="dfFactoryConsole__history" aria-label="Task control history"><summary>HISTORY<\/summary>/);
+  assert.match(markup, />REFRESH<\/button>/);
+  assert.match(markup, />VIEW CONVERSATION<\/button>/);
+});
+
 test("a controller-owned draft and refusal survive the composer changing to a follow-up", () => {
   const markup = renderToStaticMarkup(createElement(AgentInstruction, {
     terminal: terminalView({ instructionDraft: "Keep this task", instructionError: { code: "stale" }, taskTitle: "Standing inspection" }),
