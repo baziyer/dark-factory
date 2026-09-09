@@ -237,7 +237,14 @@ func (store *Store) PeerQuestionsForTask(ctx context.Context, taskID TaskID, off
 		return nil, nil, err
 	}
 	defer read.Close()
-	rows, err := read.connection.QueryContext(ctx, `SELECT `+peerQuestionColumns+` FROM peer_questions WHERE source_task_id=? OR target_task_id=? ORDER BY created_at_ms DESC,id DESC LIMIT 2 OFFSET ?`, taskID.Bytes(), taskID.Bytes(), int64(offset))
+	return peerQuestionsForTask(ctx, read.connection, taskID, offset)
+}
+
+func peerQuestionsForTask(ctx context.Context, connection *sql.Conn, taskID TaskID, offset uint64) ([]PeerQuestion, *uint64, error) {
+	if offset > uint64(^uint64(0)>>1)-1 {
+		return nil, nil, ErrInvalidValue
+	}
+	rows, err := connection.QueryContext(ctx, `SELECT `+peerQuestionColumns+` FROM peer_questions WHERE source_task_id=? OR target_task_id=? ORDER BY created_at_ms DESC,id DESC LIMIT 2 OFFSET ?`, taskID.Bytes(), taskID.Bytes(), int64(offset))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -256,6 +263,62 @@ func (store *Store) PeerQuestionsForTask(ctx context.Context, taskID TaskID, off
 			return result, &next, nil
 		}
 		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return result, nil, nil
+}
+
+// PeerTargetsForAttempt exposes only current same-project worker tasks so a
+// worker can choose an asynchronous collaborator without learning task text.
+func (store *Store) PeerTargetsForAttempt(ctx context.Context, digest AttemptDigest, offset uint64) ([]PeerTarget, *uint64, error) {
+	if offset > uint64(^uint64(0)>>1)-4 {
+		return nil, nil, ErrInvalidValue
+	}
+	read, err := store.beginRead(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer read.Close()
+	run, found, err := runByDigest(ctx, read.connection, digest)
+	if err != nil || !found {
+		if err == nil {
+			err = ErrUnauthorized
+		}
+		return nil, nil, err
+	}
+	if run.Role != RoleWorker || run.Phase != RunRunning || run.CredentialRevokedAt != nil {
+		return nil, nil, ErrUnauthorized
+	}
+	rows, err := read.connection.QueryContext(ctx, `SELECT t.id, t.assigned_agent_id, a.name, t.title, t.status, t.revision
+		FROM tasks AS t JOIN agents AS a ON a.id=t.assigned_agent_id AND a.project_id=t.project_id
+		WHERE t.project_id=? AND t.id<>? AND a.role='worker' AND a.provider='codex' AND t.status IN ('queued','running')
+		ORDER BY t.priority DESC,t.created_at_ms,t.id LIMIT 5 OFFSET ?`, run.ProjectID.Bytes(), run.TaskID.Bytes(), int64(offset))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	result := []PeerTarget{}
+	for rows.Next() {
+		var rawTask, rawAgent []byte
+		var name, title, status string
+		var revision int64
+		if err := rows.Scan(&rawTask, &rawAgent, &name, &title, &status, &revision); err != nil {
+			return nil, nil, err
+		}
+		taskID, e1 := TaskIDFromBytes(rawTask)
+		agentID, e2 := AgentIDFromBytes(rawAgent)
+		state, e3 := parseTaskStatus(status)
+		rev, e4 := NewRevision(revision)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil || !utf8TextWithin(name, 1, 128) || !utf8TextWithin(title, 1, 1024) {
+			return nil, nil, ErrCorruptState
+		}
+		if len(result) == 4 {
+			next := offset + 4
+			return result, &next, nil
+		}
+		result = append(result, PeerTarget{TaskID: taskID, AgentID: agentID, Name: name, Title: title, Status: state, Revision: rev})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
@@ -308,13 +371,10 @@ func (store *Store) ReservePeerDelivery(ctx context.Context, questionID PeerQues
 		return PeerDelivery{}, false, tx.Rollback(ErrUnauthorized)
 	}
 	if existing != nil {
-		if *existing != deliveryID {
-			return PeerDelivery{}, false, tx.Rollback(ErrConflict)
-		}
 		if err := tx.Rollback(nil); err != nil {
 			return PeerDelivery{}, false, err
 		}
-		return PeerDelivery{QuestionID: question.ID, RunID: run.ID, Provider: run.Provider, DeliveryID: deliveryID, Revision: question.Revision, Payload: payload, Answer: answer}, false, nil
+		return PeerDelivery{QuestionID: question.ID, RunID: run.ID, Provider: run.Provider, DeliveryID: *existing, Revision: question.Revision, Payload: payload, Answer: answer}, false, nil
 	}
 	if state != PeerDeliveryPending {
 		return PeerDelivery{}, false, tx.Rollback(ErrCorruptState)

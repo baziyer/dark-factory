@@ -1,0 +1,32 @@
+package api
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestPeerStatusEscapesTerminalControlsAndKeepsEmptyLists(t *testing.T) {
+	status := PeerStatus{Targets: []PeerTarget{}, Questions: []PeerQuestion{}}
+	encoded, err := status.MarshalJSON()
+	if err != nil || string(encoded) != `{"targets":[],"questions":[],"next_target_offset":null,"next_offset":null}` {
+		t.Fatalf("empty status=%s %v", encoded, err)
+	}
+	status.Questions = append(status.Questions, PeerQuestion{ID: "0123456789abcdef0123456789abcdef", SourceTaskID: "1123456789abcdef0123456789abcdef", TargetTaskID: "2123456789abcdef0123456789abcdef", Question: "\x1b\u009b", RecipientDeliveryState: "pending", AnswerDeliveryState: "pending", Revision: 1})
+	encoded, err = status.MarshalJSON()
+	if err != nil || bytes.Contains(encoded, []byte{0x1b, 0xc2, 0x9b}) || !bytes.Contains(encoded, []byte(`\u009b`)) {
+		t.Fatalf("terminal unsafe status=%q %v", encoded, err)
+	}
+}
+
+func TestPeerStatusWorstEscapedPageFitsControlFrame(t *testing.T) {
+	control := strings.Repeat("\u009b", 2048)
+	status := PeerStatus{Targets: []PeerTarget{}, Questions: []PeerQuestion{{ID: "0123456789abcdef0123456789abcdef", SourceTaskID: "1123456789abcdef0123456789abcdef", TargetTaskID: "2123456789abcdef0123456789abcdef", Question: control, Answer: control, RecipientDeliveryState: "pending", AnswerDeliveryState: "pending", RecipientAvailability: "available", AnswerAvailability: "pending", Revision: 1}}}
+	for i := 0; i < 4; i++ {
+		status.Targets = append(status.Targets, PeerTarget{TaskID: "3123456789abcdef0123456789abcdef", AgentID: "4abcdef0123456789abcdef012345678", Name: strings.Repeat("\u009b", 128), Title: strings.Repeat("\u009b", 1024), Status: "queued", Revision: 1})
+	}
+	encoded, err := status.MarshalJSON()
+	if err != nil || len(encoded) >= 64<<10 {
+		t.Fatalf("encoded peer page=%d %v", len(encoded), err)
+	}
+}

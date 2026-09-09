@@ -446,7 +446,15 @@ type PeerAnswerInput struct {
 }
 
 type PeerStatus struct {
-	Questions []PeerQuestion `json:"questions"`
+	Targets          []PeerTarget   `json:"targets"`
+	Questions        []PeerQuestion `json:"questions"`
+	NextTargetOffset *uint64        `json:"next_target_offset"`
+	NextOffset       *uint64        `json:"next_offset"`
+}
+
+type PeerStatusInput struct {
+	Offset       uint64 `json:"offset"`
+	TargetOffset uint64 `json:"target_offset"`
 }
 
 // Peer status is printed in an authenticated provider terminal.
@@ -472,9 +480,23 @@ type PeerQuestion struct {
 	Revision               uint64 `json:"revision"`
 }
 
+type PeerTarget struct {
+	TaskID   string `json:"task_id"`
+	AgentID  string `json:"agent_id"`
+	Name     string `json:"name"`
+	Title    string `json:"title"`
+	Status   string `json:"status"`
+	Revision uint64 `json:"revision"`
+}
+
 func validPeerStatus(status PeerStatus) bool {
-	if len(status.Questions) > 1 {
+	if status.Targets == nil || status.Questions == nil || len(status.Targets) > 4 || len(status.Questions) > 1 || status.NextOffset != nil && *status.NextOffset == 0 || status.NextTargetOffset != nil && *status.NextTargetOffset == 0 {
 		return false
+	}
+	for _, target := range status.Targets {
+		if !validID(target.TaskID) || !validID(target.AgentID) || !validText(target.Name, 1, 128) || !validText(target.Title, 1, 1024) || !validTaskStatus(target.Status) || target.Revision == 0 {
+			return false
+		}
 	}
 	for _, question := range status.Questions {
 		if !validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) || question.RecipientAvailability != "" && !validPeerAvailability(question.RecipientAvailability) || question.AnswerAvailability != "" && !validPeerAvailability(question.AnswerAvailability) {

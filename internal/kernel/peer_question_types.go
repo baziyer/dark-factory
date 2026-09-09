@@ -93,3 +93,14 @@ type PeerDelivery struct {
 	Payload    []byte `json:"-"`
 	Answer     bool
 }
+
+// PeerTarget is the bounded, non-private same-project worker directory. Task
+// bodies, results, and terminal controls intentionally have no fields here.
+type PeerTarget struct {
+	TaskID   TaskID
+	AgentID  AgentID
+	Name     string
+	Title    string
+	Status   TaskStatus
+	Revision Revision
+}

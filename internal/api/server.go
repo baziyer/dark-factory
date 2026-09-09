@@ -73,6 +73,8 @@ type Call struct {
 	humanQuestion     HumanQuestionInput
 	peerQuestion      PeerQuestionInput
 	peerAnswer        PeerAnswerInput
+	peerStatusOffset  uint64
+	peerTargetOffset  uint64
 	sendBack          SendBackInput
 	overseerTask      OverseerTaskCreateInput
 	overseerSnapshot  OverseerSnapshotInput
@@ -173,6 +175,9 @@ func (call Call) PeerQuestionInput() (PeerQuestionInput, bool) {
 }
 func (call Call) PeerAnswerInput() (PeerAnswerInput, bool) {
 	return call.peerAnswer, call.kind == CallPeerAnswer
+}
+func (call Call) PeerStatusOffsets() (uint64, uint64, bool) {
+	return call.peerStatusOffset, call.peerTargetOffset, call.kind == CallPeerStatus
 }
 
 // SendBackInput is the task and note of a send-back, from an orchestrator's
@@ -595,9 +600,11 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 			return Call{}, RemoteInvalidRequest
 		}
 	case CallPeerStatus:
-		if err := decodeExact(request.Params, &struct{}{}); err != nil {
+		var input PeerStatusInput
+		if err := decodeExact(request.Params, &input); err != nil || input.Offset > uint64(^uint64(0)>>1)-1 || input.TargetOffset > uint64(^uint64(0)>>1)-4 {
 			return Call{}, RemoteInvalidRequest
 		}
+		call.peerStatusOffset, call.peerTargetOffset = input.Offset, input.TargetOffset
 	case CallPeerAsk:
 		if err := decodeExact(request.Params, &call.peerQuestion); err != nil || !validID(call.peerQuestion.TargetTaskID) || !validID(call.peerQuestion.IdempotencyKey) || !validText(call.peerQuestion.Question, 1, 2048) {
 			return Call{}, RemoteInvalidRequest

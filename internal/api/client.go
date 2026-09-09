@@ -248,8 +248,15 @@ func (client *AttemptClient) RequestHuman(ctx context.Context, input HumanQuesti
 }
 
 func (client *AttemptClient) PeerStatus(ctx context.Context) (PeerStatus, error) {
+	return client.PeerStatusPage(ctx, 0, 0)
+}
+
+func (client *AttemptClient) PeerStatusPage(ctx context.Context, offset, targetOffset uint64) (PeerStatus, error) {
+	if offset > uint64(^uint64(0)>>1)-1 || targetOffset > uint64(^uint64(0)>>1)-4 {
+		return PeerStatus{}, ErrInvalidInput
+	}
 	var result PeerStatus
-	if err := client.client.call(ctx, "peer_status", struct{}{}, &result); err != nil {
+	if err := client.client.call(ctx, "peer_status", PeerStatusInput{Offset: offset, TargetOffset: targetOffset}, &result); err != nil {
 		return PeerStatus{}, err
 	}
 	if !validPeerStatus(result) {
@@ -874,8 +881,10 @@ func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
 			return false
 		}
 	}
-	if !validPeerStatus(PeerStatus{Questions: snapshot.PeerQuestions}) {
-		return false
+	for _, question := range snapshot.PeerQuestions {
+		if !validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) {
+			return false
+		}
 	}
 	for _, item := range snapshot.History {
 		if !validID(item.OperationID) || !validID(item.TaskID) || !validID(item.RunID) || item.SuccessorTaskID != "" && !validID(item.SuccessorTaskID) || (item.Kind != "message" && item.Kind != "interrupt" && item.Kind != "stop" && item.Kind != "replace") || (item.Actor != "operator" && item.Actor != "orchestrator") || !validText(item.Payload, 0, kernel.MaxTaskInterventionPayloadBytes) || (item.State != "pending" && item.State != "delivered" && item.State != "unknown" && item.State != "rejected") || !validText(item.Detail, 0, 4096) {

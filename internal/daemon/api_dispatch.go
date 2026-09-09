@@ -261,11 +261,7 @@ func (daemon *Daemon) attemptTask(ctx context.Context, call api.Call) api.Reply 
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
-	task := authority.Task()
-	if authority.Provider == kernel.ProviderCodex {
-		task += "\n\nPeer collaboration is asynchronous. Use `factoryctl attempt peer status` to read task-linked questions or answers; it grants no terminal or task-control authority."
-	}
-	reply, err := api.NewAttemptTaskReply(api.AttemptTask{Task: task})
+	reply, err := api.NewAttemptTaskReply(api.AttemptTask{Task: authority.Task()})
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
@@ -288,11 +284,22 @@ func (daemon *Daemon) peerStatus(ctx context.Context, call api.Call) api.Reply {
 		}
 		return newErrorReply(remoteErrorCode(err))
 	}
-	items, _, err := daemon.store.PeerQuestionsForTask(ctx, authority.TaskID, 0)
+	offset, targetOffset, ok := call.PeerStatusOffsets()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	items, nextOffset, err := daemon.store.PeerQuestionsForTask(ctx, authority.TaskID, offset)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
-	status := api.PeerStatus{Questions: make([]api.PeerQuestion, 0, len(items))}
+	targets, nextTargetOffset, err := daemon.store.PeerTargetsForAttempt(ctx, kDigest, targetOffset)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	status := api.PeerStatus{Targets: make([]api.PeerTarget, 0, len(targets)), Questions: make([]api.PeerQuestion, 0, len(items)), NextOffset: nextOffset, NextTargetOffset: nextTargetOffset}
+	for _, target := range targets {
+		status.Targets = append(status.Targets, api.PeerTarget{TaskID: target.TaskID.String(), AgentID: target.AgentID.String(), Name: target.Name, Title: target.Title, Status: target.Status.String(), Revision: uint64(target.Revision.Int64())})
+	}
 	for _, item := range items {
 		status.Questions = append(status.Questions, daemon.projectPeerQuestion(ctx, item))
 	}
@@ -402,6 +409,9 @@ func (daemon *Daemon) peerAnswer(ctx context.Context, call api.Call) api.Reply {
 
 func (daemon *Daemon) notifyPeerDelivery(ctx context.Context, question kernel.PeerQuestion) error {
 	if !terminalEffectsSupported {
+		return nil
+	}
+	if question.AnswerIdempotencyKey == nil && question.RecipientDeliveryID != nil || question.AnswerIdempotencyKey != nil && question.AnswerDeliveryID != nil {
 		return nil
 	}
 	run, found, err := daemon.store.RunningPeerTarget(ctx, question)

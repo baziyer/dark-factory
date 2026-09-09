@@ -257,11 +257,12 @@ func (store *Store) OverseerSnapshotForAttempt(ctx context.Context, digest Attem
 		result.Questions = append(result.Questions, OverseerQuestion{ID: humanRequest.ID, AgentID: run.AgentID, TaskID: run.TaskID, Status: humanRequest.Status, Revision: humanRequest.Revision, Question: humanRequest.QuestionText})
 	}
 	if request.TaskID != nil {
-		peer, _, err := store.PeerQuestionsForTask(ctx, *request.TaskID, request.Offset)
+		peer, peerNext, err := peerQuestionsForTask(ctx, read.connection, *request.TaskID, request.Offset/OverseerSnapshotPageSize)
 		if err != nil {
 			return OverseerSnapshot{}, err
 		}
 		result.PeerQuestions = peer
+		hasMore = hasMore || peerNext != nil
 	}
 	if hasMore {
 		result.NextOffset = &nextOffset

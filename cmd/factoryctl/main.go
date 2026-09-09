@@ -43,7 +43,7 @@ const (
   factoryctl attempt block --detail TEXT
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
-  factoryctl attempt peer status
+  factoryctl attempt peer status [--offset N] [--target-offset N]
   factoryctl attempt peer ask --task ID --idempotency-key HEX32 --question TEXT
   factoryctl attempt peer answer --question ID --revision REVISION --idempotency-key HEX32 --answer TEXT
   factoryctl attempt send-back --task ID --note TEXT
@@ -238,7 +238,7 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		return writeJSON(stdout, result)
 	}
 	if command.kind == commandPeerStatus {
-		result, statusErr := client.PeerStatus(callContext)
+		result, statusErr := client.PeerStatusPage(callContext, command.offset, command.textOffset)
 		if statusErr != nil {
 			writeFailure(stderr, command.kind, statusErr)
 			return exitFailure
@@ -361,6 +361,14 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	case "peer":
 		if len(args) == 3 && args[2] == "status" {
 			return attemptCommand{kind: commandPeerStatus}, false, true
+		}
+		if len(args) == 5 && args[2] == "status" && args[3] == "--offset" && validRevision(args[4]) {
+			offset, _ := strconv.ParseUint(args[4], 10, 64)
+			return attemptCommand{kind: commandPeerStatus, offset: offset}, false, true
+		}
+		if len(args) == 5 && args[2] == "status" && args[3] == "--target-offset" && validRevision(args[4]) {
+			offset, _ := strconv.ParseUint(args[4], 10, 64)
+			return attemptCommand{kind: commandPeerStatus, textOffset: offset}, false, true
 		}
 		if len(args) == 9 && args[2] == "ask" && args[3] == "--task" && validHumanRequestKey(args[4]) && args[5] == "--idempotency-key" && validHumanRequestKey(args[6]) && args[7] == "--question" && validPeerText(args[8]) {
 			return attemptCommand{kind: commandPeerAsk, id: args[4], idempotencyKey: args[6], text: args[8]}, false, true
