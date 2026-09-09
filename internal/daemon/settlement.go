@@ -22,7 +22,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 	if daemon == nil || daemon.store == nil || runID == (kernel.RunID{}) {
 		return kernel.Run{}, fmt.Errorf("%w: invalid run settlement", kernel.ErrInvalidValue)
 	}
-	storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	run, found, err := daemon.store.Run(storeCtx, runID)
 	cancel()
 	if err != nil || !found {
@@ -42,7 +42,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 		if err != nil {
 			return run, err
 		}
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		final, err := daemon.store.FinalizeRun(storeCtx, run.ID, run.Revision, at)
 		cancel()
 		return final, err
@@ -50,7 +50,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 	if run.ChangeID == nil {
 		return run, fmt.Errorf("%w: worker run without a candidate change", kernel.ErrCorruptState)
 	}
-	storeCtx, cancel = context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+	storeCtx, cancel = context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	changeState, found, err := daemon.store.Change(storeCtx, *run.ChangeID)
 	cancel()
 	if err != nil || !found {
@@ -69,7 +69,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 		if err != nil {
 			return run, err
 		}
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		final, err := daemon.store.FinalizeWorkerRun(storeCtx, run.ID, run.Revision, settlement, at)
 		cancel()
 		return final, err
@@ -93,7 +93,7 @@ func (daemon *Daemon) settleRun(changeParent string, runID kernel.RunID) (kernel
 		if err != nil {
 			return run, err
 		}
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		final, err := daemon.store.FinalizeWorkerRun(storeCtx, run.ID, run.Revision, settlement, at)
 		cancel()
 		return final, err

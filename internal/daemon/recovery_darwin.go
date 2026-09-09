@@ -187,7 +187,7 @@ func (daemon *Daemon) recoverRun(ctx context.Context, parent *RuntimeParent, cha
 		}
 		if runtimeRoot.State == kernel.ResourceReleasing && errors.Is(err, errRecoveredRuntimeLayout) {
 			if result, resultErr := recoveredConsumedAttemptResult(run, runtimeRoot, providerProcess); resultErr == nil {
-				storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+				storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 				_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
 				cancel()
 				if authorizeErr == nil {
@@ -284,7 +284,7 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 	if err != nil {
 		return RecoveredUncertain, err
 	}
-	if _, err := daemon.consumeAttemptResult(result); err != nil {
+	if _, err := daemon.consumeRecoveredAttemptResult(result); err != nil {
 		return RecoveredUncertain, err
 	}
 	current, found, err := daemon.store.Resource(context.Background(), runnerProcess.ID)
@@ -302,7 +302,7 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 	if _, err := daemon.closeTerminalAfterRunner(result); err != nil {
 		return RecoveredUncertain, err
 	}
-	storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
 	cancel()
 	if authorizeErr != nil {
@@ -341,7 +341,7 @@ func (daemon *Daemon) recoverWithoutResult(ctx context.Context, run kernel.Run, 
 		if err != nil {
 			return RecoveredUncertain, err
 		}
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		failed, failErr := daemon.store.FailRun(storeCtx, run.ID, run.Revision, failure, at)
 		cancel()
 		if failErr != nil {
@@ -377,7 +377,7 @@ func (daemon *Daemon) recoverWithoutResult(ctx context.Context, run kernel.Run, 
 		if err != nil {
 			return RecoveredUncertain, err
 		}
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		_, _, _, markErr := daemon.store.MarkProviderResourcesUnresolved(storeCtx, run.ID, process.ID, group.ID, freshRun.Revision, process.Revision, group.Revision, process.Identity, "provider absent without an attempt result at recovery", at)
 		cancel()
 		if markErr != nil {
@@ -443,7 +443,7 @@ func (daemon *Daemon) recoveredProviderAbsent(resource kernel.Resource) bool {
 func (daemon *Daemon) recordUnregisteredRunnerConverged(runID kernel.RunID, runnerID kernel.ResourceID) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, runID)
 		if readErr != nil || !found {
 			cancel()
@@ -475,7 +475,7 @@ func (daemon *Daemon) recordUnregisteredRunnerConverged(runID kernel.RunID, runn
 func (daemon *Daemon) recordRecoveredRunnerAbsence(runID kernel.RunID, resourceID kernel.ResourceID, identity kernel.ResourceIdentity) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, runID)
 		if readErr != nil || !found {
 			cancel()
@@ -569,7 +569,7 @@ func runtimeFileIdentity(identity kernel.ResourceIdentity) (runner.FileIdentity,
 func (daemon *Daemon) recordPreSessionRunnerAbsence(runID kernel.RunID, resourceID kernel.ResourceID, identity kernel.ResourceIdentity) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, runID)
 		if readErr != nil || !found {
 			cancel()
