@@ -36,7 +36,7 @@ func (id identifier) zero() bool {
 	return id.b == [IDBytes]byte{}
 }
 
-func (id identifier) bytes() []byte {
+func (id identifier) Bytes() []byte {
 	value := make([]byte, IDBytes)
 	copy(value, id.b[:])
 	return value
@@ -127,22 +127,6 @@ func TaskInterventionIDFromBytes(value []byte) (TaskInterventionID, error) {
 	id, err := identifierFromBytes(value)
 	return TaskInterventionID{id}, err
 }
-
-func (id ProjectID) Bytes() []byte              { return id.bytes() }
-func (id AgentID) Bytes() []byte                { return id.bytes() }
-func (id AccountID) Bytes() []byte              { return id.bytes() }
-func (id TaskID) Bytes() []byte                 { return id.bytes() }
-func (id IncarnationID) Bytes() []byte          { return id.bytes() }
-func (id ChangeID) Bytes() []byte               { return id.bytes() }
-func (id RunID) Bytes() []byte                  { return id.bytes() }
-func (id ResourceID) Bytes() []byte             { return id.bytes() }
-func (id TerminalSessionID) Bytes() []byte      { return id.bytes() }
-func (id DaemonID) Bytes() []byte               { return id.bytes() }
-func (id BootID) Bytes() []byte                 { return id.bytes() }
-func (id BrowserClientID) Bytes() []byte        { return id.bytes() }
-func (id HumanRequestID) Bytes() []byte         { return id.bytes() }
-func (id HumanRequestDeliveryID) Bytes() []byte { return id.bytes() }
-func (id TaskInterventionID) Bytes() []byte     { return id.bytes() }
 
 func (id ProjectID) MarshalText() ([]byte, error)              { return []byte(id.String()), nil }
 func (id AgentID) MarshalText() ([]byte, error)                { return []byte(id.String()), nil }
