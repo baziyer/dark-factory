@@ -248,18 +248,18 @@ func (client *AttemptClient) RequestHuman(ctx context.Context, input HumanQuesti
 }
 
 func (client *AttemptClient) PeerStatus(ctx context.Context) (PeerStatus, error) {
-	return client.PeerStatusPage(ctx, 0, 0)
+	return client.PeerStatusPage(ctx, 0, 0, 0)
 }
 
-func (client *AttemptClient) PeerStatusPage(ctx context.Context, offset, targetOffset uint64) (PeerStatus, error) {
-	if offset > uint64(^uint64(0)>>1)-1 || targetOffset > uint64(^uint64(0)>>1)-4 {
+func (client *AttemptClient) PeerStatusPage(ctx context.Context, offset, targetOffset, expectedHead uint64) (PeerStatus, error) {
+	if offset > uint64(^uint64(0)>>1)-1 || targetOffset > uint64(^uint64(0)>>1)-4 || expectedHead > uint64(^uint64(0)>>1) || expectedHead == 0 && (offset != 0 || targetOffset != 0) {
 		return PeerStatus{}, ErrInvalidInput
 	}
 	var result PeerStatus
-	if err := client.client.call(ctx, "peer_status", PeerStatusInput{Offset: offset, TargetOffset: targetOffset}, &result); err != nil {
+	if err := client.client.call(ctx, "peer_status", PeerStatusInput{Offset: offset, TargetOffset: targetOffset, ExpectedHead: expectedHead}, &result); err != nil {
 		return PeerStatus{}, err
 	}
-	if !validPeerStatus(result) {
+	if !validPeerStatus(result) || expectedHead != 0 && result.Head != expectedHead {
 		return PeerStatus{}, ErrProtocol
 	}
 	return result, nil

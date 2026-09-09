@@ -39,7 +39,7 @@ func TestPeerQuestionIsTaskLinkedIdempotentAndPrivate(t *testing.T) {
 	if _, err := store.CreatePeerQuestionForAttempt(ctx, source.CredentialDigest, changed, mustTime(t, 35)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("changed replay = %v", err)
 	}
-	history, next, err := store.PeerQuestionsForTask(ctx, target.ID, 0)
+	history, next, _, err := store.PeerQuestionsForTask(ctx, target.ID, 0, EventSequence{})
 	if err != nil || next != nil || len(history) != 1 || history[0].Question != input.Question || history[0].SourceTaskID != source.TaskID {
 		t.Fatalf("history = %+v, %v, next=%v", history, err, next)
 	}
@@ -103,20 +103,111 @@ func TestPeerTargetsAndHistoryPageWithoutLeakingOtherProjects(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	targets, next, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, 0)
+	_, _, head, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0, EventSequence{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, next, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, 0, head)
 	if err != nil || len(targets) != 4 || next == nil || *next != 4 {
 		t.Fatalf("targets=%+v next=%v err=%v", targets, next, err)
 	}
-	page, next, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, *next)
+	page, next, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, *next, head)
 	if err != nil || len(page) != 1 || next != nil {
 		t.Fatalf("target page=%+v next=%v err=%v", page, next, err)
 	}
-	history, nextHistory, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0)
-	if err != nil || len(history) != 1 || nextHistory == nil || *nextHistory != 1 {
-		t.Fatalf("history=%+v next=%v err=%v", history, nextHistory, err)
+	history, nextHistory, historyHead, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0, EventSequence{})
+	if err != nil || historyHead != head || len(history) != 1 || nextHistory == nil || *nextHistory != 1 {
+		t.Fatalf("history=%+v next=%v head=%v err=%v", history, nextHistory, historyHead, err)
 	}
-	if _, _, err := store.PeerTargetsForAttempt(ctx, AttemptDigest{}, 0); !errors.Is(err, ErrUnauthorized) {
+	if _, _, err := store.PeerTargetsForAttempt(ctx, AttemptDigest{}, 0, head); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("unauthenticated targets=%v", err)
+	}
+}
+
+func TestPeerPagesRejectChangedHeadAndRestartFromNewest(t *testing.T) {
+	ctx := context.Background()
+	store, source, _ := runningWorkerRun(t)
+	defer store.Close()
+	agent, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 230), ProjectID: source.ProjectID, Name: "peer", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 231), ProjectID: source.ProjectID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 232), Title: "peer"}, mustTime(t, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := byte(0); i < 2; i++ {
+		if _, err := store.CreatePeerQuestionForAttempt(ctx, source.CredentialDigest, NewPeerQuestion{TargetTaskID: target.ID, IdempotencyKey: peerKey(233 + i), Question: "older"}, mustTime(t, int64(33+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, next, head, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0, EventSequence{})
+	if err != nil || len(first) != 1 || next == nil {
+		t.Fatalf("first history = %+v next=%v head=%v err=%v", first, next, head, err)
+	}
+	second, secondNext, secondHead, err := store.PeerQuestionsForTask(ctx, source.TaskID, *next, head)
+	if err != nil || len(second) != 1 || secondNext != nil || secondHead != head || first[0].ID == second[0].ID {
+		t.Fatalf("same-head continuation = %+v next=%v head=%v err=%v", second, secondNext, secondHead, err)
+	}
+	newest, err := store.CreatePeerQuestionForAttempt(ctx, source.CredentialDigest, NewPeerQuestion{TargetTaskID: target.ID, IdempotencyKey: peerKey(235), Question: "newest"}, mustTime(t, 35))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.PeerQuestionsForTask(ctx, source.TaskID, *next, head); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("changed history continuation = %v", err)
+	}
+	restarted, _, restartedHead, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0, EventSequence{})
+	if err != nil || len(restarted) != 1 || restarted[0].ID != newest.ID || restartedHead == head {
+		t.Fatalf("restarted history = %+v head=%v old=%v err=%v", restarted, restartedHead, head, err)
+	}
+	for i := byte(0); i < 4; i++ {
+		if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 236+i), ProjectID: source.ProjectID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 240+i), Title: "target"}, mustTime(t, int64(36+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, targetHead, err := store.PeerQuestionsForTask(ctx, source.TaskID, 0, EventSequence{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, nextTarget, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, 0, targetHead)
+	if err != nil || len(targets) != 4 || nextTarget == nil || *nextTarget != 4 {
+		t.Fatalf("first targets = %+v next=%v err=%v", targets, nextTarget, err)
+	}
+	if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 245), ProjectID: source.ProjectID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 246), Title: "later target"}, mustTime(t, 41)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.PeerTargetsForAttempt(ctx, source.CredentialDigest, *nextTarget, targetHead); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("changed target continuation = %v", err)
+	}
+}
+
+func TestOverseerPeerPageRejectsPeerInvalidation(t *testing.T) {
+	ctx := context.Background()
+	store, worker, overseer, _ := runningWorkerAndOverseer(t)
+	defer store.Close()
+	agent, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 217), ProjectID: worker.ProjectID, Name: "peer", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 4}, mustTime(t, 60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 218), ProjectID: worker.ProjectID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 219), Title: "peer"}, mustTime(t, 61))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := byte(0); i < 2; i++ {
+		if _, err := store.CreatePeerQuestionForAttempt(ctx, worker.CredentialDigest, NewPeerQuestion{TargetTaskID: target.ID, IdempotencyKey: peerKey(220 + i), Question: "peer"}, mustTime(t, int64(62+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task := worker.TaskID
+	first, err := store.OverseerSnapshotForAttempt(ctx, overseer.CredentialDigest, OverseerSnapshotRequest{TaskID: &task})
+	if err != nil || first.NextOffset == nil || len(first.PeerQuestions) != 1 {
+		t.Fatalf("first overseer peer page = %+v err=%v", first, err)
+	}
+	if _, err := store.CreatePeerQuestionForAttempt(ctx, worker.CredentialDigest, NewPeerQuestion{TargetTaskID: target.ID, IdempotencyKey: peerKey(222), Question: "new peer"}, mustTime(t, 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.OverseerSnapshotForAttempt(ctx, overseer.CredentialDigest, OverseerSnapshotRequest{TaskID: &task, Offset: *first.NextOffset, ExpectedHead: first.Head}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("changed overseer peer continuation = %v", err)
 	}
 }
 

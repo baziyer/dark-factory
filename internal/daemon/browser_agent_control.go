@@ -170,13 +170,24 @@ func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browse
 	if task.Revision != expected {
 		return browserprotocol.TaskDetail{}, browser.ErrStale
 	}
+	expectedHead := kernel.EventSequence{}
+	if request.ExpectedHead != nil {
+		value, err := browserSequence(*request.ExpectedHead)
+		if err != nil {
+			return browserprotocol.TaskDetail{}, browser.ErrStale
+		}
+		expectedHead, err = kernel.NewEventSequence(int64(value))
+		if err != nil {
+			return browserprotocol.TaskDetail{}, browser.ErrStale
+		}
+	}
 	instruction, instructionMore := taskDetailTextChunk(kernel.TaskInstruction(task), uint64(request.TextOffset))
 	feedback, feedbackMore := taskDetailTextChunk(kernel.TaskFeedback(task), uint64(request.TextOffset))
-	result := browserprotocol.TaskDetail{TaskID: task.ID.String(), Revision: decimalRevision(task.Revision), Instruction: instruction, Feedback: feedback, PeerQuestions: []browserprotocol.TaskPeerQuestion{}}
-	questions, nextPeerOffset, err := backend.store.PeerQuestionsForTask(ctx, task.ID, uint64(request.PeerOffset))
+	questions, nextPeerOffset, head, err := backend.store.PeerQuestionsForTask(ctx, task.ID, uint64(request.PeerOffset), expectedHead)
 	if err != nil {
 		return browserprotocol.TaskDetail{}, mapBrowserError(err)
 	}
+	result := browserprotocol.TaskDetail{TaskID: task.ID.String(), Revision: decimalRevision(task.Revision), Head: decimalSequence(head), Instruction: instruction, Feedback: feedback, PeerQuestions: []browserprotocol.TaskPeerQuestion{}}
 	for _, question := range questions {
 		item := browserprotocol.TaskPeerQuestion{
 			ID: question.ID.String(), SourceTaskID: question.SourceTaskID.String(), TargetTaskID: question.TargetTaskID.String(),

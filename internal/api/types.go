@@ -446,6 +446,7 @@ type PeerAnswerInput struct {
 }
 
 type PeerStatus struct {
+	Head             uint64         `json:"head"`
 	Targets          []PeerTarget   `json:"targets"`
 	Questions        []PeerQuestion `json:"questions"`
 	NextTargetOffset *uint64        `json:"next_target_offset"`
@@ -455,6 +456,7 @@ type PeerStatus struct {
 type PeerStatusInput struct {
 	Offset       uint64 `json:"offset"`
 	TargetOffset uint64 `json:"target_offset"`
+	ExpectedHead uint64 `json:"expected_head"`
 }
 
 // Peer status is printed in an authenticated provider terminal.
@@ -490,7 +492,7 @@ type PeerTarget struct {
 }
 
 func validPeerStatus(status PeerStatus) bool {
-	if status.Targets == nil || status.Questions == nil || len(status.Targets) > 4 || len(status.Questions) > 1 || status.NextOffset != nil && *status.NextOffset == 0 || status.NextTargetOffset != nil && *status.NextTargetOffset == 0 {
+	if status.Head == 0 || status.Targets == nil || status.Questions == nil || len(status.Targets) > 4 || len(status.Questions) > 1 || status.NextOffset != nil && *status.NextOffset == 0 || status.NextTargetOffset != nil && *status.NextTargetOffset == 0 {
 		return false
 	}
 	for _, target := range status.Targets {

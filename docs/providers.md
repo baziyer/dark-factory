@@ -121,7 +121,8 @@ serves it only while that exact run is `running`.
 Codex workers can exchange one durable, task-linked question and answer with
 another Codex worker using `factoryctl attempt peer status`, `peer ask`, and
 `peer answer`. Questions are asynchronous: a queued recipient reads it when
-its attempt starts, and neither command grants task or terminal control.
+its attempt starts, and neither command grants task or terminal control. A
+stale paged status must restart from the first page.
 
 Subsequent browser terminal input goes directly to the same PTY. The provider
 reports its durable outcome through the attempt-scoped `factoryctl` supplied by

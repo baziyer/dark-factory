@@ -226,18 +226,30 @@ func (store *Store) AnswerPeerQuestionForAttempt(ctx context.Context, digest Att
 	return result, nil
 }
 
-// PeerQuestionsForTask is bounded task-linked history. Browser callers must
-// first authorize their private task-detail read before using this projection.
-func (store *Store) PeerQuestionsForTask(ctx context.Context, taskID TaskID, offset uint64) ([]PeerQuestion, *uint64, error) {
-	if offset > uint64(^uint64(0)>>1)-1 {
-		return nil, nil, ErrInvalidValue
+// PeerQuestionsForTask is bounded task-linked history. expectedHead fences
+// continuation pages against intervening durable changes. Browser callers
+// must first authorize their private task-detail read before using it.
+func (store *Store) PeerQuestionsForTask(ctx context.Context, taskID TaskID, offset uint64, expectedHead EventSequence) ([]PeerQuestion, *uint64, EventSequence, error) {
+	if offset > uint64(^uint64(0)>>1)-1 || expectedHead.Int64() < 0 || expectedHead.Int64() == 0 && offset != 0 {
+		return nil, nil, EventSequence{}, ErrInvalidValue
 	}
 	read, err := store.beginRead(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, EventSequence{}, err
 	}
 	defer read.Close()
-	return peerQuestionsForTask(ctx, read.connection, taskID, offset)
+	state, err := factoryState(ctx, read.connection)
+	if err != nil {
+		return nil, nil, EventSequence{}, err
+	}
+	if expectedHead.Int64() != 0 && expectedHead != state.Head {
+		return nil, nil, EventSequence{}, ErrRevisionConflict
+	}
+	items, next, err := peerQuestionsForTask(ctx, read.connection, taskID, offset)
+	if err != nil {
+		return nil, nil, EventSequence{}, err
+	}
+	return items, next, state.Head, nil
 }
 
 func peerQuestionsForTask(ctx context.Context, connection *sql.Conn, taskID TaskID, offset uint64) ([]PeerQuestion, *uint64, error) {
@@ -272,8 +284,8 @@ func peerQuestionsForTask(ctx context.Context, connection *sql.Conn, taskID Task
 
 // PeerTargetsForAttempt exposes only current same-project worker tasks so a
 // worker can choose an asynchronous collaborator without learning task text.
-func (store *Store) PeerTargetsForAttempt(ctx context.Context, digest AttemptDigest, offset uint64) ([]PeerTarget, *uint64, error) {
-	if offset > uint64(^uint64(0)>>1)-4 {
+func (store *Store) PeerTargetsForAttempt(ctx context.Context, digest AttemptDigest, offset uint64, expectedHead EventSequence) ([]PeerTarget, *uint64, error) {
+	if offset > uint64(^uint64(0)>>1)-4 || expectedHead.Int64() < 0 || expectedHead.Int64() == 0 && offset != 0 {
 		return nil, nil, ErrInvalidValue
 	}
 	read, err := store.beginRead(ctx)
@@ -290,6 +302,13 @@ func (store *Store) PeerTargetsForAttempt(ctx context.Context, digest AttemptDig
 	}
 	if run.Role != RoleWorker || run.Phase != RunRunning || run.CredentialRevokedAt != nil {
 		return nil, nil, ErrUnauthorized
+	}
+	state, err := factoryState(ctx, read.connection)
+	if err != nil {
+		return nil, nil, err
+	}
+	if expectedHead.Int64() != 0 && expectedHead != state.Head {
+		return nil, nil, ErrRevisionConflict
 	}
 	rows, err := read.connection.QueryContext(ctx, `SELECT t.id, t.assigned_agent_id, a.name, t.title, t.status, t.revision
 		FROM tasks AS t JOIN agents AS a ON a.id=t.assigned_agent_id AND a.project_id=t.project_id

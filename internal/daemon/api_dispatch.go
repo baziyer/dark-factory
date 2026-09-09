@@ -284,24 +284,35 @@ func (daemon *Daemon) peerStatus(ctx context.Context, call api.Call) api.Reply {
 		}
 		return newErrorReply(remoteErrorCode(err))
 	}
-	offset, targetOffset, ok := call.PeerStatusOffsets()
+	offset, targetOffset, expectedHead, ok := call.PeerStatusPage()
 	if !ok {
 		return newErrorReply(api.RemoteInvalidRequest)
 	}
-	items, nextOffset, err := daemon.store.PeerQuestionsForTask(ctx, authority.TaskID, offset)
+	head, err := kernel.NewEventSequence(int64(expectedHead))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	items, nextOffset, head, err := daemon.store.PeerQuestionsForTask(ctx, authority.TaskID, offset, head)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
-	targets, nextTargetOffset, err := daemon.store.PeerTargetsForAttempt(ctx, kDigest, targetOffset)
+	targets, nextTargetOffset, err := daemon.store.PeerTargetsForAttempt(ctx, kDigest, targetOffset, head)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
-	status := api.PeerStatus{Targets: make([]api.PeerTarget, 0, len(targets)), Questions: make([]api.PeerQuestion, 0, len(items)), NextOffset: nextOffset, NextTargetOffset: nextTargetOffset}
+	status := api.PeerStatus{Head: uint64(head.Int64()), Targets: make([]api.PeerTarget, 0, len(targets)), Questions: make([]api.PeerQuestion, 0, len(items)), NextOffset: nextOffset, NextTargetOffset: nextTargetOffset}
 	for _, target := range targets {
 		status.Targets = append(status.Targets, api.PeerTarget{TaskID: target.TaskID.String(), AgentID: target.AgentID.String(), Name: target.Name, Title: target.Title, Status: target.Status.String(), Revision: uint64(target.Revision.Int64())})
 	}
 	for _, item := range items {
 		status.Questions = append(status.Questions, daemon.projectPeerQuestion(ctx, item))
+	}
+	state, err := daemon.store.Factory(ctx)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if state.Head != head {
+		return newErrorReply(api.RemoteRevisionConflict)
 	}
 	reply, err := api.NewPeerStatusReply(status)
 	if err != nil {

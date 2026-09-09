@@ -43,7 +43,7 @@ const (
   factoryctl attempt block --detail TEXT
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
-  factoryctl attempt peer status [--offset N] [--target-offset N]
+  factoryctl attempt peer status [--offset N] [--target-offset N] [--head HEAD]
   factoryctl attempt peer ask --task ID --idempotency-key HEX32 --question TEXT
   factoryctl attempt peer answer --question ID --revision REVISION --idempotency-key HEX32 --answer TEXT
   factoryctl attempt send-back --task ID --note TEXT
@@ -238,7 +238,7 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		return writeJSON(stdout, result)
 	}
 	if command.kind == commandPeerStatus {
-		result, statusErr := client.PeerStatusPage(callContext, command.offset, command.textOffset)
+		result, statusErr := client.PeerStatusPage(callContext, command.offset, command.textOffset, command.head)
 		if statusErr != nil {
 			writeFailure(stderr, command.kind, statusErr)
 			return exitFailure
@@ -359,24 +359,33 @@ func parse(args []string) (attemptCommand, bool, bool) {
 			return attemptCommand{kind: commandRequestHuman, idempotencyKey: args[3], text: args[5]}, false, true
 		}
 	case "peer":
-		if len(args) == 3 && args[2] == "status" {
-			return attemptCommand{kind: commandPeerStatus}, false, true
-		}
-		if len(args) == 5 && args[2] == "status" && args[3] == "--offset" && validRevision(args[4]) {
-			offset, _ := strconv.ParseUint(args[4], 10, 64)
-			return attemptCommand{kind: commandPeerStatus, offset: offset}, false, true
-		}
-		if len(args) == 5 && args[2] == "status" && args[3] == "--target-offset" && validRevision(args[4]) {
-			offset, _ := strconv.ParseUint(args[4], 10, 64)
-			return attemptCommand{kind: commandPeerStatus, textOffset: offset}, false, true
-		}
-		if len(args) == 7 && args[2] == "status" && validRevision(args[4]) && validRevision(args[6]) && ((args[3] == "--offset" && args[5] == "--target-offset") || (args[3] == "--target-offset" && args[5] == "--offset")) {
-			first, _ := strconv.ParseUint(args[4], 10, 64)
-			second, _ := strconv.ParseUint(args[6], 10, 64)
-			if args[3] == "--offset" {
-				return attemptCommand{kind: commandPeerStatus, offset: first, textOffset: second}, false, true
+		if len(args) >= 3 && args[2] == "status" {
+			command := attemptCommand{kind: commandPeerStatus}
+			seen := map[string]bool{}
+			for index := 3; index < len(args); index += 2 {
+				if index+1 >= len(args) || seen[args[index]] {
+					return attemptCommand{}, false, false
+				}
+				seen[args[index]] = true
+				value, ok := parseRevision(args[index+1])
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				switch args[index] {
+				case "--offset":
+					command.offset = value
+				case "--target-offset":
+					command.textOffset = value
+				case "--head":
+					command.head = value
+				default:
+					return attemptCommand{}, false, false
+				}
 			}
-			return attemptCommand{kind: commandPeerStatus, offset: second, textOffset: first}, false, true
+			if command.head == 0 && (command.offset != 0 || command.textOffset != 0) {
+				return attemptCommand{}, false, false
+			}
+			return command, false, true
 		}
 		if len(args) == 9 && args[2] == "ask" && args[3] == "--task" && validHumanRequestKey(args[4]) && args[5] == "--idempotency-key" && validHumanRequestKey(args[6]) && args[7] == "--question" && validPeerText(args[8]) {
 			return attemptCommand{kind: commandPeerAsk, id: args[4], idempotencyKey: args[6], text: args[8]}, false, true

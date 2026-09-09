@@ -419,11 +419,13 @@ the journal says you stopped.
 
 Workers use `attempt peer status` to discover eligible same-project Codex tasks
 and read questions or answers linked to their own task. Follow `next_offset`
-with `--offset` for older conversations and `next_target_offset` with
-`--target-offset` for more targets. `attempt peer ask` and `attempt peer answer`
-are asynchronous: queued recipients can read the question when admitted, and
-neither operation changes capacity or waits for another worker. Reuse the same
-idempotency key when retrying an uncertain request.
+with `--offset` and `head` with `--head` for older conversations, and
+`next_target_offset` with `--target-offset` under the same head for more
+targets. A stale continuation must restart from the first page. `attempt peer
+ask` and `attempt peer answer` are asynchronous: queued recipients can read
+the question when admitted, and neither operation changes capacity or waits for
+another worker. Reuse the same idempotency key when retrying an uncertain
+request.
 
 The overseer can read peer conversations with `overseer status --task TASK_ID`;
 follow its existing `next_offset` and head fence. Peers provide collaboration
