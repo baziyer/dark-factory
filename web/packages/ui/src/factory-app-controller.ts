@@ -508,6 +508,11 @@ export class FactoryAppController {
     try {
       const result = await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
       if (!this.#current(generation) || this.#edit !== edit) return false;
+      if (result.revision !== task.revision + 1n) {
+        this.#edit = { target: task.id, pending: false, error: new SessionError("stale") };
+        this.#publish();
+        return false;
+      }
       const current = this.#state?.tasks.get(task.id);
       if (current?.revision === result.revision) {
         this.#edit = undefined;

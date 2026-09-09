@@ -533,6 +533,18 @@ test("a queued edit keeps queue controls disabled until its canonical revision a
   assert.equal(interrupted.latest().edit, undefined, "a state restart releases the canonical-state fence");
 });
 
+test("a queued edit refuses an acknowledgement that does not advance its revision", async () => {
+  const queued = [...fixtureState.tasks.values()].find((task) => task.status === "queued");
+  const context = harness({ updateTask: async () => ({ taskId: queued.id, revision: queued.revision }) });
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+
+  assert.equal(await context.controller.editTask(queued, { title: "saved" }), false);
+  assert.equal(context.latest().edit.pending, false);
+  assert.equal(context.latest().edit.error.code, "stale");
+});
+
 test("switching agents discards only that queued edit's canonical-state fence", async () => {
   const firstAgent = fixtureState.agents.get([...fixtureState.agents.keys()][0]);
   const secondAgent = fixtureState.agents.get([...fixtureState.agents.keys()][2]);
