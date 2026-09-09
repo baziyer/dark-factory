@@ -291,6 +291,7 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	_, authorizedErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
 	cancel()
+	alreadyAuthorized := authorizedErr == nil
 	if authorizedErr != nil {
 		if !errors.Is(authorizedErr, kernel.ErrConflict) {
 			return RecoveredUncertain, authorizedErr
@@ -320,11 +321,13 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 			return RecoveredUncertain, err
 		}
 	}
-	storeCtx, cancel = context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
-	_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
-	cancel()
-	if authorizeErr != nil {
-		return RecoveredUncertain, authorizeErr
+	if !alreadyAuthorized {
+		storeCtx, cancel = context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+		_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
+		cancel()
+		if authorizeErr != nil {
+			return RecoveredUncertain, authorizeErr
+		}
 	}
 	if err := recovered.RemoveResult(record); err != nil {
 		return RecoveredUncertain, err
