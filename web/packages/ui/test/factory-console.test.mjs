@@ -507,6 +507,7 @@ test("the sidebar replaces the right column and the terminal owns it outright", 
   assert.match(css, /\.dfFactoryConsole__terminalPanel :where\(p\)\s*\{\s*margin: 0;/);
   assert.match(css, /\.dfConsoleLayout\s*\{[^}]*grid-template-columns: minmax\(0, 2fr\) minmax\(0, 1fr\);/);
   assert.match(css, /\.dfConsoleLayout--narrow \{ grid-template-columns: minmax\(0, 1fr\); \}/);
+  assert.match(css, /@media \(max-width: 960px\)[\s\S]*?\.dfFactoryConsole__terminalPanel\s*\{[^}]*width: 100%;[^}]*max-width: 90rem;/);
   assert.match(css, /\.dfConsoleSidebar\s*\{[^}]*flex: 0 0 clamp\(22rem, 40vw, 44rem\);[^}]*min-width: 0;/);
   // Every rule the console scopes to its own subtree names the sidebar too,
   // or the sidebar renders in the browser's default serif on the page ground.
