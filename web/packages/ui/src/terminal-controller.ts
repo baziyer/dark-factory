@@ -73,6 +73,7 @@ class TerminalController {
   #phase: TerminalPhase = "idle";
   #writable = false;
   #error: SessionError | ProtocolError | undefined;
+  #target: TerminalTarget | undefined;
   #handle: TerminalHandle | undefined;
   #handleClosed = false;
   #detachRequested = false;
@@ -96,6 +97,11 @@ class TerminalController {
   }
 
   get snapshot(): TerminalControllerSnapshot { return this.#snapshot(); }
+
+  /** The live opaque authority may be reused for one exact task control. */
+  get target(): TerminalTarget | undefined {
+    return this.#phase === "ready" && this.#liveHandle() ? this.#target : undefined;
+  }
 
   start(): void {
     if (this.#started || this.#closing) return;
@@ -219,7 +225,8 @@ class TerminalController {
         this.#handleEnded(new SessionError("not_found"), true);
         return;
       }
-      const handle = this.#options.session.openTerminal(target as TerminalTarget, {
+      this.#target = target;
+      const handle = this.#options.session.openTerminal(target, {
         ...(this.#options.resume === undefined ? {} : { afterSequence: this.#options.resume.head, afterSessionId: this.#options.resume.sessionId }),
         onOutput: (output) => {
           this.#outputPending = true;
@@ -383,6 +390,7 @@ class TerminalController {
   #handleEnded(error: SessionError | ProtocolError, retryDiscovery = false): void {
     if (this.#handleClosed) return;
     this.#handleClosed = true;
+    this.#target = undefined;
     this.#writable = false;
     this.#inputBuffer = new Uint8Array(0);
     this.#inputInFlightBytes = 0;

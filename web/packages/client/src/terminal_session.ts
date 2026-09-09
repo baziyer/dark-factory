@@ -294,6 +294,13 @@ class TerminalHandleImpl implements InternalTerminalHandle {
     if (!this.#attached || frame.direction !== "output" || !(frame.payload instanceof Uint8Array) || frame.payload.length === 0 || frame.payload.length > MAX_TERMINAL_PAYLOAD || !sameBytes(frame.sessionId, hexSessionID(this.#target.sessionId)) || frame.leaseGeneration !== 0n) return false;
     if (this.#outputInFlight) { this.#closeLocal(new SessionErrorLikeError("output callback reentrant")); return true; }
     if (frame.sequence !== this.#nextOutputSequence) return false;
+    // Once detach begins, consume ordered tail output without presenting or
+    // acknowledging it. An ACK sent after the server clears the attachment
+    // would otherwise close the shared browser session as an invalid control.
+    if (this.#detaching) {
+      this.#nextOutputSequence += BigInt(frame.payload.length);
+      return true;
+    }
     this.#outputInFlight = true;
     const output = Object.freeze({ sequence: frame.sequence, payload: frame.payload.slice() });
     let closeResolve: (() => void) | undefined;

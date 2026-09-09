@@ -564,7 +564,12 @@ export class FactoryAppController {
       session === undefined || selected.controlPending !== undefined || this.#terminal?.snapshot.phase !== "ready"
     ) return false;
     const current = this.#state?.tasks.get(task.id);
-    if (current === undefined || current.revision !== task.revision || current.status !== "running" || current.assigned_agent_id !== selected.agent.id) return false;
+    const target = this.#terminal.target;
+    if (current === undefined || current.revision !== task.revision || current.status !== "running" || current.assigned_agent_id !== selected.agent.id || target === undefined) {
+      selected.controlError = new SessionError("stale");
+      this.#publish();
+      return false;
+    }
     const body = instruction.trim();
     if ((action === "message" || action === "replace") && body === "") return false;
     let operationId: string, successorTaskId = "", successorIncarnationId = "";
@@ -580,14 +585,11 @@ export class FactoryAppController {
       return false;
     }
     const generation = this.#generation;
-    const expectedHead = selected.head;
     selected.controlPending = action;
     selected.controlError = undefined;
     selected.controlStatus = undefined;
     this.#publish();
     try {
-      const target = await session.resolveAgentTerminal({ agentId: selected.agent.id, expectedAgentRevision: selected.agent.revision, expectedHead });
-      if (!this.#current(generation) || this.#selectedAgent !== selected || target === null || selected.task?.id !== task.id || selected.task.revision !== task.revision || this.#state?.head !== expectedHead) throw new SessionError("stale");
       const result = await session.controlAgent({
         operationId,
         taskId: task.id,

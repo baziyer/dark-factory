@@ -205,12 +205,13 @@ function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView
     if (await controller.controlAgent(action, instruction)) setInstruction("");
   };
   const unknown = terminal.controlStatus === "delivery_unknown" || terminal.controlError?.code === "connection";
+  const refused = terminal.controlStatus === "rejected" || (terminal.controlError !== undefined && ["invalid_request", "unauthorized", "stale", "too_large", "rate_limited", "not_found", "unsupported"].includes(terminal.controlError.code));
   const status = terminal.controlStatus === "stopping"
     ? "STOPPING CURRENT WORK"
     : terminal.controlStatus === "queued"
       ? "REPLACEMENT QUEUED"
-      : terminal.controlStatus === "rejected"
-        ? "CONTROL REJECTED"
+      : refused
+        ? "CONTROL NOT SENT"
         : unknown
           ? "DELIVERY COULD NOT BE CONFIRMED — CHECK TERMINAL/HISTORY BEFORE SENDING AGAIN"
           : undefined;
