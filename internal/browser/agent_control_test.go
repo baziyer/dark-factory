@@ -13,6 +13,8 @@ type agentControlTestBackend struct {
 	mismatch bool
 }
 
+var _ AgentControlBackend = (*agentControlTestBackend)(nil)
+
 func (b *agentControlTestBackend) ControlAgent(_ context.Context, _ Principal, r browserprotocol.AgentControl) (browserprotocol.AgentControlResult, error) {
 	result := browserprotocol.AgentControlResult{OperationID: r.OperationID, TaskID: r.TaskID, RunID: r.RunID, Status: "delivered"}
 	if b.mismatch {
@@ -53,6 +55,15 @@ func TestAgentControlTransportCorrelatesDurableOperation(t *testing.T) {
 			frame = readServerFrame(t, connection)
 			if frame.Type != browserprotocol.TypeTaskHistory || frame.ID != "history" || frame.Body.(browserprotocol.TaskHistory).TaskID != request.TaskID {
 				t.Fatalf("history: %+v", frame)
+			}
+			payload, err = browserprotocol.EncodeTaskDetailGet("detail", browserprotocol.TaskDetailGet{TaskID: request.TaskID, ExpectedRevision: request.ExpectedTaskRevision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeClientFrame(t, connection, payload)
+			frame = readServerFrame(t, connection)
+			if frame.Type != browserprotocol.TypeTaskDetail || frame.ID != "detail" || frame.Body.(browserprotocol.TaskDetail).TaskID != request.TaskID {
+				t.Fatalf("detail: %+v", frame)
 			}
 		})
 	}
