@@ -779,7 +779,7 @@
 
 .dfCompactConsole .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal {
   flex: 0 0 auto;
-  height: clamp(12rem, 30svh, 22rem);
+  height: min(22rem, 30svh);
   min-height: 0;
 }
 
@@ -796,7 +796,6 @@
 @media (max-width: 720px) {
   .dfCompactConsole__overview { grid-template-columns: minmax(0, 1fr); }
   .dfCompactConsole .dfFactoryConsole__terminalPanel { height: auto; min-height: 0; }
-  .dfCompactConsole .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal { height: 20rem; }
 }
 
 @media (max-width: 1024px) {
