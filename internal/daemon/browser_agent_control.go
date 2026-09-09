@@ -160,16 +160,6 @@ func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browse
 	if err != nil {
 		return browserprotocol.TaskDetail{}, browser.ErrStale
 	}
-	task, found, err := backend.store.Task(ctx, taskID)
-	if err != nil {
-		return browserprotocol.TaskDetail{}, mapBrowserError(err)
-	}
-	if !found {
-		return browserprotocol.TaskDetail{}, browser.ErrNotFound
-	}
-	if task.Revision != expected {
-		return browserprotocol.TaskDetail{}, browser.ErrStale
-	}
 	expectedHead := kernel.EventSequence{}
 	if request.ExpectedHead != nil {
 		value, err := browserSequence(*request.ExpectedHead)
@@ -180,6 +170,25 @@ func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browse
 		if err != nil {
 			return browserprotocol.TaskDetail{}, browser.ErrStale
 		}
+	} else {
+		state, err := backend.store.Factory(ctx)
+		if err != nil {
+			return browserprotocol.TaskDetail{}, mapBrowserError(err)
+		}
+		expectedHead = state.Head
+	}
+	task, found, err := backend.store.Task(ctx, taskID)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, mapBrowserError(err)
+	}
+	if !found {
+		return browserprotocol.TaskDetail{}, browser.ErrNotFound
+	}
+	if task.Revision != expected {
+		return browserprotocol.TaskDetail{}, browser.ErrStale
+	}
+	if backend.afterTaskDetailTaskRead != nil {
+		backend.afterTaskDetailTaskRead()
 	}
 	instruction, instructionMore := taskDetailTextChunk(kernel.TaskInstruction(task), uint64(request.TextOffset))
 	feedback, feedbackMore := taskDetailTextChunk(kernel.TaskFeedback(task), uint64(request.TextOffset))

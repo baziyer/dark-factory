@@ -68,3 +68,34 @@ func TestBrowserTaskDetailSeparatesEditableInstructionFromFeedback(t *testing.T)
 		t.Fatalf("stale detail = %v", err)
 	}
 }
+
+func TestBrowserTaskDetailRejectsEditBetweenBriefAndPeerReads(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail)
+	fixture.pair(t)
+	projectID, _ := kernel.ProjectIDFromBytes(adapterID(t, 174))
+	project, err := fixture.store.CreateProject(ctx, kernel.NewProject{ID: projectID, Name: "detail-project", Root: "/detail-project"}, adapterTime(t, 200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID, _ := kernel.AgentIDFromBytes(adapterID(t, 175))
+	agent, err := fixture.store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: "detail-worker", Role: kernel.RoleWorker, Provider: kernel.ProviderCodex, ToolBudgetLimit: 4}, adapterTime(t, 201))
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := kernel.TaskIDFromBytes(adapterID(t, 176))
+	incarnationID, _ := kernel.IncarnationIDFromBytes(adapterID(t, 177))
+	task, err := fixture.store.EnqueueTask(ctx, kernel.NewTask{ID: taskID, ProjectID: project.ID, AssignedAgentID: agent.ID, IncarnationID: incarnationID, Title: "detail", Body: "old brief"}, adapterTime(t, 202))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.backend.afterTaskDetailTaskRead = func() {
+		body := "new brief"
+		if _, err := fixture.store.UpdateTask(ctx, task.ID, task.Revision, kernel.TaskPatch{Body: &body}, adapterTime(t, 203)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fixture.backend.TaskDetail(ctx, rawBrowserClient(fixture.client.ID), browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision)}); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("mixed task detail = %v", err)
+	}
+}

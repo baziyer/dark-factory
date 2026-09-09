@@ -49,6 +49,9 @@ type browserBackend struct {
 	subMu   sync.Mutex
 	closing bool
 	subs    map[*browserStateWatch]struct{}
+
+	// package-test-only seam for a task-detail read that races a durable edit.
+	afterTaskDetailTaskRead func()
 }
 
 type browserClientGate struct {
