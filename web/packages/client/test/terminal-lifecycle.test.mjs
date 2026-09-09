@@ -741,6 +741,30 @@ test("release precedes detach and exact release ambiguity never sends detach", a
   assert.equal(refused.fatals.length, 0);
 });
 
+test("detach consumes ordered tail output without presenting or ACKing it", async () => {
+  const outputs = [];
+  const context = makeHandle({ options: { onOutput: (output) => outputs.push([...output.payload]) } });
+  await attachedWithLease(context);
+  const detached = context.handle.detach();
+  const release = lastControl(context.sent);
+  context.handle.receive(serverFrame(encodeTerminalLeaseResult(release.id, {
+    operation: "released", run_id: runId, session_id: sessionId, generation: 2n,
+    last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
+  })));
+  const detach = lastControl(context.sent);
+  assert.equal(detach.type, "TERMINAL_DETACH");
+  // The server can clear its attachment after this outbound DETACH while
+  // already-buffered output is still reaching the browser. It is valid output
+  // from this session, but no longer has an observer that may ACK it.
+  assert.equal(await context.handle.receiveBinary(outputFrame(0n, [4, 5])), true);
+  assert.equal(await context.handle.receiveBinary(outputFrame(2n, [6])), true);
+  assert.deepEqual(outputs, []);
+  assert.equal(context.sent.filter(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_ACK").length, 0);
+  context.handle.receive(serverFrame(encodeTerminalDetached(detach.id, { session_id: sessionId })));
+  await detached;
+  assert.equal(context.fatals.length, 0);
+});
+
 test("detach waits for a pending attach before sending detach", async () => {
   const context = makeHandle();
   const attach = context.handle.attach();

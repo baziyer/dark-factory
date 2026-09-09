@@ -529,7 +529,7 @@ test("selected terminal drops output arriving while detach releases its lease", 
   assert.equal(await handle.receiveBinary({ direction: "output", sessionId: new Uint8Array(16).fill(0x55), sequence: 0n, leaseGeneration: 0n, payload: new Uint8Array([1]) }), true);
   await tick();
   assert.equal(sessionCloses, 0);
-  assert.equal(sent.some(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_ACK"), true);
+  assert.equal(sent.some(({ payload }) => typeof payload === "string" && decodeClientControl(payload).type === "TERMINAL_ACK"), false);
   handle.receive(decodeServerControl(encodeTerminalLeaseResult(request.id, {
     operation: "released", run_id: "44".repeat(16), session_id: "55".repeat(16), generation: 2n,
     last_input_sequence: 0n, run_revision: 1n, session_revision: 1n,
