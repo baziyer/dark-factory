@@ -508,13 +508,9 @@ export class FactoryAppController {
     try {
       const result = await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
       if (!this.#current(generation) || this.#edit !== edit) return false;
-      if (result.revision !== task.revision + 1n) {
-        this.#edit = { target: task.id, pending: false, error: new SessionError("stale") };
-        this.#publish();
-        return false;
-      }
+      if (result.revision !== task.revision + 1n) throw new SessionError("stale");
       const current = this.#state?.tasks.get(task.id);
-      if (current?.revision === result.revision) {
+      if (current !== undefined && current.revision >= result.revision) {
         this.#edit = undefined;
         this.#publish();
         return true;
@@ -995,7 +991,7 @@ export class FactoryAppController {
     const confirmation = this.#taskEditConfirmation;
     if (confirmation !== undefined) {
       const current = state.tasks.get(confirmation.edit.target);
-      if (current?.revision === confirmation.revision) {
+      if (current !== undefined && current.revision >= confirmation.revision) {
         this.#taskEditConfirmation = undefined;
         if (this.#edit === confirmation.edit) this.#edit = undefined;
       } else if (current === undefined || current.revision !== confirmation.previousRevision) {
@@ -1404,10 +1400,9 @@ export class FactoryAppController {
     const task = agent === undefined || this.#state === undefined ? undefined : agentCurrentTask(agent, this.#state);
     const queuedTask = agent === undefined || this.#state === undefined ? undefined : agentQueuedTask(agent, this.#state);
     const sameAgent = agent !== undefined && prior?.agent.id === agent.id;
-    // A refused edit belongs to the agent it was made against; a new selection
-    // must not inherit its error. A same-agent rebind keeps either its pending
-    // config update or task fence until the canonical task revision arrives.
-    if (!sameAgent || (this.#taskEditConfirmation?.edit !== this.#edit && (this.#edit?.target !== agent?.id || this.#edit.pending !== true))) {
+    // A new selection must not inherit an error. Keep the one serialized
+    // pending edit while its selected agent is rebound to a newer revision.
+    if (!sameAgent || this.#edit?.pending !== true) {
       this.#discardTaskEditConfirmation();
       this.#edit = undefined;
     }

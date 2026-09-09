@@ -512,7 +512,7 @@ test("a queued edit keeps queue controls disabled until its canonical revision a
   context.emitState({ ...fixtureState, agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]) });
   assert.equal(context.latest().edit.pending, true, "a same-agent rebind cannot clear the task fence against an old task revision");
 
-  const revised = { ...queued, title: "saved", revision: queued.revision + 1n };
+  const revised = { ...queued, title: "saved", revision: queued.revision + 2n };
   context.emitState({
     ...fixtureState,
     agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]),
@@ -531,6 +531,33 @@ test("a queued edit keeps queue controls disabled until its canonical revision a
   interrupted.emitStatus("syncing");
   assert.equal(await cancelled, true);
   assert.equal(interrupted.latest().edit, undefined, "a state restart releases the canonical-state fence");
+});
+
+test("a same-agent rebind keeps an in-flight queued edit until a later canonical state", async () => {
+  const agent = fixtureState.agents.get([...fixtureState.agents.keys()][0]);
+  const queued = [...fixtureState.tasks.values()].find((task) => task.status === "queued");
+  const result = deferred();
+  const context = harness({ updateTask: () => result.promise });
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+  context.controller.selectAgent(agent);
+
+  const save = context.controller.editTask(queued, { title: "saved" });
+  await settle();
+  const agentRevised = { ...agent, revision: agent.revision + 1n };
+  context.emitState({ ...fixtureState, agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]) });
+  assert.equal(context.latest().edit.pending, true, "a same-agent rebind keeps the in-flight write fenced");
+
+  const later = { ...queued, title: "saved", revision: queued.revision + 2n };
+  context.emitState({
+    ...fixtureState,
+    agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]),
+    tasks: new Map([...fixtureState.tasks, [later.id, later]]),
+  });
+  result.resolve({ taskId: queued.id, revision: queued.revision + 1n });
+  assert.equal(await save, true, "a canonical revision after the accepted write settles the edit");
+  assert.equal(context.latest().edit, undefined);
 });
 
 test("a queued edit refuses an acknowledgement that does not advance its revision", async () => {
