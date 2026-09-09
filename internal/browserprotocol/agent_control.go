@@ -31,14 +31,16 @@ type TaskHistoryGet struct {
 // TaskDetailGet reads private task text at one exact queued revision. The
 // browser never receives task bodies in a public state snapshot.
 type TaskDetailGet struct {
-	TaskID           string  `json:"task_id"`
-	ExpectedRevision Decimal `json:"expected_revision"`
-	TextOffset       Decimal `json:"text_offset,omitempty"`
-	PeerOffset       Decimal `json:"peer_offset,omitempty"`
+	TaskID           string   `json:"task_id"`
+	ExpectedRevision Decimal  `json:"expected_revision"`
+	TextOffset       Decimal  `json:"text_offset,omitempty"`
+	PeerOffset       Decimal  `json:"peer_offset,omitempty"`
+	ExpectedHead     *Decimal `json:"expected_head,omitempty"`
 }
 type TaskDetail struct {
 	TaskID         string             `json:"task_id"`
 	Revision       Decimal            `json:"revision"`
+	Head           Decimal            `json:"head"`
 	Instruction    string             `json:"instruction"`
 	Feedback       string             `json:"feedback"`
 	NextTextOffset *Decimal           `json:"next_text_offset,omitempty"`
@@ -150,11 +152,11 @@ func validAgentControl(kind MessageType, body any) error {
 			return bad()
 		}
 	case TaskDetailGet:
-		if validateDynamicID(v.TaskID) != nil || v.ExpectedRevision == 0 || v.TextOffset > MaxTaskInstructionBytes || v.PeerOffset > MaxJSONArray {
+		if validateDynamicID(v.TaskID) != nil || v.ExpectedRevision == 0 || v.TextOffset > MaxTaskInstructionBytes || v.PeerOffset > MaxJSONArray || v.ExpectedHead != nil && *v.ExpectedHead == 0 || v.PeerOffset != 0 && v.ExpectedHead == nil {
 			return bad()
 		}
 	case TaskDetail:
-		if validateDynamicID(v.TaskID) != nil || v.Revision == 0 || validateBoundedText(v.Instruction, 0, MaxTaskInstructionBytes) != nil || validateBoundedText(v.Feedback, 0, MaxTaskInstructionBytes) != nil || len(v.PeerQuestions) > 1 || v.PeerQuestions == nil || v.NextTextOffset != nil && *v.NextTextOffset == 0 || v.NextPeerOffset != nil && *v.NextPeerOffset == 0 {
+		if validateDynamicID(v.TaskID) != nil || v.Revision == 0 || v.Head == 0 || validateBoundedText(v.Instruction, 0, MaxTaskInstructionBytes) != nil || validateBoundedText(v.Feedback, 0, MaxTaskInstructionBytes) != nil || len(v.PeerQuestions) > 1 || v.PeerQuestions == nil || v.NextTextOffset != nil && *v.NextTextOffset == 0 || v.NextPeerOffset != nil && *v.NextPeerOffset == 0 {
 			return bad()
 		}
 		for _, question := range v.PeerQuestions {

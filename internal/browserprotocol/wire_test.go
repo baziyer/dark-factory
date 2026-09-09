@@ -754,6 +754,7 @@ func TestTaskDetailEscapedPageFitsControlBound(t *testing.T) {
 	page := TaskDetail{
 		TaskID:      strings.Repeat("02", 16),
 		Revision:    3,
+		Head:        4,
 		Instruction: strings.Repeat("😀", 2048),
 		Feedback:    strings.Repeat("😀", 2048),
 		PeerQuestions: []TaskPeerQuestion{{
@@ -764,6 +765,24 @@ func TestTaskDetailEscapedPageFitsControlBound(t *testing.T) {
 	encoded, err := EncodeTaskDetail("detail", page)
 	if err != nil || len(encoded) > MaxControlBytes {
 		t.Fatalf("escaped task detail = %d bytes, %v", len(encoded), err)
+	}
+}
+
+func TestTaskDetailPeerContinuationCarriesHead(t *testing.T) {
+	head := Decimal(9)
+	encoded, err := EncodeTaskDetailGet("detail", TaskDetailGet{TaskID: strings.Repeat("02", 16), ExpectedRevision: 3, PeerOffset: 1, ExpectedHead: &head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := DecodeClientControl(encoded)
+	if err != nil || frame.Body.(TaskDetailGet).ExpectedHead == nil || *frame.Body.(TaskDetailGet).ExpectedHead != head {
+		t.Fatalf("continuation = %+v, %v", frame, err)
+	}
+	if _, err := EncodeTaskDetailGet("detail", TaskDetailGet{TaskID: strings.Repeat("02", 16), ExpectedRevision: 3, PeerOffset: 1}); err == nil {
+		t.Fatal("continuation without head was accepted")
+	}
+	if _, err := EncodeTaskDetail("detail", TaskDetail{TaskID: strings.Repeat("02", 16), Revision: 3, PeerQuestions: []TaskPeerQuestion{}}); err == nil {
+		t.Fatal("detail without head was accepted")
 	}
 }
 

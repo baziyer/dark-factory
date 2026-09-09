@@ -587,7 +587,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
       selectedAgent: agentSelection(),
       onSaveAgentConfig: (config) => edits.push(["config", config]),
       onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
-		onLoadTaskDetail: async (task, peerOffset) => ({ taskId: task.id, revision: task.revision, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) }),
+		onLoadTaskDetail: async (task, peerOffset, expectedHead) => ({ taskId: task.id, revision: task.revision, head: expectedHead ?? 7n, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) }),
     };
     let renderer;
     await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
@@ -680,18 +680,23 @@ test("task history selects every served finished task and pages one conversation
   const task = fixtureState.tasks.get(ids.task);
   const props = {
     status: "ready", state: baseState(), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
-    onLoadTaskDetail: async (selected, peerOffset) => {
-      calls.push([selected.id, peerOffset]);
-      return { taskId: selected.id, revision: selected.revision, instruction: "", feedback: "", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) };
+    onLoadTaskDetail: async (selected, peerOffset, expectedHead) => {
+      calls.push([selected.id, peerOffset, expectedHead]);
+      if (peerOffset !== undefined) throw new SessionError("stale");
+      return { taskId: selected.id, revision: selected.revision, head: expectedHead ?? 9n, instruction: "", feedback: "", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) };
     },
   };
   let renderer;
   await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
   assert.ok(renderer.root.findAllByProps({ "aria-label": "Task history" }).length === 1);
   await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
-  assert.deepEqual(calls, [[task.id, undefined]]);
+  assert.deepEqual(calls, [[task.id, undefined, undefined]]);
   await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
-  assert.deepEqual(calls, [[task.id, undefined], [task.id, 1n]]);
+  assert.deepEqual(calls, [[task.id, undefined, undefined], [task.id, 1n, 9n]]);
+  assert.ok(renderer.root.findAllByType("span").some((item) => item.props.children === "Question"), "a stale continuation keeps the loaded conversation");
+  assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("REFUSED THIS HISTORY")));
+  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
+  assert.deepEqual(calls.at(-1), [task.id, undefined, undefined], "reloading starts a fresh first page without the stale head");
 });
 
 test("a rejected edit says plainly that the durable value did not change", () => {

@@ -511,10 +511,10 @@ export class FactoryAppController {
   }
 
   /** Load private task text only when an operator opens its brief. */
-  taskDetail(task: Pick<TaskItem, "id" | "revision">, peerOffset = 0n): Promise<TaskDetailView> {
+  taskDetail(task: Pick<TaskItem, "id" | "revision">, peerOffset = 0n, expectedHead?: bigint): Promise<TaskDetailView> {
     const session = this.#client?.session;
     if (this.#closed || this.#status !== "ready" || session === undefined) return Promise.reject(new SessionError("closed"));
-    return this.#readTaskDetail(session, task.id, task.revision, peerOffset);
+    return this.#readTaskDetail(session, task.id, task.revision, peerOffset, expectedHead);
   }
 
   clearAgentTerminal(): void {
@@ -669,7 +669,7 @@ export class FactoryAppController {
     const detail = selected?.taskDetail;
     const taskID = selected?.historyTaskID;
     const revision = selected?.historyTaskRevision;
-    if (selected !== undefined && detail?.nextPeerOffset !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision, detail.nextPeerOffset);
+    if (selected !== undefined && detail?.nextPeerOffset !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision, detail.nextPeerOffset, detail.head);
   }
 
   /**
@@ -1238,7 +1238,7 @@ export class FactoryAppController {
     }
   }
 
-  async #loadTaskDetail(selected: AgentTerminalSelection, taskID: string, revision: bigint, peerOffset = 0n): Promise<void> {
+  async #loadTaskDetail(selected: AgentTerminalSelection, taskID: string, revision: bigint, peerOffset = 0n, expectedHead?: bigint): Promise<void> {
     const session = this.#client?.session;
     if (this.#closed || this.#status !== "ready" || session === undefined || selected.taskDetailPending) return;
     const generation = this.#generation;
@@ -1246,7 +1246,7 @@ export class FactoryAppController {
     selected.taskDetailError = undefined;
     this.#publish();
     try {
-      const detail = await this.#readTaskDetail(session, taskID, revision, peerOffset);
+      const detail = await this.#readTaskDetail(session, taskID, revision, peerOffset, expectedHead);
       if (!this.#current(generation) || this.#selectedAgent !== selected || detail.taskId !== taskID || detail.revision !== revision) return;
       selected.taskDetail = detail;
       selected.taskDetailTaskID = taskID;
@@ -1262,24 +1262,27 @@ export class FactoryAppController {
     }
   }
 
-  async #readTaskDetail(session: AgentTaskSession, taskID: string, revision: bigint, peerOffset: bigint): Promise<TaskDetailView> {
+  async #readTaskDetail(session: AgentTaskSession, taskID: string, revision: bigint, peerOffset: bigint, expectedHead?: bigint): Promise<TaskDetailView> {
     let textOffset = 0n;
     let instruction = "";
     let feedback = "";
     let peerQuestions: TaskDetailView["peerQuestions"] = [];
     let nextPeerOffset: bigint | undefined;
+    let head = expectedHead;
     // Task bodies are limited to 128 KiB and each page is 2,048 runes, so 64
     // pages cover every valid body without treating conversation pagination as
     // an unbounded background load.
     for (let page = 0; page < 64; page += 1) {
-      const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset });
+      const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset, ...(head === undefined ? {} : { expectedHead: head }) });
+      if (head !== undefined && detail.head !== head) throw new ProtocolError("malformed");
+      head = detail.head;
       instruction += detail.instruction;
       feedback += detail.feedback;
       if (page === 0) {
         peerQuestions = detail.peerQuestions;
         nextPeerOffset = detail.nextPeerOffset;
       }
-      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, instruction, feedback, peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
+      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, head, instruction, feedback, peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
       textOffset = detail.nextTextOffset;
     }
     throw new ProtocolError("malformed");

@@ -20,7 +20,7 @@ export type DiscoveredAccount = Readonly<{
 }>;
 
 export type TaskEdit = Readonly<{ title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
-export type TaskBrief = Readonly<{ taskId: string; revision: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
+export type TaskBrief = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
 
 /** One private peer-conversation page, shared by queued and completed work. */
 export function TaskConversation({ brief, onOlder, pending = false }: { brief: TaskBrief; onOlder?: () => void; pending?: boolean }) {
@@ -61,7 +61,7 @@ export function AgentPanel({
   ready: boolean;
   onSaveConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
-  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint) => Promise<TaskBrief>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onOpenTerminal?: () => void;
   onClose?: () => void;
   /** The instruction composer the terminal view owns for an idle agent. */
@@ -144,7 +144,7 @@ export function AgentPanel({
         <select id={`df-history-${agent.id}`} value={historyTask.id} disabled={conversationPending} onChange={(event) => { setHistoryTaskID(event.currentTarget.value); setConversation(undefined); setConversationError(false); }}>{historyTasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select>
         <button type="button" disabled={conversationPending} onClick={async () => { setConversationPending(true); try { setConversation({ task: historyTask, brief: await onLoadTaskDetail(historyTask) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } }}>VIEW CONVERSATION</button>
         {conversationError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : null}
-        {conversation === undefined ? null : <TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} />}
+        {conversation === undefined ? null : <TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset, conversation.brief.head) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} />}
       </div>}
 
       {onOpenTerminal === undefined ? null : (
@@ -282,7 +282,7 @@ function QueuedTask({
   pending: boolean;
   ready: boolean;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
-  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint) => Promise<TaskBrief>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
 }) {
   const [brief, setBrief] = useState<TaskBrief>();
   const [title, setTitle] = useState(task.title);
@@ -293,12 +293,12 @@ function QueuedTask({
   const [openedRevision, setOpenedRevision] = useState<bigint>();
   const disabled = pending || !ready || onEditTask === undefined;
   const stale = open && openedRevision !== task.revision;
-  const load = async (peerOffset?: bigint) => {
+  const load = async (peerOffset?: bigint, expectedHead?: bigint) => {
     if (onLoadTaskDetail === undefined) return;
     setLoading(true);
     setDetailError(false);
     try {
-      const loaded = await onLoadTaskDetail(task, peerOffset);
+      const loaded = await onLoadTaskDetail(task, peerOffset, expectedHead);
       setBrief(loaded);
       if (peerOffset === undefined) {
         setTitle(task.title);
@@ -323,7 +323,7 @@ function QueuedTask({
         <label htmlFor={`df-instruction-${task.id}`}>INSTRUCTION</label>
         <textarea id={`df-instruction-${task.id}`} rows={4} value={instruction} disabled={disabled || loading || stale} onChange={(event) => setInstruction(event.currentTarget.value)} />
         {brief?.feedback === "" || brief === undefined ? null : <><label>RETAINED REVIEW FEEDBACK</label><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
-		{brief === undefined ? null : <TaskConversation brief={brief} pending={loading} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { void load(brief.nextPeerOffset); }} />}
+		{brief === undefined ? null : <TaskConversation brief={brief} pending={loading} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { void load(brief.nextPeerOffset, brief.head); }} />}
 		{stale ? <p role="alert">TASK CHANGED — REOPEN BRIEF TO SAVE</p> : null}
         <div className="dfConsoleSidebar__taskActions">
           <button type="button" disabled={disabled || loading || stale || title.trim() === ""} onClick={async () => { if (await onEditTask(task, { title, body: instruction })) setOpen(false); }}>{pending ? "SAVING" : "SAVE BRIEF"}</button>

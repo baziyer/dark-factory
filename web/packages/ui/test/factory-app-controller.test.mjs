@@ -50,6 +50,7 @@ function harness(overrides = {}) {
     cancelHumanRequest: overrides.cancel ?? (async () => ({ request_id: request.id })),
     updateAgent: overrides.updateAgent ?? (async () => { throw new SessionError("not_found"); }),
     updateTask: overrides.updateTask ?? (async () => { throw new SessionError("not_found"); }),
+    getTaskDetail: overrides.getTaskDetail ?? (async () => { throw new SessionError("not_found"); }),
     getTopology: overrides.getTopology ?? (async () => { throw new SessionError("not_found"); }),
     getRunPaths: overrides.getRunPaths ?? (async () => { throw new SessionError("not_found"); }),
     inviteRemote: overrides.inviteRemote ?? (async () => remoteInvite),
@@ -132,6 +133,41 @@ test("status changes are deduplicated without affecting snapshot updates", () =>
   context.emitState(fixtureState);
   assert.deepEqual(context.statusChanges, [{ status: "connecting" }]);
   assert.equal(context.snapshots.length, 3);
+});
+
+test("task-detail pages keep one head across text chunks and peer continuation", async () => {
+  const task = [...fixtureState.tasks.values()][0];
+  const calls = [];
+  const context = harness({
+    getTaskDetail: async (taskID, revision, offsets) => {
+      calls.push([taskID, revision, offsets]);
+      if (offsets.peerOffset === 1n) {
+        assert.equal(offsets.expectedHead, 9n);
+        return { taskId: taskID, revision, head: 9n, instruction: "", feedback: "", peerQuestions: [], nextPeerOffset: undefined };
+      }
+      if (offsets.textOffset === 1n) {
+        assert.equal(offsets.expectedHead, 9n);
+        return { taskId: taskID, revision, head: 9n, instruction: "second", feedback: "feedback", peerQuestions: [] };
+      }
+      assert.equal(offsets.expectedHead, undefined);
+      return { taskId: taskID, revision, head: 9n, instruction: "first", feedback: "review ", peerQuestions: [], nextTextOffset: 1n, nextPeerOffset: 1n };
+    },
+  });
+  context.controller.start();
+  context.emitStatus("ready");
+
+  const first = await context.controller.taskDetail(task);
+  assert.equal(first.head, 9n);
+  assert.equal(first.instruction, "firstsecond");
+  assert.equal(first.feedback, "review feedback");
+  assert.deepEqual(calls, [
+    [task.id, task.revision, { textOffset: 0n, peerOffset: 0n }],
+    [task.id, task.revision, { textOffset: 1n, peerOffset: 0n, expectedHead: 9n }],
+  ]);
+
+  await context.controller.taskDetail(task, first.nextPeerOffset, first.head);
+  assert.deepEqual(calls.at(-1), [task.id, task.revision, { textOffset: 0n, peerOffset: 1n, expectedHead: 9n }]);
+  context.controller.close();
 });
 
 test("a failed fragment scrub creates no client or browser effect", () => {
