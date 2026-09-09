@@ -23,6 +23,7 @@ This review traced task submission/editing, supervision, terminal controls and r
 | Status vocabulary | Durable task/run states, operator labels and sprite activity are different projections. Duplicated precedence rules can disagree. | Centralize each projection and derive presentation from it; keep durable task outcome distinct from run cleanup phase. |
 | Delivery semantics | A PTY write may succeed while its reply is lost. Retry wrappers can duplicate a message or answer. | Reuse the serialized effect path and explicit receipt states. Keep “saved”, “delivered”, and “unknown” distinct. Never replay unknown delivery automatically. |
 | Historical schemas | Current schema edits previously changed the reconstructed identity of older homes. | Freeze replaced SQL and derive versions in order; require historical digest and preservation checks for each migration. |
+| Reconciliation | Full invariant validation runs on store writes. A short deadline can interrupt valid recovery, while replaying a committed result with a newly read revision can reject its own postcondition. | Use a measured bounded store window and exact durable replay postconditions; check interruption between recovery stages. Profile validation cost as retained history grows before changing its authority boundary. |
 
 ## Checks that should remain
 
