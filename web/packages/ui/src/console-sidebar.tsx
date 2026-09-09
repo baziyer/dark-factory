@@ -330,7 +330,8 @@ function QueuedTask({
           {stale ? <button type="button" disabled={loading} onClick={() => { void load(); }}>REOPEN BRIEF</button> : null}
           <button type="button" disabled={loading} onClick={() => setOpen(false)}>DISCARD</button>
         </div>
-      </> : <><p className="dfConsoleRow__title">{task.title}</p><button type="button" disabled={disabled || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button>{detailError ? <p role="alert">THE FACTORY REFUSED THIS EDIT</p> : null}</>}
+      </> : <><p className="dfConsoleRow__title">{task.title}</p><button type="button" disabled={disabled || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button></>}
+      {detailError ? <p role="alert">{open ? "COULD NOT LOAD DETAILS. SAVE OR DISCARD YOUR DRAFT, THEN REOPEN TO RETRY." : "COULD NOT LOAD DETAILS. REOPEN THE BRIEF TO RETRY."}</p> : null}
       <div className="dfConsoleSidebar__taskActions">
         <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) void onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
         <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) void onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>

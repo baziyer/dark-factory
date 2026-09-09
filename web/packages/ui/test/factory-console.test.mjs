@@ -587,7 +587,10 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
       selectedAgent: agentSelection(),
       onSaveAgentConfig: (config) => edits.push(["config", config]),
       onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
-		onLoadTaskDetail: async (task, peerOffset, expectedHead) => ({ taskId: task.id, revision: task.revision, head: expectedHead ?? 7n, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) }),
+      onLoadTaskDetail: async (task, peerOffset, expectedHead) => {
+        if (peerOffset !== undefined) throw new SessionError("stale");
+        return { taskId: task.id, revision: task.revision, head: expectedHead ?? 7n, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], nextPeerOffset: 1n };
+      },
     };
     let renderer;
     await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
@@ -633,6 +636,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
     assert.equal(titleValue(), "Keep this draft");
     assert.equal(instructionValue(), "Keep this instruction");
+    assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("SAVE OR DISCARD YOUR DRAFT")));
     const revised = baseState({ tasks: new Map([[queued.id, { ...queued, assigned_agent_id: ids.agent, revision: queued.revision + 1n }], [other.id, { ...other, assigned_agent_id: ids.agent }]]) });
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, state: revised })); });
     assert.equal(titleValue(), "Keep this draft");
