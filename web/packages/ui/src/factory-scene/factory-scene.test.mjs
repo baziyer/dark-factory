@@ -160,15 +160,24 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   const densePlacements = placeWorkers(layout, denseWorkers);
   assert.equal(new Set(densePlacements.map(({ x, y }) => `${x},${y}`)).size, denseWorkers.length);
   const srcRoom = layout.rooms.find((room) => room.id === "src");
-  assert.deepEqual(densePlacements[0], { id: "worker-0", area: "room", roomId: "src", x: srcRoom.anchor.x, y: srcRoom.anchor.y });
+  assert.deepEqual(densePlacements[0], { id: "worker-0", area: "room", roomId: "src", x: srcRoom.anchor.x, y: srcRoom.y + 48 });
   for (const placement of densePlacements.filter(({ y }) => y < layout.height)) {
     assert.ok(placement.x - 8 >= srcRoom.x && placement.x + 8 <= srcRoom.x + srcRoom.width);
     assert.ok(placement.y - 8 >= srcRoom.y && placement.y + 8 <= srcRoom.y + srcRoom.height);
+    assert.ok(placement.y - 8 >= srcRoom.y + 40, "room workers stay below the title and kind");
   }
   const denseSvg = render({ workers: denseWorkers });
-  assert.match(denseSvg, /WORKER AREA AT CAPACITY · 68/);
+  assert.match(denseSvg, /WORKER AREA AT CAPACITY · 84/);
   const denseHeight = Number(denseSvg.match(/viewBox="0 0 [^ ]+ ([^"]+)"/)[1]);
   assert.ok(denseHeight > Math.max(...densePlacements.map(({ y }) => y + 8)));
+
+  const mixedPlacements = placeWorkers(layout, [
+    ...denseWorkers,
+    { ...workers[1], location: "resting" },
+  ]);
+  const restingBottom = Math.max(...mixedPlacements.filter((placement) => placement.area === "resting").map((placement) => placement.y + 8));
+  const overflowTop = Math.min(...mixedPlacements.filter((placement) => placement.area === "overflow").map((placement) => placement.y));
+  assert.ok(overflowTop - restingBottom >= 24, "resting and overflow areas have separate rows");
 
   const stackedLayout = {
     width: 176,
@@ -202,7 +211,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   const emptySvg = render({ topology: { digest: "empty", nodes: [] }, workers: emptyWorkers, workItems: [] });
   assert.match(emptySvg, /EMPTY FLOOR/);
   // An empty floor in a wide column stays a panel, not a poster.
-  assert.match(emptySvg, new RegExp(`width:${emptyLayout.width * 3}px`));
+  assert.match(emptySvg, new RegExp(`min-width:${Math.min(emptyLayout.width * 3, 864)}px`));
   assert.match(emptySvg, /aria-label="RESTING AREA · 20"/);
 });
 

@@ -133,7 +133,8 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
     const room = rooms.get(worker.nodeId);
     const roomSlot = room === undefined ? -1 : roomCounts.get(room.id) ?? 0;
     const roomColumns = room === undefined ? 0 : Math.max(1, Math.floor((room.width - 16) / WORKER_GAP));
-    const roomRows = room === undefined ? 0 : Math.max(1, Math.floor((room.height - 16) / WORKER_GAP));
+    // The title and served kind occupy the first 40px of every room.
+    const roomRows = room === undefined ? 0 : Math.max(1, Math.floor((room.height - 56) / WORKER_GAP));
     if (room === undefined || roomSlot >= roomColumns * roomRows) {
       overflow.push(worker);
       continue;
@@ -144,12 +145,12 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
       area: "room",
       roomId: room.id,
       x: room.anchor.x + centeredSlot(roomSlot % roomColumns) * WORKER_GAP,
-      y: room.anchor.y + centeredSlot(Math.floor(roomSlot / roomColumns)) * WORKER_GAP,
+      y: room.y + 48 + Math.floor(roomSlot / roomColumns) * WORKER_GAP,
     });
   }
   const restingTop = layout.height + 28;
-  const stagingTop = restingTop + restRows * WORKER_GAP + (resting.length === 0 || staging.length === 0 ? 0 : 24);
-  const overflowTop = stagingTop + stagingRows * WORKER_GAP + (staging.length === 0 || overflow.length === 0 ? 0 : 24);
+  const stagingTop = restingTop + restRows * WORKER_GAP + (resting.length === 0 || (staging.length === 0 && overflow.length === 0) ? 0 : 32);
+  const overflowTop = stagingTop + stagingRows * WORKER_GAP + (staging.length === 0 || overflow.length === 0 ? 0 : 32);
   return [...placed, ...outside(resting, "resting", restingTop), ...outside(staging, "staging", stagingTop), ...outside(overflow, "overflow", overflowTop)]
     .sort((left, right) => compareText(left.id, right.id));
 }

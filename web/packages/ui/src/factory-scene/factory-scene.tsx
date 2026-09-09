@@ -70,7 +70,7 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
       role="group"
       aria-label="Dark Factory codebase floor"
       data-topology-digest={topology.digest}
-      style={{ display: "block", width: maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
+      style={{ display: "block", width: "100%", minWidth: Math.min(maxWidth, 864), maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
     >
       <title>Dark Factory codebase floor</title>
       <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks${omittedLocations === 0 ? "" : `, ${omittedLocations} current locations omitted by the room cap`}`}</desc>
@@ -129,8 +129,8 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
       ) : null}
 
       {resting.length === 0 ? null : <Area label={`RESTING AREA · ${resting.length}`} width={layout.width - PADDING * 2} top={layout.height} bottom={Math.max(...resting.map((placement) => placement.y + 8)) + PADDING} />}
-      {staging.length === 0 ? null : <Area label={`WORKING · ${staging.length} LOCATION${staging.length === 1 ? "" : "S"} NOT YET OBSERVED`} width={layout.width - PADDING * 2} top={Math.min(...staging.map((placement) => placement.y)) - 20} bottom={Math.max(...staging.map((placement) => placement.y + 8)) + PADDING} />}
-      {overflow.length === 0 ? null : <Area label={omittedLocations === 0 ? `WORKER AREA AT CAPACITY · ${overflow.length}` : `ROOM MAP AT CAPACITY · ${omittedLocations} LOCATIONS NOT SHOWN`} width={layout.width - PADDING * 2} top={Math.min(...overflow.map((placement) => placement.y)) - 20} bottom={Math.max(...overflow.map((placement) => placement.y + 8)) + PADDING} />}
+      {staging.length === 0 ? null : <Area label={`WORKING · ${staging.length} LOCATION${staging.length === 1 ? "" : "S"} NOT YET OBSERVED`} width={layout.width - PADDING * 2} top={Math.min(...staging.map((placement) => placement.y)) - 28} bottom={Math.max(...staging.map((placement) => placement.y + 8)) + PADDING} />}
+      {overflow.length === 0 ? null : <Area label={omittedLocations === 0 ? `WORKER AREA AT CAPACITY · ${overflow.length}` : `ROOM MAP AT CAPACITY · ${omittedLocations} LOCATIONS NOT SHOWN`} width={layout.width - PADDING * 2} top={Math.min(...overflow.map((placement) => placement.y)) - 28} bottom={Math.max(...overflow.map((placement) => placement.y + 8)) + PADDING} />}
 
       {placements.map((placement) => {
         const worker = workerById.get(placement.id);
@@ -160,7 +160,7 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
       })}
 
       {([[
-        "FREE",
+        "RESTING",
         resting.length,
         `${resting.length} workers in the resting area`,
         "bay.free",
