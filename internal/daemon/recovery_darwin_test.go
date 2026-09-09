@@ -545,7 +545,7 @@ func TestRecoveryReplaysResultConsumedBeforeRunnerAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.daemon.consumeAttemptResult(result); err != nil {
+	if _, err := fixture.daemon.consumeAttemptResult(result, false); err != nil {
 		t.Fatalf("initial result consume: %v", err)
 	}
 	// A crash before runner-absence convergence leaves the authenticated spool

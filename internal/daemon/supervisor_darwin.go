@@ -648,7 +648,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if err != nil {
 		return daemon.failRun(run, kernel.FailureProtocol, err)
 	}
-	run, err = daemon.consumeAttemptResult(result)
+	run, err = daemon.consumeAttemptResult(result, false)
 	if err != nil {
 		return kernel.Run{}, err
 	}
@@ -1179,7 +1179,7 @@ func (daemon *Daemon) convergeActivatedRunner(run kernel.Run, owner *supervisorA
 		if resultErr != nil {
 			return kernel.Run{}, kernel.NewOutcomeUnknownError(errors.Join(cause, resultErr))
 		}
-		converged, consumeErr := daemon.consumeAttemptResult(result)
+		converged, consumeErr := daemon.consumeAttemptResult(result, false)
 		if consumeErr != nil {
 			return kernel.Run{}, errors.Join(cause, consumeErr)
 		}
@@ -1316,17 +1316,8 @@ func terminalExitEvent(record *runner.AttemptResultRecord) (TerminalEvent, error
 	return TerminalEvent{}, errInvalidContract
 }
 
-func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult) (kernel.Run, error) {
-	return daemon.consumeAttemptResultWithRecoveryReplay(result, false)
-}
-
-// consumeRecoveredAttemptResult recognizes the exact result that recovery
-// already consumed before a later durable recovery edge was interrupted.
-func (daemon *Daemon) consumeRecoveredAttemptResult(result kernel.AttemptResult) (kernel.Run, error) {
-	return daemon.consumeAttemptResultWithRecoveryReplay(result, true)
-}
-
-func (daemon *Daemon) consumeAttemptResultWithRecoveryReplay(result kernel.AttemptResult, recovered bool) (kernel.Run, error) {
+// Recovery may replay an exact result consumed before a later cleanup edge failed.
+func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult, recovered bool) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
 		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)

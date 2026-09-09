@@ -284,7 +284,7 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 	if err != nil {
 		return RecoveredUncertain, err
 	}
-	if _, err := daemon.consumeRecoveredAttemptResult(result); err != nil {
+	if _, err := daemon.consumeAttemptResult(result, true); err != nil {
 		return RecoveredUncertain, err
 	}
 	current, found, err := daemon.store.Resource(context.Background(), runnerProcess.ID)
