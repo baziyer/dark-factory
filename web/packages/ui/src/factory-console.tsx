@@ -113,7 +113,7 @@ export function FactoryConsole({
         <header className="dfFactoryConsole__header">
           <div>
             <p className="dfFactoryConsole__eyebrow">OPERATOR VIEW</p>
-            <h1>FACTORY</h1>
+            <h1>DARK FACTORY</h1>
           </div>
           <dl className="dfConsoleBar__counters" aria-label="Factory counters">
             <Counter label="ACTIVE RUNS" value={state === undefined ? "—" : `${state.factory.active_runs} / ${state.factory.capacity} WORKERS + 1 OVERSEER`} />

@@ -520,6 +520,7 @@ test("the workbench keeps one terminal slot beside the persistent roster", () =>
   assert.match(css, /:focus-visible\s*\{\s*outline: 2px solid var\(--df-console-accent\);/);
 
   const withTerminal = render({ selectedAgent: agentSelection(), terminalContent: createElement("section", { "aria-label": "Agent terminal" }) });
+  assert.match(withTerminal, /<h1>DARK FACTORY<\/h1>/);
   assert.match(withTerminal, /dfCompactConsole__roster[\s\S]*?dfCompactConsole__workbench/);
   assert.match(withTerminal, /dfConsoleSidebar__terminalSlot"><section aria-label="Agent terminal"><\/section>/);
   assert.equal(withTerminal.includes("dfConsoleLayout__right"), false);
