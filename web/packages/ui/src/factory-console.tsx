@@ -8,9 +8,6 @@ import { factoryCounters, stageOfTask } from "./console-view.js";
 
 export type ConsoleView = "floor" | "agents";
 
-/** The right column stays short: the rest is one click away in the sidebar. */
-const RIGHT_COLUMN_LIMIT = 8;
-
 export type FactoryConsoleProps = FactoryAppSnapshot & {
   view?: ConsoleView;
   onView?: (view: ConsoleView) => void;
@@ -18,8 +15,6 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onToggleSettings?: () => void;
   selectedAgent?: FactoryAgentSelection;
   onSelectAgent?: (agent: AgentItem) => void;
-  onCloseAgent?: () => void;
-  onOpenAgentTerminal?: () => void;
   onSaveAgentConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
@@ -37,9 +32,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   address?: string;
   /** Overrides the pairing surface the settings modal mounts by default. */
   pairing?: ReactNode;
-  /** The agent's enqueue composer, shown under the sidebar queue. */
-  instructionContent?: ReactNode;
-  /** The live terminal; when present it is the whole sidebar. */
+  /** The selected agent's one mounted terminal and durable composer. */
   terminalContent?: ReactNode;
 };
 
@@ -72,7 +65,7 @@ const ERROR_LABELS = new Map<string, string>([
   ["unsupported", "The factory does not support this request yet."],
 ]);
 
-/** One screen: the floor or the agents on the left, what needs you on the right. */
+/** One screen: a roster, an optional map, and one selected-agent workbench. */
 export function FactoryConsole({
   status,
   state,
@@ -88,8 +81,6 @@ export function FactoryConsole({
   selectedHumanRequest,
   selectedAgent,
   onSelectAgent,
-  onCloseAgent,
-  onOpenAgentTerminal,
   onSaveAgentConfig,
   onEditTask,
   onLoadTaskDetail,
@@ -111,44 +102,11 @@ export function FactoryConsole({
   onLinkAccount,
   address = BROWSER_HOST,
   pairing,
-  instructionContent,
   terminalContent,
 }: FactoryConsoleProps) {
   const ready = status === "ready";
   const counters = factoryCounters(state);
   const agent = selectedAgent === undefined ? undefined : state?.agents.get(selectedAgent.id);
-  const sidebar = terminalContent ?? (
-    selectedHumanRequest !== undefined ? (
-      <HumanRequestPanel
-        selected={selectedHumanRequest}
-        project={projectLabel(state?.projects, selectedHumanRequest.request.project_id)}
-        agent={entityLabel(state?.agents, selectedHumanRequest.request.agent_id, "AGENT")}
-        task={entityLabel(state?.tasks, selectedHumanRequest.request.task_id, "TASK")}
-        onReplyChange={onHumanReplyChange}
-        onReply={onReplyHumanRequest}
-        onCancel={onCancelHumanRequest}
-        onClose={onCloseHumanRequest}
-        onOpenTerminal={onOpenTerminalForHumanRequest}
-        terminalReady={ready}
-      />
-    ) : agent !== undefined ? (
-      <AgentPanel
-        key={agent.id}
-        agent={agent}
-        state={state}
-        edit={edit}
-        ready={ready}
-        onSaveConfig={onSaveAgentConfig}
-        onEditTask={onEditTask}
-        onLoadTaskDetail={onLoadTaskDetail}
-        onOpenTerminal={onOpenAgentTerminal}
-        onClose={onCloseAgent}
-      >
-        {instructionContent}
-      </AgentPanel>
-    ) : undefined
-  );
-
   return (
     <div className="dfConsoleShell">
       <main className="dfFactoryConsole" aria-label="Factory operator console">
@@ -182,43 +140,52 @@ export function FactoryConsole({
           </p>
         )}
 
-        <div className={`dfConsoleLayout${sidebar === undefined ? "" : " dfConsoleLayout--narrow"}`}>
-          <section className="dfConsoleLayout__left dfFactoryConsole__section" aria-label={view === "floor" ? "Factory floor" : "Agents"}>
+        <div className="dfCompactConsole">
+          <aside className="dfCompactConsole__roster" aria-label="Agents">
             <div className="dfFactoryConsole__sectionHeading">
-              <h2>{view === "floor" ? "FACTORY FLOOR" : "AGENTS"}</h2>
-              <div className="dfConsoleViewToggle" role="group" aria-label="Left view">
-                {(["floor", "agents"] as const).map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    aria-pressed={view === option}
-                    disabled={onView === undefined}
-                    onClick={() => onView?.(option)}
-                  >
-                    {option.toUpperCase()}
-                  </button>
-                ))}
-              </div>
+              <h2>AGENTS</h2>
             </div>
-            {view === "floor"
-              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
-              : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />}
-          </section>
+            <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />
+            <details className="dfCompactConsole__floor" open={view === "floor"} onToggle={(event) => onView?.(event.currentTarget.open ? "floor" : "agents")}>
+              <summary>FACTORY FLOOR</summary>
+              {view !== "floor" ? null : <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />}
+            </details>
+          </aside>
 
-          {sidebar !== undefined ? null : (
-            <div className="dfConsoleLayout__right">
-              <NeedsYouColumn
-                state={state}
-                status={status}
-                selectedHumanRequestId={selectedHumanRequest?.request.id}
-                onSelectHumanRequest={onSelectHumanRequest}
-              />
+          <section className="dfCompactConsole__workbench" aria-label="Selected agent workbench">
+            <div className="dfCompactConsole__overview" aria-label="Factory overview">
+              <NeedsYouColumn state={state} status={status} selectedHumanRequestId={selectedHumanRequest?.request.id} onSelectHumanRequest={onSelectHumanRequest} />
               <QueueColumn state={state} />
             </div>
-          )}
+            {selectedHumanRequest === undefined ? null : <HumanRequestPanel
+              selected={selectedHumanRequest}
+              project={projectLabel(state?.projects, selectedHumanRequest.request.project_id)}
+              agent={entityLabel(state?.agents, selectedHumanRequest.request.agent_id, "AGENT")}
+              task={entityLabel(state?.tasks, selectedHumanRequest.request.task_id, "TASK")}
+              onReplyChange={onHumanReplyChange}
+              onReply={onReplyHumanRequest}
+              onCancel={onCancelHumanRequest}
+              onClose={onCloseHumanRequest}
+              onOpenTerminal={onOpenTerminalForHumanRequest}
+              terminalReady={ready}
+            />}
+            {agent === undefined ? <p className="dfFactoryConsole__empty dfCompactConsole__empty">SELECT AN AGENT TO OPEN ITS WORKBENCH</p> : <>
+              <p className="dfCompactConsole__project">PROJECT · {projectLabel(state?.projects, agent.project_id)}</p>
+              <AgentPanel
+                key={agent.id}
+                agent={agent}
+                state={state}
+                edit={edit}
+                ready={ready}
+                onSaveConfig={onSaveAgentConfig}
+                onEditTask={onEditTask}
+                onLoadTaskDetail={onLoadTaskDetail}
+                terminalContent={terminalContent}
+              />
+            </>}
+          </section>
         </div>
       </main>
-      {sidebar === undefined ? null : <aside className="dfConsoleSidebar" aria-label="Selected detail">{sidebar}</aside>}
       {settingsOpen !== true ? null : (
         <SettingsDialog
           state={state}
@@ -261,9 +228,10 @@ function NeedsYouColumn({
         <span>{requests?.length ?? "—"} {requests?.length === 1 ? "ITEM" : "ITEMS"}</span>
       </div>
       {requests === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
-        : requests.length === 0 ? <p className="dfFactoryConsole__empty">all quiet — nothing needs you</p> : (
+        : requests.length === 0 ? <p className="dfFactoryConsole__empty">all quiet — nothing needs you</p> : <details className="dfCompactConsole__overviewList">
+          <summary>VIEW REQUESTS</summary>
           <ul className="dfFactoryConsole__list dfFactoryConsole__list--requests">
-            {requests.slice(0, RIGHT_COLUMN_LIMIT).map((request) => {
+              {requests.map((request) => {
               const selected = selectedHumanRequestId === request.id;
               const copy = humanRequestStatusCopy(request.status);
               return (
@@ -283,8 +251,7 @@ function NeedsYouColumn({
               );
             })}
           </ul>
-        )}
-      <Overflow shown={Math.min(requests?.length ?? 0, RIGHT_COLUMN_LIMIT)} total={requests?.length ?? 0} />
+        </details>}
     </section>
   );
 }
@@ -300,9 +267,10 @@ function QueueColumn({ state }: Pick<FactoryConsoleProps, "state">) {
         <span>{tasks === undefined ? "— queued" : `${tasks.length} open`}</span>
       </div>
       {tasks === undefined ? <p className="dfFactoryConsole__empty">waiting for snapshot</p>
-        : tasks.length === 0 ? <p className="dfFactoryConsole__empty">the queue is empty</p> : (
+        : tasks.length === 0 ? <p className="dfFactoryConsole__empty">the queue is empty</p> : <details className="dfCompactConsole__overviewList">
+          <summary>VIEW OPEN TASKS</summary>
           <ul className="dfConsoleRows">
-            {tasks.slice(0, RIGHT_COLUMN_LIMIT).map((task) => (
+            {tasks.map((task) => (
               <li key={task.id}>
                 <div className="dfConsoleRow">
                   <span className="dfConsoleRow__glyph" aria-hidden="true">{task.status === "running" ? "░" : "▒"}</span>
@@ -315,15 +283,9 @@ function QueueColumn({ state }: Pick<FactoryConsoleProps, "state">) {
               </li>
             ))}
           </ul>
-        )}
-      <Overflow shown={Math.min(tasks?.length ?? 0, RIGHT_COLUMN_LIMIT)} total={tasks?.length ?? 0} />
+        </details>}
     </section>
   );
-}
-
-function Overflow({ shown, total }: { shown: number; total: number }) {
-  if (total <= shown) return null;
-  return <p className="dfFactoryConsole__empty">+{total - shown} more</p>;
 }
 
 function projectLabel(projects: ReadonlyMap<string, { name: string }> | undefined, projectID: string): string {

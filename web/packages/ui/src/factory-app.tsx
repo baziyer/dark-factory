@@ -17,9 +17,11 @@ export type FactoryAppProps = {
 /** Complete browser application lifecycle; hosts only render this component. */
 export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   const [snapshot, setSnapshot] = useState<FactoryAppSnapshot>(INITIAL_SNAPSHOT);
-  const [view, setView] = useState<ConsoleView>("floor");
+  // The roster is always visible. The view state now only controls whether
+  // the optional floor disclosure is open, which keeps its live polling tied
+  // to what the operator can see.
+  const [view, setView] = useState<ConsoleView>("agents");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [terminalOpen, setTerminalOpen] = useState(false);
   const owner = useRef<FactoryAppController | undefined>(undefined);
   const defaultedController = useRef<FactoryAppController | undefined>(undefined);
   const statusChange = useRef(onStatusChange);
@@ -71,27 +73,14 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
 
   const controller = owner.current;
   const agentTerminal = controller === undefined || snapshot.selectedAgent === undefined ? undefined : snapshot.terminal;
-  const terminal = agentTerminal === undefined || controller === undefined || !terminalOpen ? undefined : (
+  const terminal = agentTerminal === undefined || controller === undefined ? undefined : (
     <TerminalPanel
       terminal={agentTerminal}
-      onClose={() => { setTerminalOpen(false); controller.closeAgentTerminal(); }}
+      onClose={() => controller.clearAgentTerminal()}
     >
       <TerminalContent terminal={agentTerminal} controller={controller} />
     </TerminalPanel>
   );
-  // The sidebar always owns a durable task composer. While a run is live its
-  // explicit action is queueing follow-up work; terminal keystrokes stay raw.
-  const instruction = agentTerminal === undefined || controller === undefined ? undefined : (
-    agentTerminal.taskTitle === undefined ? (
-      <AgentIdleTools terminal={agentTerminal} controller={controller} />
-    ) : <AgentTaskTools terminal={agentTerminal} controller={controller} />
-  );
-
-  const openSidebar = (open: () => void) => {
-    setTerminalOpen(false);
-    open();
-  };
-
   return (
     <FactoryConsole
       {...snapshot}
@@ -99,19 +88,16 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       onView={setView}
       settingsOpen={settingsOpen}
       onToggleSettings={() => setSettingsOpen((open) => !open)}
-      onSelectAgent={(agent) => openSidebar(() => { owner.current?.clearHumanRequest(); owner.current?.selectAgent(agent); })}
-      onCloseAgent={() => { setTerminalOpen(false); owner.current?.clearAgentTerminal(); }}
-      onOpenAgentTerminal={() => setTerminalOpen(true)}
+      onSelectAgent={(agent) => owner.current?.selectAgent(agent)}
       onSaveAgentConfig={(config) => { void owner.current?.updateAgentConfig(config); }}
       onEditTask={(task, change) => owner.current?.editTask(task, change) ?? Promise.resolve(false)}
       onLoadTaskDetail={(task, peerOffset, expectedHead) => owner.current?.taskDetail(task, peerOffset, expectedHead) ?? Promise.reject(new Error("closed"))}
-      onOpenTerminalForHumanRequest={(request) => { setTerminalOpen(true); owner.current?.openTerminalForHumanRequest(request); }}
-      onSelectHumanRequest={(request) => openSidebar(() => { void owner.current?.selectHumanRequest(request); })}
+      onOpenTerminalForHumanRequest={(request) => owner.current?.openTerminalForHumanRequest(request)}
+      onSelectHumanRequest={(request) => { void owner.current?.selectHumanRequest(request); }}
       onHumanReplyChange={(reply) => owner.current?.setHumanReply(reply)}
       onReplyHumanRequest={() => { void owner.current?.replyHumanRequest(); }}
       onCancelHumanRequest={() => { void owner.current?.cancelHumanRequest(); }}
       onCloseHumanRequest={() => owner.current?.clearHumanRequest()}
-      instructionContent={instruction}
       onLoadAccounts={() => { void owner.current?.loadAccounts(); }}
       onLinkAccount={(login, label) => { void owner.current?.linkAccount({ provider: login.provider, home: login.home, label }); }}
       onInviteRemote={() => { void owner.current?.inviteRemote(); }}
