@@ -613,6 +613,48 @@ func prepareActiveAttempt(t *testing.T, fixture *dispatchFixture, seed byte) act
 	return activeAttempt{client: client, run: active, bearer: append([]byte(nil), bearer...)}
 }
 
+func TestDaemonOverseerTaskUpdateAuthorizesBeforeProviderPreflight(t *testing.T) {
+	fixture := newDispatchFixture(t)
+	active := prepareActiveAttempt(t, fixture, 171)
+	ctx := context.Background()
+	at := mustKernelTime(t, 1100)
+	project, err := fixture.store.CreateProject(ctx, kernel.NewProject{ID: mustProjectID(t, testID(181)), Name: "foreign", Root: filepath.Join(filepath.Dir(fixture.socket), "foreign")}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := fixture.store.CreateAgent(ctx, kernel.NewAgent{ID: mustAgentID(t, testID(182)), ProjectID: project.ID, Name: "foreign worker", Role: kernel.RoleWorker, Provider: kernel.ProviderCodex, ToolBudgetLimit: 1}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incarnation, err := kernel.IncarnationIDFromBytes(mustIDBytes(t, testID(184)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := fixture.store.EnqueueTask(ctx, kernel.NewTask{ID: mustTaskID(t, testID(183)), ProjectID: project.ID, AssignedAgentID: worker.ID, IncarnationID: incarnation, Title: "foreign", Body: "valid", Priority: 1}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := "valid"
+	tooLargeForCodex := strings.Repeat("x", 8<<10+1)
+	priority := int64(2)
+	for _, input := range []api.OverseerTaskUpdateInput{
+		{TaskID: foreign.ID.String(), ExpectedRevision: uint64(foreign.Revision.Int64()), Body: &valid},
+		{TaskID: foreign.ID.String(), ExpectedRevision: uint64(foreign.Revision.Int64()), Body: &tooLargeForCodex},
+		{TaskID: foreign.ID.String(), ExpectedRevision: uint64(foreign.Revision.Int64() + 1), Body: &valid},
+		{TaskID: foreign.ID.String(), ExpectedRevision: uint64(foreign.Revision.Int64()), Priority: &priority},
+		{TaskID: foreign.ID.String(), ExpectedRevision: uint64(foreign.Revision.Int64()), Cancel: true},
+		{TaskID: testID(185), ExpectedRevision: 1, Body: &valid},
+	} {
+		done := fixture.serve(t)
+		_, err := active.client.OverseerUpdateTask(ctx, input)
+		waitDispatch(t, done)
+		var remote *api.RemoteError
+		if !errors.As(err, &remote) || remote.Code() != api.RemoteUnauthorized {
+			t.Fatalf("foreign update %#v = %v", input, err)
+		}
+	}
+}
+
 func TestDaemonDispatchesBlockAndFailCalls(t *testing.T) {
 	for _, test := range []struct {
 		name string

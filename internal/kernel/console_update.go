@@ -151,6 +151,38 @@ func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDig
 	return store.updateTask(ctx, &digest, id, expected, patch, at)
 }
 
+// AuthorizeWorkerTaskForOverseer establishes that a live overseer may inspect
+// a worker task before the daemon validates a provider-specific edit.
+func (store *Store) AuthorizeWorkerTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID) error {
+	if id.zero() {
+		return fmt.Errorf("%w: invalid task authorization", ErrInvalidValue)
+	}
+	read, err := store.beginRead(ctx)
+	if err != nil {
+		return err
+	}
+	defer read.Close()
+	overseer, err := overseerRun(ctx, read.connection, digest)
+	if err != nil {
+		return err
+	}
+	task, found, err := taskByID(ctx, read.connection, id)
+	if err != nil {
+		return err
+	}
+	if !found || task.ProjectID != overseer.ProjectID {
+		return ErrUnauthorized
+	}
+	agent, found, err := agentByID(ctx, read.connection, task.AssignedAgentID)
+	if err != nil {
+		return err
+	}
+	if !found || agent.Role != RoleWorker {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
 func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
 	if id.zero() || expected.Int64() < 1 {
 		return Task{}, fmt.Errorf("%w: invalid task update", ErrInvalidValue)

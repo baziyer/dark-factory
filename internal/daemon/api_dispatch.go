@@ -899,6 +899,9 @@ func (daemon *Daemon) overseerUpdateTask(ctx context.Context, call api.Call) api
 		assignedAgentID = &agentID
 	}
 	patch := kernel.TaskPatch{Title: input.Title, Body: input.Body, Priority: input.Priority, AssignedAgentID: assignedAgentID, Cancel: input.Cancel}
+	if err := daemon.store.AuthorizeWorkerTaskForOverseer(ctx, digest, id); err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
 	if err := prepareQueuedTaskPatch(ctx, daemon.store, id, expected, patch); err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}

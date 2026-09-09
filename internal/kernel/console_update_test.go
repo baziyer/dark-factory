@@ -158,6 +158,9 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 			t.Fatalf("orchestrator task patch = %v", err)
 		}
 	}
+	if err := store.AuthorizeWorkerTaskForOverseer(ctx, keys.AttemptDigest, queued.ID); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("orchestrator task authorization = %v", err)
+	}
 	worker, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 233), ProjectID: run.ProjectID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 1}, mustTime(t, 43))
 	if err != nil {
 		t.Fatal(err)
@@ -165,6 +168,12 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 	workerTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 234), ProjectID: run.ProjectID, AssignedAgentID: worker.ID, IncarnationID: incarnationID(t, 235), Title: "worker work"}, mustTime(t, 44))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := store.AuthorizeWorkerTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID); err != nil {
+		t.Fatalf("worker task authorization = %v", err)
+	}
+	if err := store.AuthorizeWorkerTaskForOverseer(ctx, keys.AttemptDigest, taskID(t, 236)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("missing task authorization = %v", err)
 	}
 	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, TaskPatch{Priority: &priority}, mustTime(t, 45))
 	if err != nil || updated.Priority != priority || updated.Title != workerTask.Title {
