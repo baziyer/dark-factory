@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 6
+	userVersion   = 7
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -354,10 +354,36 @@ var schemaStatements = []string{
     invalidation_sequence INTEGER NOT NULL CHECK (invalidation_sequence >= 0),
     FOREIGN KEY (agent_id) REFERENCES agents(id)
 ) STRICT, WITHOUT ROWID`,
+	`CREATE TABLE peer_questions (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16),
+    source_task_id BLOB NOT NULL CHECK (length(source_task_id) = 16),
+    target_task_id BLOB NOT NULL CHECK (length(target_task_id) = 16),
+    idempotency_key BLOB NOT NULL CHECK (length(idempotency_key) = 16 AND idempotency_key <> zeroblob(16)),
+    question_text TEXT NOT NULL CHECK (length(CAST(question_text AS BLOB)) BETWEEN 1 AND 8192),
+    answer_idempotency_key BLOB CHECK (answer_idempotency_key IS NULL OR (length(answer_idempotency_key) = 16 AND answer_idempotency_key <> zeroblob(16))),
+    answer_text TEXT CHECK (answer_text IS NULL OR length(CAST(answer_text AS BLOB)) BETWEEN 1 AND 8192),
+    recipient_delivery_id BLOB CHECK (recipient_delivery_id IS NULL OR length(recipient_delivery_id) = 16),
+    recipient_delivery_state TEXT NOT NULL CHECK (recipient_delivery_state IN ('pending', 'delivered', 'unknown')),
+    answer_delivery_id BLOB CHECK (answer_delivery_id IS NULL OR length(answer_delivery_id) = 16),
+    answer_delivery_state TEXT NOT NULL CHECK (answer_delivery_state IN ('pending', 'delivered', 'unknown')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    CHECK (source_task_id <> target_task_id),
+    CHECK ((answer_idempotency_key IS NULL AND answer_text IS NULL) OR (answer_idempotency_key IS NOT NULL AND answer_text IS NOT NULL)),
+    CHECK ((recipient_delivery_id IS NULL AND recipient_delivery_state = 'pending') OR (recipient_delivery_id IS NOT NULL AND recipient_delivery_state IN ('delivered', 'unknown'))),
+    CHECK ((answer_text IS NULL AND answer_delivery_id IS NULL AND answer_delivery_state = 'pending') OR (answer_text IS NOT NULL AND ((answer_delivery_id IS NULL AND answer_delivery_state = 'pending') OR (answer_delivery_id IS NOT NULL AND answer_delivery_state IN ('delivered', 'unknown')))))
+) STRICT, WITHOUT ROWID`,
+	`CREATE UNIQUE INDEX peer_questions_source_key_unique ON peer_questions(source_task_id, idempotency_key)`,
+	`CREATE UNIQUE INDEX peer_questions_recipient_delivery_unique ON peer_questions(recipient_delivery_id) WHERE recipient_delivery_id IS NOT NULL`,
+	`CREATE UNIQUE INDEX peer_questions_answer_delivery_unique ON peer_questions(answer_delivery_id) WHERE answer_delivery_id IS NOT NULL`,
+	`CREATE INDEX peer_questions_task_history ON peer_questions(project_id, source_task_id, target_task_id, created_at_ms, id)`,
 	`CREATE TABLE invalidations (
     sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
-    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request', 'account')),
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request', 'account', 'peer_question')),
     entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -165,6 +166,12 @@ func (daemon *Daemon) dispatch(ctx context.Context, call api.Call) api.Reply {
 		return daemon.attemptTask(ctx, call)
 	case api.CallRequestHuman:
 		return daemon.requestHuman(ctx, call)
+	case api.CallPeerStatus:
+		return daemon.peerStatus(ctx, call)
+	case api.CallPeerAsk:
+		return daemon.peerAsk(ctx, call)
+	case api.CallPeerAnswer:
+		return daemon.peerAnswer(ctx, call)
 	case api.CallSendBack, api.CallSendBackTask:
 		return daemon.sendBack(ctx, call)
 	case api.CallOverseerSnapshot:
@@ -254,11 +261,189 @@ func (daemon *Daemon) attemptTask(ctx context.Context, call api.Call) api.Reply 
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}
-	reply, err := api.NewAttemptTaskReply(api.AttemptTask{Task: authority.Task()})
+	task := authority.Task()
+	if authority.Provider == kernel.ProviderCodex {
+		task += "\n\nPeer collaboration is asynchronous. Use `factoryctl attempt peer status` to read task-linked questions or answers; it grants no terminal or task-control authority."
+	}
+	reply, err := api.NewAttemptTaskReply(api.AttemptTask{Task: task})
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
 	return reply
+}
+
+func (daemon *Daemon) peerStatus(ctx context.Context, call api.Call) api.Reply {
+	digest, ok := call.AttemptDigest()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	kDigest, err := attemptDigest(digest)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	authority, err := daemon.store.AuthenticateAttempt(ctx, kDigest)
+	if err != nil || authority.Role != kernel.RoleWorker {
+		if err == nil {
+			err = kernel.ErrUnauthorized
+		}
+		return newErrorReply(remoteErrorCode(err))
+	}
+	items, _, err := daemon.store.PeerQuestionsForTask(ctx, authority.TaskID, 0)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	status := api.PeerStatus{Questions: make([]api.PeerQuestion, 0, len(items))}
+	for _, item := range items {
+		status.Questions = append(status.Questions, daemon.projectPeerQuestion(ctx, item))
+	}
+	reply, err := api.NewPeerStatusReply(status)
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	return reply
+}
+
+func (daemon *Daemon) projectPeerQuestion(ctx context.Context, item kernel.PeerQuestion) api.PeerQuestion {
+	target, targetFound, _ := daemon.store.Task(ctx, item.TargetTaskID)
+	source, sourceFound, _ := daemon.store.Task(ctx, item.SourceTaskID)
+	availability := func(task kernel.Task, found bool) string {
+		if !found || (task.Status != kernel.TaskQueued && task.Status != kernel.TaskRunning) {
+			return "stale"
+		}
+		if task.Status == kernel.TaskRunning {
+			return "available"
+		}
+		return "pending"
+	}
+	return api.PeerQuestion{ID: item.ID.String(), SourceTaskID: item.SourceTaskID.String(), TargetTaskID: item.TargetTaskID.String(), Question: item.Question, Answer: item.Answer, RecipientDeliveryState: item.RecipientDeliveryState.String(), AnswerDeliveryState: item.AnswerDeliveryState.String(), RecipientAvailability: availability(target, targetFound), AnswerAvailability: availability(source, sourceFound), Revision: uint64(item.Revision.Int64())}
+}
+
+func (daemon *Daemon) peerAsk(ctx context.Context, call api.Call) api.Reply {
+	digest, ok := call.AttemptDigest()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	kDigest, err := attemptDigest(digest)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	input, ok := call.PeerQuestionInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	target, err := parseTaskID(input.TargetTaskID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	raw, err := parseID(input.IdempotencyKey)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	var key [kernel.IDBytes]byte
+	copy(key[:], raw)
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	question, err := daemon.store.CreatePeerQuestionForAttempt(ctx, kDigest, kernel.NewPeerQuestion{TargetTaskID: target, IdempotencyKey: key, Question: input.Question}, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if err := daemon.notifyPeerDelivery(ctx, question); err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.mutation(ctx, question.Revision)
+}
+
+func (daemon *Daemon) peerAnswer(ctx context.Context, call api.Call) api.Reply {
+	digest, ok := call.AttemptDigest()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	kDigest, err := attemptDigest(digest)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	input, ok := call.PeerAnswerInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	rawID, err := parseID(input.QuestionID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	id, err := kernel.PeerQuestionIDFromBytes(rawID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	raw, err := parseID(input.IdempotencyKey)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	var key [kernel.IDBytes]byte
+	copy(key[:], raw)
+	revision, err := kernel.NewRevision(int64(input.ExpectedRevision))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	question, err := daemon.store.AnswerPeerQuestionForAttempt(ctx, kDigest, kernel.PeerAnswer{QuestionID: id, Expected: revision, IdempotencyKey: key, Answer: input.Answer}, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	if err := daemon.notifyPeerDelivery(ctx, question); err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.mutation(ctx, question.Revision)
+}
+
+func (daemon *Daemon) notifyPeerDelivery(ctx context.Context, question kernel.PeerQuestion) error {
+	if !terminalEffectsSupported {
+		return nil
+	}
+	run, found, err := daemon.store.RunningPeerTarget(ctx, question)
+	if err != nil || !found {
+		return err
+	}
+	var raw [kernel.IDBytes]byte
+	if _, err := rand.Read(raw[:]); err != nil || raw == ([kernel.IDBytes]byte{}) {
+		if err == nil {
+			err = kernel.ErrCorruptState
+		}
+		return err
+	}
+	deliveryID, err := kernel.PeerDeliveryIDFromBytes(raw[:])
+	if err != nil {
+		return err
+	}
+	answer := question.AnswerIdempotencyKey != nil
+	daemon.operationMu.Lock()
+	defer daemon.operationMu.Unlock()
+	at, err := daemon.timestamp()
+	if err != nil {
+		return err
+	}
+	delivery, newly, err := daemon.store.ReservePeerDelivery(ctx, question.ID, run.ID, deliveryID, answer, at)
+	if err != nil || !newly {
+		return err
+	}
+	attempt, err := daemon.liveTerminalAttempt(run.ID, kernel.TerminalSessionID{})
+	if err != nil {
+		return nil
+	}
+	result := attempt.submitEffect(ctx, terminalEffect{kind: terminalEffectHumanReply, payload: delivery.Payload, submit: true})
+	if result.effectError(len(delivery.Payload)) != nil {
+		return nil
+	}
+	ackAt, err := daemon.timestamp()
+	if err != nil {
+		return err
+	}
+	_, err = daemon.store.AcknowledgePeerDelivery(ctx, question.ID, delivery.DeliveryID, answer, delivery.Revision, ackAt)
+	return err
 }
 
 func (daemon *Daemon) health(ctx context.Context) api.Reply {

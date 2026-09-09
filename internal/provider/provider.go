@@ -30,7 +30,7 @@ const (
 	claudeConfigDir      = ".claude"
 	codexConfigDir       = ".codex"
 	claudeTaskLead       = "Complete this Dark Factory task. Before exiting, report the durable outcome with $DARK_FACTORY_FACTORYCTL attempt succeed, block, or fail. Task: "
-	codexBootstrapPrompt = "Run \"$DARK_FACTORY_FACTORYCTL\" attempt task before doing anything else. The returned JSON task field is the exact task: complete only that task. Before exiting, report the durable outcome with \"$DARK_FACTORY_FACTORYCTL\" attempt succeed, block, or fail."
+	codexBootstrapPrompt = "Run \"$DARK_FACTORY_FACTORYCTL\" attempt task before doing anything else. The returned JSON task field is the exact task: complete only that task. Peer collaboration is asynchronous: use \"$DARK_FACTORY_FACTORYCTL\" attempt peer status to read or answer task-linked questions, but it grants no task or terminal control. Before exiting, report the durable outcome with \"$DARK_FACTORY_FACTORYCTL\" attempt succeed, block, or fail."
 )
 
 var (

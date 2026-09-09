@@ -118,6 +118,11 @@ bounded to 8 KiB so the configured 32,768-token tool-result budget cannot
 truncate it even under worst-case control-character escaping. The attempt API
 serves it only while that exact run is `running`.
 
+Codex workers can exchange one durable, task-linked question and answer with
+another Codex worker using `factoryctl attempt peer status`, `peer ask`, and
+`peer answer`. Questions are asynchronous: a queued recipient reads it when
+its attempt starts, and neither command grants task or terminal control.
+
 Subsequent browser terminal input goes directly to the same PTY. The provider
 reports its durable outcome through the attempt-scoped `factoryctl` supplied by
 the daemon. Before reporting success, a worker removes only generated

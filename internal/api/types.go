@@ -242,6 +242,7 @@ type OverseerSnapshot struct {
 	Tasks          []OverseerTask         `json:"tasks"`
 	Runs           []OverseerRun          `json:"runs"`
 	Questions      []OverseerQuestion     `json:"questions"`
+	PeerQuestions  []PeerQuestion         `json:"peer_questions"`
 	History        []OverseerIntervention `json:"history"`
 }
 
@@ -427,6 +428,65 @@ type EnqueueTaskInput struct {
 type HumanQuestionInput struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	Question       string `json:"question"`
+}
+
+type PeerQuestionInput struct {
+	TargetTaskID   string `json:"target_task_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Question       string `json:"question"`
+}
+
+type PeerAnswerInput struct {
+	QuestionID       string `json:"question_id"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+	IdempotencyKey   string `json:"idempotency_key"`
+	Answer           string `json:"answer"`
+}
+
+type PeerStatus struct {
+	Questions []PeerQuestion `json:"questions"`
+}
+
+// Peer status is printed in an authenticated provider terminal.
+func (status PeerStatus) MarshalJSON() ([]byte, error) {
+	type plain PeerStatus
+	encoded, err := json.Marshal(plain(status))
+	if err != nil {
+		return nil, err
+	}
+	return terminalSafeJSON(nil, encoded), nil
+}
+
+type PeerQuestion struct {
+	ID                     string `json:"id"`
+	SourceTaskID           string `json:"source_task_id"`
+	TargetTaskID           string `json:"target_task_id"`
+	Question               string `json:"question"`
+	Answer                 string `json:"answer"`
+	RecipientDeliveryState string `json:"recipient_delivery_state"`
+	AnswerDeliveryState    string `json:"answer_delivery_state"`
+	RecipientAvailability  string `json:"recipient_availability"`
+	AnswerAvailability     string `json:"answer_availability"`
+	Revision               uint64 `json:"revision"`
+}
+
+func validPeerStatus(status PeerStatus) bool {
+	if len(status.Questions) > 1 {
+		return false
+	}
+	for _, question := range status.Questions {
+		if !validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) || question.RecipientAvailability != "" && !validPeerAvailability(question.RecipientAvailability) || question.AnswerAvailability != "" && !validPeerAvailability(question.AnswerAvailability) {
+			return false
+		}
+	}
+	return true
+}
+
+func validPeerState(value string) bool {
+	return value == "pending" || value == "delivered" || value == "unknown"
+}
+func validPeerAvailability(value string) bool {
+	return value == "pending" || value == "available" || value == "stale"
 }
 
 // SendBackInput returns a finished task to its worker's queue with a note.

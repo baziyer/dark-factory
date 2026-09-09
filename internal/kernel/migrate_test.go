@@ -303,6 +303,11 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	} else if version >= v4UserVersion {
 		agentColumnsFor = testAgentColumnsV4
 	}
+	if version != legacyUserVersion {
+		if err := rebuildTable(ctx, connection, legacy, "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := rebuildTable(ctx, connection, legacy, "agents", agentColumnsFor, "agents_id_project_unique", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +328,9 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	}
 	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
 	if version < userVersion {
+		downgrade = append([]string{"DROP TABLE peer_questions"}, downgrade...)
+	}
+	if version < v6UserVersion {
 		downgrade = append([]string{"DROP TABLE task_interventions", "DROP TABLE overseer_wake_cursors"}, downgrade...)
 	}
 	if version == legacyUserVersion {
@@ -491,7 +499,8 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
+		{"current", schemaStatements, "bf097f5630d1e6873aa8a05b2cf1b5265e9d8fd656eb3ffb794e5b77003609c9"},
+		{"v6", v6SchemaStatements(), "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
 		{"v4", v4SchemaStatements(), "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
 		{"v3", priorSchemaStatements(), "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
 		{"v2", previousSchemaStatements(), "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
@@ -508,7 +517,7 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 // that reaches inside the migration transaction: the two above are rejected by
 // the preflight, on its disposable copy, before any pool exists.
 func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t, version)
 		})

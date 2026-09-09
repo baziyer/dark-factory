@@ -46,7 +46,7 @@ func projectSnapshot(snapshot kernel.DashboardSnapshot) api.DashboardSnapshot {
 func projectOverseerSnapshot(snapshot kernel.OverseerSnapshot) api.OverseerSnapshot {
 	result := api.OverseerSnapshot{
 		ProjectID: snapshot.ProjectID.String(), Head: uint64(snapshot.Head.Int64()), NextOffset: snapshot.NextOffset, NextTextOffset: snapshot.NextTextOffset,
-		Agents: []api.AgentSummary{}, Tasks: []api.OverseerTask{}, Runs: []api.OverseerRun{}, Questions: []api.OverseerQuestion{}, History: []api.OverseerIntervention{},
+		Agents: []api.AgentSummary{}, Tasks: []api.OverseerTask{}, Runs: []api.OverseerRun{}, Questions: []api.OverseerQuestion{}, PeerQuestions: []api.PeerQuestion{}, History: []api.OverseerIntervention{},
 	}
 	for _, agent := range snapshot.Agents {
 		result.Agents = append(result.Agents, api.AgentSummary{ID: agent.ID.String(), ProjectID: agent.ProjectID.String(), Name: agent.Name, Role: agent.Role, Provider: agent.Provider, Paused: agent.Paused, Revision: uint64(agent.Revision.Int64())})
@@ -59,6 +59,9 @@ func projectOverseerSnapshot(snapshot kernel.OverseerSnapshot) api.OverseerSnaps
 	}
 	for _, question := range snapshot.Questions {
 		result.Questions = append(result.Questions, api.OverseerQuestion{ID: question.ID.String(), AgentID: question.AgentID.String(), TaskID: question.TaskID.String(), Status: question.Status.String(), Revision: uint64(question.Revision.Int64()), Question: question.Question})
+	}
+	for _, question := range snapshot.PeerQuestions {
+		result.PeerQuestions = append(result.PeerQuestions, api.PeerQuestion{ID: question.ID.String(), SourceTaskID: question.SourceTaskID.String(), TargetTaskID: question.TargetTaskID.String(), Question: question.Question, Answer: question.Answer, RecipientDeliveryState: question.RecipientDeliveryState.String(), AnswerDeliveryState: question.AnswerDeliveryState.String(), Revision: uint64(question.Revision.Int64())})
 	}
 	for _, item := range snapshot.History {
 		detail := ""
