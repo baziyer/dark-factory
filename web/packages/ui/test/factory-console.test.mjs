@@ -55,8 +55,7 @@ const runSample = (agentId, paths, taskId = ids.task, taskRevision = fixtureStat
 
 test("error banner keeps its centered layout after the paragraph reset", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
-  // The sidebar is a sibling of the console, so it needs the same reset.
-  assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),\s*\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
+  assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
   assert.match(css, /\.dfFactoryScene__room--empty > rect,[\s\S]*?\.dfFactoryScene__room--empty > use \{ opacity: 0\.45; \}/);
   assert.match(css, /\.dfFactoryFloor \{ overflow-x: auto; \}/);
@@ -65,10 +64,10 @@ test("error banner keeps its centered layout after the paragraph reset", () => {
   assert.equal(css.includes("@keyframes dfFactoryScene"), false);
 });
 
-test("one screen shows the floor, the counters, and what needs you at once", () => {
+test("one screen keeps the roster, compact overview, and optional floor together", () => {
   const markup = render();
   assert.match(markup, /<main class="dfFactoryConsole" aria-label="Factory operator console">/);
-  for (const label of ["Factory counters", "Left view", "Factory floor", "NEEDS YOU", "Queue"]) {
+  for (const label of ["Factory counters", "Agents", "Factory overview", "NEEDS YOU", "Queue"]) {
     assert.match(markup, new RegExp(`aria-label="${label}"`));
   }
   // Counters read the served factory, not a second count of it.
@@ -83,10 +82,10 @@ test("one screen shows the floor, the counters, and what needs you at once", () 
   assert.equal(markup.includes("BUILDING STATE UNAVAILABLE"), false);
 });
 
-test("the left view toggles between the floor and the ranked agent list", () => {
+test("the roster stays visible while the optional floor opens and closes", () => {
   const floor = render();
   assert.match(floor, /aria-label="Dark Factory codebase floor"/);
-  assert.equal(floor.includes('aria-label="OVERSEER"'), false);
+  assert.match(floor, /aria-label="OVERSEER"/);
 
   const agents = render({ view: "agents" });
   assert.match(agents, /aria-label="Agents"/);
@@ -379,9 +378,10 @@ test("transitional session statuses have stable live labels and offer no factory
   for (const status of ["idle", "connecting", "authenticating", "syncing", "closed"]) {
     const markup = render({ status, onSelectAgent: () => {}, onSelectHumanRequest: () => {}, onView: () => {}, onToggleSettings: () => {} });
     assert.match(markup, new RegExp(`>${status.toUpperCase()}<`));
-    // Only the three local chrome controls are live before the factory is.
+    // SETTINGS is the only button before the factory is ready; the floor is a
+    // native disclosure, not a factory action.
     const live = (markup.match(/<button(?![^>]*disabled)/g) ?? []).length;
-    assert.equal(live, 3, status);
+    assert.equal(live, 1, status);
     assert.match(markup, /<button type="button" aria-pressed="false" disabled=""/);
   }
   const ready = render({ status: "ready" });
@@ -394,8 +394,8 @@ test("closed and pairing-uncertain errors have no ineffective action", () => {
     const markup = render({ status: "closed", error, onSelectAgent: () => {}, onSelectHumanRequest: () => {}, onView: () => {}, onToggleSettings: () => {} });
     assert.match(markup, /role="alert"/);
     // The banner offers nothing to press, and the only live buttons on a
-    // closed console are the three that change nothing in the factory.
-    assert.equal((markup.match(/<button(?![^>]*disabled)/g) ?? []).length, 3);
+    // closed console is SETTINGS, which changes nothing in the factory.
+    assert.equal((markup.match(/<button(?![^>]*disabled)/g) ?? []).length, 1);
     assert.doesNotMatch(markup, /role="alert"[^>]*>[^<]*<button/);
     assert.equal(markup.includes("RETRY CONNECTION"), false);
     assert.equal(markup.includes("Error:"), false);
@@ -417,7 +417,7 @@ test("unknown and inherited error codes use a finite fallback", () => {
   }
 });
 
-test("empty and bounded right-column collections are explicit and capped", () => {
+test("compact overview keeps every needs-you and queue item reachable", () => {
   const emptyState = baseState({ projects: new Map(), agents: new Map(), tasks: new Map(), humanRequests: new Map() });
   assert.match(render({ state: emptyState }), /all quiet — nothing needs you/);
   assert.match(render({ state: emptyState }), /the queue is empty/);
@@ -437,9 +437,9 @@ test("empty and bounded right-column collections are explicit and capped", () =>
   }
   const bounded = baseState({ agents, tasks, humanRequests: requests });
   const markup = render({ state: bounded });
-  assert.equal((markup.match(/class="dfFactoryConsole__card"/g) ?? []).length, 8);
-  assert.equal((markup.match(/class="dfConsoleRow"/g) ?? []).length, 8);
-  assert.equal((markup.match(/\+1 more/g) ?? []).length, 2, "both columns own their overflow");
+  assert.equal((markup.match(/class="dfFactoryConsole__card"/g) ?? []).length, 9);
+  assert.equal((markup.match(/class="dfConsoleRow"/g) ?? []).length, 18);
+  assert.equal((markup.match(/\+1 more/g) ?? []).length, 0);
   assert.match(markup, />9 ITEMS</);
   assert.match(markup, />9 open</);
   assert.equal((render({ state: bounded, view: "agents" }).match(/dfAgentList__row/g) ?? []).length, 0, "no handler, no button");
@@ -500,19 +500,16 @@ test("HumanRequest delivery states remain visibly distinct", () => {
   }
 });
 
-test("the sidebar replaces the right column and the terminal owns it outright", () => {
+test("the workbench keeps one terminal slot beside the persistent roster", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
   assert.match(css, /\.dfConsoleRow__agent\s*\{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere;/);
   assert.match(css, /\.dfConsoleShell\s*\{[^}]*display: flex;[^}]*align-items: flex-start;/);
   assert.match(css, /\.dfFactoryConsole__terminalPanel :where\(p\)\s*\{\s*margin: 0;/);
   assert.match(css, /\.dfConsoleRow\s*\{[^}]*flex-wrap: wrap;/);
-  assert.match(css, /\.dfConsoleLayout\s*\{[^}]*grid-template-columns: minmax\(0, 2fr\) minmax\(0, 1fr\);/);
-  assert.match(css, /\.dfConsoleLayout--narrow \{ grid-template-columns: minmax\(0, 1fr\); \}/);
+  assert.match(css, /\.dfCompactConsole\s*\{[^}]*grid-template-columns: minmax\(17rem, 0\.8fr\) minmax\(0, 2fr\);/);
+  assert.match(css, /\.dfCompactConsole__roster,[\s\S]*?\.dfCompactConsole__workbench\s*\{[^}]*max-height: calc\(100svh - 9rem\);[^}]*overflow: auto;/);
   assert.match(css, /\.dfFactoryConsole__instructionActions\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap;/);
-  assert.match(css, /\.dfConsoleSidebar\s*\{[^}]*flex: 0 0 clamp\(22rem, 40vw, 44rem\);[^}]*min-width: 0;/);
-  // Every rule the console scopes to its own subtree names the sidebar too,
-  // or the sidebar renders in the browser's default serif on the page ground.
-  for (const rule of [/\.dfConsoleSidebar \*,/, /\.dfConsoleSidebar button \{/, /\.dfConsoleSidebar button:disabled/, /\.dfConsoleSidebar\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleSidebar\s*\{[^}]*color: var\(--df-console-text\)/, /\.dfConsoleDialog \*,/, /\.dfConsoleDialog button,/, /\.dfConsoleDialog button:disabled,/, /\.dfConsoleDialog\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleDialog\s*\{[^}]*color: var\(--df-console-text\)/]) {
+  for (const rule of [/\.dfConsoleDialog \*/, /\.dfConsoleDialog button,/, /\.dfConsoleDialog button:disabled \{/, /\.dfConsoleDialog\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleDialog\s*\{[^}]*color: var\(--df-console-text\)/]) {
     assert.match(css, rule);
   }
   // The panel scrolls, never the <dialog>: a scrollbar click on the dialog
@@ -522,35 +519,32 @@ test("the sidebar replaces the right column and the terminal owns it outright", 
   assert.match(css, /@media \(max-width: 1024px\)[\s\S]*?\.dfConsoleShell \{ display: block; \}/);
   assert.match(css, /:focus-visible\s*\{\s*outline: 2px solid var\(--df-console-accent\);/);
 
-  const quiet = render();
-  assert.match(quiet, /dfConsoleLayout__right/);
-  assert.equal(quiet.includes("dfConsoleSidebar"), false);
-
-  const withTerminal = render({ terminalContent: createElement("section", { "aria-label": "Terminal sidebar" }) });
-  assert.match(withTerminal, /<\/main><aside class="dfConsoleSidebar" aria-label="Selected detail"><section aria-label="Terminal sidebar"><\/section><\/aside><\/div>$/);
-  assert.match(withTerminal, /dfConsoleLayout dfConsoleLayout--narrow/);
+  const withTerminal = render({ selectedAgent: agentSelection(), terminalContent: createElement("section", { "aria-label": "Agent terminal" }) });
+  assert.match(withTerminal, /<h1>DARK FACTORY<\/h1>/);
+  assert.match(withTerminal, /dfCompactConsole__roster[\s\S]*?dfCompactConsole__workbench/);
+  assert.match(withTerminal, /dfConsoleSidebar__terminalSlot"><section aria-label="Agent terminal"><\/section>/);
   assert.equal(withTerminal.includes("dfConsoleLayout__right"), false);
 });
 
-test("selecting an agent opens the agent sidebar with its config and queue", () => {
+test("selecting an agent opens one workbench with compact durable sections", () => {
   const markup = render({
     view: "agents",
     selectedAgent: agentSelection(),
     onSelectAgent: () => {},
     onSaveAgentConfig: () => {},
     onEditTask: () => {},
-    onOpenAgentTerminal: () => {},
-    onCloseAgent: () => {},
   });
   assert.match(markup, /aria-label="Agent Builder One"/);
-  assert.match(markup, />WORKER · claude_code · claude-opus-5</);
-  assert.match(markup, /aria-label="NOW"[\s\S]*?Review the state projection/);
+  assert.match(markup, /Builder One[\s\S]*?claude_code · claude-opus-5/);
+  assert.match(markup, /PROJECT · North Workshop/);
   assert.match(markup, /aria-label="Agent configuration"/);
   assert.match(markup, /value="claude-opus-5"/);
   assert.match(markup, /value="high"/);
   assert.match(markup, /aria-label="Agent queue"/);
-  assert.match(markup, />OPEN TERMINAL</);
-  // The whole right column is gone while the sidebar is open.
+  assert.match(markup, /<details class="dfConsoleSidebar__section"/);
+  assert.match(markup, />CONFIG<\/summary>/);
+  // The roster stays present while this workbench is open.
+  assert.match(markup, /dfCompactConsole__roster/);
   assert.equal(markup.includes("dfConsoleLayout__right"), false);
 
   // Without handlers the sidebar is a readout, never a dead form.
@@ -773,14 +767,14 @@ test("SETTINGS opens and closes as a native modal, over whatever sidebar is open
   }
 });
 
-test("the view toggle rides in the left panel's heading, not the top bar", () => {
+test("the floor disclosure rides beside the persistent roster, not the top bar", () => {
   const floor = render();
-  assert.match(floor, /class="dfConsoleLayout__left[^"]*"[^>]*><div class="dfFactoryConsole__sectionHeading"><h2>FACTORY FLOOR<\/h2><div class="dfConsoleViewToggle" role="group" aria-label="Left view">/);
-  assert.match(render({ view: "agents" }), /<h2>AGENTS<\/h2><div class="dfConsoleViewToggle"/);
+  assert.match(floor, /class="dfCompactConsole__roster" aria-label="Agents">[\s\S]*?<details class="dfCompactConsole__floor" open=""><summary>FACTORY FLOOR<\/summary>/);
+  assert.match(render({ view: "agents" }), /<details class="dfCompactConsole__floor"><summary>FACTORY FLOOR<\/summary><\/details>/);
   // The top bar keeps the wordmark, the counters, and SETTINGS.
   const actions = floor.split('class="dfConsoleBar__actions"')[1];
   assert.match(actions.slice(0, actions.indexOf("</div>")), />SETTINGS</);
-  assert.equal(floor.indexOf("Left view") > floor.indexOf("dfConsoleLayout__left"), true);
+  assert.equal(floor.indexOf("FACTORY FLOOR") > floor.indexOf("dfCompactConsole__roster"), true);
 });
 
 test("FactoryApp server-renders without reading browser globals", () => {
@@ -861,7 +855,7 @@ test("agent and question terminal actions expose only current public intent", ()
   assert.equal(calls[0][1].revision, agent.revision);
   assert.deepEqual(calls[1], ["request", request]);
 
-  const markup = render({ terminalContent: createElement("div", null, "<raw-output>") });
+  const markup = render({ selectedAgent: agentSelection(), terminalContent: createElement("div", null, "<raw-output>") });
   assert.match(markup, /&lt;raw-output&gt;/);
   assert.equal(markup.includes("runId"), false);
   assert.equal(markup.includes("sessionId"), false);
@@ -876,9 +870,10 @@ test("the view toggle and settings forward exactly one intent each", () => {
     onToggleSettings: () => calls.push(["settings"]),
   }));
   const chrome = elements.filter((element) => element.type === "button" && element.props.disabled !== true);
-  assert.deepEqual(chrome.map((element) => element.props.children), ["SETTINGS", "FLOOR", "AGENTS"]);
-  for (const button of chrome) button.props.onClick();
-  assert.deepEqual(calls, [["settings"], ["view", "floor"], ["view", "agents"]]);
+  assert.deepEqual(chrome.map((element) => element.props.children), ["SETTINGS"]);
+  chrome[0].props.onClick();
+  elements.find((element) => element.type === "details" && element.props.className === "dfCompactConsole__floor").props.onToggle({ currentTarget: { open: false } });
+  assert.deepEqual(calls, [["settings"], ["view", "agents"]]);
 });
 
 function expand(node, result = []) {
@@ -939,9 +934,9 @@ test("the console shows the model an agent will actually run with", () => {
   const rows = render({ view: "agents" });
   assert.match(rows, /codex · gpt-6-astra/);
   assert.match(rows, /claude_code · claude-opus-5/);
-  assert.match(withAgent(inheritingAgent()), />WORKER · codex · gpt-6-astra</);
+  assert.match(withAgent(inheritingAgent()), /Builder Two[\s\S]*?codex · gpt-6-astra/);
   // The provider with no model says nothing extra rather than a dangling dot.
-  assert.match(withAgent(shellAgent), />WORKER · shell</);
+  assert.match(withAgent(shellAgent), /Shell Hand[\s\S]*?shell/);
 });
 
 test("the config inputs stay the agent's own override and caption where it came from", () => {

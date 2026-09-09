@@ -51,9 +51,7 @@ export function AgentPanel({
   onSaveConfig,
   onEditTask,
   onLoadTaskDetail,
-  onOpenTerminal,
-  onClose,
-  children,
+  terminalContent,
 }: {
   agent: AgentItem;
   state: StateView | undefined;
@@ -62,10 +60,8 @@ export function AgentPanel({
   onSaveConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
-  onOpenTerminal?: () => void;
-  onClose?: () => void;
-  /** The instruction composer the terminal view owns for an idle agent. */
-  children?: ReactNode;
+  /** The workbench owns one terminal surface for this selected agent. */
+  terminalContent?: ReactNode;
 }) {
   const activity = state === undefined ? "ready" : agentStatus(agent, state);
   const current = state === undefined ? undefined : agentCurrentTask(agent, state);
@@ -96,28 +92,15 @@ export function AgentPanel({
     `${id}:${revision}:${errorCopy !== undefined && edit?.target === id ? "refused" : ""}`;
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
-      <div className="dfConsoleSidebar__heading">
-        <div>
-          <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
-          <h2>{agent.name}</h2>
-        </div>
-        {onClose === undefined ? null : <button type="button" onClick={onClose}>CLOSE</button>}
-      </div>
-
       <p className="dfConsoleSidebar__status">{activity === "needs-you" ? "! needs you" : activity}</p>
       {queueHint === undefined ? null : <p className="dfConsoleSidebar__inherit">{queueHint}</p>}
 
-      <div className="dfConsoleSidebar__section" aria-label="NOW">
-        <h3>NOW</h3>
-        <p className="dfConsoleSidebar__now">{current?.title ?? "ready for work"}</p>
-      </div>
-
       {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
 
-      <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} accounts={state === undefined ? [] : [...state.accounts.values()]} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
+      {terminalContent === undefined ? null : <div className="dfConsoleSidebar__terminalSlot">{terminalContent}</div>}
 
-      <div className="dfConsoleSidebar__section" aria-label="Agent queue">
-        <h3>QUEUE</h3>
+      <details className="dfConsoleSidebar__section" aria-label="Agent queue" open={queued.length > 0}>
+        <summary>QUEUE · {queued.length}</summary>
         {queued.length === 0 ? <p className="dfFactoryConsole__empty">nothing queued</p> : (
           <ul className="dfFactoryConsole__list">
             {queued.map((task, index) => (
@@ -135,21 +118,21 @@ export function AgentPanel({
             ))}
           </ul>
         )}
-        {children}
-      </div>
+      </details>
 
-      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Task history">
-        <h3>TASK HISTORY</h3>
+      <details className="dfConsoleSidebar__section">
+        <summary>CONFIG</summary>
+        <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} accounts={state === undefined ? [] : [...state.accounts.values()]} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
+      </details>
+
+      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <details className="dfConsoleSidebar__section" aria-label="Task history">
+        <summary>TASK HISTORY</summary>
         <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-history-${agent.id}`}>TASK HISTORY</label>
         <select id={`df-history-${agent.id}`} value={historyTask.id} disabled={conversationPending} onChange={(event) => { setHistoryTaskID(event.currentTarget.value); setConversation(undefined); setConversationError(false); }}>{historyTasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select>
         <button type="button" disabled={conversationPending} onClick={async () => { setConversationPending(true); try { setConversation({ task: historyTask, brief: await onLoadTaskDetail(historyTask) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } }}>VIEW CONVERSATION</button>
         {conversationError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : null}
         {conversation === undefined ? null : <TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset, conversation.brief.head) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} />}
-      </div>}
-
-      {onOpenTerminal === undefined ? null : (
-        <button type="button" className="dfConsoleSidebar__terminal" disabled={!ready} onClick={onOpenTerminal}>OPEN TERMINAL</button>
-      )}
+      </details>}
     </section>
   );
 }
@@ -215,7 +198,6 @@ function AgentConfig({
   };
   return (
     <form className="dfConsoleSidebar__section dfConsoleSidebar__config" aria-label="Agent configuration" onSubmit={submit}>
-      <h3>CONFIG</h3>
       {agent.provider === "shell" ? <p className="dfConsoleSidebar__inherit">shell has no model</p> : (
         <>
           <label htmlFor={`df-model-${agent.id}`}>MODEL</label>

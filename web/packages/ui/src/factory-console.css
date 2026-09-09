@@ -39,12 +39,8 @@
 .dfConsoleDialog,
 .dfConsoleDialog *,
 .dfConsoleDialog *::before,
-.dfConsoleDialog *::after,
-.dfConsoleSidebar,
-.dfConsoleSidebar *,
-.dfConsoleSidebar *::before,
-.dfConsoleSidebar *::after {
-  box-sizing: inherit;
+.dfConsoleDialog *::after {
+  box-sizing: border-box;
 }
 
 .dfFactoryConsole__visuallyHidden {
@@ -84,7 +80,6 @@
 .dfFactoryConsole button,
 .dfFactoryConsole__terminalPanel button,
 .dfConsoleDialog button,
-.dfConsoleSidebar button,
 .dfFactoryConsole__reply label {
   font-size: 0.7rem;
   letter-spacing: 0.08em;
@@ -98,8 +93,7 @@
   color: var(--df-console-muted);
 }
 
-.dfFactoryConsole :where(h1, h2, p, dl, ul),
-.dfConsoleSidebar :where(h1, h2, h3, p, dl, ul) {
+.dfFactoryConsole :where(h1, h2, p, dl, ul) {
   margin: 0;
 }
 
@@ -143,8 +137,7 @@
 
 .dfFactoryConsole button,
 .dfFactoryConsole__terminalPanel button,
-.dfConsoleDialog button,
-.dfConsoleSidebar button {
+.dfConsoleDialog button {
   padding: 0.6rem 0.75rem;
   color: var(--df-console-text);
   background: transparent;
@@ -154,22 +147,19 @@
 
 .dfFactoryConsole button:hover:not(:disabled),
 .dfFactoryConsole__terminalPanel button:hover:not(:disabled),
-.dfConsoleDialog button:hover:not(:disabled),
-.dfConsoleSidebar button:hover:not(:disabled) { border-color: var(--df-console-accent); }
+.dfConsoleDialog button:hover:not(:disabled) { border-color: var(--df-console-accent); }
 .dfFactoryConsole button:focus-visible,
 .dfFactoryConsole textarea:focus-visible,
 .dfFactoryConsole__terminalPanel button:focus-visible,
 .dfFactoryConsole__terminalPanel textarea:focus-visible,
-.dfConsoleDialog :where(button, textarea, input, select):focus-visible,
-.dfConsoleSidebar :where(button, textarea, input, select):focus-visible {
+.dfConsoleDialog :where(button, textarea, input, select):focus-visible {
   outline: 2px solid var(--df-console-accent);
   outline-offset: 3px;
 }
 
 .dfFactoryConsole button:disabled,
 .dfFactoryConsole__terminalPanel button:disabled,
-.dfConsoleDialog button:disabled,
-.dfConsoleSidebar button:disabled { cursor: default; opacity: 0.5; }
+.dfConsoleDialog button:disabled { cursor: default; opacity: 0.5; }
 
 .dfFactoryConsole__error {
   max-width: 90rem;
@@ -618,39 +608,9 @@
   gap: 0.5rem;
 }
 
-.dfConsoleViewToggle { display: flex; flex: 0 0 auto; }
-.dfConsoleViewToggle button + button { margin-left: -1px; }
-.dfConsoleShell .dfConsoleViewToggle button[aria-pressed="true"],
 .dfConsoleShell .dfConsoleBar__actions > button[aria-pressed="true"] {
   color: var(--df-console-accent);
   border-color: var(--df-console-accent);
-}
-
-.dfConsoleLayout {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-  gap: 1.5rem;
-  max-width: 90rem;
-  margin: 0 auto;
-}
-
-.dfConsoleLayout--narrow { grid-template-columns: minmax(0, 1fr); }
-.dfConsoleLayout .dfFactoryConsole__section { margin: 0 0 1.5rem; }
-.dfConsoleLayout__left { min-width: 0; }
-.dfConsoleLayout__right { min-width: 0; }
-
-/* The sidebar is a sibling of the console main element, so every rule the
-   console scopes to its own subtree has to name it too. */
-.dfConsoleSidebar {
-  position: sticky;
-  top: 1rem;
-  flex: 0 0 clamp(22rem, 40vw, 44rem);
-  min-width: 0;
-  max-height: calc(100svh - 2rem);
-  overflow-y: auto;
-  padding: 1rem 1rem 1rem 0;
-  color: var(--df-console-text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .dfConsoleSidebar__panel {
@@ -672,7 +632,6 @@
 }
 
 .dfConsoleSidebar__status { margin: 0.75rem 0 0; color: var(--df-console-accent); font-size: 0.875rem; }
-.dfConsoleSidebar__now { font-size: 0.9rem; line-height: 1.5; overflow-wrap: anywhere; }
 .dfConsoleSidebar__address { font-size: 0.875rem; overflow-wrap: anywhere; }
 
 .dfConsoleSidebar__section {
@@ -693,7 +652,7 @@
   min-height: 2.25rem;
 }
 
-.dfConsoleSidebar :where(input[type="text"], input:not([type]), select) {
+.dfConsoleSidebar__panel :where(input[type="text"], input:not([type]), select) {
   width: 100%;
   padding: 0.6rem;
   color: var(--df-console-text);
@@ -718,7 +677,6 @@
 }
 
 .dfConsoleSidebar__taskActions select { width: auto; flex: 1 1 8rem; }
-.dfConsoleSidebar__terminal { margin-top: 1.25rem; width: 100%; }
 
 /* SETTINGS is a modal over the console, not a panel that squeezes it. */
 .dfConsoleDialog {
@@ -744,10 +702,104 @@
 .dfAgentList__count { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; color: var(--df-console-muted); font-size: 0.8rem; }
 .dfAgentList__activity { color: var(--df-console-accent); }
 
+/* Compact workbench -------------------------------------------------------
+   The roster remains available while the selected agent's terminal and
+   durable controls share one scrollable workbench. Native disclosures hide
+   density, not state: their forms and the Xterm host remain mounted. */
+.dfCompactConsole {
+  display: grid;
+  grid-template-columns: minmax(17rem, 0.8fr) minmax(0, 2fr);
+  gap: 1rem;
+  max-width: 90rem;
+  margin: 0 auto;
+}
+
+/* The host already names Dark Factory. Keep the operator's factory context
+   in one compact row rather than spending a second screen heading on it. */
+@media (min-width: 721px) {
+  .dfFactoryConsole { padding-block: 1rem; }
+  .dfFactoryConsole__header { flex-wrap: nowrap; align-items: center; margin-bottom: 1rem; padding-bottom: 0.75rem; }
+  .dfFactoryConsole__header h1 { font-size: 1.35rem; }
+  .dfConsoleBar__counters { gap: 0.75rem; }
+  .dfConsoleBar__counter dt { font-size: 0.65rem; }
+  .dfConsoleBar__counter dd { font-size: 0.9rem; }
+}
+
+.dfCompactConsole__roster,
+.dfCompactConsole__workbench {
+  min-width: 0;
+  max-height: calc(100svh - 9rem);
+  overflow: auto;
+  padding: 1rem;
+  background: var(--df-console-surface);
+  border: 1px solid var(--df-console-rule);
+}
+
+.dfCompactConsole__roster { position: sticky; top: 1rem; }
+.dfCompactConsole__workbench { display: grid; align-content: start; gap: 0.75rem; }
+.dfCompactConsole__project { color: var(--df-console-muted); font-size: 0.75rem; letter-spacing: 0.08em; }
+.dfCompactConsole__empty { padding: 1rem 0; }
+
+.dfCompactConsole__overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.dfCompactConsole__overview .dfFactoryConsole__section {
+  min-width: 0;
+  margin: 0;
+  padding: 0.75rem;
+  border-color: var(--df-console-rule);
+}
+
+.dfCompactConsole__overview .dfFactoryConsole__sectionHeading { margin-bottom: 0.55rem; padding-bottom: 0.45rem; }
+.dfCompactConsole__overviewList > summary { cursor: pointer; color: var(--df-console-muted); font-size: 0.75rem; letter-spacing: 0.08em; }
+.dfCompactConsole__overviewList[open] > summary { margin-bottom: 0.55rem; }
+.dfCompactConsole__floor { margin-top: 1rem; }
+.dfCompactConsole__floor > summary,
+.dfConsoleSidebar__section > summary {
+  cursor: pointer;
+  color: var(--df-console-muted);
+  font-size: 0.8rem;
+  letter-spacing: 0.1em;
+}
+.dfCompactConsole__floor > summary { margin-bottom: 0.75rem; }
+
+.dfCompactConsole .dfConsoleSidebar__panel { padding: 0; border: 0; }
+.dfConsoleSidebar__terminalSlot { margin-top: 0.75rem; }
+.dfCompactConsole .dfFactoryConsole__terminalPanel {
+  position: static;
+  flex: none;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+}
+
+.dfCompactConsole .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal {
+  flex: 0 0 auto;
+  min-height: clamp(12rem, 30svh, 22rem);
+}
+
+.dfCompactConsole .dfConsoleSidebar__section { margin-top: 0.75rem; padding-top: 0.75rem; }
+.dfCompactConsole .dfConsoleSidebar__section > summary { margin-bottom: 0.75rem; }
+.dfCompactConsole .dfConsoleSidebar__config { border-top: 0; margin-top: 0; padding-top: 0; }
+
+@media (max-width: 1024px) {
+  .dfCompactConsole { grid-template-columns: minmax(0, 1fr); }
+  .dfCompactConsole__roster,
+  .dfCompactConsole__workbench { position: static; max-height: none; overflow: visible; }
+}
+
+@media (max-width: 720px) {
+  .dfCompactConsole__overview { grid-template-columns: minmax(0, 1fr); }
+  .dfCompactConsole .dfFactoryConsole__terminalPanel { height: auto; min-height: 0; }
+  .dfCompactConsole .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal { min-height: 20rem; }
+}
+
 @media (max-width: 1024px) {
   .dfConsoleShell { display: block; }
-  .dfConsoleLayout { grid-template-columns: minmax(0, 1fr); }
-  .dfConsoleSidebar { position: static; max-height: none; padding: 0 clamp(1rem, 3vw, 3rem) 1.5rem; }
 }
 
 .dfFactoryScene__room--empty > rect,

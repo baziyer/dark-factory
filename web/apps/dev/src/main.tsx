@@ -9,7 +9,7 @@ import { fixtureState, fixtureTopologies } from "../../../fixtures/state.mjs";
 // handlers are deliberately absent so one-shot actions cannot pretend to
 // succeed.
 function FixtureTour() {
-  const [view, setView] = useState<FactoryConsoleProps["view"]>("floor");
+  const [view, setView] = useState<FactoryConsoleProps["view"]>("agents");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState<FactoryConsoleProps["selectedAgent"]>();
   const [selectedHumanRequest, setSelectedHumanRequest] = useState<FactoryConsoleProps["selectedHumanRequest"]>();
@@ -32,7 +32,6 @@ function FixtureTour() {
           setSelectedHumanRequest(undefined);
           setSelectedAgent({ id: agent.id, name: agent.name, revision: agent.revision });
         }}
-        onCloseAgent={() => setSelectedAgent(undefined)}
         onSelectHumanRequest={(request) => {
           setSelectedHumanRequest({
             request,
