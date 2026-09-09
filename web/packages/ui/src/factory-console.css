@@ -741,7 +741,7 @@
 .dfAgentList__row { width: 100%; border: 1px solid var(--df-console-rule); }
 .dfAgentList__provider,
 .dfAgentList__activity,
-.dfAgentList__count { flex: 0 0 auto; color: var(--df-console-muted); font-size: 0.8rem; }
+.dfAgentList__count { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; color: var(--df-console-muted); font-size: 0.8rem; }
 .dfAgentList__activity { color: var(--df-console-accent); }
 
 @media (max-width: 1024px) {
