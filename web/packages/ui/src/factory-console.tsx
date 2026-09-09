@@ -133,6 +133,7 @@ export function FactoryConsole({
       />
     ) : agent !== undefined ? (
       <AgentPanel
+        key={agent.id}
         agent={agent}
         state={state}
         edit={edit}

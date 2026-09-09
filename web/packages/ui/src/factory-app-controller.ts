@@ -88,6 +88,7 @@ export type FactoryTerminalView = Readonly<{
   historyPending: boolean;
   taskDetail?: TaskDetailView;
   taskDetailPending: boolean;
+  taskDetailError?: SessionError | ProtocolError;
   controlReady: boolean;
   queued: boolean;
   /** The mounted Xterm scrollback belongs to this agent's completed work. */
@@ -185,6 +186,7 @@ type AgentTerminalSelection = {
   taskDetailTaskID?: string;
   taskDetailTaskRevision?: bigint;
   taskDetailPending: boolean;
+  taskDetailError?: SessionError | ProtocolError;
   queuedTaskID?: string;
 };
 
@@ -1241,6 +1243,7 @@ export class FactoryAppController {
     if (this.#closed || this.#status !== "ready" || session === undefined || selected.taskDetailPending) return;
     const generation = this.#generation;
     selected.taskDetailPending = true;
+    selected.taskDetailError = undefined;
     this.#publish();
     try {
       const detail = await this.#readTaskDetail(session, taskID, revision, peerOffset);
@@ -1250,7 +1253,7 @@ export class FactoryAppController {
       selected.taskDetailTaskRevision = revision;
     } catch (error) {
       if (!this.#current(generation) || this.#selectedAgent !== selected) return;
-      selected.controlError = finiteError(error);
+      selected.taskDetailError = finiteError(error);
     } finally {
       if (this.#current(generation) && this.#selectedAgent === selected) {
         selected.taskDetailPending = false;
@@ -1456,6 +1459,7 @@ export class FactoryAppController {
         historyPending: this.#selectedAgent.historyPending,
 		taskDetail: this.#selectedAgent.taskDetail,
 		taskDetailPending: this.#selectedAgent.taskDetailPending,
+		taskDetailError: this.#selectedAgent.taskDetailError,
         controlReady: this.#selectedAgent.task !== undefined && !this.#selectedAgent.finishing && this.#terminal?.snapshot.phase === "ready",
         queued: this.#selectedAgent.queuedTaskID !== undefined && this.#selectedAgent.task === undefined,
         hasOutputSurface: this.#terminalSurface !== undefined,

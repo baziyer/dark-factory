@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "rea
 import type { AccountItem, AgentItem, StateView, TaskItem, TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
-import { agentStatus, agentCurrentTask } from "./console-view.js";
+import { agentStatus, agentCurrentTask, orderTasksForHome } from "./console-view.js";
 
 /** Only the controls the operator actually changed; the rest are left alone. */
 export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: "wait" | "standing_instruction"; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }>;
@@ -21,6 +21,11 @@ export type DiscoveredAccount = Readonly<{
 
 export type TaskEdit = Readonly<{ title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
 export type TaskBrief = Readonly<{ taskId: string; revision: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
+
+/** One private peer-conversation page, shared by queued and completed work. */
+export function TaskConversation({ brief, onOlder, pending = false }: { brief: TaskBrief; onOlder?: () => void; pending?: boolean }) {
+  return <section aria-label="Task conversation"><h3>CONVERSATION</h3>{brief.peerQuestions.length === 0 ? <p>NO PEER QUESTIONS</p> : <ol>{brief.peerQuestions.map((question) => <li key={question.id}><strong>QUESTION · {question.source_task_id} → {question.target_task_id}</strong><span>{question.question}</span><small>RECIPIENT DELIVERY · {question.recipient_delivery_state.toUpperCase()}</small>{question.answer === undefined || question.answer === "" ? null : <><span>ANSWER · {question.answer}</span><small>ANSWER DELIVERY · {question.answer_delivery_state.toUpperCase()}</small></>}</li>)}</ol>}{brief.nextPeerOffset === undefined || onOlder === undefined ? null : <button type="button" disabled={pending} onClick={onOlder}>OLDER CONVERSATION</button>}</section>;
+}
 
 const EDIT_ERRORS = new Map<string, string>([
   ["stale", "SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN"],
@@ -67,13 +72,15 @@ export function AgentPanel({
   const queued = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
     .sort((left, right) => right.priority - left.priority);
-  const recent = state === undefined ? [] : [...state.tasks.values()]
-    .filter((task) => task.assigned_agent_id === agent.id && task.status !== "queued")
-    .sort((left, right) => left.revision === right.revision ? 0 : left.revision > right.revision ? -1 : 1)
-    .slice(0, 4);
+  const historyTasks = state === undefined ? [] : orderTasksForHome(state)
+    .filter((task) => task.assigned_agent_id === agent.id && task.status !== "queued");
   const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
   const [conversation, setConversation] = useState<{ task: TaskItem; brief: TaskBrief }>();
-  useEffect(() => { setConversation(undefined); }, [agent.id]);
+  const [conversationError, setConversationError] = useState(false);
+  const [conversationPending, setConversationPending] = useState(false);
+  const [historyTaskID, setHistoryTaskID] = useState<string>();
+  useEffect(() => { setConversation(undefined); setConversationError(false); setHistoryTaskID(undefined); }, [agent.id]);
+  const historyTask = historyTasks.find((task) => task.id === historyTaskID) ?? historyTasks[0];
   const errorCopy = editErrorCopy(edit);
   const queueHint = agent.paused
     ? "QUEUE PAUSED"
@@ -131,10 +138,13 @@ export function AgentPanel({
         {children}
       </div>
 
-      {recent.length === 0 || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Recent work">
-        <h3>RECENT WORK</h3>
-        <ul className="dfFactoryConsole__list">{recent.map((task) => <li key={task.id} className="dfConsoleSidebar__task"><p className="dfConsoleRow__title">{task.title}</p><button type="button" onClick={async () => { try { setConversation({ task, brief: await onLoadTaskDetail(task) }); } catch { setConversation(undefined); } }}>VIEW CONVERSATION</button></li>)}</ul>
-        {conversation === undefined ? null : <section aria-label="Task conversation"><p>{conversation.task.title}</p>{conversation.brief.peerQuestions.length === 0 ? <p>NO PEER QUESTIONS</p> : conversation.brief.peerQuestions.map((question) => <p key={question.id}>QUESTION · {question.source_task_id} → {question.target_task_id} · {question.recipient_delivery_state.toUpperCase()}<br />{question.question}{question.answer === undefined || question.answer === "" ? "" : `\nANSWER · ${question.answer} · ${question.answer_delivery_state.toUpperCase()}`}</p>)}</section>}
+      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Task history">
+        <h3>TASK HISTORY</h3>
+        <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-history-${agent.id}`}>TASK HISTORY</label>
+        <select id={`df-history-${agent.id}`} value={historyTask.id} disabled={conversationPending} onChange={(event) => { setHistoryTaskID(event.currentTarget.value); setConversation(undefined); setConversationError(false); }}>{historyTasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select>
+        <button type="button" disabled={conversationPending} onClick={async () => { setConversationPending(true); try { setConversation({ task: historyTask, brief: await onLoadTaskDetail(historyTask) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } }}>VIEW CONVERSATION</button>
+        {conversationError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : null}
+        {conversation === undefined ? null : <TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} />}
       </div>}
 
       {onOpenTerminal === undefined ? null : (
@@ -313,8 +323,7 @@ function QueuedTask({
         <label htmlFor={`df-instruction-${task.id}`}>INSTRUCTION</label>
         <textarea id={`df-instruction-${task.id}`} rows={4} value={instruction} disabled={disabled || loading || stale} onChange={(event) => setInstruction(event.currentTarget.value)} />
         {brief?.feedback === "" || brief === undefined ? null : <><label>RETAINED REVIEW FEEDBACK</label><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
-		{brief?.peerQuestions.length === 0 || brief === undefined ? null : <section aria-label="Task conversation"><label>CONVERSATION</label>{brief.peerQuestions.map((question) => <p key={question.id}>{question.question}{question.answer === undefined || question.answer === "" ? "" : ` · ${question.answer}`}</p>)}</section>}
-		{brief?.nextPeerOffset === undefined ? null : <button type="button" disabled={loading} onClick={() => { void load(brief.nextPeerOffset); }}>OLDER CONVERSATION</button>}
+		{brief === undefined ? null : <TaskConversation brief={brief} pending={loading} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { void load(brief.nextPeerOffset); }} />}
 		{stale ? <p role="alert">TASK CHANGED — REOPEN BRIEF TO SAVE</p> : null}
         <div className="dfConsoleSidebar__taskActions">
           <button type="button" disabled={disabled || loading || stale || title.trim() === ""} onClick={async () => { if (await onEditTask(task, { title, body: instruction })) setOpen(false); }}>{pending ? "SAVING" : "SAVE BRIEF"}</button>

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
 import { FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
 import { FactoryConsole, type ConsoleView } from "./factory-console.js";
+import { TaskConversation } from "./console-sidebar.js";
 import { primaryAgent } from "./console-view.js";
 import { XtermTerminal } from "./xterm-terminal.js";
 
@@ -243,7 +244,8 @@ function TaskHistory({ terminal, onRefresh, onLoadConversation, onLoadOlderConve
           {history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span></li>)}
         </ol>
       )}
-		{terminal.taskDetail === undefined ? null : <section aria-label="Task conversation"><h3>CONVERSATION</h3>{terminal.taskDetail.peerQuestions.length === 0 ? <p className="dfFactoryConsole__instructionState">NO PEER QUESTIONS</p> : <ol>{terminal.taskDetail.peerQuestions.map((question) => <li key={question.id}><strong>QUESTION · {question.source_task_id} → {question.target_task_id}</strong><span>{question.question}</span><small>RECIPIENT DELIVERY · {question.recipient_delivery_state.toUpperCase()}</small>{question.answer === undefined || question.answer === "" ? null : <><span>ANSWER · {question.answer}</span><small>ANSWER DELIVERY · {question.answer_delivery_state.toUpperCase()}</small></>}</li>)}</ol>}{terminal.taskDetail.nextPeerOffset === undefined ? null : <button type="button" disabled={terminal.taskDetailPending} onClick={onLoadOlderConversation}>OLDER CONVERSATION</button>}</section>}
+		{terminal.taskDetailError === undefined ? null : <p role="alert">THE FACTORY REFUSED THIS HISTORY</p>}
+		{terminal.taskDetail === undefined ? null : <TaskConversation brief={terminal.taskDetail} pending={terminal.taskDetailPending} onOlder={terminal.taskDetail.nextPeerOffset === undefined ? undefined : onLoadOlderConversation} />}
     </section>
   );
 }
