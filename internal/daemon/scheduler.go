@@ -201,7 +201,7 @@ func (daemon *Daemon) validateScheduledCompletion(changeParent string, unsettled
 	var found bool
 	var err error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		ctx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, err = readRun(ctx, observed.ID)
 		cancel()
 		if err == nil || found || errors.Is(err, kernel.ErrCorruptState) {

@@ -1517,6 +1517,28 @@ func TestSupervisorReconcilesAmbiguousAdmissionAndRevokesBearer(t *testing.T) {
 	}
 }
 
+func TestSupervisorDoesNotRepeatNoAdmissionObservationAfterHookFailure(t *testing.T) {
+	fixture := newSupervisorFixture(t, supervisorProgram(t, false, false))
+	factory, err := fixture.store.Factory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.SetDispatch(context.Background(), factory.Revision, false, supervisorTime()); err != nil {
+		t.Fatal(err)
+	}
+	hookErr := errors.New("injected no-admission hook failure")
+	var admissions []bool
+	fixture.spec.admissionObserved = func(admitted bool) { admissions = append(admissions, admitted) }
+	fixture.spec.afterAdmission = func() error { return hookErr }
+	run, err := fixture.daemon.RunNext(context.Background(), fixture.spec)
+	if !errors.Is(err, hookErr) || !errors.Is(err, kernel.ErrConflict) {
+		t.Fatalf("RunNext no-admission hook failure = %v", err)
+	}
+	if run.ID != (kernel.RunID{}) || len(admissions) != 1 || admissions[0] {
+		t.Fatalf("no-admission observations = run %+v observations %v", run, admissions)
+	}
+}
+
 func TestSupervisorRetriesTransientAdmissionReconciliation(t *testing.T) {
 	fixture := newSupervisorFixture(t, supervisorProgram(t, false, false))
 	commitErr := errors.New("injected lost admission commit acknowledgement")

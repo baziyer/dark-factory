@@ -453,7 +453,7 @@ func attemptResultConsumedPostcondition(run Run, footprint lifecycleFootprint, r
 	if result.kind == AttemptInnerUnregisteredConverged {
 		return run.Proposal.code == FailureSpawn && run.ProviderExit == nil && footprint.providerProcess.Identity.Empty() &&
 			(footprint.session.State == TerminalSessionReleasing || footprint.session.State == TerminalSessionUnresolved) &&
-			(footprint.runner.State == ResourceReleasing || footprint.runner.State == ResourceUnresolved)
+			(footprint.runner.State == ResourceReleasing || footprint.runner.State == ResourceUnresolved || footprint.runner.State == ResourceReleased)
 	}
 	if footprint.session.State != TerminalSessionReleasing && footprint.session.State != TerminalSessionUnresolved {
 		return false

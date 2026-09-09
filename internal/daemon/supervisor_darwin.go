@@ -167,8 +167,10 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		Resources: keys.resources, RuntimeRoot: runtimeRoot,
 	}
 	admission, err := daemon.store.AdmitNext(ctx, admissionKeys, at)
+	admissionObserved := false
 	if err == nil && spec.admissionObserved != nil {
 		spec.admissionObserved(admission.Admitted())
+		admissionObserved = true
 	}
 	if err == nil && spec.afterAdmission != nil {
 		err = spec.afterAdmission()
@@ -183,7 +185,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		}
 		var reconcileErr error
 		for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-			reconcileCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+			reconcileCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 			reconciled, readErr := reconcileAdmission(reconcileCtx, admissionKeys)
 			cancel()
 			reconcileErr = readErr
@@ -191,10 +193,18 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 				continue
 			}
 			if reconciled.Admitted() {
+				if !admissionObserved && spec.admissionObserved != nil {
+					spec.admissionObserved(true)
+				}
 				return daemon.failRunBeforeRuntime(*reconciled.Run, keys.resources.RuntimeRoot, kernel.FailureInternal, err)
 			}
 			if reconciled.Reason == kernel.NoAdmissionNotReconciled {
-				return kernel.Run{}, err
+				// The reconciliation read proves the failed write created no run, so
+				// a scheduler can treat this as its ordinary no-admission probe.
+				if !admissionObserved && spec.admissionObserved != nil {
+					spec.admissionObserved(false)
+				}
+				return kernel.Run{}, errors.Join(kernel.ErrConflict, err)
 			}
 			reconcileErr = kernel.ErrCorruptState
 		}
@@ -637,7 +647,7 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 	if err != nil {
 		return daemon.failRun(run, kernel.FailureProtocol, err)
 	}
-	run, err = daemon.consumeAttemptResult(result)
+	run, err = daemon.consumeAttemptResult(result, false)
 	if err != nil {
 		return kernel.Run{}, err
 	}
@@ -967,7 +977,7 @@ func (daemon *Daemon) failRun(run kernel.Run, code kernel.FailureCode, cause err
 	}
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, run.ID)
 		if readErr != nil || !found {
 			cancel()
@@ -1012,7 +1022,7 @@ func (daemon *Daemon) failRunBeforeRuntime(run kernel.Run, runtimeID kernel.Reso
 	}
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, run.ID)
 		if readErr != nil || !found {
 			cancel()
@@ -1060,7 +1070,7 @@ func (daemon *Daemon) convergeUnstartedRunner(run kernel.Run, owner *supervisorA
 	}
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, run.ID)
 		if readErr != nil || !found {
 			cancel()
@@ -1168,7 +1178,7 @@ func (daemon *Daemon) convergeActivatedRunner(run kernel.Run, owner *supervisorA
 		if resultErr != nil {
 			return kernel.Run{}, kernel.NewOutcomeUnknownError(errors.Join(cause, resultErr))
 		}
-		converged, consumeErr := daemon.consumeAttemptResult(result)
+		converged, consumeErr := daemon.consumeAttemptResult(result, false)
 		if consumeErr != nil {
 			return kernel.Run{}, errors.Join(cause, consumeErr)
 		}
@@ -1198,7 +1208,7 @@ func (daemon *Daemon) convergeActivatedRunner(run kernel.Run, owner *supervisorA
 	}
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, run.ID)
 		if readErr != nil || !found {
 			cancel()
@@ -1305,10 +1315,11 @@ func terminalExitEvent(record *runner.AttemptResultRecord) (TerminalEvent, error
 	return TerminalEvent{}, errInvalidContract
 }
 
-func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult) (kernel.Run, error) {
+// Recovery may replay an exact result consumed before a later cleanup edge failed.
+func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult, recovered bool) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, result.RunID())
 		if readErr != nil || !found {
 			cancel()
@@ -1325,6 +1336,14 @@ func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult) (kernel.
 			continue
 		}
 		consumed, consumeErr := daemon.store.ConsumeAttemptResult(storeCtx, result, current.Revision, at)
+		if errors.Is(consumeErr, kernel.ErrConflict) && recovered && current.Phase == kernel.RunFinalizing && current.Revision.Int64() > 1 {
+			previous, revisionErr := kernel.NewRevision(current.Revision.Int64() - 1)
+			if revisionErr == nil {
+				consumed, consumeErr = daemon.store.ConsumeAttemptResult(storeCtx, result, previous, at)
+			} else {
+				consumeErr = revisionErr
+			}
+		}
 		cancel()
 		if consumeErr == nil {
 			return consumed, nil
@@ -1337,7 +1356,7 @@ func (daemon *Daemon) consumeAttemptResult(result kernel.AttemptResult) (kernel.
 func (daemon *Daemon) recordLiveRunnerExit(runID kernel.RunID, resourceID kernel.ResourceID, identity kernel.ResourceIdentity, exit kernel.ProcessExit) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, runID)
 		if readErr != nil || !found {
 			cancel()
@@ -1375,7 +1394,7 @@ func (daemon *Daemon) recordLiveRunnerExit(runID kernel.RunID, resourceID kernel
 func (daemon *Daemon) closeTerminalAfterRunner(result kernel.AttemptResult) (kernel.Run, error) {
 	var lastErr error
 	for attempt := 0; attempt < supervisorReconcileAttempts; attempt++ {
-		storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+		storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 		current, found, readErr := daemon.store.Run(storeCtx, result.RunID())
 		if readErr != nil || !found {
 			cancel()
@@ -1411,7 +1430,7 @@ func (daemon *Daemon) closeTerminalAfterRunner(result kernel.AttemptResult) (ker
 }
 
 func (daemon *Daemon) removeAttemptResult(runtimeDirectory *os.File, result kernel.AttemptResult, record *runner.AttemptResultRecord) error {
-	storeCtx, cancel := context.WithTimeout(context.Background(), supervisorStoreAttemptWindow)
+	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	_, err := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
 	cancel()
 	if err != nil {
