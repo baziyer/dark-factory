@@ -167,8 +167,10 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 		Resources: keys.resources, RuntimeRoot: runtimeRoot,
 	}
 	admission, err := daemon.store.AdmitNext(ctx, admissionKeys, at)
+	admissionObserved := false
 	if err == nil && spec.admissionObserved != nil {
 		spec.admissionObserved(admission.Admitted())
+		admissionObserved = true
 	}
 	if err == nil && spec.afterAdmission != nil {
 		err = spec.afterAdmission()
@@ -191,10 +193,19 @@ func (daemon *Daemon) runNext(ctx context.Context, spec SupervisorSpec) (_ kerne
 				continue
 			}
 			if reconciled.Admitted() {
+				if !admissionObserved && spec.admissionObserved != nil {
+					spec.admissionObserved(true)
+					admissionObserved = true
+				}
 				return daemon.failRunBeforeRuntime(*reconciled.Run, keys.resources.RuntimeRoot, kernel.FailureInternal, err)
 			}
 			if reconciled.Reason == kernel.NoAdmissionNotReconciled {
-				return kernel.Run{}, err
+				// The reconciliation read proves the failed write created no run, so
+				// a scheduler can treat this as its ordinary no-admission probe.
+				if spec.admissionObserved != nil {
+					spec.admissionObserved(false)
+				}
+				return kernel.Run{}, errors.Join(kernel.ErrConflict, err)
 			}
 			reconcileErr = kernel.ErrCorruptState
 		}
