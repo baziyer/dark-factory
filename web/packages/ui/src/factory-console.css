@@ -455,7 +455,7 @@
   .dfConsoleShell { display: block; }
   .dfFactoryConsole__terminalPanel {
     position: static;
-    width: 100%;
+    width: auto;
     max-width: 90rem;
     height: auto;
     min-height: 0;
