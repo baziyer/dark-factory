@@ -480,6 +480,17 @@ func (client client) call(ctx context.Context, method string, params, output any
 	return responseErr
 }
 
+func verifySocketConnection(connection net.Conn, expected socketRecord) error {
+	if err := verifyPeerEUID(connection); err != nil {
+		return err
+	}
+	current, err := inspectSocket(connection.RemoteAddr().String())
+	if err != nil || !current.same(expected) {
+		return ErrInvalidClient
+	}
+	return nil
+}
+
 func (client client) revalidate(before socketRecord) error {
 	after, err := inspectSocket(client.socketPath)
 	if err != nil || !after.same(before) {

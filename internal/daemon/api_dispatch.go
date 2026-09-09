@@ -96,10 +96,7 @@ type supervisorRegistration struct {
 // NewDaemon creates an API composition root using the wall clock for durable
 // timestamps. The Store is never replaced or wrapped by the daemon.
 func NewDaemon(store *kernel.Store) (*Daemon, error) {
-	if store == nil {
-		return nil, fmt.Errorf("%w: nil kernel store", kernel.ErrInvalidValue)
-	}
-	return &Daemon{store: store, now: time.Now, browsers: make(map[*BrowserRuntime]struct{}), browserClientGates: &browserClientGates{}, attempts: make(map[kernel.RunID]*liveAttempt), supervisors: make(map[*supervisorRegistration]struct{}), schedulerWake: make(chan struct{}, 1)}, nil
+	return newDaemon(store, time.Now)
 }
 
 func newDaemon(store *kernel.Store, now func() time.Time) (*Daemon, error) {
