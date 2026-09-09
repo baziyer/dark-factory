@@ -17,7 +17,7 @@ import (
 )
 
 func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion} {
 		for _, persistWAL := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d/wal=%v", version, persistWAL), func(t *testing.T) {
 				testLegacyHomeMigratesAndKeepsEveryRow(t, version, persistWAL)
@@ -303,6 +303,11 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	} else if version >= v4UserVersion {
 		agentColumnsFor = testAgentColumnsV4
 	}
+	if version != legacyUserVersion {
+		if err := rebuildTable(ctx, connection, legacy, "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := rebuildTable(ctx, connection, legacy, "agents", agentColumnsFor, "agents_id_project_unique", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +328,9 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 	}
 	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
 	if version < userVersion {
+		downgrade = append([]string{"DROP TABLE peer_questions"}, downgrade...)
+	}
+	if version < v6UserVersion {
 		downgrade = append([]string{"DROP TABLE task_interventions", "DROP TABLE overseer_wake_cursors"}, downgrade...)
 	}
 	if version == legacyUserVersion {
@@ -412,9 +420,13 @@ var testBrowserColumns = map[string]string{
 // snapshotRows reads every v1 table, agents through the list above because the
 // added account_id makes SELECT * differ either side of the migration.
 func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[string][]string {
+	return snapshotSchemaRows(t, ctx, connection, legacySchemaStatements(), true)
+}
+
+func snapshotSchemaRows(t *testing.T, ctx context.Context, connection *sql.Conn, statements []string, legacyColumns bool) map[string][]string {
 	t.Helper()
 	result := make(map[string][]string)
-	for name, object := range expectedSchemaOf(legacySchemaStatements()) {
+	for name, object := range expectedSchemaOf(statements) {
 		if object.kind != "table" {
 			continue
 		}
@@ -428,6 +440,9 @@ func snapshotRows(t *testing.T, ctx context.Context, connection *sql.Conn) map[s
 			// The v3 migration rewrites masks on purpose; the migration test
 			// asserts them separately.
 			columns = testBrowserColumns[name]
+		}
+		if !legacyColumns {
+			columns = "*"
 		}
 		rows, err := connection.QueryContext(ctx, "SELECT "+columns+" FROM "+name+" ORDER BY 1")
 		if err != nil {
@@ -491,7 +506,8 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
+		{"current", schemaStatements, "c6793e1552a878dfff3fb4efc4179ba6343a26f122337580b6ac558e8a6bfedf"},
+		{"v6", v6SchemaStatements(), "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
 		{"v4", v4SchemaStatements(), "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
 		{"v3", priorSchemaStatements(), "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
 		{"v2", previousSchemaStatements(), "6a1de54c3fcad5f6770c6d80b91fda3f914e8b236f34d62bb875a7f4efde347c"},
@@ -508,7 +524,7 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 // that reaches inside the migration transaction: the two above are rejected by
 // the preflight, on its disposable copy, before any pool exists.
 func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t, version)
 		})

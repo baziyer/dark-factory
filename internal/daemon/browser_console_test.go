@@ -94,10 +94,10 @@ func TestBrowserConsoleUpdatesAdvanceTheExactRevision(t *testing.T) {
 		t.Fatalf("replayed agent update = %v", err)
 	}
 
-	title, priority, status := "edited", int64(5), "cancelled"
+	title, body, priority, status := "edited", "replacement instruction", int64(5), "cancelled"
 	taskResult, err := fixture.backend.UpdateTask(ctx, client, browserprotocol.TaskUpdate{
 		TaskID: fixture.task.ID.String(), ExpectedRevision: decimalRevision(fixture.task.Revision),
-		Title: &title, Priority: &priority,
+		Title: &title, Body: &body, Priority: &priority,
 	})
 	if err != nil || taskResult.TaskID != fixture.task.ID.String() || taskResult.Revision != decimalRevision(fixture.task.Revision)+1 {
 		t.Fatalf("task update = %+v, %v", taskResult, err)
@@ -109,7 +109,7 @@ func TestBrowserConsoleUpdatesAdvanceTheExactRevision(t *testing.T) {
 		t.Fatalf("task cancel = %+v, %v", cancelled, err)
 	}
 	storedTask, found, err := fixture.store.Task(ctx, fixture.task.ID)
-	if err != nil || !found || storedTask.Title != title || storedTask.Priority != priority || storedTask.Status != kernel.TaskCancelled {
+	if err != nil || !found || storedTask.Title != title || storedTask.Body != body || storedTask.Priority != priority || storedTask.Status != kernel.TaskCancelled {
 		t.Fatalf("stored task = %+v, found=%v, err=%v", storedTask, found, err)
 	}
 	// A task that has left the queue is a conflict, not a fresh edit.

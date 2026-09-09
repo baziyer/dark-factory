@@ -410,6 +410,25 @@ func TestAttemptClientHasExactScopedOutcomesAndNoOperatorFallback(t *testing.T) 
 	})
 }
 
+func TestPeerStatusPageRejectsMismatchedContinuationHead(t *testing.T) {
+	bearer := testCredential('P')
+	fixture := newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {
+		return writeTestResponse(connection, wireAttemptDomain, successResponse(`{"head":8,"targets":[],"questions":[],"next_target_offset":null,"next_offset":null}`))
+	})
+	t.Setenv(attemptTokenFileEnv, fixture.token)
+	client, err := NewAttemptClientFromEnvironment(fixture.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PeerStatusPage(context.Background(), 1, 0, 7); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("mismatched continuation head = %v", err)
+	}
+	if got := requestJSON(t, <-fixture.request, wireAttemptDomain, bearer); got != `{"method":"peer_status","params":{"offset":1,"target_offset":0,"expected_head":7}}` {
+		t.Fatalf("peer status request = %s", got)
+	}
+	fixture.wait(t)
+}
+
 func TestAttemptClientReadsExactTask(t *testing.T) {
 	bearer := testCredential('T')
 	fixture := newWireFixture(t, bearer, func(connection net.Conn, _ []byte) error {

@@ -27,6 +27,38 @@ type AgentControlResult struct {
 type TaskHistoryGet struct {
 	TaskID string `json:"task_id"`
 }
+
+// TaskDetailGet reads private task text at one exact queued revision. The
+// browser never receives task bodies in a public state snapshot.
+type TaskDetailGet struct {
+	TaskID           string   `json:"task_id"`
+	ExpectedRevision Decimal  `json:"expected_revision"`
+	TextOffset       Decimal  `json:"text_offset,omitempty"`
+	PeerOffset       Decimal  `json:"peer_offset,omitempty"`
+	ExpectedHead     *Decimal `json:"expected_head,omitempty"`
+}
+type TaskDetail struct {
+	TaskID         string             `json:"task_id"`
+	Revision       Decimal            `json:"revision"`
+	Head           Decimal            `json:"head"`
+	Instruction    string             `json:"instruction"`
+	Feedback       string             `json:"feedback"`
+	NextTextOffset *Decimal           `json:"next_text_offset,omitempty"`
+	PeerQuestions  []TaskPeerQuestion `json:"peer_questions"`
+	NextPeerOffset *Decimal           `json:"next_peer_offset,omitempty"`
+}
+type TaskPeerQuestion struct {
+	ID                     string  `json:"id"`
+	SourceTaskID           string  `json:"source_task_id"`
+	TargetTaskID           string  `json:"target_task_id"`
+	Question               string  `json:"question"`
+	Answer                 *string `json:"answer,omitempty"`
+	RecipientDeliveryState string  `json:"recipient_delivery_state"`
+	AnswerDeliveryState    string  `json:"answer_delivery_state"`
+	Revision               Decimal `json:"revision"`
+	CreatedAtMillis        Decimal `json:"created_at_ms"`
+	UpdatedAtMillis        Decimal `json:"updated_at_ms"`
+}
 type TaskHistory struct {
 	TaskID  string             `json:"task_id"`
 	Entries []TaskHistoryEntry `json:"entries"`
@@ -49,6 +81,12 @@ func EncodeAgentControlResult(id string, value AgentControlResult) ([]byte, erro
 func EncodeTaskHistoryGet(id string, value TaskHistoryGet) ([]byte, error) {
 	return encodeControl(TypeTaskHistoryGet, id, value)
 }
+func EncodeTaskDetailGet(id string, value TaskDetailGet) ([]byte, error) {
+	return encodeControl(TypeTaskDetailGet, id, value)
+}
+func EncodeTaskDetail(id string, value TaskDetail) ([]byte, error) {
+	return encodeControl(TypeTaskDetail, id, value)
+}
 func EncodeTaskHistory(id string, value TaskHistory) ([]byte, error) {
 	return encodeControl(TypeTaskHistory, id, value)
 }
@@ -64,6 +102,10 @@ func validAgentControl(kind MessageType, body any) error {
 	case *AgentControlResult:
 		return validAgentControl(kind, *v)
 	case *TaskHistoryGet:
+		return validAgentControl(kind, *v)
+	case *TaskDetailGet:
+		return validAgentControl(kind, *v)
+	case *TaskDetail:
 		return validAgentControl(kind, *v)
 	case *TaskHistory:
 		return validAgentControl(kind, *v)
@@ -109,6 +151,19 @@ func validAgentControl(kind MessageType, body any) error {
 		if validateDynamicID(v.TaskID) != nil {
 			return bad()
 		}
+	case TaskDetailGet:
+		if validateDynamicID(v.TaskID) != nil || v.ExpectedRevision == 0 || v.TextOffset > MaxTaskInstructionBytes || v.PeerOffset > MaxJSONArray || v.ExpectedHead != nil && *v.ExpectedHead == 0 || v.PeerOffset != 0 && v.ExpectedHead == nil {
+			return bad()
+		}
+	case TaskDetail:
+		if validateDynamicID(v.TaskID) != nil || v.Revision == 0 || v.Head == 0 || validateBoundedText(v.Instruction, 0, MaxTaskInstructionBytes) != nil || validateBoundedText(v.Feedback, 0, MaxTaskInstructionBytes) != nil || len(v.PeerQuestions) > 1 || v.PeerQuestions == nil || v.NextTextOffset != nil && *v.NextTextOffset == 0 || v.NextPeerOffset != nil && *v.NextPeerOffset == 0 {
+			return bad()
+		}
+		for _, question := range v.PeerQuestions {
+			if validateDynamicID(question.ID) != nil || validateDynamicID(question.SourceTaskID) != nil || validateDynamicID(question.TargetTaskID) != nil || validateBoundedText(question.Question, 1, 2048) != nil || question.Answer != nil && validateBoundedText(*question.Answer, 0, 2048) != nil || !validPeerDeliveryState(question.RecipientDeliveryState) || !validPeerDeliveryState(question.AnswerDeliveryState) || question.Revision == 0 || question.CreatedAtMillis == 0 || question.UpdatedAtMillis < question.CreatedAtMillis {
+				return bad()
+			}
+		}
 	case TaskHistory:
 		if validateDynamicID(v.TaskID) != nil || v.Entries == nil || len(v.Entries) > MaxJSONArray {
 			return bad()
@@ -127,4 +182,8 @@ func validAgentControl(kind MessageType, body any) error {
 		return bad()
 	}
 	return nil
+}
+
+func validPeerDeliveryState(value string) bool {
+	return value == "pending" || value == "delivered" || value == "unknown"
 }

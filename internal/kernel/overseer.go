@@ -15,6 +15,7 @@ type OverseerSnapshot struct {
 	Tasks          []OverseerTask
 	Runs           []OverseerRunSummary
 	Questions      []OverseerQuestion
+	PeerQuestions  []PeerQuestion
 	History        []TaskIntervention
 	HistoryExcerpt bool
 }
@@ -85,7 +86,7 @@ func (store *Store) OverseerSnapshotForAttempt(ctx context.Context, digest Attem
 	if request.ExpectedHead.Int64() != 0 && request.ExpectedHead != state.Head {
 		return OverseerSnapshot{}, ErrRevisionConflict
 	}
-	result := OverseerSnapshot{ProjectID: authority.ProjectID, Head: state.Head, Agents: []AgentSummary{}, Tasks: []OverseerTask{}, Runs: []OverseerRunSummary{}, Questions: []OverseerQuestion{}, History: []TaskIntervention{}, HistoryExcerpt: request.TaskID == nil}
+	result := OverseerSnapshot{ProjectID: authority.ProjectID, Head: state.Head, Agents: []AgentSummary{}, Tasks: []OverseerTask{}, Runs: []OverseerRunSummary{}, Questions: []OverseerQuestion{}, PeerQuestions: []PeerQuestion{}, History: []TaskIntervention{}, HistoryExcerpt: request.TaskID == nil}
 	offset := int64(request.Offset)
 	nextOffset := uint64(offset + OverseerSnapshotPageSize)
 	hasMore := false
@@ -254,6 +255,14 @@ func (store *Store) OverseerSnapshotForAttempt(ctx context.Context, digest Attem
 			return OverseerSnapshot{}, ErrCorruptState
 		}
 		result.Questions = append(result.Questions, OverseerQuestion{ID: humanRequest.ID, AgentID: run.AgentID, TaskID: run.TaskID, Status: humanRequest.Status, Revision: humanRequest.Revision, Question: humanRequest.QuestionText})
+	}
+	if request.TaskID != nil {
+		peer, peerNext, err := peerQuestionsForTask(ctx, read.connection, *request.TaskID, request.Offset/OverseerSnapshotPageSize)
+		if err != nil {
+			return OverseerSnapshot{}, err
+		}
+		result.PeerQuestions = peer
+		hasMore = hasMore || peerNext != nil
 	}
 	if hasMore {
 		result.NextOffset = &nextOffset

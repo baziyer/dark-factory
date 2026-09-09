@@ -22,6 +22,10 @@ export type SceneWorker = Readonly<{
   role: "orchestrator" | "worker";
   provider?: "claude_code" | "codex" | "shell";
   activity: "busy" | "waiting" | "needs-you" | "idle";
+  paused?: boolean;
+  /** Live work is placed in a room; retained samples annotate the resting area. */
+  location?: "working" | "last-observed" | "unobserved" | "resting";
+  locationLabel?: string;
   nodeId?: string;
 }>;
 
@@ -52,6 +56,7 @@ export type SceneLayout = Readonly<{
 
 export type SceneWorkerPlacement = Readonly<{
   id: string;
+  area: "room" | "resting" | "staging" | "overflow";
   roomId?: string;
   x: number;
   y: number;
@@ -110,32 +115,44 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
   const rooms = new Map(layout.rooms.map((room) => [room.id, room]));
   const roomCounts = new Map<string, number>();
   const outsideColumns = Math.max(1, Math.floor((layout.width - PADDING * 2 - 16) / WORKER_GAP) + 1);
-  let outside = 0;
-  return [...workers]
-    .sort((left, right) => compareText(left.id, right.id))
-    .map((worker) => {
-      const room = worker.nodeId === undefined ? undefined : rooms.get(worker.nodeId);
-      const roomSlot = room === undefined ? -1 : roomCounts.get(room.id) ?? 0;
-      const roomColumns = room === undefined ? 0 : Math.max(1, Math.floor((room.width - 16) / WORKER_GAP));
-      const roomRows = room === undefined ? 0 : Math.max(1, Math.floor((room.height - 16) / WORKER_GAP));
-      if (room === undefined || roomSlot >= roomColumns * roomRows) {
-        const slot = outside;
-        outside += 1;
-        return {
-          id: worker.id,
-          ...(room === undefined ? {} : { roomId: room.id }),
-          x: PADDING + 8 + (slot % outsideColumns) * WORKER_GAP,
-          y: layout.height + 28 + Math.floor(slot / outsideColumns) * WORKER_GAP,
-        };
-      }
-      roomCounts.set(room.id, roomSlot + 1);
-      return {
-        id: worker.id,
-        roomId: room.id,
-        x: room.anchor.x + centeredSlot(roomSlot % roomColumns) * WORKER_GAP,
-        y: room.anchor.y + centeredSlot(Math.floor(roomSlot / roomColumns)) * WORKER_GAP,
-      };
+  const sorted = [...workers].sort((left, right) => compareText(left.id, right.id));
+  const resting = sorted.filter((worker) => worker.location !== "working" && worker.location !== "unobserved");
+  const staging = sorted.filter((worker) => worker.location === "unobserved");
+  const restRows = Math.ceil(resting.length / outsideColumns);
+  const stagingRows = Math.ceil(staging.length / outsideColumns);
+  const outside = (workers: readonly SceneWorker[], area: "resting" | "staging" | "overflow", top: number) => workers.map((worker, slot) => ({
+    id: worker.id,
+    area,
+    x: PADDING + 8 + (slot % outsideColumns) * WORKER_GAP,
+    y: top + Math.floor(slot / outsideColumns) * WORKER_GAP,
+  }));
+  const placed: SceneWorkerPlacement[] = [];
+  const overflow: SceneWorker[] = sorted.filter((worker) => worker.location === "working" && worker.nodeId === undefined);
+  for (const worker of sorted) {
+    if (worker.location !== "working" || worker.nodeId === undefined) continue;
+    const room = rooms.get(worker.nodeId);
+    const roomSlot = room === undefined ? -1 : roomCounts.get(room.id) ?? 0;
+    const roomColumns = room === undefined ? 0 : Math.max(1, Math.floor((room.width - 16) / WORKER_GAP));
+    // The title and served kind occupy the first 40px of every room.
+    const roomRows = room === undefined ? 0 : Math.max(1, Math.floor((room.height - 56) / WORKER_GAP));
+    if (room === undefined || roomSlot >= roomColumns * roomRows) {
+      overflow.push(worker);
+      continue;
+    }
+    roomCounts.set(room.id, roomSlot + 1);
+    placed.push({
+      id: worker.id,
+      area: "room",
+      roomId: room.id,
+      x: room.anchor.x + centeredSlot(roomSlot % roomColumns) * WORKER_GAP,
+      y: room.y + 48 + Math.floor(roomSlot / roomColumns) * WORKER_GAP,
     });
+  }
+  const restingTop = layout.height + 28;
+  const stagingTop = restingTop + restRows * WORKER_GAP + (resting.length === 0 || (staging.length === 0 && overflow.length === 0) ? 0 : 32);
+  const overflowTop = stagingTop + stagingRows * WORKER_GAP + (staging.length === 0 || overflow.length === 0 ? 0 : 32);
+  return [...placed, ...outside(resting, "resting", restingTop), ...outside(staging, "staging", stagingTop), ...outside(overflow, "overflow", overflowTop)]
+    .sort((left, right) => compareText(left.id, right.id));
 }
 
 /** The sheet frame a worker stands as; an unknown provider wears shell. */
@@ -148,10 +165,4 @@ export function workerFrame(worker: SceneWorker): string {
   const provider = worker.provider === "claude_code" || worker.provider === "codex" ? worker.provider : "shell";
   const frame = `${role}.${provider}.${identity}.${worker.activity}.0`;
   return frame in spriteAtlas.frames ? frame : `${role}.${provider}.${identity}.idle.0`;
-}
-
-/** busy and idle carry a second frame; every other activity holds still. */
-export function alternateFrame(frame: string): string | undefined {
-  const alternate = frame.replace(/\.0$/, ".1");
-  return alternate in spriteAtlas.frames ? alternate : undefined;
 }

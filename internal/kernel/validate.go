@@ -53,10 +53,35 @@ func validateDurableEntityControls(ctx context.Context, connection *sql.Conn) (F
 	if err := validateHumanRequests(ctx, connection); err != nil {
 		return FactoryState{}, err
 	}
+	if err := validatePeerQuestions(ctx, connection); err != nil {
+		return FactoryState{}, err
+	}
 	if err := validateResourceIdentityCollisions(ctx, connection); err != nil {
 		return FactoryState{}, err
 	}
 	return state, nil
+}
+
+func validatePeerQuestions(ctx context.Context, connection *sql.Conn) error {
+	rows, err := connection.QueryContext(ctx, `SELECT `+peerQuestionColumns+` FROM peer_questions ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		question, _, err := scanPeerQuestion(rows)
+		if err != nil {
+			return err
+		}
+		var linked int
+		if err := connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE id IN (?, ?) AND project_id = ?`, question.SourceTaskID.Bytes(), question.TargetTaskID.Bytes(), question.ProjectID.Bytes()).Scan(&linked); err != nil {
+			return err
+		}
+		if linked != 2 {
+			return fmt.Errorf("%w: peer question task relationship", ErrCorruptState)
+		}
+	}
+	return rows.Err()
 }
 
 func validateHumanRequests(ctx context.Context, connection *sql.Conn) error {

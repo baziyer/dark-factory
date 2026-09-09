@@ -10,17 +10,6 @@ import (
 	"unsafe"
 )
 
-func verifySocketConnection(connection net.Conn, expected socketRecord) error {
-	if err := verifyPeerEUID(connection); err != nil {
-		return err
-	}
-	current, err := inspectSocket(connection.RemoteAddr().String())
-	if err != nil || !current.same(expected) {
-		return ErrInvalidClient
-	}
-	return nil
-}
-
 func verifyPeerEUID(connection net.Conn) error {
 	unix, ok := connection.(*net.UnixConn)
 	if !ok {

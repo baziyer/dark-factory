@@ -28,15 +28,47 @@ func SentBackBody(task Task, note string) string {
 	return fmt.Sprintf("%s%s%d\n\n%s", instruction, sentBackMarker, task.WorkRevision.Int64()+1, note)
 }
 
-func sentBackInstruction(task Task) string {
+// TaskInstruction is the editable instruction before a retained send-back
+// note. It deliberately does not substitute the title: an empty task body is
+// meaningful to the normal supervisor, which applies that fallback itself.
+func TaskInstruction(task Task) string {
 	instruction := task.Body
 	if task.SentBackInstructionBytes != nil {
 		instruction = instruction[:*task.SentBackInstructionBytes]
 	}
+	return instruction
+}
+
+func sentBackInstruction(task Task) string {
+	instruction := TaskInstruction(task)
 	if instruction == "" {
 		instruction = task.Title
 	}
 	return instruction
+}
+
+// TaskFeedback is the one retained send-back note. It is read-only feedback,
+// not part of the instruction an operator replaces.
+func TaskFeedback(task Task) string {
+	if task.SentBackInstructionBytes == nil {
+		return ""
+	}
+	return task.Body[*task.SentBackInstructionBytes:]
+}
+
+// TaskBodyWithInstruction replaces only the editable instruction and retains
+// the current send-back note. A blank base before a note falls back to title,
+// matching SentBackBody and leaving a useful effective prompt.
+func TaskBodyWithInstruction(task Task, instruction string) (string, *int64) {
+	feedback := TaskFeedback(task)
+	if feedback == "" {
+		return instruction, nil
+	}
+	if instruction == "" {
+		instruction = task.Title
+	}
+	offset := int64(byteLen(instruction))
+	return instruction + feedback, &offset
 }
 
 // SendBackTask returns a finished task to its queue at the next work revision

@@ -33,6 +33,8 @@ type terminalTestBackend struct {
 	controlEntered, controlRelease              chan struct{}
 }
 
+var _ AgentControlBackend = (*terminalTestBackend)(nil)
+
 type terminalTestAttachment struct {
 	events        chan TerminalEvent
 	closeDone     chan struct{}

@@ -12,6 +12,7 @@ import {
   type AgentItem,
   type AgentControlAction,
   type TaskHistoryView,
+  type TaskDetailView,
   type HumanRequestDetail,
   type HumanRequestItem,
   type SessionErrorCode,
@@ -20,9 +21,11 @@ import {
   type StateView,
   type TaskItem,
   type TerminalReset,
+  type RunPathsView,
   randomOperationID,
   type TopologyView,
 } from "@dark-factory/client";
+import type { RunPathSample } from "./console-view.js";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
 
 const BROWSER_ENDPOINT = new URL("ws://127.0.0.1:43123/browser");
@@ -83,6 +86,9 @@ export type FactoryTerminalView = Readonly<{
   /** Explicit durable receipts only; terminal keystrokes and output stay local. */
   history?: TaskHistoryView;
   historyPending: boolean;
+  taskDetail?: TaskDetailView;
+  taskDetailPending: boolean;
+  taskDetailError?: SessionError | ProtocolError;
   controlReady: boolean;
   queued: boolean;
   /** The mounted Xterm scrollback belongs to this agent's completed work. */
@@ -110,7 +116,9 @@ export type FactoryAppSnapshot = Readonly<{
   /** Regenerable structure per project, empty until the daemon serves it. */
   topologies?: ReadonlyMap<string, TopologyView>;
   /** Repository directories each running agent's live run is changing. */
-  runPaths?: ReadonlyMap<string, readonly string[]>;
+  runPaths?: ReadonlyMap<string, RunPathSample>;
+  /** Most recent observed paths remain an annotation after that run ends. */
+  lastRunPaths?: ReadonlyMap<string, RunPathSample>;
   edit?: FactoryEditView;
   /** True only while a ready session carries the full loopback grant. */
   remoteInviteAllowed?: boolean;
@@ -128,7 +136,7 @@ export type FactoryAppStatus =
 
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
-type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "resolveAgentTerminal">;
+type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
 type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "discoverAccounts" | "linkAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
@@ -174,6 +182,11 @@ type AgentTerminalSelection = {
   historyTaskRevision?: bigint;
   historyPendingTaskRevision?: bigint;
   historyPending: boolean;
+  taskDetail?: TaskDetailView;
+  taskDetailTaskID?: string;
+  taskDetailTaskRevision?: bigint;
+  taskDetailPending: boolean;
+  taskDetailError?: SessionError | ProtocolError;
   queuedTaskID?: string;
 };
 
@@ -223,7 +236,8 @@ export class FactoryAppController {
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
   #topologies: ReadonlyMap<string, TopologyView> = new Map();
   #topologyPending = new Set<string>();
-  #runPaths: ReadonlyMap<string, readonly string[]> = new Map();
+  #runPaths: ReadonlyMap<string, RunPathSample> = new Map();
+  #lastRunPaths: ReadonlyMap<string, RunPathSample> = new Map();
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
   #runPathsTicks = 0;
   #runPathsPending = false;
@@ -395,9 +409,12 @@ export class FactoryAppController {
     const session = this.#client?.session;
     const state = this.#state;
     if (session === undefined || state === undefined || this.#runPathsPending) return;
-    const running = [...new Set([...state.tasks.values()]
-      .filter((task) => task.status === "running" && task.assigned_agent_id !== "" && this.#topologies.has(task.project_id))
-      .map((task) => task.assigned_agent_id))];
+    const running = [...state.agents.values()]
+      .map((agent) => {
+        const task = agentCurrentTask(agent, state);
+        return task === undefined || !this.#topologies.has(task.project_id) ? undefined : { agentId: agent.id, taskId: task.id, taskRevision: task.revision, projectId: task.project_id };
+      })
+      .filter((task): task is { agentId: string; taskId: string; taskRevision: bigint; projectId: string } => task !== undefined);
     if (running.length === 0) {
       // Nothing to ask leaves no round in flight, so the round a served
       // structure triggers is not lost behind an empty one.
@@ -409,11 +426,10 @@ export class FactoryAppController {
     }
     this.#runPathsPending = true;
     const generation = this.#generation;
-    void Promise.all(running.map((agentId) => session.getRunPaths(agentId).then(
-      (answer) => [agentId, answer.paths] as const,
-      // A refused answer keeps the last known room rather than bouncing the
-      // worker back to its project room for one cycle.
-      () => [agentId, this.#runPaths.get(agentId) ?? []] as const,
+    void Promise.all(running.map(({ agentId, taskId, taskRevision, projectId }) => session.getRunPaths(agentId).then(
+      (answer) => [agentId, sampleFor(taskId, taskRevision, projectId, answer)] as const,
+      // A refused answer keeps the last sample as a retained observation.
+      () => [agentId, this.#runPaths.get(agentId)] as const,
     ))).then((answers) => {
       this.#runPathsPending = false;
       // A round owed to a structure that arrived meanwhile is asked now, and
@@ -424,8 +440,17 @@ export class FactoryAppController {
       if (due && this.#runPathsTimer !== undefined) this.#pollRunPaths();
       // An agent that stopped running loses its entry; an unchanged round is
       // not a new snapshot, so the floor does not re-render on a heartbeat.
-      if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;
-      this.#runPaths = new Map(answers);
+      const current = new Map(answers.filter((entry): entry is readonly [string, RunPathSample] => {
+        const sample = entry[1];
+        const agent = this.#state?.agents.get(entry[0]);
+        const task = sample === undefined || agent === undefined || this.#state === undefined ? undefined : agentCurrentTask(agent, this.#state);
+        return sample !== undefined && task?.id === sample.taskId && task.revision === sample.taskRevision && task.project_id === sample.projectId;
+      }));
+      const last = new Map(this.#lastRunPaths);
+      for (const [agentId, sample] of answers) if (sample !== undefined && sample.paths.length > 0) last.set(agentId, sample);
+      if (sameSamples(this.#runPaths, current) && sameSamples(this.#lastRunPaths, last)) return;
+      this.#runPaths = current;
+      this.#lastRunPaths = last;
       this.#publish();
     });
   }
@@ -464,22 +489,32 @@ export class FactoryAppController {
   }
 
   /** Edit one queued task against its exact revision. */
-  async editTask(task: Pick<TaskItem, "id" | "revision">, change: { title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<void> {
+  async editTask(task: Pick<TaskItem, "id" | "revision">, change: { title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<boolean> {
     const session = this.#client?.session;
-    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
+    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return false;
     const generation = this.#generation;
     const edit: FactoryEditView = { target: task.id, pending: true };
     this.#edit = edit;
     this.#publish();
     try {
       await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
-      if (!this.#current(generation) || this.#edit !== edit) return;
+      if (!this.#current(generation) || this.#edit !== edit) return false;
       this.#edit = undefined;
+		this.#publish();
+		return true;
     } catch (error) {
-      if (!this.#current(generation) || this.#edit !== edit) return;
+      if (!this.#current(generation) || this.#edit !== edit) return false;
       this.#edit = { target: task.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
+	return false;
+  }
+
+  /** Load private task text only when an operator opens its brief. */
+  taskDetail(task: Pick<TaskItem, "id" | "revision">, peerOffset = 0n, expectedHead?: bigint): Promise<TaskDetailView> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined) return Promise.reject(new SessionError("closed"));
+    return this.#readTaskDetail(session, task.id, task.revision, peerOffset, expectedHead);
   }
 
   clearAgentTerminal(): void {
@@ -620,6 +655,21 @@ export class FactoryAppController {
     const selected = this.#selectedAgent;
     const taskID = selected?.task?.id ?? selected?.historyTaskID;
     if (selected !== undefined && taskID !== undefined) void this.#loadTaskHistory(selected, taskID);
+  }
+
+  loadTaskDetail(): void {
+    const selected = this.#selectedAgent;
+    const taskID = selected?.historyTaskID;
+    const revision = selected?.historyTaskRevision;
+    if (selected !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision);
+  }
+
+  loadOlderTaskConversation(): void {
+    const selected = this.#selectedAgent;
+    const detail = selected?.taskDetail;
+    const taskID = selected?.historyTaskID;
+    const revision = selected?.historyTaskRevision;
+    if (selected !== undefined && detail?.nextPeerOffset !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision, detail.nextPeerOffset, detail.head);
   }
 
   /**
@@ -1188,18 +1238,80 @@ export class FactoryAppController {
     }
   }
 
+  async #loadTaskDetail(selected: AgentTerminalSelection, taskID: string, revision: bigint, peerOffset = 0n, expectedHead?: bigint): Promise<void> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined || selected.taskDetailPending) return;
+    const generation = this.#generation;
+    selected.taskDetailPending = true;
+    selected.taskDetailError = undefined;
+    this.#publish();
+    try {
+      const detail = await this.#readTaskDetail(session, taskID, revision, peerOffset, expectedHead);
+      if (!this.#current(generation) || this.#selectedAgent !== selected || detail.taskId !== taskID || detail.revision !== revision) return;
+      selected.taskDetail = detail;
+      selected.taskDetailTaskID = taskID;
+      selected.taskDetailTaskRevision = revision;
+    } catch (error) {
+      if (!this.#current(generation) || this.#selectedAgent !== selected) return;
+      selected.taskDetailError = finiteError(error);
+    } finally {
+      if (this.#current(generation) && this.#selectedAgent === selected) {
+        selected.taskDetailPending = false;
+        this.#publish();
+      }
+    }
+  }
+
+  async #readTaskDetail(session: AgentTaskSession, taskID: string, revision: bigint, peerOffset: bigint, expectedHead?: bigint): Promise<TaskDetailView> {
+    let textOffset = 0n;
+    let instruction = "";
+    let feedback = "";
+    let peerQuestions: TaskDetailView["peerQuestions"] = [];
+    let nextPeerOffset: bigint | undefined;
+    let head = expectedHead;
+    // Task bodies are limited to 128 KiB and each page is 2,048 runes, so 64
+    // pages cover every valid body without treating conversation pagination as
+    // an unbounded background load.
+    for (let page = 0; page < 64; page += 1) {
+      const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset, ...(head === undefined ? {} : { expectedHead: head }) });
+      if (head !== undefined && detail.head !== head) throw new ProtocolError("malformed");
+      head = detail.head;
+      instruction += detail.instruction;
+      feedback += detail.feedback;
+      if (page === 0) {
+        peerQuestions = detail.peerQuestions;
+        nextPeerOffset = detail.nextPeerOffset;
+      }
+      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, head, instruction, feedback, peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
+      textOffset = detail.nextTextOffset;
+    }
+    throw new ProtocolError("malformed");
+  }
+
   #refreshTerminalTask(selected: AgentTerminalSelection, state: StateView): void {
     const task = agentCurrentTask(selected.agent, state);
     this.#refreshQueuedTask(selected, state);
     const current = task === undefined ? undefined : { id: task.id, revision: task.revision };
     if (sameTaskIdentity(selected.task, current) && selected.task?.revision === current?.revision) return;
+    const previous = selected.task;
     const changedTask = selected.task?.id !== current?.id;
     selected.task = current;
     selected.finishing = false;
+    // A terminal can settle between snapshots. Keep its final revision for
+    // the private history reader rather than asking with the running revision.
+    if (current === undefined && previous !== undefined) {
+      const completed = state.tasks.get(previous.id);
+      if (completed !== undefined) {
+        selected.historyTaskID = completed.id;
+        selected.historyTaskRevision = completed.revision;
+        selected.taskDetail = undefined;
+      }
+    }
     if (current !== undefined && selected.instructionDraft === "") selected.instructionError = undefined;
     if (current !== undefined && (selected.historyTaskID !== current.id || selected.historyTaskRevision !== current.revision)) {
       selected.historyTaskID = current.id;
       selected.history = undefined;
+		selected.taskDetail = undefined;
       void this.#loadTaskHistory(selected, current.id);
     }
     if (changedTask) this.#dropPendingTerminalInput();
@@ -1259,6 +1371,7 @@ export class FactoryAppController {
       instructionError: sameAgent ? prior.instructionError : undefined,
       instructionPending: sameAgent ? prior.instructionPending : false,
       historyPending: false,
+		taskDetailPending: false,
       queuedTaskID: queuedTask?.id,
     };
     this.#error = replacement.error ?? (replacement.agentId !== undefined && agent === undefined ? new SessionError("stale") : undefined);
@@ -1305,6 +1418,7 @@ export class FactoryAppController {
       error: this.#error,
       topologies: this.#topologies,
       runPaths: this.#runPaths,
+      lastRunPaths: this.#lastRunPaths,
       edit: this.#edit,
       selectedHumanRequest: selection === undefined ? undefined : {
         request: selection.request,
@@ -1346,6 +1460,9 @@ export class FactoryAppController {
         controlStatus: this.#selectedAgent.controlStatus,
         history: this.#selectedAgent.history,
         historyPending: this.#selectedAgent.historyPending,
+		taskDetail: this.#selectedAgent.taskDetail,
+		taskDetailPending: this.#selectedAgent.taskDetailPending,
+		taskDetailError: this.#selectedAgent.taskDetailError,
         controlReady: this.#selectedAgent.task !== undefined && !this.#selectedAgent.finishing && this.#terminal?.snapshot.phase === "ready",
         queued: this.#selectedAgent.queuedTaskID !== undefined && this.#selectedAgent.task === undefined,
         hasOutputSurface: this.#terminalSurface !== undefined,
@@ -1371,8 +1488,17 @@ function finiteError(error: unknown): SessionError | ProtocolError {
   return error instanceof SessionError || error instanceof ProtocolError ? error : new SessionError("connection");
 }
 
-function sameText(left: readonly string[] | undefined, right: readonly string[]): boolean {
-  return left !== undefined && left.length === right.length && left.every((value, index) => value === right[index]);
+function sampleFor(taskId: string, taskRevision: bigint, projectId: string, answer: RunPathsView): RunPathSample | undefined {
+  if (typeof answer.runId !== "string" || answer.runId === "") return undefined;
+  return Object.freeze({ taskId, taskRevision, projectId, runId: answer.runId, paths: Object.freeze([...answer.paths]) });
+}
+
+function sameSamples(left: ReadonlyMap<string, RunPathSample>, right: ReadonlyMap<string, RunPathSample>): boolean {
+  return left.size === right.size && [...left].every(([agentId, sample]) => {
+    const candidate = right.get(agentId);
+    return candidate !== undefined && candidate.taskId === sample.taskId && candidate.taskRevision === sample.taskRevision && candidate.projectId === sample.projectId && candidate.runId === sample.runId
+      && candidate.paths.length === sample.paths.length && candidate.paths.every((path, index) => path === sample.paths[index]);
+  });
 }
 
 function sameStatus(left: FactoryAppStatus | undefined, right: FactoryAppStatus): boolean {

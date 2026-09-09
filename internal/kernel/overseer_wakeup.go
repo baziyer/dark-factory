@@ -138,9 +138,12 @@ func workerInvalidationAfter(ctx context.Context, connection *sql.Conn, projectI
 			(i.entity_kind = 'human_request' AND EXISTS(
 				SELECT 1 FROM human_requests AS h JOIN runs AS r ON r.id = h.run_id
 				WHERE h.id = i.entity_id AND r.project_id = ? AND r.role = 'worker'
+			)) OR
+			(i.entity_kind = 'peer_question' AND EXISTS(
+				SELECT 1 FROM peer_questions AS q WHERE q.id = i.entity_id AND q.project_id = ?
 			))
 		)
-	)`, cursor, head, projectID.Bytes(), projectID.Bytes(), projectID.Bytes()).Scan(&found)
+	)`, cursor, head, projectID.Bytes(), projectID.Bytes(), projectID.Bytes(), projectID.Bytes()).Scan(&found)
 	if err != nil {
 		return false, err
 	}

@@ -25,6 +25,7 @@ import {
   encodeRemoteInviteResult,
   encodeTaskEnqueueResult,
   encodeTaskHistory,
+  encodeTaskDetail,
   encodeStateChanged,
   encodeStateSnapshot,
   encodeTerminalAttached,
@@ -331,6 +332,13 @@ test("agent controls and private task history keep exact task and run identities
   assert.deepEqual(historyGet.body, { task_id: taskId });
   socket.reply(encodeTaskHistory(historyGet.id, { task_id: taskId, entries: [{ operation_id: operationId, kind: "interrupt", actor: "operator", body: "", status: "delivered", created_at_ms: 100n }] }));
   assert.deepEqual(await history, { taskId, entries: [{ operationId, kind: "interrupt", actor: "operator", body: "", status: "delivered", createdAtMs: 100n }] });
+
+  const taskDetail = session.getTaskDetail(taskId, 2n, { peerOffset: 1n, expectedHead: 9n });
+  const taskDetailGet = decodeClientControl(socket.sent.at(-1));
+  assert.deepEqual(taskDetailGet.body, { task_id: taskId, expected_revision: 2n, peer_offset: 1n, expected_head: 9n });
+  socket.reply(encodeTaskDetail(taskDetailGet.id, { task_id: taskId, revision: 2n, head: 9n, instruction: "", feedback: "", peer_questions: [] }));
+  assert.deepEqual(await taskDetail, { taskId, revision: 2n, head: 9n, instruction: "", feedback: "", peerQuestions: [] });
+  await assert.rejects(session.getTaskDetail(taskId, 2n, { peerOffset: 1n }), (error) => error instanceof ProtocolError && error.code === "malformed");
   session.close();
 });
 

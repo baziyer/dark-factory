@@ -29,6 +29,7 @@ const (
 	priorUserVersion    = 3
 	v4UserVersion       = 4
 	v5UserVersion       = 5
+	v6UserVersion       = 6
 
 	legacyAgents = `CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -51,6 +52,15 @@ const (
     sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
     entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request')),
+    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))
+) STRICT`
+
+	v6Invalidations = `CREATE TABLE invalidations (
+    sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('factory', 'project', 'agent', 'task', 'change', 'run', 'human_request', 'account')),
     entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))
@@ -136,12 +146,10 @@ const (
 // v4SchemaStatements is the exact v4 schema: the current one with the frozen
 // tasks definition substituted.
 func v4SchemaStatements() []string {
-	statements := make([]string, 0, len(schemaStatements))
-	for _, statement := range schemaStatements {
+	v5 := v5SchemaStatements()
+	statements := make([]string, 0, len(v5))
+	for _, statement := range v5 {
 		_, name := schemaObjectIdentity(statement)
-		if name == "task_interventions" || name == "task_interventions_project_task" || name == "overseer_wake_cursors" {
-			continue
-		}
 		if name == "tasks" {
 			statement = v4Tasks
 		}
@@ -153,11 +161,28 @@ func v4SchemaStatements() []string {
 // v5SchemaStatements is the exact schema before durable operator
 // interventions and overseer wake cursors were added.
 func v5SchemaStatements() []string {
-	statements := make([]string, 0, len(schemaStatements))
-	for _, statement := range schemaStatements {
+	v6 := v6SchemaStatements()
+	statements := make([]string, 0, len(v6))
+	for _, statement := range v6 {
 		_, name := schemaObjectIdentity(statement)
 		if name == "task_interventions" || name == "task_interventions_project_task" || name == "overseer_wake_cursors" {
 			continue
+		}
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// v6SchemaStatements is the exact schema before task-linked peer questions.
+func v6SchemaStatements() []string {
+	statements := make([]string, 0, len(schemaStatements))
+	for _, statement := range schemaStatements {
+		_, name := schemaObjectIdentity(statement)
+		switch name {
+		case "peer_questions", "peer_questions_source_key_unique", "peer_questions_recipient_delivery_unique", "peer_questions_answer_delivery_unique", "peer_questions_task_history":
+			continue
+		case "invalidations":
+			statement = v6Invalidations
 		}
 		statements = append(statements, statement)
 	}
@@ -248,6 +273,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return v4SchemaStatements(), true
 	case v5UserVersion:
 		return v5SchemaStatements(), true
+	case v6UserVersion:
+		return v6SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -273,7 +300,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -286,6 +313,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[3:]
 	case v5UserVersion:
 		steps = all[4:]
+	case v6UserVersion:
+		steps = all[5:]
 	default:
 		return connection.Close()
 	}
@@ -416,7 +445,7 @@ func migrateV4Transaction(ctx context.Context, connection *sql.Conn) error {
 	if err := validateSchemaVersion(ctx, connection, v4UserVersion, v4SchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
+	target := expectedSchemaOf(v5SchemaStatements())
 	if err := rebuildTable(ctx, connection, target, "tasks", v4TaskColumns, "tasks_id_project_incarnation_unique", "tasks_incarnation_unique", "tasks_canonical_queue", "sent_back_instruction_bytes", "NULL"); err != nil {
 		return err
 	}
@@ -432,8 +461,29 @@ func migrateV5Transaction(ctx context.Context, connection *sql.Conn) error {
 	if err := validateSchemaVersion(ctx, connection, v5UserVersion, v5SchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
+	target := expectedSchemaOf(v6SchemaStatements())
 	for _, name := range []string{"task_interventions", "task_interventions_project_task", "overseer_wake_cursors"} {
+		if _, err := connection.ExecContext(ctx, target[name].sql); err != nil {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v6UserVersion)); err != nil {
+		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, v6UserVersion, v6SchemaStatements())
+}
+
+// migrateV6Transaction adds peer history and widens the invalidation journal
+// atomically so an existing wake cursor never sees a foreign entity kind.
+func migrateV6Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v6UserVersion, v6SchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	if err := rebuildTable(ctx, connection, target, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
+		return err
+	}
+	for _, name := range []string{"peer_questions", "peer_questions_source_key_unique", "peer_questions_recipient_delivery_unique", "peer_questions_answer_delivery_unique", "peer_questions_task_history"} {
 		if _, err := connection.ExecContext(ctx, target[name].sql); err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}

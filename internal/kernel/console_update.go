@@ -26,6 +26,7 @@ type AgentPatch struct {
 // column alone; Cancel is the only status transition the console may ask for.
 type TaskPatch struct {
 	Title           *string
+	Body            *string
 	Priority        *int64
 	AssignedAgentID *AgentID
 	Cancel          bool
@@ -144,11 +145,42 @@ func (store *Store) UpdateTask(ctx context.Context, id TaskID, expected Revision
 	return store.updateTask(ctx, nil, id, expected, patch, at)
 }
 
-// UpdateTaskForOverseer edits the dispatch controls of a queued worker task
-// in the running orchestrator's project, with authorization checked in the
-// update transaction. It deliberately cannot edit the task's title or body.
-func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID, expected Revision, priority *int64, assignedAgentID *AgentID, cancel bool, at UnixMillis) (Task, error) {
-	return store.updateTask(ctx, &digest, id, expected, TaskPatch{Priority: priority, AssignedAgentID: assignedAgentID, Cancel: cancel}, at)
+// UpdateTaskForOverseer edits a queued worker task in the running
+// orchestrator's project, with authorization checked in the update transaction.
+func (store *Store) UpdateTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
+	return store.updateTask(ctx, &digest, id, expected, patch, at)
+}
+
+// AuthorizeWorkerTaskForOverseer establishes that a live overseer may inspect
+// a worker task before the daemon validates a provider-specific edit.
+func (store *Store) AuthorizeWorkerTaskForOverseer(ctx context.Context, digest AttemptDigest, id TaskID) error {
+	if id.zero() {
+		return fmt.Errorf("%w: invalid task authorization", ErrInvalidValue)
+	}
+	read, err := store.beginRead(ctx)
+	if err != nil {
+		return err
+	}
+	defer read.Close()
+	overseer, err := overseerRun(ctx, read.connection, digest)
+	if err != nil {
+		return err
+	}
+	task, found, err := taskByID(ctx, read.connection, id)
+	if err != nil {
+		return err
+	}
+	if !found || task.ProjectID != overseer.ProjectID {
+		return ErrUnauthorized
+	}
+	agent, found, err := agentByID(ctx, read.connection, task.AssignedAgentID)
+	if err != nil {
+		return err
+	}
+	if !found || agent.Role != RoleWorker {
+		return ErrUnauthorized
+	}
+	return nil
 }
 
 func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id TaskID, expected Revision, patch TaskPatch, at UnixMillis) (Task, error) {
@@ -195,6 +227,9 @@ func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id Ta
 	if patch.Title != nil {
 		task.Title = *patch.Title
 	}
+	if patch.Body != nil {
+		task.Body, task.SentBackInstructionBytes = TaskBodyWithInstruction(task, *patch.Body)
+	}
 	if patch.Priority != nil {
 		task.Priority = *patch.Priority
 	}
@@ -217,11 +252,15 @@ func (store *Store) updateTask(ctx context.Context, digest *AttemptDigest, id Ta
 	if patch.Cancel {
 		status, completed = TaskCancelled.String(), at.Int64()
 	}
-	if byteLen(task.Title) < 1 || byteLen(task.Title) > 1024 || task.Priority < -1_000_000 || task.Priority > 1_000_000 {
+	if byteLen(task.Title) < 1 || byteLen(task.Title) > 1024 || byteLen(task.Body) > 131072 || task.Priority < -1_000_000 || task.Priority > 1_000_000 {
 		return Task{}, tx.Rollback(fmt.Errorf("%w: invalid task update", ErrInvalidValue))
 	}
-	result, err := tx.connection.ExecContext(ctx, `UPDATE tasks SET title = ?, priority = ?, assigned_agent_id = ?, status = ?, completed_at_ms = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND status = 'queued' AND revision = ?`,
-		task.Title, task.Priority, task.AssignedAgentID.Bytes(), status, completed, at.Int64(), id.Bytes(), expected.Int64())
+	var sentBack any
+	if task.SentBackInstructionBytes != nil {
+		sentBack = *task.SentBackInstructionBytes
+	}
+	result, err := tx.connection.ExecContext(ctx, `UPDATE tasks SET title = ?, body = ?, sent_back_instruction_bytes = ?, priority = ?, assigned_agent_id = ?, status = ?, completed_at_ms = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND status = 'queued' AND revision = ?`,
+		task.Title, task.Body, sentBack, task.Priority, task.AssignedAgentID.Bytes(), status, completed, at.Int64(), id.Bytes(), expected.Int64())
 	if err := requireOneRow(result, err); err != nil {
 		return Task{}, tx.Rollback(err)
 	}

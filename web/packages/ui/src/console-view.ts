@@ -47,23 +47,23 @@ export function agentCurrentTask(agent: AgentItem, state: StateView): TaskItem |
   return undefined;
 }
 
-/** Precedence: an open question outranks activity; pause outranks waiting. */
-export function agentActivity(agent: AgentItem, state: StateView): AgentActivity {
-  for (const request of state.humanRequests.values()) {
-    if (request.agent_id === agent.id) return "needs-you";
-  }
-  if (agentCurrentTask(agent, state) !== undefined) return "busy";
-  return agent.paused ? "idle" : "waiting";
-}
-
-/** The console's words are smaller than the sprite vocabulary. */
+/** The operator-facing state has one name for each actionable condition. */
 export function agentStatus(agent: AgentItem, state: StateView): AgentStatus {
   for (const request of state.humanRequests.values()) {
     if (request.agent_id === agent.id) return "needs-you";
   }
   if (agentCurrentTask(agent, state) !== undefined) return "working";
-  if (agent.paused) return "paused";
-  return "ready";
+  return agent.paused ? "paused" : "ready";
+}
+
+/** The sprite vocabulary derives from the operator-facing status once. */
+export function agentActivity(agent: AgentItem, state: StateView): AgentActivity {
+  switch (agentStatus(agent, state)) {
+    case "needs-you": return "needs-you";
+    case "working": return "busy";
+    case "paused": return "idle";
+    case "ready": return "waiting";
+  }
 }
 
 /** The overseer is the console's entry point; a worker is a usable fallback. */
@@ -128,52 +128,87 @@ export type FloorScene = Readonly<{
   topology: SceneTopology;
   workers: readonly SceneWorker[];
   workItems: readonly SceneWorkItem[];
+  omittedLocations: number;
+}>;
+
+/** One changed-path sample is tied to the task and provider run that produced it. */
+export type RunPathSample = Readonly<{
+  taskId: string;
+  taskRevision: bigint;
+  runId: string;
+  projectId: string;
+  paths: readonly string[];
 }>;
 
 /**
  * The floor is a projection, never a second source of truth: every project is a
  * block of rooms taken from its own served topology, or the one room that
  * stands for a project whose structure the daemon has not served yet, and every
- * worker stands in the room of the code its live run is changing inside its own
- * project. The floor is a grid because the served nodes carry no edges: it
+ * worker stands in the room of code its matching live run is changing. A
+ * retained sample only annotates a resting worker; no sample ever invents a
+ * root location. The floor is a grid because served nodes carry no edges: it
  * shows what the code is, not what depends on what.
  */
 export function floorScene(
   state: StateView | undefined,
   topologies: ReadonlyMap<string, TopologyView> | undefined,
-  runPaths?: ReadonlyMap<string, readonly string[]>,
+  runPaths?: ReadonlyMap<string, RunPathSample>,
+  lastRunPaths?: ReadonlyMap<string, RunPathSample>,
 ): FloorScene {
-  const projects = state === undefined ? [] : [...state.projects.values()];
+  const projects = state === undefined ? [] : [...state.projects.values()].sort((left, right) => compareText(left.name, right.name) || compareText(left.id, right.id));
   const blocks = projects.map((project) => projectBlock(project, topologies?.get(project.id)));
-  // The cap is shared, never first come: every project keeps its own room
-  // before any project keeps a second, and past that the largest rooms win.
-  const rooms = blocks
-    .flatMap((block, project) => block.map((room, rank) => ({ project, rank, room })))
-    .sort((left, right) => left.rank - right.rank || left.project - right.project)
-    .slice(0, MAX_FLOOR_ROOMS)
-    .map((entry) => entry.room);
+  const blocksByProject = new Map(projects.map((project, index) => [project.id, blocks[index]]));
+  const allRooms = new Map(blocks.flat().map((room) => [room.id, room]));
+  const liveRooms = new Set<string>();
+  if (state !== undefined) for (const agent of state.agents.values()) {
+    const task = agentCurrentTask(agent, state);
+    const sample = runPaths?.get(agent.id);
+    if (task === undefined || sample?.taskId !== task.id || sample.taskRevision !== task.revision || sample.projectId !== agent.project_id || sample.runId === "") continue;
+    const nodeId = roomOfRunPaths(blocksByProject.get(agent.project_id) ?? [], sample.paths);
+    if (nodeId !== undefined) liveRooms.add(nodeId);
+  }
+  // A current observed location wins the shared cap. Project roots make the
+  // rest of the map stable; remaining rooms then fill by the served size rank.
+  const roots = blocks.map((block) => block[0]).filter((room): room is SceneNode => room !== undefined);
+  const order = (rooms: readonly SceneNode[]) => [...rooms].sort((left, right) =>
+    compareText(left.project?.name ?? "", right.project?.name ?? "") || compareText(left.project?.id ?? "", right.project?.id ?? "") || compareText(left.path, right.path) || compareText(left.id, right.id));
+  const occupied = order([...liveRooms].map((id) => allRooms.get(id)).filter((room): room is SceneNode => room !== undefined));
+  const remaining = blocks.flat().filter((room) => !liveRooms.has(room.id) && !roots.some((root) => root.id === room.id)).sort((left, right) =>
+    SIZE_BUCKETS.indexOf(left.sizeBucket ?? "empty") - SIZE_BUCKETS.indexOf(right.sizeBucket ?? "empty")
+    || compareText(left.project?.name ?? "", right.project?.name ?? "") || compareText(left.path, right.path) || compareText(left.id, right.id));
+  const roomIDs = new Set<string>();
+  const rooms = [...occupied, ...order(roots), ...remaining].filter((room) => {
+    if (roomIDs.has(room.id)) return false;
+    roomIDs.add(room.id);
+    return true;
+  }).slice(0, MAX_FLOOR_ROOMS);
   const kept = new Set(rooms.map((room) => room.id));
-  const shown = new Map(projects.map((project, index) => [project.id, blocks[index]!.filter((room) => kept.has(room.id))]));
   const workers = state === undefined ? [] : [...state.agents.values()].map((agent) => {
-    // A run only ever names paths in its own project, and that project's own
-    // room is the first one it keeps, so an unmapped path costs no worker its
-    // room. Only an agent whose project the cap never reached has none.
-    const block = shown.get(agent.project_id) ?? [];
-    const nodeId = roomOfRunPaths(block, runPaths?.get(agent.id) ?? []) ?? block[0]?.id;
+    const task = agentCurrentTask(agent, state);
+    const block = blocksByProject.get(agent.project_id) ?? [];
+    const sample = runPaths?.get(agent.id);
+    const live = task === undefined || sample?.taskId !== task.id || sample.taskRevision !== task.revision || sample.projectId !== agent.project_id || sample.runId === "" ? undefined : roomOfRunPaths(block, sample.paths);
+    const previous = lastRunPaths?.get(agent.id);
+    const last = previous?.projectId === agent.project_id && previous.paths.length > 0 ? roomOfRunPaths(block, previous.paths) : undefined;
+    const location: "working" | "last-observed" | "unobserved" | "resting" = task === undefined ? last === undefined ? "resting" : "last-observed" : live === undefined ? "unobserved" : "working";
+    const room = location === "working" ? allRooms.get(live!) : location === "last-observed" ? allRooms.get(last!) : undefined;
     return {
       id: agent.id,
       name: agent.name,
       role: agent.role,
       provider: agent.provider,
       activity: agentActivity(agent, state),
-      ...(nodeId === undefined ? {} : { nodeId }),
+      paused: agent.paused,
+      location,
+      ...(room === undefined ? {} : { locationLabel: room.label }),
+      ...(location === "working" && live !== undefined && kept.has(live) ? { nodeId: live } : {}),
     };
   });
   const workItems = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.status === "succeeded" || task.status === "running" || task.status === "blocked")
     .map((task) => ({ id: task.id, stage: task.status === "succeeded" ? "release-ready" as const : "staged" as const }));
   const digest = projects.map((project) => topologies?.get(project.id)?.digest).filter((value) => value !== undefined).join(" ");
-  return { topology: { digest, nodes: rooms }, workers, workItems };
+  return { topology: { digest, nodes: rooms }, workers, workItems, omittedLocations: [...liveRooms].filter((id) => !kept.has(id)).length };
 }
 
 /**

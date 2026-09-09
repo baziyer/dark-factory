@@ -8,7 +8,7 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
-import { alternateFrame, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
+import { layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
 const topology = {
@@ -21,7 +21,7 @@ const topology = {
 };
 
 const workers = [
-  { id: "worker-b", name: "Builder", role: "worker", provider: "codex", activity: "busy", nodeId: "src" },
+  { id: "worker-b", name: "Builder", role: "worker", provider: "codex", activity: "busy", location: "working", nodeId: "src" },
   { id: "worker-a", name: "Planner", role: "orchestrator", activity: "needs-you", nodeId: "missing" },
 ];
 
@@ -88,8 +88,6 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.equal(workerFrame(workers[0]), frameName(workers[0]));
   assert.equal(workerFrame(workers[1]), frameName(workers[1]));
   assert.equal(workerFrame({ ...workers[0], provider: "made_up" }), frameName({ ...workers[0], provider: "made_up" }));
-  assert.equal(alternateFrame(frameName({ ...workers[0], activity: "busy" })), `${frameName(workers[0]).replace("busy.0", "busy.1")}`);
-  assert.equal(alternateFrame(frameName({ ...workers[1], activity: "needs-you" })), undefined);
 
   const first = render();
   const reordered = render({
@@ -111,7 +109,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.match(first, /&lt;Shared &amp; Library…/);
   assert.equal(first.includes("�"), false);
   assert.equal((first.match(/data-worker-id=/g) ?? []).length, workers.length);
-  assert.equal((first.match(/data-worker-id="[^"]+" transform="translate\([^)]+\)"/g) ?? []).length, workers.length);
+  assert.equal((first.match(/data-worker-location=/g) ?? []).length, workers.length);
   // The sheet is one <defs> entry, not one copy per worker, and every frame a
   // worker stands on is a real window on it.
   assert.equal(first.split(spriteSheet).length - 1, 1);
@@ -120,20 +118,21 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     const rendered = first.slice(first.indexOf(`data-worker-id="${worker.id}"`));
     const frame = rendered.slice(0, rendered.indexOf("</g>")).match(/href="#df-frame-([^"]+)"/g)
       .map((match) => match.slice('href="#df-frame-'.length, -1));
-    assert.deepEqual(frame, [frameName(worker)]
-      .concat(worker.activity === "busy" || worker.activity === "idle" ? [`${frameName(worker).replace(`${worker.activity}.0`, `${worker.activity}.1`)}`] : []));
+    assert.deepEqual(frame, [frameName(worker)]);
     for (const name of frame) assert.ok(name in spriteAtlas.frames, name);
-    if (frame.length === 2) {
-      assert.match(rendered, /<use[^>]+class="dfFactoryScene__primary"/);
-      assert.match(rendered, /<use[^>]+class="dfFactoryScene__alternate"/);
-    }
   }
-  // Only a two-frame activity animates, and it does so in CSS so that the
-  // reduced-motion rule can stop it.
-  assert.equal((first.match(/dfFactoryScene__alternate/g) ?? []).length,
-    workers.filter((worker) => worker.activity === "busy" || worker.activity === "idle").length);
+  assert.equal(first.includes("dfFactoryScene__alternate"), false);
   assert.equal(first.includes("<line"), false);
   assert.equal(first.includes("<animate"), false);
+  const unobserved = render({ workers: [{ ...workers[0], location: "unobserved", nodeId: undefined }] });
+  assert.match(unobserved, /WORKING · 1 LOCATION NOT YET OBSERVED/);
+  assert.match(unobserved, /working; location not yet observed/);
+  assert.match(first, /RESTING AREA · 1/);
+  const capped = render({ workers: [{ ...workers[0], location: "working", locationLabel: "Source", nodeId: undefined }], omittedLocations: 1 });
+  assert.match(capped, /ROOM MAP AT CAPACITY · 1 LOCATIONS NOT SHOWN/);
+  assert.match(capped, /working near observed changes in Source; room map at capacity/);
+  const observed = render({ workers: [{ ...workers[1], location: "last-observed", locationLabel: "Source" }] });
+  assert.match(observed, /last observed near changes in Source/);
 
   // The sheet the renderer reads is every frame it can draw, on a 16px grid,
   // inside the size the generator wrote next to it.
@@ -155,20 +154,30 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     name: `Worker ${index}`,
     role: "worker",
     activity: "busy",
+    location: "working",
     nodeId: "src",
   }));
   const densePlacements = placeWorkers(layout, denseWorkers);
   assert.equal(new Set(densePlacements.map(({ x, y }) => `${x},${y}`)).size, denseWorkers.length);
   const srcRoom = layout.rooms.find((room) => room.id === "src");
-  assert.deepEqual(densePlacements[0], { id: "worker-0", roomId: "src", x: srcRoom.anchor.x, y: srcRoom.anchor.y });
+  assert.deepEqual(densePlacements[0], { id: "worker-0", area: "room", roomId: "src", x: srcRoom.anchor.x, y: srcRoom.y + 48 });
   for (const placement of densePlacements.filter(({ y }) => y < layout.height)) {
     assert.ok(placement.x - 8 >= srcRoom.x && placement.x + 8 <= srcRoom.x + srcRoom.width);
     assert.ok(placement.y - 8 >= srcRoom.y && placement.y + 8 <= srcRoom.y + srcRoom.height);
+    assert.ok(placement.y - 8 >= srcRoom.y + 40, "room workers stay below the title and kind");
   }
   const denseSvg = render({ workers: denseWorkers });
-  assert.match(denseSvg, /WORKER OVERFLOW · 68/);
+  assert.match(denseSvg, /WORKER AREA AT CAPACITY · 84/);
   const denseHeight = Number(denseSvg.match(/viewBox="0 0 [^ ]+ ([^"]+)"/)[1]);
   assert.ok(denseHeight > Math.max(...densePlacements.map(({ y }) => y + 8)));
+
+  const mixedPlacements = placeWorkers(layout, [
+    ...denseWorkers,
+    { ...workers[1], location: "resting" },
+  ]);
+  const restingBottom = Math.max(...mixedPlacements.filter((placement) => placement.area === "resting").map((placement) => placement.y + 8));
+  const overflowTop = Math.min(...mixedPlacements.filter((placement) => placement.area === "overflow").map((placement) => placement.y));
+  assert.ok(overflowTop - restingBottom >= 24, "resting and overflow areas have separate rows");
 
   const stackedLayout = {
     width: 176,
@@ -196,14 +205,14 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.notDeepEqual(changed, layout);
 
   const emptyLayout = layoutScene({ digest: "empty", nodes: [] });
-  const emptyWorkers = denseWorkers.slice(0, 20).map(({ nodeId: _nodeId, ...worker }) => worker);
+  const emptyWorkers = denseWorkers.slice(0, 20).map(({ nodeId: _nodeId, location: _location, ...worker }) => ({ ...worker, location: "resting" }));
   const emptyPlacements = placeWorkers(emptyLayout, emptyWorkers);
   assert.equal(new Set(emptyPlacements.map(({ x, y }) => `${x},${y}`)).size, emptyWorkers.length);
   const emptySvg = render({ topology: { digest: "empty", nodes: [] }, workers: emptyWorkers, workItems: [] });
   assert.match(emptySvg, /EMPTY FLOOR/);
   // An empty floor in a wide column stays a panel, not a poster.
-  assert.match(emptySvg, new RegExp(`max-width:${emptyLayout.width * 3}px`));
-  assert.match(emptySvg, /aria-label="20 unassigned workers"/);
+  assert.match(emptySvg, new RegExp(`min-width:${Math.min(emptyLayout.width * 3, 864)}px`));
+  assert.match(emptySvg, /aria-label="RESTING AREA · 20"/);
 });
 
 test("rooms group under their project's heading and stay on the tile grid", () => {
@@ -268,8 +277,6 @@ test("every identity and operational frame is reachable, including fallbacks", (
           const worker = { id: idForIdentity(identity), name: "Agent", role, provider, activity };
           const frame = workerFrame(worker);
           reached.add(frame);
-          const alternate = alternateFrame(frame);
-          if (alternate !== undefined) reached.add(alternate);
         }
       }
     }
@@ -277,8 +284,7 @@ test("every identity and operational frame is reachable, including fallbacks", (
   const fallback = { id: idForIdentity(2), name: "Fallback", role: "worker", provider: "unknown", activity: "debugging" };
   assert.equal(workerFrame(fallback), "worker.shell.2.idle.0");
   reached.add(workerFrame(fallback));
-  reached.add(alternateFrame(workerFrame({ ...fallback, activity: "busy" })));
-  const personFrames = Object.keys(spriteAtlas.frames).filter((name) => /^(worker|overseer)\./.test(name));
+  const personFrames = Object.keys(spriteAtlas.frames).filter((name) => /^(worker|overseer)\./.test(name) && name.endsWith(".0"));
   assert.deepEqual([...reached].sort(), personFrames.sort());
 });
 

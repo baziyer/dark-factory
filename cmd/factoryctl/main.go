@@ -43,10 +43,13 @@ const (
   factoryctl attempt block --detail TEXT
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT
+  factoryctl attempt peer status [--offset N] [--target-offset N] [--head HEAD]
+  factoryctl attempt peer ask --task ID --idempotency-key HEX32 --question TEXT
+  factoryctl attempt peer answer --question ID --revision REVISION --idempotency-key HEX32 --answer TEXT
   factoryctl attempt send-back --task ID --note TEXT
   factoryctl overseer status [--task ID] [--offset N --head HEAD] [--text-offset RUNES --head HEAD]
   factoryctl overseer task add --agent ID --title TEXT [--body TEXT] [--priority N] [--task-id ID --incarnation-id ID]
-  factoryctl overseer task update --task ID --revision REVISION [--priority N] [--agent ID] [--cancel]
+  factoryctl overseer task update --task ID --revision REVISION [--title TEXT] [--body TEXT] [--priority N] [--agent ID] [--cancel]
   factoryctl overseer task send-back --task ID --note TEXT
   factoryctl overseer agent pause|resume --agent ID --revision REVISION
   factoryctl overseer worker stop --operation-id ID --task ID --task-revision REVISION --run ID --run-revision REVISION
@@ -82,6 +85,9 @@ const (
 	commandBlock
 	commandFail
 	commandRequestHuman
+	commandPeerStatus
+	commandPeerAsk
+	commandPeerAnswer
 	commandSendBack
 	commandAttemptTask
 	commandWebStatus
@@ -135,6 +141,7 @@ type attemptCommand struct {
 	account         string
 	title           string
 	body            string
+	bodySet         bool
 	toolBudget      uint64
 	priority        int64
 	prioritySet     bool
@@ -216,12 +223,24 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		return exitFailure
 	}
 
-	callContext, cancel := context.WithTimeout(ctx, attemptRequestTimeout)
+	timeout := attemptRequestTimeout
+	if command.kind == commandPeerAsk || command.kind == commandPeerAnswer {
+		timeout = serviceRequestTimeout
+	}
+	callContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if command.kind == commandAttemptTask {
 		result, taskErr := client.Task(callContext)
 		if taskErr != nil {
 			writeFailure(stderr, command.kind, taskErr)
+			return exitFailure
+		}
+		return writeJSON(stdout, result)
+	}
+	if command.kind == commandPeerStatus {
+		result, statusErr := client.PeerStatusPage(callContext, command.offset, command.textOffset, command.head)
+		if statusErr != nil {
+			writeFailure(stderr, command.kind, statusErr)
 			return exitFailure
 		}
 		return writeJSON(stdout, result)
@@ -236,6 +255,10 @@ func runWithDependencies(ctx context.Context, args []string, getenv func(string)
 		result, err = client.Fail(callContext, command.text)
 	case commandRequestHuman:
 		result, err = client.RequestHuman(callContext, api.HumanQuestionInput{IdempotencyKey: command.idempotencyKey, Question: command.text})
+	case commandPeerAsk:
+		result, err = client.PeerAsk(callContext, api.PeerQuestionInput{TargetTaskID: command.id, IdempotencyKey: command.idempotencyKey, Question: command.text})
+	case commandPeerAnswer:
+		result, err = client.PeerAnswer(callContext, api.PeerAnswerInput{QuestionID: command.id, ExpectedRevision: command.expectedRevision, IdempotencyKey: command.idempotencyKey, Answer: command.text})
 	case commandSendBack:
 		result, err = client.SendBack(callContext, api.SendBackInput{TaskID: command.id, Note: command.text})
 	default:
@@ -294,7 +317,7 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	}
 	if len(args) == 3 && helpFlag(args[2]) {
 		switch args[1] {
-		case "task", "succeed", "block", "fail", "request-human", "send-back":
+		case "task", "succeed", "block", "fail", "request-human", "send-back", "peer":
 			return attemptCommand{}, true, true
 		case "status", "list-clients", "revoke":
 			if args[0] == "web" {
@@ -334,6 +357,42 @@ func parse(args []string) (attemptCommand, bool, bool) {
 	case "request-human":
 		if len(args) == 6 && args[2] == "--idempotency-key" && validHumanRequestKey(args[3]) && args[4] == "--question" && validQuestion(args[5]) {
 			return attemptCommand{kind: commandRequestHuman, idempotencyKey: args[3], text: args[5]}, false, true
+		}
+	case "peer":
+		if len(args) >= 3 && args[2] == "status" {
+			command := attemptCommand{kind: commandPeerStatus}
+			seen := map[string]bool{}
+			for index := 3; index < len(args); index += 2 {
+				if index+1 >= len(args) || seen[args[index]] {
+					return attemptCommand{}, false, false
+				}
+				seen[args[index]] = true
+				value, ok := parseRevision(args[index+1])
+				if !ok {
+					return attemptCommand{}, false, false
+				}
+				switch args[index] {
+				case "--offset":
+					command.offset = value
+				case "--target-offset":
+					command.textOffset = value
+				case "--head":
+					command.head = value
+				default:
+					return attemptCommand{}, false, false
+				}
+			}
+			if command.head == 0 && (command.offset != 0 || command.textOffset != 0) {
+				return attemptCommand{}, false, false
+			}
+			return command, false, true
+		}
+		if len(args) == 9 && args[2] == "ask" && args[3] == "--task" && validHumanRequestKey(args[4]) && args[5] == "--idempotency-key" && validHumanRequestKey(args[6]) && args[7] == "--question" && validPeerText(args[8]) {
+			return attemptCommand{kind: commandPeerAsk, id: args[4], idempotencyKey: args[6], text: args[8]}, false, true
+		}
+		if len(args) == 11 && args[2] == "answer" && args[3] == "--question" && validHumanRequestKey(args[4]) && args[5] == "--revision" && validRevision(args[6]) && args[7] == "--idempotency-key" && validHumanRequestKey(args[8]) && args[9] == "--answer" && validPeerText(args[10]) {
+			revision, _ := strconv.ParseUint(args[6], 10, 64)
+			return attemptCommand{kind: commandPeerAnswer, id: args[4], expectedRevision: revision, idempotencyKey: args[8], text: args[10]}, false, true
 		}
 	case "send-back":
 		if len(args) == 6 && args[2] == "--task" && validHumanRequestKey(args[3]) && args[4] == "--note" && validQuestion(args[5]) {
@@ -863,15 +922,15 @@ func parseOverseer(args []string) (attemptCommand, bool, bool) {
 			}
 			command.account = value
 		case "--title":
-			if command.kind != commandOverseerTaskAdd || !validOperatorText(value, 1, 1024) {
+			if command.kind != commandOverseerTaskAdd && command.kind != commandOverseerTaskUpdate || !validOperatorText(value, 1, 1024) {
 				return attemptCommand{}, false, false
 			}
 			command.title = value
 		case "--body":
-			if command.kind != commandOverseerTaskAdd || !validOperatorText(value, 0, 131072) {
+			if command.kind != commandOverseerTaskAdd && command.kind != commandOverseerTaskUpdate || !validOperatorText(value, 0, 131072) {
 				return attemptCommand{}, false, false
 			}
-			command.body = value
+			command.body, command.bodySet = value, true
 		case "--priority":
 			priority, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || value != strconv.FormatInt(priority, 10) || priority < -1_000_000 || priority > 1_000_000 || command.kind != commandOverseerTaskAdd && command.kind != commandOverseerTaskUpdate {
@@ -917,7 +976,7 @@ func parseOverseer(args []string) (attemptCommand, bool, bool) {
 			return attemptCommand{}, false, false
 		}
 	case commandOverseerTaskUpdate:
-		if command.id == "" || command.expectedRevision == 0 || !command.cancel && command.agent == "" && !command.prioritySet {
+		if command.id == "" || command.expectedRevision == 0 || !command.cancel && command.agent == "" && command.title == "" && !command.bodySet && !command.prioritySet {
 			return attemptCommand{}, false, false
 		}
 	case commandOverseerTaskSendBack:
@@ -1002,12 +1061,23 @@ func validQuestion(value string) bool {
 	return len(value) >= 1 && len(value) <= 8192 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
 }
 
+func validPeerText(value string) bool {
+	return len(value) >= 1 && len(value) <= 2048 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+}
+
+func validRevision(value string) bool {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && parsed > 0 && parsed <= uint64(^uint64(0)>>1)
+}
+
 func writeFailure(stderr io.Writer, kind commandKind, err error) {
 	subject, input := "outcome request", "attempt input"
 	if kind == commandAttemptTask {
 		subject = "task request"
 	} else if kind == commandRequestHuman {
 		subject, input = "human request", "human request input"
+	} else if kind == commandPeerStatus || kind == commandPeerAsk || kind == commandPeerAnswer {
+		subject, input = "peer collaboration", "peer collaboration input"
 	} else if kind == commandSendBack {
 		subject, input = "send-back", "send-back input"
 	}
@@ -1176,6 +1246,12 @@ func runOverseer(ctx context.Context, command attemptCommand, getenv func(string
 		result, err = client.OverseerEnqueueTask(callContext, api.OverseerTaskCreateInput{ID: id, AssignedAgentID: command.agent, IncarnationID: incarnation, Title: command.title, Body: command.body, Priority: command.priority})
 	case commandOverseerTaskUpdate:
 		input := api.OverseerTaskUpdateInput{TaskID: command.id, ExpectedRevision: command.expectedRevision, Cancel: command.cancel}
+		if command.title != "" {
+			input.Title = &command.title
+		}
+		if command.bodySet {
+			input.Body = &command.body
+		}
 		if command.prioritySet {
 			priority := command.priority
 			input.Priority = &priority

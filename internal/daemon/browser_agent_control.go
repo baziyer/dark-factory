@@ -143,6 +143,99 @@ func (backend *browserBackend) TaskHistory(ctx context.Context, rawClient [brows
 	return result, nil
 }
 
+// TaskDetail reads task text through the same private capability as task
+// history. Its instruction excludes the managed send-back note so an editor
+// never appends that note a second time.
+func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskDetailGet) (browserprotocol.TaskDetail, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityPrivateHumanRequestDetail)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, err
+	}
+	defer release()
+	taskID, err := browserID(request.TaskID, kernel.TaskIDFromBytes)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, browser.ErrStale
+	}
+	expected, err := browserDecimal(request.ExpectedRevision)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, browser.ErrStale
+	}
+	expectedHead := kernel.EventSequence{}
+	if request.ExpectedHead != nil {
+		value, err := browserSequence(*request.ExpectedHead)
+		if err != nil {
+			return browserprotocol.TaskDetail{}, browser.ErrStale
+		}
+		expectedHead, err = kernel.NewEventSequence(int64(value))
+		if err != nil {
+			return browserprotocol.TaskDetail{}, browser.ErrStale
+		}
+	} else {
+		state, err := backend.store.Factory(ctx)
+		if err != nil {
+			return browserprotocol.TaskDetail{}, mapBrowserError(err)
+		}
+		expectedHead = state.Head
+	}
+	task, found, err := backend.store.Task(ctx, taskID)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, mapBrowserError(err)
+	}
+	if !found {
+		return browserprotocol.TaskDetail{}, browser.ErrNotFound
+	}
+	if task.Revision != expected {
+		return browserprotocol.TaskDetail{}, browser.ErrStale
+	}
+	if backend.afterTaskDetailTaskRead != nil {
+		backend.afterTaskDetailTaskRead()
+	}
+	instruction, instructionMore := taskDetailTextChunk(kernel.TaskInstruction(task), uint64(request.TextOffset))
+	feedback, feedbackMore := taskDetailTextChunk(kernel.TaskFeedback(task), uint64(request.TextOffset))
+	questions, nextPeerOffset, head, err := backend.store.PeerQuestionsForTask(ctx, task.ID, uint64(request.PeerOffset), expectedHead)
+	if err != nil {
+		return browserprotocol.TaskDetail{}, mapBrowserError(err)
+	}
+	result := browserprotocol.TaskDetail{TaskID: task.ID.String(), Revision: decimalRevision(task.Revision), Head: decimalSequence(head), Instruction: instruction, Feedback: feedback, PeerQuestions: []browserprotocol.TaskPeerQuestion{}}
+	for _, question := range questions {
+		item := browserprotocol.TaskPeerQuestion{
+			ID: question.ID.String(), SourceTaskID: question.SourceTaskID.String(), TargetTaskID: question.TargetTaskID.String(),
+			Question: question.Question, RecipientDeliveryState: question.RecipientDeliveryState.String(), AnswerDeliveryState: question.AnswerDeliveryState.String(),
+			Revision: decimalRevision(question.Revision), CreatedAtMillis: browserprotocol.Decimal(question.CreatedAt.Int64()), UpdatedAtMillis: browserprotocol.Decimal(question.UpdatedAt.Int64()),
+		}
+		if question.Answer != "" {
+			answer := question.Answer
+			item.Answer = &answer
+		}
+		result.PeerQuestions = append(result.PeerQuestions, item)
+	}
+	if instructionMore || feedbackMore {
+		next := browserprotocol.Decimal(uint64(request.TextOffset) + 2048)
+		result.NextTextOffset = &next
+	}
+	if nextPeerOffset != nil {
+		next := browserprotocol.Decimal(*nextPeerOffset)
+		result.NextPeerOffset = &next
+	}
+	return result, nil
+}
+
+func taskDetailTextChunk(value string, offset uint64) (string, bool) {
+	start := taskDetailRuneOffset(value, offset)
+	end := taskDetailRuneOffset(value[start:], 2048) + start
+	return value[start:end], end < len(value)
+}
+
+func taskDetailRuneOffset(value string, count uint64) int {
+	for offset := range value {
+		if count == 0 {
+			return offset
+		}
+		count--
+	}
+	return len(value)
+}
+
 func (backend *browserBackend) prepareAgentInstruction(ctx context.Context, agentID kernel.AgentID, instruction string) error {
 	agent, found, err := backend.store.Agent(ctx, agentID)
 	if err != nil {

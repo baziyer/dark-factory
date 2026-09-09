@@ -247,6 +247,38 @@ func (client *AttemptClient) RequestHuman(ctx context.Context, input HumanQuesti
 	return client.client.mutate(ctx, "request_human", input)
 }
 
+func (client *AttemptClient) PeerStatus(ctx context.Context) (PeerStatus, error) {
+	return client.PeerStatusPage(ctx, 0, 0, 0)
+}
+
+func (client *AttemptClient) PeerStatusPage(ctx context.Context, offset, targetOffset, expectedHead uint64) (PeerStatus, error) {
+	if offset > uint64(^uint64(0)>>1)-1 || targetOffset > uint64(^uint64(0)>>1)-4 || expectedHead > uint64(^uint64(0)>>1) || expectedHead == 0 && (offset != 0 || targetOffset != 0) {
+		return PeerStatus{}, ErrInvalidInput
+	}
+	var result PeerStatus
+	if err := client.client.call(ctx, "peer_status", PeerStatusInput{Offset: offset, TargetOffset: targetOffset, ExpectedHead: expectedHead}, &result); err != nil {
+		return PeerStatus{}, err
+	}
+	if !validPeerStatus(result) || expectedHead != 0 && result.Head != expectedHead {
+		return PeerStatus{}, ErrProtocol
+	}
+	return result, nil
+}
+
+func (client *AttemptClient) PeerAsk(ctx context.Context, input PeerQuestionInput) (MutationResult, error) {
+	if !validID(input.TargetTaskID) || !validID(input.IdempotencyKey) || !validText(input.Question, 1, 2048) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "peer_ask", input)
+}
+
+func (client *AttemptClient) PeerAnswer(ctx context.Context, input PeerAnswerInput) (MutationResult, error) {
+	if !validID(input.QuestionID) || !validID(input.IdempotencyKey) || input.ExpectedRevision == 0 || !validText(input.Answer, 1, 2048) {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "peer_answer", input)
+}
+
 // SendBack returns a finished task of the attempt's project to its queue
 // with a note; only an orchestrator's attempt is allowed to.
 func (client *AttemptClient) SendBack(ctx context.Context, input SendBackInput) (MutationResult, error) {
@@ -478,6 +510,17 @@ func (client client) call(ctx context.Context, method string, params, output any
 		return err
 	}
 	return responseErr
+}
+
+func verifySocketConnection(connection net.Conn, expected socketRecord) error {
+	if err := verifyPeerEUID(connection); err != nil {
+		return err
+	}
+	current, err := inspectSocket(connection.RemoteAddr().String())
+	if err != nil || !current.same(expected) {
+		return ErrInvalidClient
+	}
+	return nil
 }
 
 func (client client) revalidate(before socketRecord) error {
@@ -799,7 +842,10 @@ func validOverseerTaskCreateInput(input OverseerTaskCreateInput) bool {
 }
 
 func validOverseerTaskUpdateInput(input OverseerTaskUpdateInput) bool {
-	if !validID(input.TaskID) || input.ExpectedRevision == 0 || input.Priority == nil && input.AssignedAgentID == nil && !input.Cancel {
+	if !validID(input.TaskID) || input.ExpectedRevision == 0 || input.Title == nil && input.Body == nil && input.Priority == nil && input.AssignedAgentID == nil && !input.Cancel {
+		return false
+	}
+	if input.Title != nil && !validText(*input.Title, 1, 1024) || input.Body != nil && !validText(*input.Body, 0, 131072) {
 		return false
 	}
 	if input.Priority != nil && (*input.Priority < -1_000_000 || *input.Priority > 1_000_000) {
@@ -809,7 +855,7 @@ func validOverseerTaskUpdateInput(input OverseerTaskUpdateInput) bool {
 }
 
 func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
-	if !validID(snapshot.ProjectID) || snapshot.Head == 0 || snapshot.Agents == nil || snapshot.Tasks == nil || snapshot.Runs == nil || snapshot.Questions == nil || snapshot.History == nil || len(snapshot.Agents) > kernel.OverseerSnapshotPageSize || len(snapshot.Tasks) > kernel.OverseerSnapshotPageSize || len(snapshot.Runs) > kernel.OverseerSnapshotPageSize || len(snapshot.Questions) > kernel.OverseerSnapshotPageSize || len(snapshot.History) > kernel.OverseerSnapshotPageSize {
+	if !validID(snapshot.ProjectID) || snapshot.Head == 0 || snapshot.Agents == nil || snapshot.Tasks == nil || snapshot.Runs == nil || snapshot.Questions == nil || snapshot.PeerQuestions == nil || snapshot.History == nil || len(snapshot.Agents) > kernel.OverseerSnapshotPageSize || len(snapshot.Tasks) > kernel.OverseerSnapshotPageSize || len(snapshot.Runs) > kernel.OverseerSnapshotPageSize || len(snapshot.Questions) > kernel.OverseerSnapshotPageSize || len(snapshot.PeerQuestions) > 1 || len(snapshot.History) > kernel.OverseerSnapshotPageSize {
 		return false
 	}
 	if snapshot.NextOffset != nil && *snapshot.NextOffset == 0 || snapshot.NextTextOffset != nil && *snapshot.NextTextOffset == 0 {
@@ -835,6 +881,12 @@ func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
 			return false
 		}
 	}
+	for _, question := range snapshot.PeerQuestions {
+		if !validPeerQuestion(question) {
+			return false
+		}
+	}
+
 	for _, item := range snapshot.History {
 		if !validID(item.OperationID) || !validID(item.TaskID) || !validID(item.RunID) || item.SuccessorTaskID != "" && !validID(item.SuccessorTaskID) || (item.Kind != "message" && item.Kind != "interrupt" && item.Kind != "stop" && item.Kind != "replace") || (item.Actor != "operator" && item.Actor != "orchestrator") || !validText(item.Payload, 0, kernel.MaxTaskInterventionPayloadBytes) || (item.State != "pending" && item.State != "delivered" && item.State != "unknown" && item.State != "rejected") || !validText(item.Detail, 0, 4096) {
 			return false

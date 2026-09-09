@@ -36,7 +36,7 @@ func (id identifier) zero() bool {
 	return id.b == [IDBytes]byte{}
 }
 
-func (id identifier) bytes() []byte {
+func (id identifier) Bytes() []byte {
 	value := make([]byte, IDBytes)
 	copy(value, id.b[:])
 	return value
@@ -59,6 +59,8 @@ type BrowserClientID struct{ identifier }
 type HumanRequestID struct{ identifier }
 type HumanRequestDeliveryID struct{ identifier }
 type TaskInterventionID struct{ identifier }
+type PeerQuestionID struct{ identifier }
+type PeerDeliveryID struct{ identifier }
 
 func ProjectIDFromBytes(value []byte) (ProjectID, error) {
 	id, err := identifierFromBytes(value)
@@ -127,22 +129,14 @@ func TaskInterventionIDFromBytes(value []byte) (TaskInterventionID, error) {
 	id, err := identifierFromBytes(value)
 	return TaskInterventionID{id}, err
 }
-
-func (id ProjectID) Bytes() []byte              { return id.bytes() }
-func (id AgentID) Bytes() []byte                { return id.bytes() }
-func (id AccountID) Bytes() []byte              { return id.bytes() }
-func (id TaskID) Bytes() []byte                 { return id.bytes() }
-func (id IncarnationID) Bytes() []byte          { return id.bytes() }
-func (id ChangeID) Bytes() []byte               { return id.bytes() }
-func (id RunID) Bytes() []byte                  { return id.bytes() }
-func (id ResourceID) Bytes() []byte             { return id.bytes() }
-func (id TerminalSessionID) Bytes() []byte      { return id.bytes() }
-func (id DaemonID) Bytes() []byte               { return id.bytes() }
-func (id BootID) Bytes() []byte                 { return id.bytes() }
-func (id BrowserClientID) Bytes() []byte        { return id.bytes() }
-func (id HumanRequestID) Bytes() []byte         { return id.bytes() }
-func (id HumanRequestDeliveryID) Bytes() []byte { return id.bytes() }
-func (id TaskInterventionID) Bytes() []byte     { return id.bytes() }
+func PeerQuestionIDFromBytes(value []byte) (PeerQuestionID, error) {
+	id, err := identifierFromBytes(value)
+	return PeerQuestionID{id}, err
+}
+func PeerDeliveryIDFromBytes(value []byte) (PeerDeliveryID, error) {
+	id, err := identifierFromBytes(value)
+	return PeerDeliveryID{id}, err
+}
 
 func (id ProjectID) MarshalText() ([]byte, error)              { return []byte(id.String()), nil }
 func (id AgentID) MarshalText() ([]byte, error)                { return []byte(id.String()), nil }
@@ -158,6 +152,8 @@ func (id BrowserClientID) MarshalText() ([]byte, error)        { return []byte(i
 func (id HumanRequestID) MarshalText() ([]byte, error)         { return []byte(id.String()), nil }
 func (id HumanRequestDeliveryID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
 func (id TaskInterventionID) MarshalText() ([]byte, error)     { return []byte(id.String()), nil }
+func (id PeerQuestionID) MarshalText() ([]byte, error)         { return []byte(id.String()), nil }
+func (id PeerDeliveryID) MarshalText() ([]byte, error)         { return []byte(id.String()), nil }
 
 type digest struct {
 	b [DigestBytes]byte
@@ -388,6 +384,7 @@ const (
 	EntityRun
 	EntityHumanRequest
 	EntityAccount
+	EntityPeerQuestion
 )
 
 func parseEntityKind(value string) (EntityKind, error) {
@@ -408,6 +405,8 @@ func parseEntityKind(value string) (EntityKind, error) {
 		return EntityHumanRequest, nil
 	case "account":
 		return EntityAccount, nil
+	case "peer_question":
+		return EntityPeerQuestion, nil
 	default:
 		return 0, corruptControl("entity kind", value)
 	}
@@ -431,6 +430,8 @@ func (value EntityKind) String() string {
 		return "human_request"
 	case EntityAccount:
 		return "account"
+	case EntityPeerQuestion:
+		return "peer_question"
 	default:
 		return ""
 	}

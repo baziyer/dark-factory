@@ -14,6 +14,7 @@ const ids = {
   secondProject: [...fixtureState.projects.keys()][1],
   agent: [...fixtureState.agents.keys()][0],
   orchestrator: [...fixtureState.agents.keys()][1],
+  idleAgent: [...fixtureState.agents.keys()][2],
   task: [...fixtureState.tasks.keys()][0],
   request: [...fixtureState.humanRequests.keys()][0],
 };
@@ -44,18 +45,24 @@ const selectedRequest = (overrides = {}) => ({
   ...overrides,
 });
 
+const runSample = (agentId, paths, taskId = ids.task, taskRevision = fixtureState.tasks.get(taskId)?.revision ?? 1n) => ({
+  taskId,
+  taskRevision,
+  runId: "71".repeat(16),
+  projectId: fixtureState.agents.get(agentId).project_id,
+  paths,
+});
+
 test("error banner keeps its centered layout after the paragraph reset", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
   // The sidebar is a sibling of the console, so it needs the same reset.
   assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),\s*\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
-  // Each animation toggles visibility of a complete pose; reduced motion keeps
-  // the primary frame visible and never leaves a stale frame underneath.
-  assert.match(css, /\.dfFactoryScene__primary \{ opacity: 1; animation: dfFactorySceneHide 1\.2s steps\(1, end\) infinite; \}/);
-  assert.match(css, /\.dfFactoryScene__alternate \{ opacity: 0; animation: dfFactorySceneFlip 1\.2s steps\(1, end\) infinite; \}/);
-  assert.match(css, /@keyframes dfFactorySceneHide \{ 50% \{ opacity: 0; \} \}/);
-  assert.match(css, /@keyframes dfFactorySceneFlip \{ 50% \{ opacity: 1; \} \}/);
-  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.dfFactoryScene__primary,\s*\.dfFactoryScene__alternate \{ animation: none; \}/);
+  assert.match(css, /\.dfFactoryScene__room--empty > rect,[\s\S]*?\.dfFactoryScene__room--empty > use \{ opacity: 0\.45; \}/);
+  assert.match(css, /\.dfFactoryFloor \{ overflow-x: auto; \}/);
+  assert.match(css, /\.dfFactoryScene__worker \{ transition: transform 180ms ease-out; \}/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.dfFactoryScene__worker \{ transition: none; \}/);
+  assert.equal(css.includes("@keyframes dfFactoryScene"), false);
 });
 
 test("one screen shows the floor, the counters, and what needs you at once", () => {
@@ -107,14 +114,14 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.equal(scene.topology.digest, fixtureTopology.digest);
   assert.deepEqual(scene, floorScene(fixtureState, new Map([[fixtureTopology.projectId, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }]])));
 
-  // The detailed project's agents stand in its repository root; a project the
-  // topology does not cover still gets a room, so nobody is stranded.
+  // No changed-path sample puts a worker in a project room: idle and paused
+  // agents rest, and a live run says that its location is not yet observed.
   const room = (path) => scene.topology.nodes.find((node) => node.path === path).id;
   const root = room(".");
-  assert.deepEqual(scene.workers.map((worker) => [worker.name, worker.activity, worker.nodeId]), [
-    ["Builder One", "needs-you", root],
-    ["Dispatch Lead", "idle", ids.secondProject],
-    ["Builder Two", "waiting", root],
+  assert.deepEqual(scene.workers.map((worker) => [worker.name, worker.activity, worker.location, worker.nodeId]), [
+    ["Builder One", "needs-you", "unobserved", undefined],
+    ["Dispatch Lead", "idle", "resting", undefined],
+    ["Builder Two", "waiting", "resting", undefined],
   ]);
   assert.deepEqual(scene.workItems.map((item) => item.stage), ["staged", "release-ready"]);
 
@@ -122,30 +129,41 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   // deepest displayed room that prefixes a path, and the room most paths sit in.
   const kernel = room("internal/kernel");
   const web = room("web");
-  const placed = (paths) => floorScene(fixtureState, fixtureTopologies, new Map([[ids.agent, paths]]))
+  const placed = (paths) => floorScene(fixtureState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, paths)]]))
     .workers.find((worker) => worker.id === ids.agent).nodeId;
   assert.equal(placed(["internal/kernel/store"]), kernel);
   assert.equal(placed(["web"]), web);
-  // The repository root is a room like any other, and an unmapped path is its.
+  // The repository root is a room like any other.
   assert.equal(placed(["."]), root);
   assert.equal(placed(["cmd/factoryd"]), root);
   // Several paths: the room holding the most of them, ties by sorted path.
   assert.equal(placed(["web", "internal/kernel", "internal/kernel/store"]), kernel);
   assert.equal(placed(["web", "internal/kernel"]), kernel);
   assert.equal(placed(["web", "web/packages/ui", "internal/kernel"]), web);
-  // No paths, or an agent the poll never covered, keeps the project room.
-  assert.equal(placed([]), root);
-  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map()).workers.at(-1).nodeId, root);
-  // Another project's agent has no rooms below its own, whatever it reports.
-  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map([[ids.orchestrator, ["internal/kernel"]]]))
-    .workers.find((worker) => worker.id === ids.orchestrator).nodeId, ids.secondProject);
+  // Empty or missing live samples never invent a root location.
+  assert.equal(placed([]), undefined);
+  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map()).workers.find((worker) => worker.id === ids.agent).location, "unobserved");
+  // A stopped agent retains a text-only last observation in the resting area.
+  const observed = floorScene(fixtureState, fixtureTopologies, undefined, new Map([[ids.idleAgent, runSample(ids.idleAgent, ["web"], "72".repeat(16))]]))
+    .workers.find((worker) => worker.id === ids.idleAgent);
+  assert.deepEqual([observed.location, observed.nodeId, observed.locationLabel], ["last-observed", undefined, "web"]);
+
+  // A prior run cannot place its agent after a replacement task has started.
+  const replacement = { ...fixtureState.tasks.get(ids.task), revision: 2n };
+  const replacementState = { ...fixtureState, tasks: new Map([[replacement.id, replacement]]) };
+  const stale = floorScene(replacementState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, ["web"])]]))
+    .workers.find((worker) => worker.id === ids.agent);
+  assert.deepEqual([stale.location, stale.nodeId], ["unobserved", undefined]);
+  const current = floorScene(replacementState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, ["web"], replacement.id, replacement.revision)]]))
+    .workers.find((worker) => worker.id === ids.agent);
+  assert.deepEqual([current.location, current.nodeId], ["working", web]);
 
   // Without topology the floor still has a room per project.
   const fallback = floorScene(fixtureState, undefined);
   assert.deepEqual(fallback.topology.nodes.map((node) => node.label), ["North Workshop", "South Workshop"]);
   assert.deepEqual(fallback.topology.nodes.map((node) => node.sizeBucket), [undefined, undefined]);
-  assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [ids.project, ids.secondProject, ids.project]);
-  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [] });
+  assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [undefined, undefined, undefined]);
+  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [], omittedLocations: 0 });
   // The size bucket, not a file count, is what the room subtitle carries.
   const markup = render({ topologies: fixtureTopologies });
   assert.match(markup, />kernel<\/text>/);
@@ -167,7 +185,7 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.equal(wide.topology.nodes.some((node) => node.id === ids.secondProject), true);
   assert.deepEqual(wide.topology.nodes.filter((node) => node.sizeBucket === "medium").map((node) => node.label),
     ["dir-0", "dir-1", "dir-2", "dir-3"]);
-  assert.equal(wide.workers.every((worker) => worker.nodeId !== undefined), true);
+  assert.equal(wide.workers.find((worker) => worker.id === ids.agent).location, "unobserved");
 });
 
 /**
@@ -253,14 +271,16 @@ test("the floor is whatever the daemon served, with no shape or name known to th
 test("every project is its own block of rooms and its own workers", () => {
   // Two projects holding the same path are served the same node id; two rooms
   // on one floor may not share one, and a worker may not walk into the other
-  // project's code.
+  // project's code. A paused worker stays in resting rather than occupying its
+  // project's latest room.
   const shape = [["repository", ".", "large"], ["directory", "src", "medium", 0]];
   const topologies = served(topologyFor(ids.project, shape), topologyFor(ids.secondProject, shape));
-  const scene = floorScene(fixtureState, topologies, new Map([[ids.agent, ["src"]], [ids.orchestrator, ["src"]]]));
+  const scene = floorScene(fixtureState, topologies, new Map([[ids.agent, runSample(ids.agent, ["src"])], [ids.orchestrator, runSample(ids.orchestrator, ["src"])]]));
   assert.equal(scene.topology.nodes.length, 4);
   assert.equal(new Set(scene.topology.nodes.map((node) => node.id)).size, 4);
   const nodeOf = (agentId) => scene.workers.find((worker) => worker.id === agentId).nodeId;
-  assert.notEqual(nodeOf(ids.agent), nodeOf(ids.orchestrator));
+  assert.notEqual(nodeOf(ids.agent), undefined);
+  assert.equal(nodeOf(ids.orchestrator), undefined);
   assert.equal(scene.topology.digest, [...topologies.values()].map((view) => view.digest).join(" "));
   // Two structures have arrived and neither root room reads as the served
   // label: on a floor of many projects only the project name tells them apart.
@@ -299,7 +319,8 @@ test("every project is its own block of rooms and its own workers", () => {
     served(...overflow.map((project) => topologyFor(project.id, [["repository", ".", "large"], ["directory", "src", "medium", 0]]))),
   );
   assert.deepEqual(stranded.topology.nodes.map((node) => node.path), Array.from({ length: 24 }, () => "."));
-  assert.equal(stranded.workers[0].nodeId !== undefined, true);
+  assert.equal(stranded.workers[0].location, "resting");
+  assert.equal(stranded.workers[0].nodeId, undefined);
   assert.equal(stranded.workers.at(-1).nodeId, undefined);
 });
 
@@ -565,7 +586,11 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
       state,
       selectedAgent: agentSelection(),
       onSaveAgentConfig: (config) => edits.push(["config", config]),
-      onEditTask: (task, change) => edits.push([task.id, change]),
+      onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
+      onLoadTaskDetail: async (task, peerOffset, expectedHead) => {
+        if (peerOffset !== undefined) throw new SessionError("stale");
+        return { taskId: task.id, revision: task.revision, head: expectedHead ?? 7n, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], nextPeerOffset: 1n };
+      },
     };
     let renderer;
     await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
@@ -580,10 +605,15 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     assert.equal(byLabel(`Move ${queued.title} up`).props.disabled, true, "the first task cannot rise");
     assert.equal(byLabel(`Move ${other.title} down`).props.disabled, true, "the last task cannot fall");
 
+    const editBrief = () => renderer.root.findAllByType("button").find((button) => button.props.children === "EDIT BRIEF");
+    await act(async () => { await editBrief().props.onClick(); });
     const title = renderer.root.findAllByType("input").find((input) => input.props.value === queued.title);
     await act(async () => { title.props.onChange({ currentTarget: { value: "Renamed" } }); });
-    await act(async () => { title.props.onBlur(); });
-    assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed" }]);
+    const instruction = renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`);
+    await act(async () => { instruction.props.onChange({ currentTarget: { value: "Replacement brief" } }); });
+		assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === "Review this carefully"));
+    await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.onClick(); });
+    assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed", body: "Replacement brief" }]);
 
     const assign = renderer.root.findAllByType("select").find((select) => select.props.id === `df-assign-${queued.id}`);
     // Reassignment offers only agents in the same project.
@@ -591,19 +621,34 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { assign.props.onChange({ currentTarget: { value: "23".repeat(16) } }); });
     assert.deepEqual(edits.at(-1), [queued.id, { assignedAgentId: "23".repeat(16) }]);
 
-    await act(async () => { buttons.filter((button) => button.props.children === "CANCEL")[0].props.onClick(); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "CANCEL").props.onClick(); });
     assert.deepEqual(edits.at(-1), [queued.id, { cancel: true }]);
 
-    // A refused rename reverts to the served title. A refusal never moves the
-    // revision, so without this the input would resend it on the next blur.
+    // A refused brief edit preserves the operator's drafts at the unchanged
+    // revision, rather than silently replacing the intended instruction.
+    await act(async () => { await editBrief().props.onClick(); });
     const titleValue = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.value;
+    const instructionValue = () => renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.value;
     const modelInput = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-model-${ids.agent}`);
-    assert.equal(titleValue(), "Renamed");
+    await act(async () => { renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this draft" } }); });
+    await act(async () => { renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this instruction" } }); });
+    assert.equal(titleValue(), "Keep this draft");
+    await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
+    assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("SAVE OR DISCARD YOUR DRAFT")));
+    const revised = baseState({ tasks: new Map([[queued.id, { ...queued, assigned_agent_id: ids.agent, revision: queued.revision + 1n }], [other.id, { ...other, assigned_agent_id: ids.agent }]]) });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, state: revised })); });
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
+    assert.equal(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("TASK CHANGED")), true);
+    assert.equal(renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.disabled, true);
     // A refusal belongs to the form that earned it: the config form the
     // operator is still typing into keeps what it holds.
     await act(async () => { modelInput().props.onChange({ currentTarget: { value: "half-typed" } }); });
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: queued.id, pending: false, error: new SessionError("stale") } })); });
-    assert.equal(titleValue(), queued.title);
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
     assert.equal(modelInput().props.value, "half-typed");
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: ids.agent, pending: false, error: new SessionError("stale") } })); });
     assert.equal(modelInput().props.value, fixtureState.agents.get(ids.agent).model);
@@ -632,6 +677,30 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
   } finally {
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
   }
+});
+
+test("task history selects every served finished task and pages one conversation", async () => {
+  const calls = [];
+  const task = fixtureState.tasks.get(ids.task);
+  const props = {
+    status: "ready", state: baseState(), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
+    onLoadTaskDetail: async (selected, peerOffset, expectedHead) => {
+      calls.push([selected.id, peerOffset, expectedHead]);
+      if (peerOffset !== undefined) throw new SessionError("stale");
+      return { taskId: selected.id, revision: selected.revision, head: expectedHead ?? 9n, instruction: "", feedback: "", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) };
+    },
+  };
+  let renderer;
+  await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+  assert.ok(renderer.root.findAllByProps({ "aria-label": "Task history" }).length === 1);
+  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
+  assert.deepEqual(calls, [[task.id, undefined, undefined]]);
+  await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
+  assert.deepEqual(calls, [[task.id, undefined, undefined], [task.id, 1n, 9n]]);
+  assert.ok(renderer.root.findAllByType("span").some((item) => item.props.children === "Question"), "a stale continuation keeps the loaded conversation");
+  assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("REFUSED THIS HISTORY")));
+  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
+  assert.deepEqual(calls.at(-1), [task.id, undefined, undefined], "reloading starts a fresh first page without the stale head");
 });
 
 test("a rejected edit says plainly that the durable value did not change", () => {

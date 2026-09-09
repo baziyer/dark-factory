@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { AgentItem, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor, StageMeter } from "./console-screens.js";
-import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type DiscoveredAccount, type TaskEdit } from "./console-sidebar.js";
+import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
 
@@ -21,7 +21,8 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onCloseAgent?: () => void;
   onOpenAgentTerminal?: () => void;
   onSaveAgentConfig?: (config: AgentConfigEdit) => void;
-  onEditTask?: (task: TaskItem, change: TaskEdit) => void;
+  onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onOpenTerminalForHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onSelectHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onHumanReplyChange?: (reply: string) => void;
@@ -78,6 +79,7 @@ export function FactoryConsole({
   error,
   topologies,
   runPaths,
+  lastRunPaths,
   edit,
   view = "floor",
   onView,
@@ -90,6 +92,7 @@ export function FactoryConsole({
   onOpenAgentTerminal,
   onSaveAgentConfig,
   onEditTask,
+  onLoadTaskDetail,
   onOpenTerminalForHumanRequest,
   onSelectHumanRequest,
   onHumanReplyChange,
@@ -130,12 +133,14 @@ export function FactoryConsole({
       />
     ) : agent !== undefined ? (
       <AgentPanel
+        key={agent.id}
         agent={agent}
         state={state}
         edit={edit}
         ready={ready}
         onSaveConfig={onSaveAgentConfig}
         onEditTask={onEditTask}
+        onLoadTaskDetail={onLoadTaskDetail}
         onOpenTerminal={onOpenAgentTerminal}
         onClose={onCloseAgent}
       >
@@ -196,7 +201,7 @@ export function FactoryConsole({
               </div>
             </div>
             {view === "floor"
-              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
+              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />}
           </section>
 

@@ -186,6 +186,13 @@ func TestParseExactAttemptCommands(t *testing.T) {
 		{name: "explicit empty success", args: []string{"attempt", "succeed", "--result", ""}, command: attemptCommand{kind: commandSucceed}},
 		{name: "explicit empty failure", args: []string{"attempt", "fail", "--detail", ""}, command: attemptCommand{kind: commandFail}},
 		{name: "human request", args: []string{"attempt", "request-human", "--idempotency-key", "0123456789abcdef0123456789abcdef", "--question", "what now?"}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "0123456789abcdef0123456789abcdef", text: "what now?"}},
+		{name: "peer status", args: []string{"attempt", "peer", "status"}, command: attemptCommand{kind: commandPeerStatus}},
+		{name: "peer status history page", args: []string{"attempt", "peer", "status", "--offset", "4", "--head", "8"}, command: attemptCommand{kind: commandPeerStatus, offset: 4, head: 8}},
+		{name: "peer status target page", args: []string{"attempt", "peer", "status", "--target-offset", "4", "--head", "8"}, command: attemptCommand{kind: commandPeerStatus, textOffset: 4, head: 8}},
+		{name: "peer status both pages", args: []string{"attempt", "peer", "status", "--offset", "4", "--target-offset", "8", "--head", "9"}, command: attemptCommand{kind: commandPeerStatus, offset: 4, textOffset: 8, head: 9}},
+		{name: "peer status both pages reversed", args: []string{"attempt", "peer", "status", "--target-offset", "8", "--head", "9", "--offset", "4"}, command: attemptCommand{kind: commandPeerStatus, offset: 4, textOffset: 8, head: 9}},
+		{name: "peer ask", args: []string{"attempt", "peer", "ask", "--task", "0123456789abcdef0123456789abcdef", "--idempotency-key", "fedcba9876543210fedcba9876543210", "--question", "need context"}, command: attemptCommand{kind: commandPeerAsk, id: "0123456789abcdef0123456789abcdef", idempotencyKey: "fedcba9876543210fedcba9876543210", text: "need context"}},
+		{name: "peer answer", args: []string{"attempt", "peer", "answer", "--question", "0123456789abcdef0123456789abcdef", "--revision", "7", "--idempotency-key", "fedcba9876543210fedcba9876543210", "--answer", "context"}, command: attemptCommand{kind: commandPeerAnswer, id: "0123456789abcdef0123456789abcdef", expectedRevision: 7, idempotencyKey: "fedcba9876543210fedcba9876543210", text: "context"}},
 		{name: "send back", args: []string{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", "five findings"}, command: attemptCommand{kind: commandSendBack, id: "0123456789abcdef0123456789abcdef", text: "five findings"}},
 		{name: "send back maximum note", args: []string{"attempt", "send-back", "--task", "ffffffffffffffffffffffffffffffff", "--note", strings.Repeat("n", 8192)}, command: attemptCommand{kind: commandSendBack, id: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("n", 8192)}},
 		{name: "human request maximum question", args: []string{"attempt", "request-human", "--idempotency-key", "ffffffffffffffffffffffffffffffff", "--question", strings.Repeat("q", 8192)}, command: attemptCommand{kind: commandRequestHuman, idempotencyKey: "ffffffffffffffffffffffffffffffff", text: strings.Repeat("q", 8192)}},
@@ -210,10 +217,11 @@ func TestParseOverseerTaskUpdateKeepsPriority(t *testing.T) {
 	}{
 		{name: "priority only", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "-5"}, priority: -5},
 		{name: "priority and agent", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "5", "--agent", id}, priority: 5, agent: id},
+		{name: "brief", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--title", "revised", "--body", "revised instruction"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			command, help, ok := parse(test.args)
-			if !ok || help || command.kind != commandOverseerTaskUpdate || !command.prioritySet || command.priority != test.priority || command.agent != test.agent {
+			if !ok || help || command.kind != commandOverseerTaskUpdate || (test.name != "brief" && (!command.prioritySet || command.priority != test.priority || command.agent != test.agent)) || test.name == "brief" && (command.title != "revised" || !command.bodySet || command.body != "revised instruction") {
 				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 			}
 		})
@@ -232,6 +240,22 @@ func TestParseOverseerStatusPaging(t *testing.T) {
 	} {
 		if _, _, ok := parse(args); ok {
 			t.Fatalf("invalid paged status accepted: %v", args)
+		}
+	}
+}
+
+func TestParsePeerStatusRejectsDuplicateOrMalformedPageFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"attempt", "peer", "status", "--offset", "4"},
+		{"attempt", "peer", "status", "--target-offset", "4"},
+		{"attempt", "peer", "status", "--offset", "4", "--offset", "8"},
+		{"attempt", "peer", "status", "--target-offset", "4", "--target-offset", "8"},
+		{"attempt", "peer", "status", "--head", "8", "--head", "9"},
+		{"attempt", "peer", "status", "--offset", "0", "--target-offset", "8"},
+		{"attempt", "peer", "status", "--offset", "4", "--target-offset", "not-a-number"},
+	} {
+		if _, _, ok := parse(args); ok {
+			t.Fatalf("invalid peer status page flags accepted: %v", args)
 		}
 	}
 }

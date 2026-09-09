@@ -373,6 +373,18 @@
       "direction": "server",
       "id": "required",
       "fixture": "task_history.json"
+    },
+    {
+      "type": "TASK_DETAIL_GET",
+      "direction": "client",
+      "id": "required",
+      "fixture": "task_detail_get.json"
+    },
+    {
+      "type": "TASK_DETAIL",
+      "direction": "server",
+      "id": "required",
+      "fixture": "task_detail.json"
     }
   ],
   "terminal": {
