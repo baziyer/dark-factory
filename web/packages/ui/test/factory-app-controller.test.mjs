@@ -476,7 +476,11 @@ test("console edits carry the exact served revision and surface a refusal", asyn
   context.controller.selectAgent(fixtureState.agents.get([...fixtureState.agents.keys()][2]));
   assert.equal(context.latest().edit, undefined);
 
-  await context.controller.editTask(queued, { priority: 11 });
+  const taskEdit = context.controller.editTask(queued, { priority: 11 });
+  await settle();
+  const revisedQueued = { ...queued, priority: 11, revision: queued.revision + 1n };
+  context.emitState({ ...fixtureState, tasks: new Map([...fixtureState.tasks, [revisedQueued.id, revisedQueued]]) });
+  await taskEdit;
   assert.deepEqual(sent.at(-1), ["task", { taskId: queued.id, expectedRevision: queued.revision, priority: 11 }]);
 
   // Nothing is sent while the session is not ready.
@@ -484,6 +488,89 @@ test("console edits carry the exact served revision and surface a refusal", asyn
   context.emitStatus("syncing");
   await context.controller.editTask(queued, { cancel: true });
   assert.equal(sent.length, settled);
+});
+
+test("a queued edit keeps queue controls disabled until its canonical revision arrives", async () => {
+  const agent = fixtureState.agents.get([...fixtureState.agents.keys()][0]);
+  const queued = [...fixtureState.tasks.values()].find((task) => task.status === "queued");
+  const result = deferred();
+  const context = harness({ updateTask: () => result.promise });
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+  context.controller.selectAgent(agent);
+
+  const save = context.controller.editTask(queued, { title: "saved" });
+  await settle();
+  result.resolve({ taskId: queued.id, revision: queued.revision + 1n });
+  await settle();
+  assert.equal(await save, true, "an accepted write keeps the brief's close-on-acceptance contract");
+  assert.equal(context.latest().edit.pending, true);
+  assert.equal(await context.controller.editTask(queued, { priority: queued.priority + 1 }), false, "the old task cannot reopen or accept another queue action before STATE advances");
+
+  const agentRevised = { ...agent, revision: agent.revision + 1n };
+  context.emitState({ ...fixtureState, agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]) });
+  assert.equal(context.latest().edit.pending, true, "a same-agent rebind cannot clear the task fence against an old task revision");
+
+  const revised = { ...queued, title: "saved", revision: queued.revision + 1n };
+  context.emitState({
+    ...fixtureState,
+    agents: new Map([...fixtureState.agents, [agentRevised.id, agentRevised]]),
+    tasks: new Map([...fixtureState.tasks, [revised.id, revised]]),
+  });
+  assert.equal(context.latest().edit, undefined);
+
+  const interruptedResult = deferred();
+  const interrupted = harness({ updateTask: () => interruptedResult.promise });
+  interrupted.controller.start();
+  interrupted.emitState(fixtureState);
+  interrupted.emitStatus("ready");
+  const cancelled = interrupted.controller.editTask(queued, { priority: queued.priority + 1 });
+  interruptedResult.resolve({ taskId: queued.id, revision: queued.revision + 1n });
+  await settle();
+  interrupted.emitStatus("syncing");
+  assert.equal(await cancelled, true);
+  assert.equal(interrupted.latest().edit, undefined, "a state restart releases the canonical-state fence");
+});
+
+test("switching agents discards only that queued edit's canonical-state fence", async () => {
+  const firstAgent = fixtureState.agents.get([...fixtureState.agents.keys()][0]);
+  const secondAgent = fixtureState.agents.get([...fixtureState.agents.keys()][2]);
+  const queued = [...fixtureState.tasks.values()].find((task) => task.status === "queued");
+  const nextQueued = { ...queued, id: "cd".repeat(16), title: "Second queued edit" };
+  const firstResult = deferred();
+  const secondResult = deferred();
+  const context = harness({
+    updateTask: (input) => input.taskId === queued.id ? firstResult.promise : secondResult.promise,
+  });
+  const initial = { ...fixtureState, tasks: new Map([...fixtureState.tasks, [nextQueued.id, nextQueued]]) };
+  context.controller.start();
+  context.emitState(initial);
+  context.emitStatus("ready");
+  context.controller.selectAgent(firstAgent);
+
+  const first = context.controller.editTask(queued, { title: "first saved" });
+  await settle();
+  firstResult.resolve({ taskId: queued.id, revision: queued.revision + 1n });
+  assert.equal(await first, true);
+  assert.equal(context.latest().edit.target, queued.id);
+
+  context.controller.selectAgent(secondAgent);
+  assert.equal(context.latest().edit, undefined, "changing agents discards the first pending fence");
+  const second = context.controller.editTask(nextQueued, { title: "second saved" });
+  await settle();
+  secondResult.resolve({ taskId: nextQueued.id, revision: nextQueued.revision + 1n });
+  assert.equal(await second, true);
+  assert.equal(context.latest().edit.target, nextQueued.id);
+
+  const firstRevised = { ...queued, title: "first saved", revision: queued.revision + 1n };
+  context.emitState({ ...initial, tasks: new Map([...initial.tasks, [firstRevised.id, firstRevised]]) });
+  assert.equal(context.latest().edit.target, nextQueued.id, "the first edit's delayed STATE cannot settle the second fence");
+  assert.equal(context.latest().edit.pending, true);
+
+  const secondRevised = { ...nextQueued, title: "second saved", revision: nextQueued.revision + 1n };
+  context.emitState({ ...initial, tasks: new Map([...initial.tasks, [firstRevised.id, firstRevised], [secondRevised.id, secondRevised]]) });
+  assert.equal(context.latest().edit, undefined);
 });
 
 test("leaving the terminal keeps the agent selected; closing the sidebar does not", () => {

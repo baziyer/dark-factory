@@ -196,6 +196,13 @@ type TerminalReplacement = {
   error?: SessionError | ProtocolError;
 };
 
+/** Keep queue controls disabled until the snapshot carries this accepted write. */
+type TaskEditConfirmation = {
+  edit: FactoryEditView;
+  previousRevision: bigint;
+  revision: bigint;
+};
+
 function agentCurrentTask(agent: AgentItem, state: StateView) {
   for (const task of state.tasks.values()) {
     if (task.assigned_agent_id === agent.id && task.status === "running") return task;
@@ -243,6 +250,7 @@ export class FactoryAppController {
   #runPathsPending = false;
   #runPathsDue = false;
   #edit: FactoryEditView | undefined;
+  #taskEditConfirmation: TaskEditConfirmation | undefined;
   #remoteInvite: FactoryRemoteInvite | undefined;
   #remoteInviteError: string | undefined;
   #remoteInvitePending = false;
@@ -305,6 +313,7 @@ export class FactoryAppController {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#discardTaskEditConfirmation();
     ++this.#generation;
     this.#clearSelection();
     this.#selectedAgent = undefined;
@@ -497,11 +506,24 @@ export class FactoryAppController {
     this.#edit = edit;
     this.#publish();
     try {
-      await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
+      const result = await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
       if (!this.#current(generation) || this.#edit !== edit) return false;
-      this.#edit = undefined;
-		this.#publish();
-		return true;
+      const current = this.#state?.tasks.get(task.id);
+      if (current?.revision === result.revision) {
+        this.#edit = undefined;
+        this.#publish();
+        return true;
+      }
+      if (current === undefined || current.revision !== task.revision) {
+        this.#edit = { target: task.id, pending: false, error: new SessionError("stale") };
+        this.#publish();
+        return false;
+      }
+      this.#taskEditConfirmation = { edit, previousRevision: task.revision, revision: result.revision };
+      // The row stays disabled until STATE carries this revision, but a
+      // successful write retains the caller's existing close-on-acceptance
+      // contract.
+      return true;
     } catch (error) {
       if (!this.#current(generation) || this.#edit !== edit) return false;
       this.#edit = { target: task.id, pending: false, error: finiteError(error) };
@@ -943,6 +965,7 @@ export class FactoryAppController {
     this.#status = status;
     this.#statusReason = status === "closed" ? this.#error?.code ?? "closed" : undefined;
     if (status !== "ready") {
+      this.#discardTaskEditConfirmation();
       this.#clearSelection();
       // A reconnect must not show a code minted for the connection that dropped.
       this.#remoteInvite = undefined;
@@ -964,6 +987,19 @@ export class FactoryAppController {
   #receiveState(generation: number, state: StateView): void {
     if (!this.#current(generation)) return;
     this.#state = state;
+    const confirmation = this.#taskEditConfirmation;
+    if (confirmation !== undefined) {
+      const current = state.tasks.get(confirmation.edit.target);
+      if (current?.revision === confirmation.revision) {
+        this.#taskEditConfirmation = undefined;
+        if (this.#edit === confirmation.edit) this.#edit = undefined;
+      } else if (current === undefined || current.revision !== confirmation.previousRevision) {
+        this.#taskEditConfirmation = undefined;
+        if (this.#edit === confirmation.edit) {
+          this.#edit = { target: confirmation.edit.target, pending: false, error: new SessionError("stale") };
+        }
+      }
+    }
     // Topology belongs to a project; a project that is gone has no rooms.
     if ([...this.#topologies.keys()].some((projectId) => !state.projects.has(projectId))) {
       this.#topologies = new Map([...this.#topologies].filter(([projectId]) => state.projects.has(projectId)));
@@ -1030,6 +1066,13 @@ export class FactoryAppController {
   #clearSelection(): void {
     ++this.#selectionToken;
     this.#selection = undefined;
+  }
+
+  #discardTaskEditConfirmation(): void {
+    const confirmation = this.#taskEditConfirmation;
+    if (confirmation === undefined || this.#edit !== confirmation.edit) return;
+    this.#taskEditConfirmation = undefined;
+    this.#edit = undefined;
   }
 
   #reconcileTerminal(): void {
@@ -1357,9 +1400,12 @@ export class FactoryAppController {
     const queuedTask = agent === undefined || this.#state === undefined ? undefined : agentQueuedTask(agent, this.#state);
     const sameAgent = agent !== undefined && prior?.agent.id === agent.id;
     // A refused edit belongs to the agent it was made against; a new selection
-    // must not inherit its error. A committed config update does replace the
-    // selected agent, though, so its pending fence stays with that agent.
-    if (!sameAgent || this.#edit?.target !== agent?.id || this.#edit.pending !== true) this.#edit = undefined;
+    // must not inherit its error. A same-agent rebind keeps either its pending
+    // config update or task fence until the canonical task revision arrives.
+    if (!sameAgent || (this.#taskEditConfirmation?.edit !== this.#edit && (this.#edit?.target !== agent?.id || this.#edit.pending !== true))) {
+      this.#discardTaskEditConfirmation();
+      this.#edit = undefined;
+    }
     this.#selectedAgent = agent === undefined ? undefined : {
       agent: { ...agent },
       head: this.#state?.head ?? 0n,
