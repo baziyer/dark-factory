@@ -163,14 +163,12 @@ test("public terminal composition buffers direct input until writable authority"
   assert.deepEqual(context.calls.filter((call) => call.kind === "input").map((call) => [...call.bytes]), [[98, 101, 102, 111, 114, 101], [0xc3, 0xa9], [0, 255]]);
 });
 
-test("explicit steering resolves the current terminal again and preserves a durable receipt", async () => {
+test("explicit steering reuses the current terminal target and preserves a durable receipt", async () => {
   const context = terminalHarness({ historyImpl: async (taskId) => ({ taskId, entries: [{ operationId: "62".repeat(16), kind: "message", actor: "operator", body: "Continue", status: "delivered", createdAtMs: 1n }] }) });
   context.controller.start();
   context.ready();
   await openTerminal(context);
   const steered = context.controller.controlAgent("message", "Continue");
-  await flush();
-  context.targetGates.at(-1).resolve(target);
   assert.equal(await steered, true);
   const control = context.calls.findLast((call) => call.kind === "control").value;
   assert.equal(control.taskId, [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running").id);
@@ -183,21 +181,51 @@ test("explicit steering resolves the current terminal again and preserves a dura
   assert.equal(context.latest().terminal.history.entries[0].body, "Continue");
 });
 
+test("steering reuses its target across an unrelated head advance", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  await openTerminal(context);
+  context.clientOptions().onState(stateAt(43));
+  const resolves = context.calls.filter((call) => call.kind === "resolve").length;
+  const steered = context.controller.controlAgent("replace", "Continue after this");
+  await flush();
+  // A redundant target read would be stale after this unrelated head change.
+  // Reject it explicitly so the old implementation fails deterministically.
+  if (context.targetGates.length > resolves) context.targetGates.at(-1).reject(new SessionError("stale"));
+  assert.equal(await steered, true);
+  assert.equal(context.calls.findLast((call) => call.kind === "control").value.action, "replace");
+  assert.equal(context.calls.filter((call) => call.kind === "resolve").length, resolves);
+});
+
+test("steering refuses a task that stops running before control", async () => {
+  const context = terminalHarness();
+  context.controller.start();
+  context.ready();
+  await openTerminal(context);
+  const task = [...fixtureState.tasks.values()].find((item) => item.assigned_agent_id === agent.id && item.status === "running");
+  const tasks = new Map(fixtureState.tasks).set(task.id, { ...task, status: "succeeded", revision: task.revision + 1n });
+  context.clientOptions().onState(stateAt(43, { tasks }));
+  const steered = context.controller.controlAgent("replace", "Continue after this");
+  assert.equal(await steered, false);
+  assert.equal(context.calls.some((call) => call.kind === "control"), false);
+  assert.equal(context.latest().terminal.controlError.code, "stale");
+});
+
 test("a live terminal follows a same-task receipt revision without rebinding before the next control", async () => {
   const context = terminalHarness();
   context.controller.start();
   context.ready();
   await openTerminal(context);
   const current = [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === agent.id && task.status === "running");
+  const resolves = context.calls.filter((call) => call.kind === "resolve").length;
   const tasks = new Map(fixtureState.tasks).set(current.id, { ...current, revision: current.revision + 1n });
   context.clientOptions().onState(stateAt(43, { tasks }));
   await flush();
 
   const steered = context.controller.controlAgent("interrupt");
-  await flush();
-  assert.deepEqual(context.calls.findLast((call) => call.kind === "resolve").value, { agentId: agent.id, expectedAgentRevision: agent.revision, expectedHead: 43n });
-  context.targetGates.at(-1).resolve(target);
   assert.equal(await steered, true);
+  assert.equal(context.calls.filter((call) => call.kind === "resolve").length, resolves);
   assert.equal(context.calls.findLast((call) => call.kind === "control").value.expectedTaskRevision, current.revision + 1n);
   assert.equal(context.latest().terminal.phase, "ready");
 });

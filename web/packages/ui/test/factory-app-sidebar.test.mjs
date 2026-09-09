@@ -117,6 +117,14 @@ test("an uncertain instruction send never claims the task was absent", () => {
   assert.equal(markup.includes(">NOT SENT<"), false);
 });
 
+test("a definite steering refusal is visible", () => {
+  const markup = renderToStaticMarkup(createElement(TerminalContent, {
+    terminal: terminalView({ taskTitle: "Standing inspection", controlReady: true, controlError: { code: "stale" } }),
+    controller: {},
+  }));
+  assert.match(markup, />CONTROL NOT SENT</);
+});
+
 test("a controller-owned draft and refusal survive the composer changing to a follow-up", () => {
   const markup = renderToStaticMarkup(createElement(AgentInstruction, {
     terminal: terminalView({ instructionDraft: "Keep this task", instructionError: { code: "stale" }, taskTitle: "Standing inspection" }),
