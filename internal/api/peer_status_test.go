@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -20,13 +21,18 @@ func TestPeerStatusEscapesTerminalControlsAndKeepsEmptyLists(t *testing.T) {
 }
 
 func TestPeerStatusWorstEscapedPageFitsControlFrame(t *testing.T) {
-	control := strings.Repeat("\u009b", 2048)
+	control := strings.Repeat("\x1b", 2048)
 	status := PeerStatus{Targets: []PeerTarget{}, Questions: []PeerQuestion{{ID: "0123456789abcdef0123456789abcdef", SourceTaskID: "1123456789abcdef0123456789abcdef", TargetTaskID: "2123456789abcdef0123456789abcdef", Question: control, Answer: control, RecipientDeliveryState: "pending", AnswerDeliveryState: "pending", RecipientAvailability: "available", AnswerAvailability: "pending", Revision: 1}}}
 	for i := 0; i < 4; i++ {
-		status.Targets = append(status.Targets, PeerTarget{TaskID: "3123456789abcdef0123456789abcdef", AgentID: "4abcdef0123456789abcdef012345678", Name: strings.Repeat("\u009b", 128), Title: strings.Repeat("\u009b", 1024), Status: "queued", Revision: 1})
+		status.Targets = append(status.Targets, PeerTarget{TaskID: "3123456789abcdef0123456789abcdef", AgentID: "4123456789abcdef0123456789abcdef", Name: strings.Repeat("\x1b", 128), Title: strings.Repeat("\x1b", 1024), Status: "queued", Revision: 1})
 	}
-	encoded, err := status.MarshalJSON()
-	if err != nil || len(encoded) >= 64<<10 {
+	if _, err := NewPeerStatusReply(status); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(struct {
+		Result PeerStatus `json:"result"`
+	}{status})
+	if err != nil || len(encoded)+responsePrelude >= 64<<10 {
 		t.Fatalf("encoded peer page=%d %v", len(encoded), err)
 	}
 }

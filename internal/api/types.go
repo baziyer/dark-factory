@@ -499,11 +499,15 @@ func validPeerStatus(status PeerStatus) bool {
 		}
 	}
 	for _, question := range status.Questions {
-		if !validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) || question.RecipientAvailability != "" && !validPeerAvailability(question.RecipientAvailability) || question.AnswerAvailability != "" && !validPeerAvailability(question.AnswerAvailability) {
+		if !validPeerQuestion(question) {
 			return false
 		}
 	}
 	return true
+}
+
+func validPeerQuestion(question PeerQuestion) bool {
+	return !(!validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) || question.RecipientAvailability != "" && !validPeerAvailability(question.RecipientAvailability) || question.AnswerAvailability != "" && !validPeerAvailability(question.AnswerAvailability))
 }
 
 func validPeerState(value string) bool {

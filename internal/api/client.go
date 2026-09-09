@@ -882,10 +882,11 @@ func validOverseerSnapshot(snapshot OverseerSnapshot) bool {
 		}
 	}
 	for _, question := range snapshot.PeerQuestions {
-		if !validID(question.ID) || !validID(question.SourceTaskID) || !validID(question.TargetTaskID) || !validText(question.Question, 1, 2048) || !validText(question.Answer, 0, 2048) || question.Revision == 0 || !validPeerState(question.RecipientDeliveryState) || !validPeerState(question.AnswerDeliveryState) {
+		if !validPeerQuestion(question) {
 			return false
 		}
 	}
+
 	for _, item := range snapshot.History {
 		if !validID(item.OperationID) || !validID(item.TaskID) || !validID(item.RunID) || item.SuccessorTaskID != "" && !validID(item.SuccessorTaskID) || (item.Kind != "message" && item.Kind != "interrupt" && item.Kind != "stop" && item.Kind != "replace") || (item.Actor != "operator" && item.Actor != "orchestrator") || !validText(item.Payload, 0, kernel.MaxTaskInterventionPayloadBytes) || (item.State != "pending" && item.State != "delivered" && item.State != "unknown" && item.State != "rejected") || !validText(item.Detail, 0, 4096) {
 			return false
