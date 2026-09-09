@@ -385,6 +385,7 @@
 
 .dfFactoryConsole__instructionActions {
   display: flex;
+  flex-wrap: wrap;
   min-height: 2.1rem;
   align-items: center;
   justify-content: flex-end;
