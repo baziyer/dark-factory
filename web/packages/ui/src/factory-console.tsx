@@ -78,6 +78,7 @@ export function FactoryConsole({
   error,
   topologies,
   runPaths,
+  lastRunPaths,
   edit,
   view = "floor",
   onView,
@@ -196,7 +197,7 @@ export function FactoryConsole({
               </div>
             </div>
             {view === "floor"
-              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
+              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />}
           </section>
 

@@ -8,6 +8,7 @@ import {
   floorScene,
   stageMeterFill,
   stageOfTask,
+  type RunPathSample,
   type TaskStage,
 } from "./console-view.js";
 import { FactoryScene } from "./factory-scene/factory-scene.js";
@@ -119,30 +120,33 @@ export function StageMeter({ stage }: { stage: TaskStage }) {
   );
 }
 
-/** The floor: every agent standing in the room of the code it is changing. */
+/** The floor shows live work locations and annotates retained observations. */
 export function FactoryFloor({
   state,
   topologies,
   runPaths,
+  lastRunPaths,
   onSelectAgent,
 }: {
   state: StateView | undefined;
   topologies: ReadonlyMap<string, TopologyView> | undefined;
-  runPaths?: ReadonlyMap<string, readonly string[]>;
+  runPaths?: ReadonlyMap<string, RunPathSample>;
+  lastRunPaths?: ReadonlyMap<string, RunPathSample>;
   onSelectAgent?: (agent: AgentItem) => void;
 }) {
-  const scene = floorScene(state, topologies, runPaths);
-  return (
+  const scene = floorScene(state, topologies, runPaths, lastRunPaths);
+  return <div className="dfFactoryFloor">
     <FactoryScene
       topology={scene.topology}
       workers={scene.workers}
       workItems={scene.workItems}
+      omittedLocations={scene.omittedLocations}
       onSelectWorker={onSelectAgent === undefined || state === undefined ? undefined : (workerID) => {
         const agent = state.agents.get(workerID);
         if (agent !== undefined) onSelectAgent(agent);
       }}
     />
-  );
+  </div>;
 }
 
 /** Rank is the served role: an orchestrator oversees, a worker builds. */

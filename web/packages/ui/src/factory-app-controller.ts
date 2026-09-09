@@ -20,9 +20,11 @@ import {
   type StateView,
   type TaskItem,
   type TerminalReset,
+  type RunPathsView,
   randomOperationID,
   type TopologyView,
 } from "@dark-factory/client";
+import type { RunPathSample } from "./console-view.js";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
 
 const BROWSER_ENDPOINT = new URL("ws://127.0.0.1:43123/browser");
@@ -110,7 +112,9 @@ export type FactoryAppSnapshot = Readonly<{
   /** Regenerable structure per project, empty until the daemon serves it. */
   topologies?: ReadonlyMap<string, TopologyView>;
   /** Repository directories each running agent's live run is changing. */
-  runPaths?: ReadonlyMap<string, readonly string[]>;
+  runPaths?: ReadonlyMap<string, RunPathSample>;
+  /** Most recent observed paths remain an annotation after that run ends. */
+  lastRunPaths?: ReadonlyMap<string, RunPathSample>;
   edit?: FactoryEditView;
   /** True only while a ready session carries the full loopback grant. */
   remoteInviteAllowed?: boolean;
@@ -223,7 +227,8 @@ export class FactoryAppController {
   #pendingTerminalResize: { rows: number; cols: number } | undefined;
   #topologies: ReadonlyMap<string, TopologyView> = new Map();
   #topologyPending = new Set<string>();
-  #runPaths: ReadonlyMap<string, readonly string[]> = new Map();
+  #runPaths: ReadonlyMap<string, RunPathSample> = new Map();
+  #lastRunPaths: ReadonlyMap<string, RunPathSample> = new Map();
   #runPathsTimer: ReturnType<typeof setInterval> | undefined;
   #runPathsTicks = 0;
   #runPathsPending = false;
@@ -395,9 +400,12 @@ export class FactoryAppController {
     const session = this.#client?.session;
     const state = this.#state;
     if (session === undefined || state === undefined || this.#runPathsPending) return;
-    const running = [...new Set([...state.tasks.values()]
-      .filter((task) => task.status === "running" && task.assigned_agent_id !== "" && this.#topologies.has(task.project_id))
-      .map((task) => task.assigned_agent_id))];
+    const running = [...state.agents.values()]
+      .map((agent) => {
+        const task = agentCurrentTask(agent, state);
+        return task === undefined || !this.#topologies.has(task.project_id) ? undefined : { agentId: agent.id, taskId: task.id, taskRevision: task.revision, projectId: task.project_id };
+      })
+      .filter((task): task is { agentId: string; taskId: string; taskRevision: bigint; projectId: string } => task !== undefined);
     if (running.length === 0) {
       // Nothing to ask leaves no round in flight, so the round a served
       // structure triggers is not lost behind an empty one.
@@ -409,11 +417,10 @@ export class FactoryAppController {
     }
     this.#runPathsPending = true;
     const generation = this.#generation;
-    void Promise.all(running.map((agentId) => session.getRunPaths(agentId).then(
-      (answer) => [agentId, answer.paths] as const,
-      // A refused answer keeps the last known room rather than bouncing the
-      // worker back to its project room for one cycle.
-      () => [agentId, this.#runPaths.get(agentId) ?? []] as const,
+    void Promise.all(running.map(({ agentId, taskId, taskRevision, projectId }) => session.getRunPaths(agentId).then(
+      (answer) => [agentId, sampleFor(taskId, taskRevision, projectId, answer)] as const,
+      // A refused answer keeps the last sample as a retained observation.
+      () => [agentId, this.#runPaths.get(agentId)] as const,
     ))).then((answers) => {
       this.#runPathsPending = false;
       // A round owed to a structure that arrived meanwhile is asked now, and
@@ -424,8 +431,17 @@ export class FactoryAppController {
       if (due && this.#runPathsTimer !== undefined) this.#pollRunPaths();
       // An agent that stopped running loses its entry; an unchanged round is
       // not a new snapshot, so the floor does not re-render on a heartbeat.
-      if (answers.length === this.#runPaths.size && answers.every(([id, paths]) => sameText(this.#runPaths.get(id), paths))) return;
-      this.#runPaths = new Map(answers);
+      const current = new Map(answers.filter((entry): entry is readonly [string, RunPathSample] => {
+        const sample = entry[1];
+        const agent = this.#state?.agents.get(entry[0]);
+        const task = sample === undefined || agent === undefined || this.#state === undefined ? undefined : agentCurrentTask(agent, this.#state);
+        return sample !== undefined && task?.id === sample.taskId && task.revision === sample.taskRevision && task.project_id === sample.projectId;
+      }));
+      const last = new Map(this.#lastRunPaths);
+      for (const [agentId, sample] of answers) if (sample !== undefined && sample.paths.length > 0) last.set(agentId, sample);
+      if (sameSamples(this.#runPaths, current) && sameSamples(this.#lastRunPaths, last)) return;
+      this.#runPaths = current;
+      this.#lastRunPaths = last;
       this.#publish();
     });
   }
@@ -1305,6 +1321,7 @@ export class FactoryAppController {
       error: this.#error,
       topologies: this.#topologies,
       runPaths: this.#runPaths,
+      lastRunPaths: this.#lastRunPaths,
       edit: this.#edit,
       selectedHumanRequest: selection === undefined ? undefined : {
         request: selection.request,
@@ -1371,8 +1388,17 @@ function finiteError(error: unknown): SessionError | ProtocolError {
   return error instanceof SessionError || error instanceof ProtocolError ? error : new SessionError("connection");
 }
 
-function sameText(left: readonly string[] | undefined, right: readonly string[]): boolean {
-  return left !== undefined && left.length === right.length && left.every((value, index) => value === right[index]);
+function sampleFor(taskId: string, taskRevision: bigint, projectId: string, answer: RunPathsView): RunPathSample | undefined {
+  if (typeof answer.runId !== "string" || answer.runId === "") return undefined;
+  return Object.freeze({ taskId, taskRevision, projectId, runId: answer.runId, paths: Object.freeze([...answer.paths]) });
+}
+
+function sameSamples(left: ReadonlyMap<string, RunPathSample>, right: ReadonlyMap<string, RunPathSample>): boolean {
+  return left.size === right.size && [...left].every(([agentId, sample]) => {
+    const candidate = right.get(agentId);
+    return candidate !== undefined && candidate.taskId === sample.taskId && candidate.taskRevision === sample.taskRevision && candidate.projectId === sample.projectId && candidate.runId === sample.runId
+      && candidate.paths.length === sample.paths.length && candidate.paths.every((path, index) => path === sample.paths[index]);
+  });
 }
 
 function sameStatus(left: FactoryAppStatus | undefined, right: FactoryAppStatus): boolean {

@@ -748,16 +748,13 @@
   .dfConsoleSidebar { position: static; max-height: none; padding: 0 clamp(1rem, 3vw, 3rem) 1.5rem; }
 }
 
-/* Exactly one complete pose at a time, including transparent pixels. */
-.dfFactoryScene__primary { opacity: 1; animation: dfFactorySceneHide 1.2s steps(1, end) infinite; }
-.dfFactoryScene__alternate { opacity: 0; animation: dfFactorySceneFlip 1.2s steps(1, end) infinite; }
-
-@keyframes dfFactorySceneHide { 50% { opacity: 0; } }
-@keyframes dfFactorySceneFlip { 50% { opacity: 1; } }
+.dfFactoryScene__room--empty > rect,
+.dfFactoryScene__room--empty > use { opacity: 0.45; }
+.dfFactoryFloor { overflow-x: auto; }
+.dfFactoryScene__worker { transition: transform 180ms ease-out; }
 
 @media (prefers-reduced-motion: reduce) {
-  .dfFactoryScene__primary,
-  .dfFactoryScene__alternate { animation: none; }
+  .dfFactoryScene__worker { transition: none; }
 }
 
 /* remote ------------------------------------------------------------------

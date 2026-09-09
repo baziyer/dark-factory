@@ -549,6 +549,7 @@ test("run paths are polled for running agents only while the floor is shown", as
   // Only the first project's structure is served; the second project has a
   // running agent too, and nobody asks where it is standing.
   const [servedProject, otherProject] = [...fixtureState.projects.keys()];
+  const runningTask = [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === runningAgentID && task.status === "running");
   const otherAgent = [...fixtureState.agents.values()].find((agent) => agent.project_id === otherProject).id;
   const state = { ...fixtureState, tasks: new Map([...fixtureState.tasks,
     ["0b".repeat(16), { id: "0b".repeat(16), project_id: otherProject, assigned_agent_id: otherAgent, title: "Unserved", status: "running", priority: 1, revision: 1n }]]) };
@@ -569,7 +570,13 @@ test("run paths are polled for running agents only while the floor is shown", as
   await settle();
   await settle();
   assert.deepEqual(asked, [runningAgentID]);
-  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, {
+    taskId: runningTask.id,
+    taskRevision: runningTask.revision,
+    projectId: servedProject,
+    runId: "0a".repeat(16),
+    paths: ["web/packages/ui"],
+  }]]);
 
   // Ten seconds is the cadence, and an unchanged round is not a new snapshot.
   const published = context.snapshots.length;
@@ -583,7 +590,13 @@ test("run paths are polled for running agents only while the floor is shown", as
   mock.timers.tick(10_000);
   await settle();
   assert.equal(asked.length, 3);
-  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["web/packages/ui"]]]);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, {
+    taskId: runningTask.id,
+    taskRevision: runningTask.revision,
+    projectId: servedProject,
+    runId: "0a".repeat(16),
+    paths: ["web/packages/ui"],
+  }]]);
 
   // An agent that is no longer running loses its entry.
   context.emitState({ ...state, tasks: new Map() });
@@ -603,11 +616,50 @@ test("run paths are polled for running agents only while the floor is shown", as
   context.controller.watchRunPaths(true);
   await settle();
   assert.equal(asked.length, 4);
-  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, ["internal/kernel"]]]);
+  assert.deepEqual([...context.latest().runPaths], [[runningAgentID, {
+    taskId: runningTask.id,
+    taskRevision: runningTask.revision,
+    projectId: servedProject,
+    runId: "0a".repeat(16),
+    paths: ["internal/kernel"],
+  }]]);
   context.emitStatus("syncing");
   mock.timers.tick(10_000);
   await settle();
   assert.equal(asked.length, 4);
+});
+
+test("a late path answer from an earlier revision only becomes a retained observation", async () => {
+  const [projectId] = [...fixtureState.projects.keys()];
+  const pending = deferred();
+  let asked = 0;
+  const context = harness({
+    getRunPaths: () => { asked += 1; return pending.promise; },
+    getTopology: async (id) => ({ projectId: id, digest: "ab".repeat(32), sourceRevision: "", nodes: [] }),
+  });
+  const original = [...fixtureState.tasks.values()].find((task) => task.assigned_agent_id === runningAgentID && task.status === "running");
+  context.controller.start();
+  context.emitState(fixtureState);
+  context.emitStatus("ready");
+  context.controller.loadTopology();
+  await settle();
+  context.controller.watchRunPaths(true);
+  await settle();
+  assert.equal(asked, 1);
+  const revised = { ...original, revision: original.revision + 1n };
+  context.emitState({ ...fixtureState, tasks: new Map([[revised.id, revised]]) });
+  assert.equal(context.latest().state.tasks.get(revised.id).revision, revised.revision);
+  pending.resolve({ agentId: runningAgentID, runId: "0a".repeat(16), paths: ["web"] });
+  await settle();
+  assert.equal(context.latest().runPaths.size, 0);
+  assert.deepEqual([...context.latest().lastRunPaths], [[runningAgentID, {
+    taskId: original.id,
+    taskRevision: original.revision,
+    projectId,
+    runId: "0a".repeat(16),
+    paths: ["web"],
+  }]]);
+  context.controller.watchRunPaths(false);
 });
 
 test("a remote invitation is offered, stored, dismissed, and its failure reported", async () => {

@@ -14,6 +14,7 @@ const ids = {
   secondProject: [...fixtureState.projects.keys()][1],
   agent: [...fixtureState.agents.keys()][0],
   orchestrator: [...fixtureState.agents.keys()][1],
+  idleAgent: [...fixtureState.agents.keys()][2],
   task: [...fixtureState.tasks.keys()][0],
   request: [...fixtureState.humanRequests.keys()][0],
 };
@@ -44,18 +45,24 @@ const selectedRequest = (overrides = {}) => ({
   ...overrides,
 });
 
+const runSample = (agentId, paths, taskId = ids.task, taskRevision = fixtureState.tasks.get(taskId)?.revision ?? 1n) => ({
+  taskId,
+  taskRevision,
+  runId: "71".repeat(16),
+  projectId: fixtureState.agents.get(agentId).project_id,
+  paths,
+});
+
 test("error banner keeps its centered layout after the paragraph reset", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
   // The sidebar is a sibling of the console, so it needs the same reset.
   assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),\s*\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
-  // Each animation toggles visibility of a complete pose; reduced motion keeps
-  // the primary frame visible and never leaves a stale frame underneath.
-  assert.match(css, /\.dfFactoryScene__primary \{ opacity: 1; animation: dfFactorySceneHide 1\.2s steps\(1, end\) infinite; \}/);
-  assert.match(css, /\.dfFactoryScene__alternate \{ opacity: 0; animation: dfFactorySceneFlip 1\.2s steps\(1, end\) infinite; \}/);
-  assert.match(css, /@keyframes dfFactorySceneHide \{ 50% \{ opacity: 0; \} \}/);
-  assert.match(css, /@keyframes dfFactorySceneFlip \{ 50% \{ opacity: 1; \} \}/);
-  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.dfFactoryScene__primary,\s*\.dfFactoryScene__alternate \{ animation: none; \}/);
+  assert.match(css, /\.dfFactoryScene__room--empty > rect,[\s\S]*?\.dfFactoryScene__room--empty > use \{ opacity: 0\.45; \}/);
+  assert.match(css, /\.dfFactoryFloor \{ overflow-x: auto; \}/);
+  assert.match(css, /\.dfFactoryScene__worker \{ transition: transform 180ms ease-out; \}/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.dfFactoryScene__worker \{ transition: none; \}/);
+  assert.equal(css.includes("@keyframes dfFactoryScene"), false);
 });
 
 test("one screen shows the floor, the counters, and what needs you at once", () => {
@@ -107,14 +114,14 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.equal(scene.topology.digest, fixtureTopology.digest);
   assert.deepEqual(scene, floorScene(fixtureState, new Map([[fixtureTopology.projectId, { ...fixtureTopology, nodes: [...fixtureTopology.nodes] }]])));
 
-  // The detailed project's agents stand in its repository root; a project the
-  // topology does not cover still gets a room, so nobody is stranded.
+  // No changed-path sample puts a worker in a project room: idle and paused
+  // agents rest, and a live run says that its location is not yet observed.
   const room = (path) => scene.topology.nodes.find((node) => node.path === path).id;
   const root = room(".");
-  assert.deepEqual(scene.workers.map((worker) => [worker.name, worker.activity, worker.nodeId]), [
-    ["Builder One", "needs-you", root],
-    ["Dispatch Lead", "idle", ids.secondProject],
-    ["Builder Two", "waiting", root],
+  assert.deepEqual(scene.workers.map((worker) => [worker.name, worker.activity, worker.location, worker.nodeId]), [
+    ["Builder One", "needs-you", "unobserved", undefined],
+    ["Dispatch Lead", "idle", "resting", undefined],
+    ["Builder Two", "waiting", "resting", undefined],
   ]);
   assert.deepEqual(scene.workItems.map((item) => item.stage), ["staged", "release-ready"]);
 
@@ -122,30 +129,41 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   // deepest displayed room that prefixes a path, and the room most paths sit in.
   const kernel = room("internal/kernel");
   const web = room("web");
-  const placed = (paths) => floorScene(fixtureState, fixtureTopologies, new Map([[ids.agent, paths]]))
+  const placed = (paths) => floorScene(fixtureState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, paths)]]))
     .workers.find((worker) => worker.id === ids.agent).nodeId;
   assert.equal(placed(["internal/kernel/store"]), kernel);
   assert.equal(placed(["web"]), web);
-  // The repository root is a room like any other, and an unmapped path is its.
+  // The repository root is a room like any other.
   assert.equal(placed(["."]), root);
   assert.equal(placed(["cmd/factoryd"]), root);
   // Several paths: the room holding the most of them, ties by sorted path.
   assert.equal(placed(["web", "internal/kernel", "internal/kernel/store"]), kernel);
   assert.equal(placed(["web", "internal/kernel"]), kernel);
   assert.equal(placed(["web", "web/packages/ui", "internal/kernel"]), web);
-  // No paths, or an agent the poll never covered, keeps the project room.
-  assert.equal(placed([]), root);
-  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map()).workers.at(-1).nodeId, root);
-  // Another project's agent has no rooms below its own, whatever it reports.
-  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map([[ids.orchestrator, ["internal/kernel"]]]))
-    .workers.find((worker) => worker.id === ids.orchestrator).nodeId, ids.secondProject);
+  // Empty or missing live samples never invent a root location.
+  assert.equal(placed([]), undefined);
+  assert.equal(floorScene(fixtureState, fixtureTopologies, new Map()).workers.find((worker) => worker.id === ids.agent).location, "unobserved");
+  // A stopped agent retains a text-only last observation in the resting area.
+  const observed = floorScene(fixtureState, fixtureTopologies, undefined, new Map([[ids.idleAgent, runSample(ids.idleAgent, ["web"], "72".repeat(16))]]))
+    .workers.find((worker) => worker.id === ids.idleAgent);
+  assert.deepEqual([observed.location, observed.nodeId, observed.locationLabel], ["last-observed", undefined, "web"]);
+
+  // A prior run cannot place its agent after a replacement task has started.
+  const replacement = { ...fixtureState.tasks.get(ids.task), revision: 2n };
+  const replacementState = { ...fixtureState, tasks: new Map([[replacement.id, replacement]]) };
+  const stale = floorScene(replacementState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, ["web"])]]))
+    .workers.find((worker) => worker.id === ids.agent);
+  assert.deepEqual([stale.location, stale.nodeId], ["unobserved", undefined]);
+  const current = floorScene(replacementState, fixtureTopologies, new Map([[ids.agent, runSample(ids.agent, ["web"], replacement.id, replacement.revision)]]))
+    .workers.find((worker) => worker.id === ids.agent);
+  assert.deepEqual([current.location, current.nodeId], ["working", web]);
 
   // Without topology the floor still has a room per project.
   const fallback = floorScene(fixtureState, undefined);
   assert.deepEqual(fallback.topology.nodes.map((node) => node.label), ["North Workshop", "South Workshop"]);
   assert.deepEqual(fallback.topology.nodes.map((node) => node.sizeBucket), [undefined, undefined]);
-  assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [ids.project, ids.secondProject, ids.project]);
-  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [] });
+  assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [undefined, undefined, undefined]);
+  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [], omittedLocations: 0 });
   // The size bucket, not a file count, is what the room subtitle carries.
   const markup = render({ topologies: fixtureTopologies });
   assert.match(markup, />kernel<\/text>/);
@@ -167,7 +185,7 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.equal(wide.topology.nodes.some((node) => node.id === ids.secondProject), true);
   assert.deepEqual(wide.topology.nodes.filter((node) => node.sizeBucket === "medium").map((node) => node.label),
     ["dir-0", "dir-1", "dir-2", "dir-3"]);
-  assert.equal(wide.workers.every((worker) => worker.nodeId !== undefined), true);
+  assert.equal(wide.workers.find((worker) => worker.id === ids.agent).location, "unobserved");
 });
 
 /**
@@ -253,14 +271,16 @@ test("the floor is whatever the daemon served, with no shape or name known to th
 test("every project is its own block of rooms and its own workers", () => {
   // Two projects holding the same path are served the same node id; two rooms
   // on one floor may not share one, and a worker may not walk into the other
-  // project's code.
+  // project's code. A paused worker stays in resting rather than occupying its
+  // project's latest room.
   const shape = [["repository", ".", "large"], ["directory", "src", "medium", 0]];
   const topologies = served(topologyFor(ids.project, shape), topologyFor(ids.secondProject, shape));
-  const scene = floorScene(fixtureState, topologies, new Map([[ids.agent, ["src"]], [ids.orchestrator, ["src"]]]));
+  const scene = floorScene(fixtureState, topologies, new Map([[ids.agent, runSample(ids.agent, ["src"])], [ids.orchestrator, runSample(ids.orchestrator, ["src"])]]));
   assert.equal(scene.topology.nodes.length, 4);
   assert.equal(new Set(scene.topology.nodes.map((node) => node.id)).size, 4);
   const nodeOf = (agentId) => scene.workers.find((worker) => worker.id === agentId).nodeId;
-  assert.notEqual(nodeOf(ids.agent), nodeOf(ids.orchestrator));
+  assert.notEqual(nodeOf(ids.agent), undefined);
+  assert.equal(nodeOf(ids.orchestrator), undefined);
   assert.equal(scene.topology.digest, [...topologies.values()].map((view) => view.digest).join(" "));
   // Two structures have arrived and neither root room reads as the served
   // label: on a floor of many projects only the project name tells them apart.
@@ -299,7 +319,8 @@ test("every project is its own block of rooms and its own workers", () => {
     served(...overflow.map((project) => topologyFor(project.id, [["repository", ".", "large"], ["directory", "src", "medium", 0]]))),
   );
   assert.deepEqual(stranded.topology.nodes.map((node) => node.path), Array.from({ length: 24 }, () => "."));
-  assert.equal(stranded.workers[0].nodeId !== undefined, true);
+  assert.equal(stranded.workers[0].location, "resting");
+  assert.equal(stranded.workers[0].nodeId, undefined);
   assert.equal(stranded.workers.at(-1).nodeId, undefined);
 });
 

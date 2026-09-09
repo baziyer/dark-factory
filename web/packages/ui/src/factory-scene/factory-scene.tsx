@@ -1,6 +1,5 @@
 import {
   PADDING,
-  alternateFrame,
   layoutScene,
   placeWorkers,
   workerFrame,
@@ -25,6 +24,8 @@ export type FactorySceneProps = Readonly<{
   topology: SceneTopology;
   workers: readonly SceneWorker[];
   workItems: readonly SceneWorkItem[];
+  /** Current changed locations omitted by the bounded room map. */
+  omittedLocations?: number;
   /** Pointer convenience only; the AGENTS list is the keyboard path. */
   onSelectWorker?: (workerId: string) => void;
 }>;
@@ -43,13 +44,15 @@ function Frame({ name, x, y, className }: { name: string; x: number; y: number; 
 }
 
 /** A disposable SVG projection of topology and current factory state. */
-export function FactoryScene({ topology, workers, workItems, onSelectWorker }: FactorySceneProps) {
+export function FactoryScene({ topology, workers, workItems, omittedLocations = 0, onSelectWorker }: FactorySceneProps) {
   const layout = layoutScene(topology);
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
-  const unassigned = placements.filter((placement) => placement.roomId === undefined);
-  const outside = placements.filter((placement) => placement.y > layout.height);
+  const resting = placements.filter((placement) => placement.area === "resting");
+  const staging = placements.filter((placement) => placement.area === "staging");
+  const overflow = placements.filter((placement) => placement.area === "overflow");
+  const occupied = new Set(placements.filter((placement) => placement.area === "room").map((placement) => placement.roomId));
   const workerBottom = Math.max(layout.height, ...placements.map((placement) => placement.y + 8));
   const serviceY = workerBottom + PADDING;
   const sceneHeight = serviceY + SERVICE_HEIGHT + PADDING;
@@ -67,10 +70,10 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
       role="group"
       aria-label="Dark Factory codebase floor"
       data-topology-digest={topology.digest}
-      style={{ display: "block", width: "100%", maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
+      style={{ display: "block", width: maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
     >
       <title>Dark Factory codebase floor</title>
-      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks`}</desc>
+      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks${omittedLocations === 0 ? "" : `, ${omittedLocations} current locations omitted by the room cap`}`}</desc>
       <defs>
         {/* The sheet enters the document once; every frame is a window on it. */}
         <image id="df-sheet" href={spriteSheet} width={spriteSheetSize.width} height={spriteSheetSize.height} style={{ imageRendering: "pixelated" }} />
@@ -104,7 +107,7 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         const node = nodes.get(room.id);
         if (node === undefined) return null;
         return (
-          <g key={room.id} data-room-id={room.id}>
+          <g key={room.id} data-room-id={room.id} className={occupied.has(room.id) ? undefined : "dfFactoryScene__room--empty"}>
             <title>{node.path}</title>
             <rect x={room.x} y={room.y} width={room.width} height={room.height} rx="3" fill="url(#df-floor)" stroke="#638095" />
             <rect x={room.x} y={room.y} width={room.width} height={FRAME} fill="url(#df-wall)" />
@@ -125,43 +128,41 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         </text>
       ) : null}
 
-      {outside.length === 0 ? null : (
-        <g role="group" aria-label={`${outside.length} workers outside rooms`}>
-          <rect x={PADDING} y={layout.height} width={layout.width - PADDING * 2} height={workerBottom - layout.height + PADDING} rx="3" fill="#101f2b" stroke="#385164" />
-          <text x={PADDING + 6} y={layout.height + 15} fill="#9db1be" fontFamily="ui-monospace, monospace" fontSize="8">
-            WORKER OVERFLOW · {outside.length}
-          </text>
-        </g>
-      )}
+      {resting.length === 0 ? null : <Area label={`RESTING AREA · ${resting.length}`} width={layout.width - PADDING * 2} top={layout.height} bottom={Math.max(...resting.map((placement) => placement.y + 8)) + PADDING} />}
+      {staging.length === 0 ? null : <Area label={`WORKING · ${staging.length} LOCATION${staging.length === 1 ? "" : "S"} NOT YET OBSERVED`} width={layout.width - PADDING * 2} top={Math.min(...staging.map((placement) => placement.y)) - 20} bottom={Math.max(...staging.map((placement) => placement.y + 8)) + PADDING} />}
+      {overflow.length === 0 ? null : <Area label={omittedLocations === 0 ? `WORKER AREA AT CAPACITY · ${overflow.length}` : `ROOM MAP AT CAPACITY · ${omittedLocations} LOCATIONS NOT SHOWN`} width={layout.width - PADDING * 2} top={Math.min(...overflow.map((placement) => placement.y)) - 20} bottom={Math.max(...overflow.map((placement) => placement.y + 8)) + PADDING} />}
 
       {placements.map((placement) => {
         const worker = workerById.get(placement.id);
         if (worker === undefined) return null;
         const room = placement.roomId === undefined ? undefined : nodes.get(placement.roomId);
-        const location = room === undefined ? "unassigned" : room.label;
+        const location = worker.location === "working"
+          ? placement.area === "room" ? `working near observed changes in ${room?.label}` : worker.nodeId === undefined ? `working near observed changes in ${worker.locationLabel}; room map at capacity` : `working near observed changes in ${worker.locationLabel}; worker area at capacity`
+          : worker.location === "unobserved" ? "working; location not yet observed"
+          : worker.location === "last-observed" && worker.locationLabel !== undefined ? `last observed near changes in ${worker.locationLabel}`
+          : worker.paused ? "paused in resting area" : "ready in resting area";
         const frame = workerFrame(worker);
-        // Complementary steps replace the whole pose; holes reveal the floor.
-        const alternate = alternateFrame(frame);
         return (
           <g
             key={worker.id}
             data-worker-id={worker.id}
+            data-worker-location={worker.location ?? "resting"}
             transform={`translate(${placement.x} ${placement.y})`}
             role="img"
             aria-label={`${worker.name}, ${worker.role}, ${worker.activity}, ${location}`}
+            className="dfFactoryScene__worker"
             {...(onSelectWorker === undefined ? {} : { onClick: () => onSelectWorker(worker.id), style: { cursor: "pointer" } })}
           >
-            <title>{worker.name}</title>
-            <Frame name={frame} x={-8} y={-8} className={alternate === undefined ? undefined : "dfFactoryScene__primary"} />
-            {alternate === undefined ? null : <Frame name={alternate} x={-8} y={-8} className="dfFactoryScene__alternate" />}
+            <title>{`${worker.name} · ${location}`}</title>
+            <Frame name={frame} x={-8} y={-8} />
           </g>
         );
       })}
 
       {([[
         "FREE",
-        unassigned.length,
-        `${unassigned.length} unassigned workers`,
+        resting.length,
+        `${resting.length} workers in the resting area`,
         "bay.free",
       ], [
         "STAGED",
@@ -185,5 +186,14 @@ export function FactoryScene({ topology, workers, workItems, onSelectWorker }: F
         );
       })}
     </svg>
+  );
+}
+
+function Area({ label, width, top, bottom }: { label: string; width: number; top: number; bottom: number }) {
+  return (
+    <g role="group" aria-label={label}>
+      <rect x={PADDING} y={top} width={width} height={bottom - top} rx="3" fill="#101f2b" stroke="#385164" />
+      <text x={PADDING + 6} y={top + 15} fill="#9db1be" fontFamily="ui-monospace, monospace" fontSize="8">{label}</text>
+    </g>
   );
 }
