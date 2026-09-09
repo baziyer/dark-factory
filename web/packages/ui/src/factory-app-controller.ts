@@ -12,6 +12,7 @@ import {
   type AgentItem,
   type AgentControlAction,
   type TaskHistoryView,
+  type TaskDetailView,
   type HumanRequestDetail,
   type HumanRequestItem,
   type SessionErrorCode,
@@ -85,6 +86,8 @@ export type FactoryTerminalView = Readonly<{
   /** Explicit durable receipts only; terminal keystrokes and output stay local. */
   history?: TaskHistoryView;
   historyPending: boolean;
+  taskDetail?: TaskDetailView;
+  taskDetailPending: boolean;
   controlReady: boolean;
   queued: boolean;
   /** The mounted Xterm scrollback belongs to this agent's completed work. */
@@ -132,7 +135,7 @@ export type FactoryAppStatus =
 
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
-type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "resolveAgentTerminal">;
+type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
 type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "discoverAccounts" | "linkAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
@@ -178,6 +181,10 @@ type AgentTerminalSelection = {
   historyTaskRevision?: bigint;
   historyPendingTaskRevision?: bigint;
   historyPending: boolean;
+  taskDetail?: TaskDetailView;
+  taskDetailTaskID?: string;
+  taskDetailTaskRevision?: bigint;
+  taskDetailPending: boolean;
   queuedTaskID?: string;
 };
 
@@ -480,22 +487,32 @@ export class FactoryAppController {
   }
 
   /** Edit one queued task against its exact revision. */
-  async editTask(task: Pick<TaskItem, "id" | "revision">, change: { title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<void> {
+  async editTask(task: Pick<TaskItem, "id" | "revision">, change: { title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<boolean> {
     const session = this.#client?.session;
-    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
+    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return false;
     const generation = this.#generation;
     const edit: FactoryEditView = { target: task.id, pending: true };
     this.#edit = edit;
     this.#publish();
     try {
       await session.updateTask({ taskId: task.id, expectedRevision: task.revision, ...change });
-      if (!this.#current(generation) || this.#edit !== edit) return;
+      if (!this.#current(generation) || this.#edit !== edit) return false;
       this.#edit = undefined;
+		this.#publish();
+		return true;
     } catch (error) {
-      if (!this.#current(generation) || this.#edit !== edit) return;
+      if (!this.#current(generation) || this.#edit !== edit) return false;
       this.#edit = { target: task.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
+	return false;
+  }
+
+  /** Load private task text only when an operator opens its brief. */
+  taskDetail(task: Pick<TaskItem, "id" | "revision">, peerOffset = 0n): Promise<TaskDetailView> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined) return Promise.reject(new SessionError("closed"));
+    return this.#readTaskDetail(session, task.id, task.revision, peerOffset);
   }
 
   clearAgentTerminal(): void {
@@ -636,6 +653,21 @@ export class FactoryAppController {
     const selected = this.#selectedAgent;
     const taskID = selected?.task?.id ?? selected?.historyTaskID;
     if (selected !== undefined && taskID !== undefined) void this.#loadTaskHistory(selected, taskID);
+  }
+
+  loadTaskDetail(): void {
+    const selected = this.#selectedAgent;
+    const taskID = selected?.historyTaskID;
+    const revision = selected?.historyTaskRevision;
+    if (selected !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision);
+  }
+
+  loadOlderTaskConversation(): void {
+    const selected = this.#selectedAgent;
+    const detail = selected?.taskDetail;
+    const taskID = selected?.historyTaskID;
+    const revision = selected?.historyTaskRevision;
+    if (selected !== undefined && detail?.nextPeerOffset !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision, detail.nextPeerOffset);
   }
 
   /**
@@ -1204,18 +1236,76 @@ export class FactoryAppController {
     }
   }
 
+  async #loadTaskDetail(selected: AgentTerminalSelection, taskID: string, revision: bigint, peerOffset = 0n): Promise<void> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined || selected.taskDetailPending) return;
+    const generation = this.#generation;
+    selected.taskDetailPending = true;
+    this.#publish();
+    try {
+      const detail = await this.#readTaskDetail(session, taskID, revision, peerOffset);
+      if (!this.#current(generation) || this.#selectedAgent !== selected || detail.taskId !== taskID || detail.revision !== revision) return;
+      selected.taskDetail = detail;
+      selected.taskDetailTaskID = taskID;
+      selected.taskDetailTaskRevision = revision;
+    } catch (error) {
+      if (!this.#current(generation) || this.#selectedAgent !== selected) return;
+      selected.controlError = finiteError(error);
+    } finally {
+      if (this.#current(generation) && this.#selectedAgent === selected) {
+        selected.taskDetailPending = false;
+        this.#publish();
+      }
+    }
+  }
+
+  async #readTaskDetail(session: AgentTaskSession, taskID: string, revision: bigint, peerOffset: bigint): Promise<TaskDetailView> {
+    let textOffset = 0n;
+    let instruction = "";
+    let feedback = "";
+    let peerQuestions: TaskDetailView["peerQuestions"] = [];
+    let nextPeerOffset: bigint | undefined;
+    // Task bodies are limited to 128 KiB and each page is 2,048 runes, so 64
+    // pages cover every valid body without treating conversation pagination as
+    // an unbounded background load.
+    for (let page = 0; page < 64; page += 1) {
+      const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset });
+      instruction += detail.instruction;
+      feedback += detail.feedback;
+      if (page === 0) {
+        peerQuestions = detail.peerQuestions;
+        nextPeerOffset = detail.nextPeerOffset;
+      }
+      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, instruction, feedback, peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
+      textOffset = detail.nextTextOffset;
+    }
+    throw new ProtocolError("malformed");
+  }
+
   #refreshTerminalTask(selected: AgentTerminalSelection, state: StateView): void {
     const task = agentCurrentTask(selected.agent, state);
     this.#refreshQueuedTask(selected, state);
     const current = task === undefined ? undefined : { id: task.id, revision: task.revision };
     if (sameTaskIdentity(selected.task, current) && selected.task?.revision === current?.revision) return;
+    const previous = selected.task;
     const changedTask = selected.task?.id !== current?.id;
     selected.task = current;
     selected.finishing = false;
+    // A terminal can settle between snapshots. Keep its final revision for
+    // the private history reader rather than asking with the running revision.
+    if (current === undefined && previous !== undefined) {
+      const completed = state.tasks.get(previous.id);
+      if (completed !== undefined) {
+        selected.historyTaskID = completed.id;
+        selected.historyTaskRevision = completed.revision;
+        selected.taskDetail = undefined;
+      }
+    }
     if (current !== undefined && selected.instructionDraft === "") selected.instructionError = undefined;
     if (current !== undefined && (selected.historyTaskID !== current.id || selected.historyTaskRevision !== current.revision)) {
       selected.historyTaskID = current.id;
       selected.history = undefined;
+		selected.taskDetail = undefined;
       void this.#loadTaskHistory(selected, current.id);
     }
     if (changedTask) this.#dropPendingTerminalInput();
@@ -1275,6 +1365,7 @@ export class FactoryAppController {
       instructionError: sameAgent ? prior.instructionError : undefined,
       instructionPending: sameAgent ? prior.instructionPending : false,
       historyPending: false,
+		taskDetailPending: false,
       queuedTaskID: queuedTask?.id,
     };
     this.#error = replacement.error ?? (replacement.agentId !== undefined && agent === undefined ? new SessionError("stale") : undefined);
@@ -1363,6 +1454,8 @@ export class FactoryAppController {
         controlStatus: this.#selectedAgent.controlStatus,
         history: this.#selectedAgent.history,
         historyPending: this.#selectedAgent.historyPending,
+		taskDetail: this.#selectedAgent.taskDetail,
+		taskDetailPending: this.#selectedAgent.taskDetailPending,
         controlReady: this.#selectedAgent.task !== undefined && !this.#selectedAgent.finishing && this.#terminal?.snapshot.phase === "ready",
         queued: this.#selectedAgent.queuedTaskID !== undefined && this.#selectedAgent.task === undefined,
         hasOutputSurface: this.#terminalSurface !== undefined,

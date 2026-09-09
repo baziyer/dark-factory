@@ -11,6 +11,7 @@ import {
   encodeStateGet,
   encodeStateWatch,
   encodeTaskEnqueue,
+  encodeTaskDetailGet,
   encodeTaskHistoryGet,
   encodeTerminalTargetGet,
   type AccountLinkResultBody,
@@ -31,6 +32,8 @@ import {
   type StateSnapshotFrame,
   type TaskEnqueueResultBody,
   type TaskHistoryBody,
+  type TaskDetailBody,
+  type TaskPeerQuestion,
   type TaskUpdateBody,
   type TerminalTargetDescriptor,
   type TopologyBody,
@@ -151,6 +154,7 @@ type HumanPending = {
 type TaskPending = { taskId: string; expectedAgentRevision: bigint; resolve: (value: { taskId: string; revision: bigint }) => void; reject: (error: unknown) => void };
 type AgentControlPending = { operationId: string; taskId: string; runId: string; resolve: (value: AgentControlResult) => void; reject: (error: unknown) => void };
 type TaskHistoryPending = { taskId: string; resolve: (value: TaskHistoryView) => void; reject: (error: unknown) => void };
+type TaskDetailPending = { taskId: string; expectedRevision: bigint; resolve: (value: TaskDetailView) => void; reject: (error: unknown) => void };
 type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 export type AgentUpdateResult = Readonly<{ agentId: string; revision: bigint }>;
@@ -167,6 +171,7 @@ export type AgentControlRequest = Readonly<{
 }>;
 export type AgentControlResult = Readonly<{ operationId: string; taskId: string; runId: string; status: AgentControlResultBody["status"]; successorTaskId: string }>;
 export type TaskHistoryView = Readonly<{ taskId: string; entries: readonly Readonly<{ operationId: string; kind: AgentControlAction; actor: string; body: string; status: "pending" | "delivered" | "unknown" | "rejected"; createdAtMs: bigint }>[] }>;
+export type TaskDetailView = Readonly<{ taskId: string; revision: bigint; instruction: string; feedback: string; nextTextOffset?: bigint; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
 export type TopologyView = Readonly<{ projectId: string; digest: string; sourceRevision: string; nodes: readonly TopologyBody["nodes"][number][] }>;
 /** One agent's live run and the repository directories it has changed. */
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
@@ -252,6 +257,7 @@ export class BrowserSession {
   #taskPending = new Map<string, TaskPending>();
   #agentControlPending = new Map<string, AgentControlPending>();
   #taskHistoryPending = new Map<string, TaskHistoryPending>();
+  #taskDetailPending = new Map<string, TaskDetailPending>();
   #consolePending = new Map<string, ConsolePending>();
   #invitePending = new Map<string, InvitePending>();
   #accountPending = new Map<string, AccountPending>();
@@ -335,6 +341,20 @@ export class BrowserSession {
     return result;
   }
 
+  /** Private editable base instruction and retained review feedback. */
+  getTaskDetail(taskId: string, expectedRevision: bigint, offsets: { textOffset?: bigint; peerOffset?: bigint } = {}): Promise<TaskDetailView> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated || (this.#capabilities & CAPABILITIES.private_human_request_detail) === 0) return Promise.reject(new SessionError("unauthorized"));
+    if (!validDynamicID(taskId) || expectedRevision < 1n || expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
+    if (this.#taskDetailPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID("task-detail");
+    let payload: string;
+    try { payload = encodeTaskDetailGet(id, { task_id: taskId, expected_revision: expectedRevision, ...(offsets.textOffset === undefined ? {} : { text_offset: offsets.textOffset }), ...(offsets.peerOffset === undefined ? {} : { peer_offset: offsets.peerOffset }) }); } catch (error) { return Promise.reject(error); }
+    const result = new Promise<TaskDetailView>((resolve, reject) => this.#taskDetailPending.set(id, { taskId, expectedRevision, resolve, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
+  }
+
   /** Edit one agent's configuration. An omitted member is left alone. */
   updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: IdlePolicy; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }): Promise<AgentUpdateResult> {
     const body: AgentUpdateBody = { agent_id: request.agentId, expected_revision: request.expectedRevision };
@@ -354,15 +374,17 @@ export class BrowserSession {
     return this.#consoleRequest("AGENT_UPDATE_RESULT", request.agentId, request.expectedRevision, "agent-update", (id) => encodeClientControl({ type: "AGENT_UPDATE", id, body }));
   }
 
-  /** Edit one still-queued task: title, priority, assignment, or cancel it. */
-  updateTask(request: { taskId: string; expectedRevision: bigint; title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<TaskUpdateResult> {
+  /** Edit one still-queued task: its brief, priority, assignment, or cancel it. */
+  updateTask(request: { taskId: string; expectedRevision: bigint; title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }): Promise<TaskUpdateResult> {
     const body: TaskUpdateBody = { task_id: request.taskId, expected_revision: request.expectedRevision };
     if (request.title !== undefined) body.title = request.title;
+    if (request.body !== undefined) body.body = request.body;
     if (request.priority !== undefined) body.priority = request.priority;
     if (request.assignedAgentId !== undefined) body.assigned_agent_id = request.assignedAgentId;
     if (request.cancel === true) body.status = "cancelled";
     if (
       (request.title !== undefined && (request.title.length === 0 || bounded(request.title, MAX_TASK_TITLE_BYTES))) ||
+      bounded(request.body, MAX_TASK_INSTRUCTION_BYTES) ||
       (request.priority !== undefined && (!Number.isSafeInteger(request.priority) || Math.abs(request.priority) > MAX_TASK_PRIORITY)) ||
       (request.assignedAgentId !== undefined && !validDynamicID(request.assignedAgentId))
     ) return Promise.reject(new SessionError("invalid_request"));
@@ -523,6 +545,7 @@ export class BrowserSession {
     this.#closeTaskPending(new SessionError("closed"));
     this.#closeAgentControlPending(new SessionError("closed"));
     this.#closeTaskHistoryPending(new SessionError("closed"));
+    this.#closeTaskDetailPending(new SessionError("closed"));
     this.#closeConsolePending(new SessionError("closed"));
     this.#closeInvitePending(new SessionError("closed"));
     this.#closeAccountPending(new SessionError("closed"));
@@ -700,6 +723,10 @@ export class BrowserSession {
       this.#taskHistoryResult(frame.body, frame.id);
       return;
     }
+    if (frame.type === "TASK_DETAIL") {
+      this.#taskDetailResult(frame.body, frame.id);
+      return;
+    }
     if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS") {
       this.#consoleResult(frame);
       return;
@@ -810,6 +837,12 @@ export class BrowserSession {
       if (history !== undefined) {
         this.#taskHistoryPending.delete(id);
         history.reject(new SessionError(frame.body.code, frame.body.retryable));
+        return;
+      }
+      const detail = this.#taskDetailPending.get(id);
+      if (detail !== undefined) {
+        this.#taskDetailPending.delete(id);
+        detail.reject(new SessionError(frame.body.code, frame.body.retryable));
         return;
       }
       const console = this.#consolePending.get(id);
@@ -943,6 +976,7 @@ export class BrowserSession {
     this.#closeTaskPending(normalized);
     this.#closeAgentControlPending(normalized);
     this.#closeTaskHistoryPending(normalized);
+    this.#closeTaskDetailPending(normalized);
     this.#closeConsolePending(normalized);
     this.#closeInvitePending(normalized);
     this.#closeAccountPending(normalized);
@@ -1040,6 +1074,11 @@ export class BrowserSession {
     this.#taskHistoryPending.clear();
   }
 
+  #closeTaskDetailPending(error: SessionError | ProtocolError): void {
+    for (const pending of this.#taskDetailPending.values()) pending.reject(error);
+    this.#taskDetailPending.clear();
+  }
+
   /** One shape for the four console request/result pairs. */
   #consoleRequest<T>(kind: ConsolePending["kind"], entityId: string, expectedRevision: bigint, prefix: string, encode: (id: string) => string): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
@@ -1135,6 +1174,13 @@ export class BrowserSession {
       taskId: body.task_id,
       entries: Object.freeze(body.entries.map((entry) => Object.freeze({ operationId: entry.operation_id, kind: entry.kind, actor: entry.actor, body: entry.body, status: entry.status, createdAtMs: entry.created_at_ms }))),
     }));
+  }
+
+  #taskDetailResult(body: TaskDetailBody, id: string): void {
+    const pending = this.#taskDetailPending.get(id);
+    if (pending === undefined || body.task_id !== pending.taskId || body.revision !== pending.expectedRevision) throw new ProtocolError("malformed");
+    this.#taskDetailPending.delete(id);
+    pending.resolve(Object.freeze({ taskId: body.task_id, revision: body.revision, instruction: body.instruction, feedback: body.feedback, ...(body.next_text_offset === undefined ? {} : { nextTextOffset: body.next_text_offset }), peerQuestions: Object.freeze(body.peer_questions.map((question) => Object.freeze({ ...question }))), ...(body.next_peer_offset === undefined ? {} : { nextPeerOffset: body.next_peer_offset }) }));
   }
 
   #mintTarget(descriptor: TerminalTargetDescriptor): TerminalTarget {

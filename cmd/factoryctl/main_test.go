@@ -213,10 +213,11 @@ func TestParseOverseerTaskUpdateKeepsPriority(t *testing.T) {
 	}{
 		{name: "priority only", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "-5"}, priority: -5},
 		{name: "priority and agent", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--priority", "5", "--agent", id}, priority: 5, agent: id},
+		{name: "brief", args: []string{"overseer", "task", "update", "--task", id, "--revision", "7", "--title", "revised", "--body", "revised instruction"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			command, help, ok := parse(test.args)
-			if !ok || help || command.kind != commandOverseerTaskUpdate || !command.prioritySet || command.priority != test.priority || command.agent != test.agent {
+			if !ok || help || command.kind != commandOverseerTaskUpdate || (test.name != "brief" && (!command.prioritySet || command.priority != test.priority || command.agent != test.agent)) || test.name == "brief" && (command.title != "revised" || !command.bodySet || command.body != "revised instruction") {
 				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 			}
 		})

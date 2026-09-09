@@ -50,3 +50,21 @@ func TestBrowserTaskHistoryRequiresPrivateTextCapability(t *testing.T) {
 		t.Fatalf("private history exposed: %v", err)
 	}
 }
+
+func TestBrowserTaskDetailSeparatesEditableInstructionFromFeedback(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail)
+	fixture.pair(t)
+	run := adapterRunningRun(t, fixture.store, 173)
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	base := task.Body
+	detail, err := fixture.backend.TaskDetail(context.Background(), rawBrowserClient(fixture.client.ID), browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision)})
+	if err != nil || detail.Instruction != base || detail.Feedback != "" || detail.Revision != decimalRevision(task.Revision) {
+		t.Fatalf("detail = %+v, %v", detail, err)
+	}
+	if _, err := fixture.backend.TaskDetail(context.Background(), rawBrowserClient(fixture.client.ID), browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision) + 1}); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("stale detail = %v", err)
+	}
+}

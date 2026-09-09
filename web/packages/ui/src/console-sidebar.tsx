@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { AccountItem, AgentItem, StateView, TaskItem } from "@dark-factory/client";
+import type { AccountItem, AgentItem, StateView, TaskItem, TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
 import { agentStatus, agentCurrentTask } from "./console-view.js";
@@ -19,7 +19,8 @@ export type DiscoveredAccount = Readonly<{
   linked_id: string;
 }>;
 
-export type TaskEdit = Readonly<{ title?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
+export type TaskEdit = Readonly<{ title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
+export type TaskBrief = Readonly<{ taskId: string; revision: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
 
 const EDIT_ERRORS = new Map<string, string>([
   ["stale", "SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN"],
@@ -44,6 +45,7 @@ export function AgentPanel({
   ready,
   onSaveConfig,
   onEditTask,
+  onLoadTaskDetail,
   onOpenTerminal,
   onClose,
   children,
@@ -53,7 +55,8 @@ export function AgentPanel({
   edit?: FactoryEditView;
   ready: boolean;
   onSaveConfig?: (config: AgentConfigEdit) => void;
-  onEditTask?: (task: TaskItem, change: TaskEdit) => void;
+  onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint) => Promise<TaskBrief>;
   onOpenTerminal?: () => void;
   onClose?: () => void;
   /** The instruction composer the terminal view owns for an idle agent. */
@@ -64,7 +67,13 @@ export function AgentPanel({
   const queued = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
     .sort((left, right) => right.priority - left.priority);
+  const recent = state === undefined ? [] : [...state.tasks.values()]
+    .filter((task) => task.assigned_agent_id === agent.id && task.status !== "queued")
+    .sort((left, right) => left.revision === right.revision ? 0 : left.revision > right.revision ? -1 : 1)
+    .slice(0, 4);
   const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
+  const [conversation, setConversation] = useState<{ task: TaskItem; brief: TaskBrief }>();
+  useEffect(() => { setConversation(undefined); }, [agent.id]);
   const errorCopy = editErrorCopy(edit);
   const queueHint = agent.paused
     ? "QUEUE PAUSED"
@@ -106,7 +115,7 @@ export function AgentPanel({
           <ul className="dfFactoryConsole__list">
             {queued.map((task, index) => (
               <QueuedTask
-                key={formKey(task.id, task.revision)}
+                key={task.id}
                 task={task}
                 above={queued[index - 1]}
                 below={queued[index + 1]}
@@ -114,12 +123,19 @@ export function AgentPanel({
                 pending={edit?.pending === true}
                 ready={ready}
                 onEditTask={onEditTask}
+				onLoadTaskDetail={onLoadTaskDetail}
               />
             ))}
           </ul>
         )}
         {children}
       </div>
+
+      {recent.length === 0 || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Recent work">
+        <h3>RECENT WORK</h3>
+        <ul className="dfFactoryConsole__list">{recent.map((task) => <li key={task.id} className="dfConsoleSidebar__task"><p className="dfConsoleRow__title">{task.title}</p><button type="button" onClick={async () => { try { setConversation({ task, brief: await onLoadTaskDetail(task) }); } catch { setConversation(undefined); } }}>VIEW CONVERSATION</button></li>)}</ul>
+        {conversation === undefined ? null : <section aria-label="Task conversation"><p>{conversation.task.title}</p>{conversation.brief.peerQuestions.length === 0 ? <p>NO PEER QUESTIONS</p> : conversation.brief.peerQuestions.map((question) => <p key={question.id}>QUESTION · {question.source_task_id} → {question.target_task_id} · {question.recipient_delivery_state.toUpperCase()}<br />{question.question}{question.answer === undefined || question.answer === "" ? "" : `\nANSWER · ${question.answer} · ${question.answer_delivery_state.toUpperCase()}`}</p>)}</section>}
+      </div>}
 
       {onOpenTerminal === undefined ? null : (
         <button type="button" className="dfConsoleSidebar__terminal" disabled={!ready} onClick={onOpenTerminal}>OPEN TERMINAL</button>
@@ -247,6 +263,7 @@ function QueuedTask({
   pending,
   ready,
   onEditTask,
+  onLoadTaskDetail,
 }: {
   task: TaskItem;
   above?: TaskItem;
@@ -254,36 +271,70 @@ function QueuedTask({
   peers: readonly AgentItem[];
   pending: boolean;
   ready: boolean;
-  onEditTask?: (task: TaskItem, change: TaskEdit) => void;
+  onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint) => Promise<TaskBrief>;
 }) {
+  const [brief, setBrief] = useState<TaskBrief>();
   const [title, setTitle] = useState(task.title);
+  const [instruction, setInstruction] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [detailError, setDetailError] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [openedRevision, setOpenedRevision] = useState<bigint>();
   const disabled = pending || !ready || onEditTask === undefined;
+  const stale = open && openedRevision !== task.revision;
+  const load = async (peerOffset?: bigint) => {
+    if (onLoadTaskDetail === undefined) return;
+    setLoading(true);
+    setDetailError(false);
+    try {
+      const loaded = await onLoadTaskDetail(task, peerOffset);
+      setBrief(loaded);
+      if (peerOffset === undefined) {
+        setTitle(task.title);
+        setInstruction(loaded.instruction);
+        setOpenedRevision(task.revision);
+        setOpen(true);
+      }
+    } catch {
+      setDetailError(true);
+    } finally {
+      setLoading(false);
+    }
+  };
   if (onEditTask === undefined) {
     return <li className="dfConsoleSidebar__task"><p className="dfConsoleRow__title">{task.title}</p></li>;
   }
   return (
     <li className="dfConsoleSidebar__task">
-      <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-title-${task.id}`}>Title for {task.title}</label>
-      <input
-        id={`df-title-${task.id}`}
-        value={title}
-        disabled={disabled}
-        onChange={(event) => setTitle(event.currentTarget.value)}
-        onBlur={() => { if (title !== task.title && title.trim().length > 0) onEditTask(task, { title }); }}
-      />
+      {open ? <>
+        <label htmlFor={`df-title-${task.id}`}>TITLE</label>
+        <input id={`df-title-${task.id}`} value={title} disabled={disabled || loading || stale} onChange={(event) => setTitle(event.currentTarget.value)} />
+        <label htmlFor={`df-instruction-${task.id}`}>INSTRUCTION</label>
+        <textarea id={`df-instruction-${task.id}`} rows={4} value={instruction} disabled={disabled || loading || stale} onChange={(event) => setInstruction(event.currentTarget.value)} />
+        {brief?.feedback === "" || brief === undefined ? null : <><label>RETAINED REVIEW FEEDBACK</label><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
+		{brief?.peerQuestions.length === 0 || brief === undefined ? null : <section aria-label="Task conversation"><label>CONVERSATION</label>{brief.peerQuestions.map((question) => <p key={question.id}>{question.question}{question.answer === undefined || question.answer === "" ? "" : ` · ${question.answer}`}</p>)}</section>}
+		{brief?.nextPeerOffset === undefined ? null : <button type="button" disabled={loading} onClick={() => { void load(brief.nextPeerOffset); }}>OLDER CONVERSATION</button>}
+		{stale ? <p role="alert">TASK CHANGED — REOPEN BRIEF TO SAVE</p> : null}
+        <div className="dfConsoleSidebar__taskActions">
+          <button type="button" disabled={disabled || loading || stale || title.trim() === ""} onClick={async () => { if (await onEditTask(task, { title, body: instruction })) setOpen(false); }}>{pending ? "SAVING" : "SAVE BRIEF"}</button>
+          {stale ? <button type="button" disabled={loading} onClick={() => { void load(); }}>REOPEN BRIEF</button> : null}
+          <button type="button" disabled={loading} onClick={() => setOpen(false)}>DISCARD</button>
+        </div>
+      </> : <><p className="dfConsoleRow__title">{task.title}</p><button type="button" disabled={disabled || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button>{detailError ? <p role="alert">THE FACTORY REFUSED THIS EDIT</p> : null}</>}
       <div className="dfConsoleSidebar__taskActions">
-        <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
-        <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>
+        <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) void onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
+        <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) void onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>
         <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-assign-${task.id}`}>Agent for {task.title}</label>
         <select
           id={`df-assign-${task.id}`}
           value={task.assigned_agent_id}
           disabled={disabled}
-          onChange={(event) => onEditTask(task, { assignedAgentId: event.currentTarget.value })}
+          onChange={(event) => { void onEditTask(task, { assignedAgentId: event.currentTarget.value }); }}
         >
           {peers.map((peer) => <option key={peer.id} value={peer.id}>{peer.name}</option>)}
         </select>
-        <button type="button" disabled={disabled} onClick={() => onEditTask(task, { cancel: true })}>CANCEL</button>
+        <button type="button" disabled={disabled} onClick={() => { void onEditTask(task, { cancel: true }); }}>CANCEL</button>
       </div>
     </li>
   );

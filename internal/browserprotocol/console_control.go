@@ -35,6 +35,7 @@ type TaskUpdate struct {
 	TaskID           string  `json:"task_id"`
 	ExpectedRevision Decimal `json:"expected_revision"`
 	Title            *string `json:"title,omitempty"`
+	Body             *string `json:"body,omitempty"`
 	Priority         *int64  `json:"priority,omitempty"`
 	AssignedAgentID  *string `json:"assigned_agent_id,omitempty"`
 	Status           *string `json:"status,omitempty"`
@@ -199,6 +200,7 @@ func validConsoleControl(kind MessageType, body any) error {
 	case TaskUpdate:
 		if validateDynamicID(value.TaskID) != nil || value.ExpectedRevision == 0 ||
 			value.Title != nil && validateBoundedText(*value.Title, 1, MaxTaskTitleBytes) != nil ||
+			value.Body != nil && validateBoundedText(*value.Body, 0, MaxTaskInstructionBytes) != nil ||
 			value.Priority != nil && (*value.Priority < -MaxTaskPriority || *value.Priority > MaxTaskPriority) ||
 			value.AssignedAgentID != nil && validateDynamicID(*value.AssignedAgentID) != nil ||
 			value.Status != nil && *value.Status != "cancelled" {

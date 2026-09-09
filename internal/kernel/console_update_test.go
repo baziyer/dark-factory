@@ -88,14 +88,14 @@ func TestUpdateTaskEditsAndCancelsOnlyWhileQueued(t *testing.T) {
 	ctx := context.Background()
 	task, err := store.EnqueueTask(ctx, NewTask{
 		ID: taskID(t, 45), ProjectID: project.ID, AssignedAgentID: agent.ID,
-		IncarnationID: incarnationID(t, 46), Title: "before", Priority: 1,
+		IncarnationID: incarnationID(t, 46), Title: "before", Body: "original instruction", Priority: 1,
 	}, mustTime(t, 5))
 	if err != nil {
 		t.Fatal(err)
 	}
-	title, priority := "after", int64(9)
-	edited, err := store.UpdateTask(ctx, task.ID, task.Revision, TaskPatch{Title: &title, Priority: &priority}, mustTime(t, 6))
-	if err != nil || edited.Title != title || edited.Priority != priority || edited.Status != TaskQueued || edited.Revision.Int64() != task.Revision.Int64()+1 {
+	title, body, priority := "after", "replacement instruction", int64(9)
+	edited, err := store.UpdateTask(ctx, task.ID, task.Revision, TaskPatch{Title: &title, Body: &body, Priority: &priority}, mustTime(t, 6))
+	if err != nil || edited.Title != title || edited.Body != body || edited.WorkRevision != task.WorkRevision || edited.Priority != priority || edited.Status != TaskQueued || edited.Revision.Int64() != task.Revision.Int64()+1 {
 		t.Fatalf("edit = %+v, %v", edited, err)
 	}
 	// A foreign agent cannot be assigned: the durable key is (agent, project).
@@ -123,6 +123,20 @@ func TestUpdateTaskEditsAndCancelsOnlyWhileQueued(t *testing.T) {
 	}
 }
 
+func TestTaskBodyWithInstructionRetainsOnlyLatestSendBackNote(t *testing.T) {
+	previousOffset := int64(len("original"))
+	task := Task{Title: "fallback title", Body: "original\n\n## Sent back for work revision 2\n\nlatest review", SentBackInstructionBytes: &previousOffset}
+	body, offset := TaskBodyWithInstruction(task, "replacement")
+	if body != "replacement\n\n## Sent back for work revision 2\n\nlatest review" || offset == nil || *offset != int64(len("replacement")) || TaskInstruction(Task{Body: body, SentBackInstructionBytes: offset}) != "replacement" || TaskFeedback(Task{Body: body, SentBackInstructionBytes: offset}) != "\n\n## Sent back for work revision 2\n\nlatest review" {
+		t.Fatalf("edited send-back body = %q offset=%v", body, offset)
+	}
+	empty := Task{Title: "fallback title", Body: "\n\n## Sent back for work revision 2\n\nlatest review", SentBackInstructionBytes: new(int64)}
+	body, offset = TaskBodyWithInstruction(empty, "")
+	if body != "fallback title\n\n## Sent back for work revision 2\n\nlatest review" || offset == nil || *offset != int64(len("fallback title")) || SentBackBody(Task{Title: empty.Title, Body: body, SentBackInstructionBytes: offset, WorkRevision: mustRevision(t, 2)}, "next") != "fallback title\n\n## Sent back for work revision 3\n\nnext" {
+		t.Fatalf("empty edited send-back body = %q offset=%v", body, offset)
+	}
+}
+
 func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 	ctx := context.Background()
 	store, run, keys := runningOrchestratorRun(t)
@@ -140,7 +154,7 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 		priority *int64
 		cancel   bool
 	}{{priority: &priority}, {cancel: true}} {
-		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, update.priority, nil, update.cancel, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
+		if _, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, queued.ID, queued.Revision, TaskPatch{Priority: update.priority, Cancel: update.cancel}, mustTime(t, 42)); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("orchestrator task patch = %v", err)
 		}
 	}
@@ -152,7 +166,7 @@ func TestUpdateTaskForOverseerTargetsOnlyWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, &priority, nil, false, mustTime(t, 45))
+	updated, err := store.UpdateTaskForOverseer(ctx, keys.AttemptDigest, workerTask.ID, workerTask.Revision, TaskPatch{Priority: &priority}, mustTime(t, 45))
 	if err != nil || updated.Priority != priority || updated.Title != workerTask.Title {
 		t.Fatalf("worker task patch = %+v, %v", updated, err)
 	}

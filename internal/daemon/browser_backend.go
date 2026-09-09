@@ -374,13 +374,16 @@ func (backend *browserBackend) UpdateTask(ctx context.Context, rawClient [browse
 	if err != nil {
 		return browserprotocol.TaskUpdateResult{}, browser.ErrStale
 	}
-	patch := kernel.TaskPatch{Title: request.Title, Priority: request.Priority, Cancel: request.Status != nil}
+	patch := kernel.TaskPatch{Title: request.Title, Body: request.Body, Priority: request.Priority, Cancel: request.Status != nil}
 	if request.AssignedAgentID != nil {
 		assigned, err := browserID(*request.AssignedAgentID, kernel.AgentIDFromBytes)
 		if err != nil {
 			return browserprotocol.TaskUpdateResult{}, browser.ErrStale
 		}
 		patch.AssignedAgentID = &assigned
+	}
+	if err := prepareQueuedTaskPatch(ctx, backend.store, taskID, expected, patch); err != nil {
+		return browserprotocol.TaskUpdateResult{}, consoleUpdateError(err)
 	}
 	at, err := backend.timestamp()
 	if err != nil {

@@ -586,7 +586,8 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
       state,
       selectedAgent: agentSelection(),
       onSaveAgentConfig: (config) => edits.push(["config", config]),
-      onEditTask: (task, change) => edits.push([task.id, change]),
+      onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
+		onLoadTaskDetail: async (task, peerOffset) => ({ taskId: task.id, revision: task.revision, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) }),
     };
     let renderer;
     await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
@@ -601,10 +602,15 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     assert.equal(byLabel(`Move ${queued.title} up`).props.disabled, true, "the first task cannot rise");
     assert.equal(byLabel(`Move ${other.title} down`).props.disabled, true, "the last task cannot fall");
 
+    const editBrief = () => renderer.root.findAllByType("button").find((button) => button.props.children === "EDIT BRIEF");
+    await act(async () => { await editBrief().props.onClick(); });
     const title = renderer.root.findAllByType("input").find((input) => input.props.value === queued.title);
     await act(async () => { title.props.onChange({ currentTarget: { value: "Renamed" } }); });
-    await act(async () => { title.props.onBlur(); });
-    assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed" }]);
+    const instruction = renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`);
+    await act(async () => { instruction.props.onChange({ currentTarget: { value: "Replacement brief" } }); });
+		assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === "Review this carefully"));
+    await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.onClick(); });
+    assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed", body: "Replacement brief" }]);
 
     const assign = renderer.root.findAllByType("select").find((select) => select.props.id === `df-assign-${queued.id}`);
     // Reassignment offers only agents in the same project.
@@ -612,19 +618,33 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { assign.props.onChange({ currentTarget: { value: "23".repeat(16) } }); });
     assert.deepEqual(edits.at(-1), [queued.id, { assignedAgentId: "23".repeat(16) }]);
 
-    await act(async () => { buttons.filter((button) => button.props.children === "CANCEL")[0].props.onClick(); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "CANCEL").props.onClick(); });
     assert.deepEqual(edits.at(-1), [queued.id, { cancel: true }]);
 
-    // A refused rename reverts to the served title. A refusal never moves the
-    // revision, so without this the input would resend it on the next blur.
+    // A refused brief edit preserves the operator's drafts at the unchanged
+    // revision, rather than silently replacing the intended instruction.
+    await act(async () => { await editBrief().props.onClick(); });
     const titleValue = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.value;
+    const instructionValue = () => renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.value;
     const modelInput = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-model-${ids.agent}`);
-    assert.equal(titleValue(), "Renamed");
+    await act(async () => { renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this draft" } }); });
+    await act(async () => { renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this instruction" } }); });
+    assert.equal(titleValue(), "Keep this draft");
+    await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
+    const revised = baseState({ tasks: new Map([[queued.id, { ...queued, assigned_agent_id: ids.agent, revision: queued.revision + 1n }], [other.id, { ...other, assigned_agent_id: ids.agent }]]) });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, state: revised })); });
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
+    assert.equal(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("TASK CHANGED")), true);
+    assert.equal(renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.disabled, true);
     // A refusal belongs to the form that earned it: the config form the
     // operator is still typing into keeps what it holds.
     await act(async () => { modelInput().props.onChange({ currentTarget: { value: "half-typed" } }); });
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: queued.id, pending: false, error: new SessionError("stale") } })); });
-    assert.equal(titleValue(), queued.title);
+    assert.equal(titleValue(), "Keep this draft");
+    assert.equal(instructionValue(), "Keep this instruction");
     assert.equal(modelInput().props.value, "half-typed");
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: ids.agent, pending: false, error: new SessionError("stale") } })); });
     assert.equal(modelInput().props.value, fixtureState.agents.get(ids.agent).model);

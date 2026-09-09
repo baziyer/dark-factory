@@ -877,11 +877,15 @@ func (daemon *Daemon) overseerUpdateTask(ctx context.Context, call api.Call) api
 		}
 		assignedAgentID = &agentID
 	}
+	patch := kernel.TaskPatch{Title: input.Title, Body: input.Body, Priority: input.Priority, AssignedAgentID: assignedAgentID, Cancel: input.Cancel}
+	if err := prepareQueuedTaskPatch(ctx, daemon.store, id, expected, patch); err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
 	at, err := daemon.timestamp()
 	if err != nil {
 		return newErrorReply(api.RemoteInternal)
 	}
-	task, err := daemon.store.UpdateTaskForOverseer(ctx, digest, id, expected, input.Priority, assignedAgentID, input.Cancel, at)
+	task, err := daemon.store.UpdateTaskForOverseer(ctx, digest, id, expected, patch, at)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
 	}

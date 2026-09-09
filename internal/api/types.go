@@ -330,6 +330,8 @@ type OverseerTaskCreateInput struct {
 type OverseerTaskUpdateInput struct {
 	TaskID           string  `json:"task_id"`
 	ExpectedRevision uint64  `json:"expected_revision"`
+	Title            *string `json:"title,omitempty"`
+	Body             *string `json:"body,omitempty"`
 	Priority         *int64  `json:"priority,omitempty"`
 	AssignedAgentID  *string `json:"assigned_agent_id,omitempty"`
 	Cancel           bool    `json:"cancel,omitempty"`

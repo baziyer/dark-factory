@@ -18,6 +18,12 @@ question, stop or replace its objective, send work back, and pause or resume
 future admission. These commands use your attempt credential; an operator
 credential is neither available nor required. Run a command with `--help` for
 its exact flags. All targets must remain in your project.
+`overseer task update --task ID --revision REVISION --title TEXT --body TEXT`
+edits only a queued worker task. The body replaces its base instruction while
+the latest retained send-back note remains attached as read-only review
+feedback; it does not create a new `work_revision`. Use priority, assignment,
+or cancel alone when changing a legacy task whose stored prompt is no longer
+accepted by its provider.
 For `factoryctl` controls, mint a 32-hex operation ID once (for example,
 `python3 -c 'import uuid; print(uuid.uuid4().hex)'`) and keep it when observing or
 retrying that operation. Supply `--task-id` and `--incarnation-id` when creating

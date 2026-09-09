@@ -102,7 +102,8 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       onCloseAgent={() => { setTerminalOpen(false); owner.current?.clearAgentTerminal(); }}
       onOpenAgentTerminal={() => setTerminalOpen(true)}
       onSaveAgentConfig={(config) => { void owner.current?.updateAgentConfig(config); }}
-      onEditTask={(task, change) => { void owner.current?.editTask(task, change); }}
+      onEditTask={(task, change) => owner.current?.editTask(task, change) ?? Promise.resolve(false)}
+      onLoadTaskDetail={(task, peerOffset) => owner.current?.taskDetail(task, peerOffset) ?? Promise.reject(new Error("closed"))}
       onOpenTerminalForHumanRequest={(request) => { setTerminalOpen(true); owner.current?.openTerminalForHumanRequest(request); }}
       onSelectHumanRequest={(request) => openSidebar(() => { void owner.current?.selectHumanRequest(request); })}
       onHumanReplyChange={(reply) => owner.current?.setHumanReply(reply)}
@@ -192,7 +193,7 @@ function AgentIdleTools({ terminal, controller }: { terminal: FactoryTerminalVie
   return (
     <>
       <AgentInstruction terminal={terminal} mode={mode} onDraftChange={(instruction) => controller.setAgentInstructionDraft(instruction)} onSubmit={(instruction, mode) => controller.enqueueAgentInstruction(instruction, mode)} />
-      {terminal.history === undefined && !terminal.historyPending ? null : <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />}
+      {terminal.history === undefined && !terminal.historyPending ? null : <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} onLoadConversation={() => controller.loadTaskDetail()} onLoadOlderConversation={() => controller.loadOlderTaskConversation()} />}
     </>
   );
 }
@@ -227,21 +228,22 @@ function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView
         <button type="button" disabled={pending} onClick={() => { void controller.controlAgent("stop"); }}>STOP CURRENT</button>
         <button type="button" disabled={pending || instruction.trim() === ""} onClick={() => { void submit("replace"); }}>STOP CURRENT / START NEW</button>
       </div>
-      <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} />
+      <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} onLoadConversation={() => controller.loadTaskDetail()} onLoadOlderConversation={() => controller.loadOlderTaskConversation()} />
     </section>
   );
 }
 
-function TaskHistory({ terminal, onRefresh }: { terminal: FactoryTerminalView; onRefresh: () => void }) {
+function TaskHistory({ terminal, onRefresh, onLoadConversation, onLoadOlderConversation }: { terminal: FactoryTerminalView; onRefresh: () => void; onLoadConversation: () => void; onLoadOlderConversation: () => void }) {
   const history = terminal.history;
   return (
     <section className="dfFactoryConsole__history" aria-label="Task control history">
-      <div className="dfFactoryConsole__historyHeading"><h3>HISTORY</h3><button type="button" disabled={terminal.historyPending} onClick={onRefresh}>{terminal.historyPending ? "LOADING" : "REFRESH"}</button></div>
+      <div className="dfFactoryConsole__historyHeading"><h3>HISTORY</h3><button type="button" disabled={terminal.historyPending} onClick={onRefresh}>{terminal.historyPending ? "LOADING" : "REFRESH"}</button><button type="button" disabled={terminal.taskDetailPending} onClick={onLoadConversation}>{terminal.taskDetailPending ? "LOADING" : "VIEW CONVERSATION"}</button></div>
       {history === undefined || history.entries.length === 0 ? <p className="dfFactoryConsole__instructionState">{terminal.historyPending ? "LOADING RECEIPTS" : "NO DURABLE CONTROLS YET"}</p> : (
         <ol>
           {history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span></li>)}
         </ol>
       )}
+		{terminal.taskDetail === undefined ? null : <section aria-label="Task conversation"><h3>CONVERSATION</h3>{terminal.taskDetail.peerQuestions.length === 0 ? <p className="dfFactoryConsole__instructionState">NO PEER QUESTIONS</p> : <ol>{terminal.taskDetail.peerQuestions.map((question) => <li key={question.id}><strong>QUESTION · {question.source_task_id} → {question.target_task_id}</strong><span>{question.question}</span><small>RECIPIENT DELIVERY · {question.recipient_delivery_state.toUpperCase()}</small>{question.answer === undefined || question.answer === "" ? null : <><span>ANSWER · {question.answer}</span><small>ANSWER DELIVERY · {question.answer_delivery_state.toUpperCase()}</small></>}</li>)}</ol>}{terminal.taskDetail.nextPeerOffset === undefined ? null : <button type="button" disabled={terminal.taskDetailPending} onClick={onLoadOlderConversation}>OLDER CONVERSATION</button>}</section>}
     </section>
   );
 }
