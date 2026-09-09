@@ -370,6 +370,14 @@ func parse(args []string) (attemptCommand, bool, bool) {
 			offset, _ := strconv.ParseUint(args[4], 10, 64)
 			return attemptCommand{kind: commandPeerStatus, textOffset: offset}, false, true
 		}
+		if len(args) == 7 && args[2] == "status" && validRevision(args[4]) && validRevision(args[6]) && ((args[3] == "--offset" && args[5] == "--target-offset") || (args[3] == "--target-offset" && args[5] == "--offset")) {
+			first, _ := strconv.ParseUint(args[4], 10, 64)
+			second, _ := strconv.ParseUint(args[6], 10, 64)
+			if args[3] == "--offset" {
+				return attemptCommand{kind: commandPeerStatus, offset: first, textOffset: second}, false, true
+			}
+			return attemptCommand{kind: commandPeerStatus, offset: second, textOffset: first}, false, true
+		}
 		if len(args) == 9 && args[2] == "ask" && args[3] == "--task" && validHumanRequestKey(args[4]) && args[5] == "--idempotency-key" && validHumanRequestKey(args[6]) && args[7] == "--question" && validPeerText(args[8]) {
 			return attemptCommand{kind: commandPeerAsk, id: args[4], idempotencyKey: args[6], text: args[8]}, false, true
 		}

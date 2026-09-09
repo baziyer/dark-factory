@@ -189,6 +189,8 @@ func TestParseExactAttemptCommands(t *testing.T) {
 		{name: "peer status", args: []string{"attempt", "peer", "status"}, command: attemptCommand{kind: commandPeerStatus}},
 		{name: "peer status history page", args: []string{"attempt", "peer", "status", "--offset", "4"}, command: attemptCommand{kind: commandPeerStatus, offset: 4}},
 		{name: "peer status target page", args: []string{"attempt", "peer", "status", "--target-offset", "4"}, command: attemptCommand{kind: commandPeerStatus, textOffset: 4}},
+		{name: "peer status both pages", args: []string{"attempt", "peer", "status", "--offset", "4", "--target-offset", "8"}, command: attemptCommand{kind: commandPeerStatus, offset: 4, textOffset: 8}},
+		{name: "peer status both pages reversed", args: []string{"attempt", "peer", "status", "--target-offset", "8", "--offset", "4"}, command: attemptCommand{kind: commandPeerStatus, offset: 4, textOffset: 8}},
 		{name: "peer ask", args: []string{"attempt", "peer", "ask", "--task", "0123456789abcdef0123456789abcdef", "--idempotency-key", "fedcba9876543210fedcba9876543210", "--question", "need context"}, command: attemptCommand{kind: commandPeerAsk, id: "0123456789abcdef0123456789abcdef", idempotencyKey: "fedcba9876543210fedcba9876543210", text: "need context"}},
 		{name: "peer answer", args: []string{"attempt", "peer", "answer", "--question", "0123456789abcdef0123456789abcdef", "--revision", "7", "--idempotency-key", "fedcba9876543210fedcba9876543210", "--answer", "context"}, command: attemptCommand{kind: commandPeerAnswer, id: "0123456789abcdef0123456789abcdef", expectedRevision: 7, idempotencyKey: "fedcba9876543210fedcba9876543210", text: "context"}},
 		{name: "send back", args: []string{"attempt", "send-back", "--task", "0123456789abcdef0123456789abcdef", "--note", "five findings"}, command: attemptCommand{kind: commandSendBack, id: "0123456789abcdef0123456789abcdef", text: "five findings"}},
@@ -238,6 +240,19 @@ func TestParseOverseerStatusPaging(t *testing.T) {
 	} {
 		if _, _, ok := parse(args); ok {
 			t.Fatalf("invalid paged status accepted: %v", args)
+		}
+	}
+}
+
+func TestParsePeerStatusRejectsDuplicateOrMalformedPageFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"attempt", "peer", "status", "--offset", "4", "--offset", "8"},
+		{"attempt", "peer", "status", "--target-offset", "4", "--target-offset", "8"},
+		{"attempt", "peer", "status", "--offset", "0", "--target-offset", "8"},
+		{"attempt", "peer", "status", "--offset", "4", "--target-offset", "not-a-number"},
+	} {
+		if _, _, ok := parse(args); ok {
+			t.Fatalf("invalid peer status page flags accepted: %v", args)
 		}
 	}
 }
