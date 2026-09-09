@@ -284,8 +284,20 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 	if err != nil {
 		return RecoveredUncertain, err
 	}
-	if _, err := daemon.consumeAttemptResult(result, true); err != nil {
-		return RecoveredUncertain, err
+	// A prior recovery may have already reached the exact terminal-close
+	// postcondition. Its removal authorization validates the same run, proof,
+	// runtime, provider, runner, and session binding without replaying a
+	// consumption edge whose predecessor revision is no longer available.
+	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	_, authorizedErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
+	cancel()
+	if authorizedErr != nil {
+		if !errors.Is(authorizedErr, kernel.ErrConflict) {
+			return RecoveredUncertain, authorizedErr
+		}
+		if _, err := daemon.consumeAttemptResult(result, true); err != nil {
+			return RecoveredUncertain, err
+		}
 	}
 	current, found, err := daemon.store.Resource(context.Background(), runnerProcess.ID)
 	if err != nil || !found {
@@ -299,10 +311,16 @@ func (daemon *Daemon) recoverAuthenticatedResult(ctx context.Context, parent *Ru
 			return RecoveredUncertain, absenceErr
 		}
 	}
-	if _, err := daemon.closeTerminalAfterRunner(result); err != nil {
-		return RecoveredUncertain, err
+	session, found, err := daemon.store.TerminalSessionForRun(context.Background(), run.ID)
+	if err != nil || !found {
+		return RecoveredUncertain, errors.Join(err, errInvalidContract)
 	}
-	storeCtx, cancel := context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
+	if session.State != kernel.TerminalSessionClosed {
+		if _, err := daemon.closeTerminalAfterRunner(result); err != nil {
+			return RecoveredUncertain, err
+		}
+	}
+	storeCtx, cancel = context.WithTimeout(context.Background(), liveAttemptStoreTimeout)
 	_, authorizeErr := daemon.store.AuthorizeAttemptResultRemoval(storeCtx, result)
 	cancel()
 	if authorizeErr != nil {

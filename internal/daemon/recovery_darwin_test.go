@@ -535,34 +535,98 @@ func TestRecoverySweepConsumesAuthenticResultBeforeAnyAbsenceEdge(t *testing.T) 
 	}
 }
 
-func TestRecoveryReplaysResultConsumedBeforeRunnerAbsence(t *testing.T) {
-	fixture := newRecoveryFixture(t, 0x41)
-	runtimeIdentity := fixture.stageRuntime(t)
-	fixture.beginRunnerStart(t)
-	fixture.activateRunner(t)
-	fixture.writeMarker(t, runner.OuterActivationMarkerName)
-	result, err := kernel.NewInnerUnregisteredConvergedAttemptResult(fixture.run.ID, fixture.run.CredentialDigest, fixture.run.ResultProofDigest(), runtimeIdentity)
-	if err != nil {
-		t.Fatal(err)
+func TestRecoveryReplaysResultAcrossCompletedEdges(t *testing.T) {
+	results := []struct {
+		name  string
+		setup func(*testing.T, *recoveryFixture, kernel.ResourceIdentity) (kernel.AttemptResult, []byte)
+	}{
+		{name: "unregistered inner", setup: func(t *testing.T, fixture *recoveryFixture, runtimeIdentity kernel.ResourceIdentity) (kernel.AttemptResult, []byte) {
+			result, err := kernel.NewInnerUnregisteredConvergedAttemptResult(fixture.run.ID, fixture.run.CredentialDigest, fixture.run.ResultProofDigest(), runtimeIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(forgedResultWire{Version: 1, AttemptID: fixture.run.ID.String(), Kind: "inner_unregistered_converged", Proof: hex.EncodeToString(fixture.proof[:])})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result, body
+		}},
+		{name: "registered inner", setup: func(t *testing.T, fixture *recoveryFixture, runtimeIdentity kernel.ResourceIdentity) (kernel.AttemptResult, []byte) {
+			providerIdentity, err := processResourceIdentity(runner.Identity{PID: 99996, PGID: 99996, Birth: runner.Birth{Seconds: 1700, Microseconds: 3}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := fixture.resourceStates(t)
+			process, group := states[kernel.ResourceProviderProcess], states[kernel.ResourceProviderGroup]
+			if _, _, err := fixture.store.ActivateProviderResources(context.Background(), fixture.run.ID, process.ID, process.Revision, group.ID, group.Revision, providerIdentity, mustKernelTime(t, 240)); err != nil {
+				t.Fatal(err)
+			}
+			session, found, err := fixture.store.TerminalSessionForRun(context.Background(), fixture.run.ID)
+			if err != nil || !found {
+				t.Fatalf("session: found=%v err=%v", found, err)
+			}
+			if fixture.run, err = fixture.store.ActivateRun(context.Background(), fixture.run.ID, session.ID, fixture.currentRun(t).Revision, session.Revision, mustKernelTime(t, 250)); err != nil {
+				t.Fatal(err)
+			}
+			fixture.writeMarker(t, runner.InnerActivationMarkerName)
+			exit, err := kernel.NewAttemptResultExitCode(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := kernel.NewInnerConvergedAttemptResult(fixture.run.ID, fixture.run.CredentialDigest, fixture.run.ResultProofDigest(), runtimeIdentity, providerIdentity, exit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result, []byte(fmt.Sprintf(`{"version":1,"attempt_id":%q,"kind":"inner_converged","proof":%q,"process":{"pid":99996,"pgid":99996,"birth":{"seconds":1700,"microseconds":3}},"exit":{"code":0}}`, fixture.run.ID.String(), hex.EncodeToString(fixture.proof[:])))
+		}},
 	}
-	if _, err := fixture.daemon.consumeAttemptResult(result, false); err != nil {
-		t.Fatalf("initial result consume: %v", err)
+	stages := []struct {
+		name    string
+		advance func(*testing.T, *recoveryFixture, kernel.AttemptResult)
+	}{
+		{name: "before runner absence", advance: func(*testing.T, *recoveryFixture, kernel.AttemptResult) {}},
+		{name: "after runner absence", advance: func(t *testing.T, fixture *recoveryFixture, _ kernel.AttemptResult) {
+			run := fixture.currentRun(t)
+			runner := fixture.resourceStates(t)[kernel.ResourceRunnerProcess]
+			if _, err := fixture.daemon.recordRecoveredRunnerAbsence(run.ID, runner.ID, runner.Identity); err != nil {
+				t.Fatalf("record runner absence: %v", err)
+			}
+		}},
+		{name: "after terminal close", advance: func(t *testing.T, fixture *recoveryFixture, result kernel.AttemptResult) {
+			run := fixture.currentRun(t)
+			runner := fixture.resourceStates(t)[kernel.ResourceRunnerProcess]
+			if _, err := fixture.daemon.recordRecoveredRunnerAbsence(run.ID, runner.ID, runner.Identity); err != nil {
+				t.Fatalf("record runner absence: %v", err)
+			}
+			if _, err := fixture.daemon.closeTerminalAfterRunner(result); err != nil {
+				t.Fatalf("close terminal: %v", err)
+			}
+		}},
 	}
-	// A crash before runner-absence convergence leaves the authenticated spool
-	// and this exact consumed result. Recovery must recognize it without
-	// accepting a different result or reapplying a write.
-	body, err := json.Marshal(forgedResultWire{Version: 1, AttemptID: fixture.run.ID.String(), Kind: "inner_unregistered_converged", Proof: hex.EncodeToString(fixture.proof[:])})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture.writeArtifact(t, body)
-	disposition := fixture.sweep(t)
-	if disposition.Action != RecoveredResultConsumed || disposition.Err != nil {
-		t.Fatalf("replay recovery = %+v", disposition)
-	}
-	run := fixture.currentRun(t)
-	if run.Phase != kernel.RunTerminal || run.RunnerExit == nil || !run.RunnerExit.RecoveredAbsence() {
-		t.Fatalf("replayed recovery run = %+v", run)
+	for resultIndex, resultCase := range results {
+		for stageIndex, stage := range stages {
+			t.Run(resultCase.name+"/"+stage.name, func(t *testing.T) {
+				fixture := newRecoveryFixture(t, byte(0x41+resultIndex*len(stages)+stageIndex))
+				runtimeIdentity := fixture.stageRuntime(t)
+				fixture.beginRunnerStart(t)
+				fixture.activateRunner(t)
+				fixture.writeMarker(t, runner.OuterActivationMarkerName)
+				result, body := resultCase.setup(t, fixture, runtimeIdentity)
+				if _, err := fixture.daemon.consumeAttemptResult(result, false); err != nil {
+					t.Fatalf("initial result consume: %v", err)
+				}
+				fixture.writeArtifact(t, body)
+				stage.advance(t, fixture, result)
+				disposition := fixture.sweep(t)
+				if disposition.Action != RecoveredResultConsumed || disposition.Err != nil {
+					t.Fatalf("replay recovery = %+v", disposition)
+				}
+				run := fixture.currentRun(t)
+				if run.Phase != kernel.RunTerminal || run.RunnerExit == nil || !run.RunnerExit.RecoveredAbsence() {
+					t.Fatalf("replayed recovery run = %+v", run)
+				}
+			})
+		}
 	}
 }
 
