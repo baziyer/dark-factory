@@ -505,6 +505,7 @@ test("the sidebar replaces the right column and the terminal owns it outright", 
   assert.match(css, /\.dfConsoleRow__agent\s*\{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere;/);
   assert.match(css, /\.dfConsoleShell\s*\{[^}]*display: flex;[^}]*align-items: flex-start;/);
   assert.match(css, /\.dfFactoryConsole__terminalPanel :where\(p\)\s*\{\s*margin: 0;/);
+  assert.match(css, /\.dfConsoleRow\s*\{[^}]*flex-wrap: wrap;/);
   assert.match(css, /\.dfConsoleLayout\s*\{[^}]*grid-template-columns: minmax\(0, 2fr\) minmax\(0, 1fr\);/);
   assert.match(css, /\.dfConsoleLayout--narrow \{ grid-template-columns: minmax\(0, 1fr\); \}/);
   assert.match(css, /\.dfFactoryConsole__instructionActions\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap;/);
