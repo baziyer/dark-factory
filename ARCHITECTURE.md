@@ -93,11 +93,21 @@ conservative inspection. No model runs merely to poll an idle project.
 
 ## Browser state
 
-The browser reads one bounded, transactionally pinned public snapshot and is
-told only that the durable head moved. There is no cursor, page, per-entity
-refresh, tombstone or restart taxonomy: a client either holds one whole
-coherent snapshot or none, and a change notification carries nothing but a
-head.
+The browser reads one bounded, transactionally pinned active-state snapshot
+and is told only that the durable head moved. A client holds one coherent
+snapshot or none; a change notification carries only a head. Tasks include
+queued/running work, unresolved request origins, and the most recent completion
+per agent so terminal settlement remains visible. The console groups queues
+by agent; within each queue, the priority/creation-time/ID ordering matches
+admission, including an explicit replacement ahead of that agent's queued
+work. These groups do not predict the global order of starts across agents.
+
+Completed history is a separate private read: `TASK_LIST_GET` returns at most
+ten public task summaries for one agent, newest first, with a total count.
+Each page is transactionally pinned; its last update time and ID form a keyset
+cursor unaffected by unrelated events. A refresh retrieves newer completions;
+no history is deleted or silently folded into the active-state bound. Task
+text and intervention history still require their existing private reads.
 
 The snapshot read runs in a single pinned SQLite transaction and selects only
 public columns, so a concurrent writer cannot produce a mixed head and private
@@ -107,8 +117,9 @@ announced immediately rather than waiting for the next poll.
 
 Bounds are exact and fail closed. Client-to-server control stays at 64 KiB;
 only a server snapshot may reach 1 MiB, and the kernel refuses to project more
-than 4,096 entities. Neither bound truncates: a Factory that does not fit is
-one finite `too_large` answer, never a partial view.
+than 4,096 entities. Neither bound truncates: active state that does not fit is one finite
+`too_large` answer, never a partial view. Accumulated completed history does
+not count against this active-state limit.
 
 The wire contract is unversioned and tolerates additive change. There is no
 envelope generation, no versioned loopback path, no version in the pairing and
@@ -117,7 +128,9 @@ the loopback path is `/browser`, and `/pair` beside it is the one HTML page
 the daemon serves: a script-free confirm page whose form mints a pairing
 challenge and redirects to the hosted console. A control frame carrying a
 member this build does not know is served, so the hosted console and the
-daemon can be installed in either order without a mismatch window.
+daemon tolerate additive members in either installation order. New message
+types still require daemon support; deploy that support before a console
+that uses them.
 
 An ignored member is an ASCII name that is not a known name under any case. A
 non-ASCII name is refused outright, and a member differing from a known one

@@ -8,6 +8,9 @@ import (
 	"fmt"
 )
 
+// taskQueueOrder is shared by admission and the browser queue projection.
+const taskQueueOrder = `priority DESC, created_at_ms ASC, id ASC`
+
 func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMillis) (AdmissionResult, error) {
 	if !keys.valid() {
 		return AdmissionResult{}, fmt.Errorf("%w: invalid admission request", ErrInvalidValue)
@@ -55,14 +58,14 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		), next_for_worker AS (
 			SELECT *, ROW_NUMBER() OVER (
 				PARTITION BY assigned_agent_id
-				ORDER BY replacement DESC, priority DESC, created_at_ms ASC, id ASC
+				ORDER BY replacement DESC, `+taskQueueOrder+`
 			) AS rank
 			FROM eligible
 		)
 		SELECT id, project_id, assigned_agent_id, incarnation_id, work_revision, title, body, sent_back_instruction_bytes, status, priority, blocked_reason, result, completed_at_ms, revision, created_at_ms, updated_at_ms
 		FROM next_for_worker
 		WHERE rank = 1
-		ORDER BY priority DESC, created_at_ms ASC, id ASC
+		ORDER BY `+taskQueueOrder+`
 		LIMIT 1`, factory.Capacity))
 	if err != nil {
 		return AdmissionResult{}, tx.Rollback(err)

@@ -58,7 +58,7 @@ test("packed UI is importable by a clean consumer with its stylesheet export", (
     assert.equal(existsSync(join(installedRoot, "index.d.ts")), true);
     assert.match(readFileSync(join(installedRoot, "factory-app.js"), "utf8"), /^"use client";/);
     const rootTypes = readFileSync(join(installedRoot, "index.d.ts"), "utf8");
-    assert.equal(/browserURL|controllerFactory|FactoryAppLifecycle|TerminalController|TerminalSurface|XtermTerminal/.test(rootTypes), false);
+    assert.equal(/browserPort|controllerFactory|FactoryAppLifecycle|TerminalController|TerminalSurface|XtermTerminal/.test(rootTypes), false);
     assert.match(readFileSync(join(consumer, "node_modules", "@dark-factory", "ui", "dist", "src", "factory-console.css"), "utf8"), /\.dfFactoryConsole\b/);
   } finally {
     rmSync(consumer, { recursive: true, force: true });

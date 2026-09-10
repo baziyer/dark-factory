@@ -114,7 +114,7 @@ review() {
         PATH="$tools:$PATH" "$repository_root/scripts/cold-review.sh" "$@" >/dev/null 2>&1)
 }
 
-unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL DARK_FACTORY_REVIEW_CLAUDE_MODEL
+unset DARK_FACTORY_REVIEW_PROVIDER DARK_FACTORY_REVIEW_MODEL DARK_FACTORY_REVIEW_CLAUDE_MODEL DARK_FACTORY_REVIEW_EVIDENCE_FILE
 printf 'Findings.\nVERDICT: ALLOW\n' >"$reply"
 DARK_FACTORY_REVIEW_OPERATION_ID=0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f \
     review owner/repo 7 "$head" "$base" "$body" "the focus sentinel" || fail "ALLOW did not exit 0"
@@ -160,12 +160,40 @@ grep -q 'submit_pull_request_review' "$args" || fail "Codex prompt does not name
 grep -q 'Do not emit VERDICT until submit_pull_request_review succeeds' "$args" || fail "Codex prompt permits an unrecorded verdict"
 grep -q "$head" "$args" || fail "prompt does not name the head"
 grep -q 'the focus sentinel' "$args" || fail "prompt does not carry the focus"
+grep -q 'No exact-head gate evidence file was supplied' "$args" || fail "prompt does not name absent gate evidence"
+grep -q 'concrete reproducer' "$args" || fail "prompt does not require a reproducer for a block"
+grep -q 'reachable code-path evidence' "$args" || fail "prompt does not require a reachable path for a block"
+grep -q 'current implementation and its existing guards' "$args" || fail "prompt does not require inspecting existing guards"
+grep -q 'documented threat model' "$args" || fail "prompt does not require inspecting the threat model"
+grep -q 'deferred note, not a block' "$args" || fail "prompt does not demote unproven concerns"
 # The session must not run inside the checkout, whose CLAUDE.md, AGENTS.md
 # or .claude directory would otherwise become its own instructions.
 case "$(sed -n 's/^cwd=//p' "$args")" in
     */repo | */repo/*) fail "session runs inside the change under review" ;;
 esac
 grep -q "git -C .* diff $base $head" "$args" || fail "Codex prompt does not scope git to the checkout"
+# A supplied exact-head receipt is copied into the isolated review directory
+# and tells the reviewer to use it rather than futile read-only reruns.
+evidence=$temporary/evidence.md
+printf '{"head":"%s","base":"%s","exit_code":0}\n' "$head" "$base" >"$evidence"
+: >"$args"
+(export DARK_FACTORY_REVIEW_EVIDENCE_FILE="$evidence"; review owner/repo 7 "$head" "$base" "$body") \
+    || fail "review with exact-head gate evidence did not exit 0"
+grep -q 'gate evidence at .*/evidence.md' "$args" || fail "prompt does not name copied gate evidence"
+grep -q 'do not rerun gates or tests' "$args" || fail "prompt does not preserve exact-head gate evidence"
+# A stale or failed receipt must stop before provider execution.
+for bad_receipt in \
+    "{\"head\":\"$base\",\"base\":\"$base\",\"exit_code\":0}" \
+    "{\"head\":\"$head\",\"base\":\"$head\",\"exit_code\":0}" \
+    "{\"head\":\"$head\",\"base\":\"$base\",\"exit_code\":1}" \
+    "{\"head\":\"$head\",\"base\":\"$base\",\"exit_code\":false}" \
+    'malformed'; do
+    printf '%s\n' "$bad_receipt" >"$evidence"
+    : >"$args"
+    status=0
+    (export DARK_FACTORY_REVIEW_EVIDENCE_FILE="$evidence"; review owner/repo 7 "$head" "$base" "$body") || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$args" ] || fail "invalid evidence started a review"
+done
 # Claude remains available for the occasional review that needs it.
 : >"$args"
 DARK_FACTORY_REVIEW_PROVIDER=claude review owner/repo 7 "$head" "$base" "$body" || fail "Claude review did not exit 0"
@@ -335,6 +363,11 @@ status=0
 review owner/repo 7 "$head" "$base" "$temporary/missing.md" || status=$?
 [ "$status" -eq 2 ] || fail "missing body exited $status, want 2"
 [ ! -s "$args" ] || fail "an argument refusal still started a session"
+: >"$args"
+status=0
+(export DARK_FACTORY_REVIEW_EVIDENCE_FILE="$temporary/missing-evidence.md"; review owner/repo 7 "$head" "$base" "$body") || status=$?
+[ "$status" -eq 2 ] || fail "missing gate evidence exited $status, want 2"
+[ ! -s "$args" ] || fail "missing gate evidence still started a session"
 [ -z "$(find "$scratch" -maxdepth 1 -type d -name 'cold-review.*' -print -quit)" ] || fail "scratch clones remain"
 
 echo "cold-review tests passed"

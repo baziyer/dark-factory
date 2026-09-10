@@ -1,5 +1,4 @@
 import {
-  CAPABILITIES,
   MAX_TERMINAL_PAYLOAD,
   MAX_TASK_INSTRUCTION_BYTES,
   ProtocolError,
@@ -20,21 +19,27 @@ import {
   type DiscoveredAccountView,
   type StateView,
   type TaskItem,
+  type TaskListView,
   type TerminalReset,
   type RunPathsView,
   randomOperationID,
   type TopologyView,
 } from "@dark-factory/client";
 import type { RunPathSample } from "./console-view.js";
+import { FactorySettingsCoordinator, type FactoryRemoteInvite } from "./factory-settings-coordinator.js";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
 
-const BROWSER_ENDPOINT = new URL("ws://127.0.0.1:43123/browser");
-const BROWSER_URL = BROWSER_ENDPOINT.toString();
-/** The one loopback address this console dials; SETTINGS shows exactly it. */
-export const BROWSER_HOST = BROWSER_ENDPOINT.host;
-// terminal_input is the bit a remote grant never carries: only a client paired
-// on this machine's own loopback may invite a phone.
-const LOOPBACK_GRANT = CAPABILITIES.human_actions | CAPABILITIES.terminal_input;
+type BrowserEndpoint = Readonly<{ url: string; host: string }>;
+
+export function browserEndpoint(port = 43123): BrowserEndpoint {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new SessionError("connection");
+  const host = `127.0.0.1:${port}`;
+  return { url: `ws://${host}/browser`, host };
+}
+
+const DEFAULT_BROWSER_ENDPOINT = browserEndpoint();
+/** The default production loopback address; settings may show an isolated development listener. */
+export const BROWSER_HOST = DEFAULT_BROWSER_ENDPOINT.host;
 // The daemon caches run paths for five seconds, so one timer at ten never
 // outruns the cache and never lets a room go more than a cycle stale.
 const RUN_PATHS_POLL_MS = 10_000;
@@ -52,11 +57,7 @@ export type FactoryHumanRequestView = Readonly<{
   reply: string;
 }>;
 
-export type FactoryRemoteInvite = Readonly<{
-  link: string;
-  svg: string;
-  expiresAtMs: bigint;
-}>;
+export type { FactoryRemoteInvite } from "./factory-settings-coordinator.js";
 
 export type FactoryAgentSelection = Readonly<{
   id: string;
@@ -137,7 +138,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "discoverAccounts" | "linkAccount">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -148,6 +149,8 @@ export type FactoryAppControllerOptions = {
   history: Pick<History, "replaceState" | "state">;
   onChange: (snapshot: FactoryAppSnapshot) => void;
   onStatusChange?: (status: FactoryAppStatus) => void;
+  /** Package-internal endpoint chosen by FactoryApp's validated public prop. */
+  browser?: BrowserEndpoint;
   /** Package-internal construction boundary used by DOM-free causal tests. */
   clientFactory?: ClientFactory;
 };
@@ -251,12 +254,14 @@ export class FactoryAppController {
   #runPathsDue = false;
   #edit: FactoryEditView | undefined;
   #taskEditConfirmation: TaskEditConfirmation | undefined;
-  #remoteInvite: FactoryRemoteInvite | undefined;
-  #remoteInviteError: string | undefined;
-  #remoteInvitePending = false;
-  #accounts: readonly DiscoveredAccountView[] | undefined;
-  #accountsPending = false;
-  #accountsError: string | undefined;
+  readonly #settings = new FactorySettingsCoordinator({
+    session: () => this.#client?.session,
+    ready: () => !this.#closed && this.#status === "ready",
+    generation: () => this.#generation,
+    current: (generation) => this.#current(generation),
+    errorCode: (error) => finiteError(error).code,
+    publish: () => this.#publish(),
+  });
   #instructionAttempt = 0;
   #generation = 0;
   #started = false;
@@ -267,6 +272,10 @@ export class FactoryAppController {
   }
 
   get snapshot(): FactoryAppSnapshot { return this.#snapshot(); }
+
+  taskList(agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }): Promise<TaskListView> {
+    return this.#client?.session?.getTaskList(agentId, cursor) ?? Promise.reject(new SessionError("closed"));
+  }
 
   start(): void {
     if (this.#started || this.#closed) return;
@@ -286,9 +295,10 @@ export class FactoryAppController {
     const factory = this.#options.clientFactory ?? createBrowserClient;
     let client: ControlledClient;
     try {
+      const browser = this.#options.browser ?? DEFAULT_BROWSER_ENDPOINT;
       client = factory({
-        url: BROWSER_URL,
-        host: BROWSER_HOST,
+        url: browser.url,
+        host: browser.host,
         origin: this.#options.origin,
         challenge: challenge ?? undefined,
         onStatus: (status) => this.#receiveStatus(generation, status),
@@ -702,81 +712,19 @@ export class FactoryAppController {
     if (selected !== undefined && detail?.nextPeerOffset !== undefined && taskID !== undefined && revision !== undefined) void this.#loadTaskDetail(selected, taskID, revision, detail.nextPeerOffset, detail.head);
   }
 
-  /**
-   * The provider logins on this machine. Discovery is an observation, not
-   * durable state, so SETTINGS asks for it when it opens and a refusal is
-   * shown rather than retried.
-   */
-  async loadAccounts(): Promise<void> {
-    const session = this.#client?.session;
-    if (this.#closed || this.#status !== "ready" || session === undefined || this.#accountsPending) return;
-    const generation = this.#generation;
-    this.#accountsPending = true;
-    this.#publish();
-    try {
-      const accounts = await session.discoverAccounts();
-      if (!this.#current(generation)) return;
-      this.#accounts = accounts;
-      this.#accountsError = undefined;
-    } catch (error) {
-      if (!this.#current(generation)) return;
-      this.#accountsError = finiteError(error).code;
-    } finally {
-      if (this.#current(generation)) this.#accountsPending = false;
-    }
-    this.#publish();
-  }
+  /** The provider logins on this machine; SETTINGS explicitly asks for them. */
+  loadAccounts(): Promise<void> { return this.#settings.loadAccounts(); }
 
   /** Link one discovered login, then reread discovery so it shows as linked. */
-  async linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<void> {
-    const session = this.#client?.session;
-    if (this.#closed || this.#status !== "ready" || session === undefined || this.#accountsPending) return;
-    const generation = this.#generation;
-    this.#accountsPending = true;
-    this.#publish();
-    try {
-      await session.linkAccount(request);
-      if (!this.#current(generation)) return;
-      this.#accountsError = undefined;
-    } catch (error) {
-      if (!this.#current(generation)) return;
-      this.#accountsError = finiteError(error).code;
-      this.#accountsPending = false;
-      this.#publish();
-      return;
-    } finally {
-      if (this.#current(generation)) this.#accountsPending = false;
-    }
-    this.#publish();
-    await this.loadAccounts();
+  linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<void> {
+    return this.#settings.linkAccount(request);
   }
 
   /** The mint is never retried: a failure is reported and the operator asks again. */
-  async inviteRemote(): Promise<void> {
-    const session = this.#client?.session;
-    if (this.#closed || this.#status !== "ready" || session === undefined || this.#remoteInvitePending) return;
-    const generation = this.#generation;
-    this.#remoteInvitePending = true;
-    try {
-      const invite = await session.inviteRemote();
-      if (!this.#current(generation)) return;
-      this.#remoteInvite = { link: invite.link, svg: invite.svg, expiresAtMs: invite.expiresAtMs };
-      this.#remoteInviteError = undefined;
-    } catch (error) {
-      if (!this.#current(generation)) return;
-      this.#remoteInvite = undefined;
-      this.#remoteInviteError = finiteError(error).code;
-    } finally {
-      this.#remoteInvitePending = false;
-    }
-    this.#publish();
-  }
+  inviteRemote(): Promise<void> { return this.#settings.inviteRemote(); }
 
   dismissRemoteInvite(): void {
-    if (this.#closed) return;
-    this.#remoteInvite = undefined;
-    this.#remoteInviteError = undefined;
-    this.#publish();
+    if (!this.#closed) this.#settings.dismissRemoteInvite();
   }
 
   beginTerminalSurface(token: object, surfaceVersion = this.#terminalSurfaceVersion): void {
@@ -976,8 +924,7 @@ export class FactoryAppController {
       this.#discardTaskEditConfirmation();
       this.#clearSelection();
       // A reconnect must not show a code minted for the connection that dropped.
-      this.#remoteInvite = undefined;
-      this.#remoteInviteError = undefined;
+      this.#settings.clearRemoteInvite();
     }
     // A wire-level state restart resnapshots on the same authenticated socket;
     // exact terminal discovery and handles remain owned by that session.
@@ -1488,12 +1435,12 @@ export class FactoryAppController {
         replyMaxBytes: selection.detail?.replyMaxBytes ?? 0,
         reply: selection.reply,
       },
-      remoteInviteAllowed: this.#status === "ready" && ((this.#client?.session?.capabilities ?? 0) & LOOPBACK_GRANT) === LOOPBACK_GRANT,
-      remoteInvite: this.#remoteInvite,
-      remoteInviteError: this.#remoteInviteError,
-      accounts: this.#accounts,
-      accountsPending: this.#accountsPending,
-      accountsError: this.#accountsError,
+      remoteInviteAllowed: this.#settings.remoteInviteAllowed,
+      remoteInvite: this.#settings.remoteInvite,
+      remoteInviteError: this.#settings.remoteInviteError,
+      accounts: this.#settings.accounts,
+      accountsPending: this.#settings.accountsPending,
+      accountsError: this.#settings.accountsError,
       selectedAgent: this.#selectedAgent === undefined ? undefined : {
         id: this.#selectedAgent.agent.id,
         name: this.#selectedAgent.agent.name,

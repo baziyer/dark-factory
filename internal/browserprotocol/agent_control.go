@@ -28,6 +28,27 @@ type AgentControlResult struct {
 	SuccessorTaskID string `json:"successor_task_id"`
 }
 
+// TaskListGet pages completed work separately from the active state snapshot.
+type TaskListGet struct {
+	AgentID         string   `json:"agent_id"`
+	BeforeUpdatedAt *Decimal `json:"before_updated_at_ms,omitempty"`
+	BeforeTaskID    string   `json:"before_task_id,omitempty"`
+}
+type TaskList struct {
+	AgentID string     `json:"agent_id"`
+	Head    Decimal    `json:"head"`
+	Total   Decimal    `json:"total"`
+	Tasks   []TaskItem `json:"tasks"`
+	HasMore Bool       `json:"has_more"`
+}
+
+func EncodeTaskListGet(id string, value TaskListGet) ([]byte, error) {
+	return encodeControl(TypeTaskListGet, id, value)
+}
+func EncodeTaskList(id string, value TaskList) ([]byte, error) {
+	return encodeControl(TypeTaskList, id, value)
+}
+
 type TaskHistoryGet struct {
 	TaskID string `json:"task_id"`
 }
@@ -106,6 +127,25 @@ func validAgentControl(kind MessageType, body any) error {
 		return validAgentControl(kind, *v)
 	case *AgentControlResult:
 		return validAgentControl(kind, *v)
+	case *TaskListGet:
+		return validAgentControl(kind, *v)
+	case *TaskList:
+		return validAgentControl(kind, *v)
+	case TaskListGet:
+		if validateDynamicID(v.AgentID) != nil || (v.BeforeUpdatedAt == nil) != (v.BeforeTaskID == "") || v.BeforeTaskID != "" && validateDynamicID(v.BeforeTaskID) != nil {
+			return bad()
+		}
+	case TaskList:
+		if validateDynamicID(v.AgentID) != nil || v.Head == 0 || v.Tasks == nil || len(v.Tasks) > 10 || uint64(v.Total) < uint64(len(v.Tasks)) || bool(v.HasMore) && len(v.Tasks) != 10 {
+			return bad()
+		}
+		seen := make(map[string]bool, len(v.Tasks))
+		for _, task := range v.Tasks {
+			if validateTaskItem(task) != nil || task.AssignedAgentID != v.AgentID || task.Status == "queued" || task.Status == "running" || seen[task.ID] {
+				return bad()
+			}
+			seen[task.ID] = true
+		}
 	case *TaskHistoryGet:
 		return validAgentControl(kind, *v)
 	case *TaskDetailGet:

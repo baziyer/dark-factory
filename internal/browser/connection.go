@@ -446,6 +446,22 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeTaskHistory(frame.ID, result)
+	case browserprotocol.TaskListGet:
+		backend, ok := current.server.backend.(TaskListBackend)
+		if !ok {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := backend.TaskList(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.AgentID != body.AgentID {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeTaskList(frame.ID, result)
 	case browserprotocol.TaskDetailGet:
 		backend, ok := current.server.backend.(AgentControlBackend)
 		if !ok {

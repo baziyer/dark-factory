@@ -143,7 +143,7 @@ func receiptMatchesInstallation(receipt serviceReceipt, home string, config Serv
 	if receipt.PlistPath != plistPath {
 		return fmt.Errorf("%w: receipt plist path", ErrServiceForeign)
 	}
-	_, digest, err := ServicePlist(home, config.Label, receipt.RelayOrigin)
+	_, digest, err := ServicePlist(home, config.Label, receipt.RelayOrigin, receipt.DevelopmentBrowserAddress)
 	if err != nil {
 		return err
 	}
@@ -208,6 +208,9 @@ func serviceInstallLockedAt(ctx context.Context, home, userHome string, config S
 			// same plist. A changed relay origin needs the old job removed.
 			return ServiceStatus{State: ServiceAmbiguous}, fmt.Errorf("%w %q; run factoryctl service uninstall first", ErrServiceRelayOrigin, inspection.relayOrigin)
 		}
+		if inspection.developmentBrowserAddress != config.DevelopmentBrowserAddress {
+			return ServiceStatus{State: ServiceAmbiguous}, fmt.Errorf("%w: installed development browser address differs; run factoryctl service uninstall first", ErrServiceForeign)
+		}
 		return status, nil
 	}
 	if err != nil && !errors.Is(err, ErrServiceResidue) {
@@ -239,14 +242,14 @@ func serviceInstallLockedAt(ctx context.Context, home, userHome string, config S
 			programDigest = digest
 		}
 	}
-	plistBytes, plistDigest, err := ServicePlist(home, config.Label, config.RelayOrigin)
+	plistBytes, plistDigest, err := ServicePlist(home, config.Label, config.RelayOrigin, config.DevelopmentBrowserAddress)
 	if err != nil {
 		return ServiceStatus{}, err
 	}
 	receipt := serviceReceipt{
 		Version: serviceReceiptVersion, Label: config.Label, PlistPath: plistPath,
 		PlistDigest: hex.EncodeToString(plistDigest[:]), ProgramDigest: programDigest,
-		RelayOrigin: config.RelayOrigin,
+		RelayOrigin: config.RelayOrigin, DevelopmentBrowserAddress: config.DevelopmentBrowserAddress,
 	}
 	body, err := encodeServiceReceipt(receipt)
 	if err != nil {
@@ -403,7 +406,7 @@ func serviceUninstallLockedAt(ctx context.Context, home, userHome string, config
 			}
 		}
 	} else {
-		expectedPlist, _, err = ServicePlist(home, config.Label, "")
+		expectedPlist, _, err = ServicePlist(home, config.Label, "", "")
 		if err != nil {
 			return ServiceStatus{}, err
 		}

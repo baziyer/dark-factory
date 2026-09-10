@@ -290,7 +290,7 @@ func TestServiceUninstallAcceptsAReceiptBoundPriorPlist(t *testing.T) {
 func TestServicePlistReadBoundCoversFourEscapedHomePaths(t *testing.T) {
 	fixture := newManageFixture(t)
 	home := "/" + strings.Repeat(`"`, serviceMaxPathBytes-1)
-	body, _, err := ServicePlist(home, fixture.config.Label, "")
+	body, _, err := ServicePlist(home, fixture.config.Label, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,8 +822,9 @@ func TestStagedWritersRefuseCollisionsInsteadOfDeleting(t *testing.T) {
 	}
 }
 
-func TestServiceRelayOriginSurvivesInstallStatusAndUninstall(t *testing.T) {
+func TestServiceArgumentsSurviveInstallStatusAndUninstall(t *testing.T) {
 	const origin = "wss://relay.darkfactory.build"
+	const address = "127.0.0.1:0"
 	fixture := newManageFixture(t)
 	deny := func(context.Context, ...string) launchctlResult {
 		t.Fatal("launchctl ran for a request that should have been refused")
@@ -844,10 +845,11 @@ func TestServiceRelayOriginSurvivesInstallStatusAndUninstall(t *testing.T) {
 	}
 
 	fixture.config.RelayOrigin = origin
+	fixture.config.DevelopmentBrowserAddress = address
 	installed := &recordedLaunchctl{results: append(fixture.printAbsent(), launchctlResult{status: 0}, fixture.printRunning(77))}
 	fixture.install(t, installed.run)
 
-	expected, expectedDigest, err := ServicePlist(fixture.home, fixture.config.Label, origin)
+	expected, expectedDigest, err := ServicePlist(fixture.home, fixture.config.Label, origin, address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,7 +862,7 @@ func TestServiceRelayOriginSurvivesInstallStatusAndUninstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	receipt, err := parseServiceReceipt(receiptBody)
-	if err != nil || receipt.RelayOrigin != origin || receipt.PlistDigest != hex.EncodeToString(expectedDigest[:]) {
+	if err != nil || receipt.RelayOrigin != origin || receipt.DevelopmentBrowserAddress != address || receipt.PlistDigest != hex.EncodeToString(expectedDigest[:]) {
 		t.Fatalf("receipt does not bind the relayed plist: %+v, %v", receipt, err)
 	}
 
@@ -868,6 +870,7 @@ func TestServiceRelayOriginSurvivesInstallStatusAndUninstall(t *testing.T) {
 	// as this installation's property rather than read as foreign bytes.
 	bare := fixture.config
 	bare.RelayOrigin = ""
+	bare.DevelopmentBrowserAddress = ""
 	running := &recordedLaunchctl{results: []launchctlResult{fixture.printRunning(77)}}
 	status, err = inspectServiceAtHome(context.Background(), fixture.home, fixture.userHome, bare, running.run)
 	if err != nil || status.State != ServiceRunning || status.PID != 77 {

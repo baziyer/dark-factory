@@ -53,6 +53,7 @@ const inventory = {
   ui: [
     "console-screens.d.ts", "console-screens.js", "console-sidebar.d.ts", "console-sidebar.js",
     "console-view.d.ts", "console-view.js",
+    "factory-settings-coordinator.d.ts", "factory-settings-coordinator.js",
     "factory-app-controller.d.ts", "factory-app-controller.js", "factory-app.d.ts", "factory-app.js",
     "factory-console.css", "factory-console.d.ts", "factory-console.js",
     "factory-scene/factory-scene.d.ts", "factory-scene/factory-scene.js",

@@ -12,9 +12,9 @@ import (
 	"testing"
 )
 
-// One snapshot carries every public kind, in raw identity order, with nothing
-// dropped. Traversal used to be paged; the coherent read replaces it.
-func TestPublicSnapshotKeepsEveryKindInRawIDOrder(t *testing.T) {
+// Every public kind remains coherent; tasks use admission order, while other
+// entity collections retain raw identity order.
+func TestPublicSnapshotKeepsEveryKindInCanonicalOrder(t *testing.T) {
 	store, run, _ := runningOrchestratorRun(t)
 	defer store.Close()
 	ctx := context.Background()

@@ -54,6 +54,8 @@ function harness(overrides = {}) {
     getTaskDetail: overrides.getTaskDetail ?? (async () => { throw new SessionError("not_found"); }),
     getTopology: overrides.getTopology ?? (async () => { throw new SessionError("not_found"); }),
     getRunPaths: overrides.getRunPaths ?? (async () => { throw new SessionError("not_found"); }),
+    discoverAccounts: overrides.discoverAccounts ?? (async () => []),
+    linkAccount: overrides.linkAccount ?? (async () => ({ accountId: "00".repeat(16), revision: 1n })),
     inviteRemote: overrides.inviteRemote ?? (async () => remoteInvite),
     capabilities: overrides.capabilities ?? 15,
   };
@@ -832,6 +834,24 @@ test("a late path answer from an earlier revision only becomes a retained observ
     paths: ["web"],
   }]]);
   context.controller.watchRunPaths(false);
+});
+
+test("account discovery links once then refreshes its provider view", async () => {
+  const discovered = [];
+  const linked = [];
+  const account = { provider: "codex", home: "/private/account", label: "work", email: "", organization: "", default_model: "", default_reasoning_effort: "", linked_id: "" };
+  const context = harness({
+    discoverAccounts: async () => { discovered.push(true); return [account]; },
+    linkAccount: async (request) => { linked.push(request); return { accountId: "00".repeat(16), revision: 1n }; },
+  });
+  context.controller.start();
+  context.emitStatus("ready");
+  await context.controller.loadAccounts();
+  assert.deepEqual(context.latest().accounts, [account]);
+  await context.controller.linkAccount({ provider: "codex", home: account.home, label: account.label });
+  assert.deepEqual(linked, [{ provider: "codex", home: account.home, label: account.label }]);
+  assert.equal(discovered.length, 2, "link refreshes the discovered provider view");
+  assert.equal(context.latest().accountsPending, false);
 });
 
 test("a remote invitation is offered, stored, dismissed, and its failure reported", async () => {

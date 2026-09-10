@@ -111,6 +111,9 @@ type serviceInspection struct {
 	// rendered from. Install compares it to the requested one so a changed
 	// relay origin refuses instead of silently keeping the old plist.
 	relayOrigin string
+	// developmentBrowserAddress is the receipt-bound requested address, which
+	// may be port zero even though the live listener chose another port.
+	developmentBrowserAddress string
 }
 
 func inspectServiceForAccount(ctx context.Context, home string, config ServiceConfig, launchctl launchctlRun) (status ServiceStatus, resultErr error) {
@@ -177,10 +180,12 @@ func inspectServiceWithCapabilityAt(ctx context.Context, home, userHome string, 
 	// be recognized nor uninstalled.
 	receipt, receiptPresent, receiptErr := readServiceReceipt(home)
 	renderedOrigin := ""
+	renderedDevelopmentBrowserAddress := ""
 	if receiptErr == nil && receiptPresent {
 		renderedOrigin = receipt.RelayOrigin
+		renderedDevelopmentBrowserAddress = receipt.DevelopmentBrowserAddress
 	}
-	plist, err := inspectServicePlist(userDirectory, home, config, renderedOrigin)
+	plist, err := inspectServicePlist(userDirectory, home, config, renderedOrigin, renderedDevelopmentBrowserAddress)
 	if err != nil {
 		return serviceInspection{status: ServiceStatus{State: ServiceAmbiguous}}, errors.Join(ErrServiceAmbiguous, err)
 	}
@@ -204,7 +209,7 @@ func inspectServiceWithCapabilityAt(ctx context.Context, home, userHome string, 
 	if err := homeCapability.stageAbsent(); err != nil {
 		return serviceInspection{status: ServiceStatus{State: ServiceAmbiguous}}, errors.Join(ErrServiceAmbiguous, err)
 	}
-	secondPlist, err := inspectServicePlist(userDirectory, home, config, renderedOrigin)
+	secondPlist, err := inspectServicePlist(userDirectory, home, config, renderedOrigin, renderedDevelopmentBrowserAddress)
 	if err != nil || secondPlist != plist {
 		return serviceInspection{status: ServiceStatus{State: ServiceAmbiguous}}, errors.Join(ErrServiceAmbiguous, err)
 	}
@@ -233,11 +238,11 @@ func inspectServiceWithCapabilityAt(ctx context.Context, home, userHome string, 
 	if err == nil && receiptPresent && plist.present {
 		if matchErr := receiptMatchesInstallation(receipt, home, config, plistPath); matchErr == nil {
 			if observation.present && observation.pid > 0 {
-				return serviceInspection{status: ServiceStatus{State: ServiceRunning, PID: observation.pid}, observation: observation, relayOrigin: renderedOrigin}, nil
+				return serviceInspection{status: ServiceStatus{State: ServiceRunning, PID: observation.pid}, observation: observation, relayOrigin: renderedOrigin, developmentBrowserAddress: renderedDevelopmentBrowserAddress}, nil
 			}
 			// A loaded-but-idle job and an unloaded plist are both restartable
 			// installations; neither grants process authority.
-			return serviceInspection{status: ServiceStatus{State: ServiceInstalled}, observation: observation, relayOrigin: renderedOrigin}, nil
+			return serviceInspection{status: ServiceStatus{State: ServiceInstalled}, observation: observation, relayOrigin: renderedOrigin, developmentBrowserAddress: renderedDevelopmentBrowserAddress}, nil
 		} else {
 			return serviceInspection{status: ServiceStatus{State: ServiceAmbiguous}}, errors.Join(ErrServiceAmbiguous, matchErr)
 		}
@@ -850,7 +855,7 @@ type servicePlistBinding struct {
 	stat   unix.Stat_t
 }
 
-func inspectServicePlist(userHome *serviceDirectory, home string, config ServiceConfig, relayOrigin string) (observation servicePlistObservation, resultErr error) {
+func inspectServicePlist(userHome *serviceDirectory, home string, config ServiceConfig, relayOrigin, developmentBrowserAddress string) (observation servicePlistObservation, resultErr error) {
 	parent := userHome.files[len(userHome.files)-1]
 	var children []*os.File
 	var bindings []servicePlistBinding
@@ -917,7 +922,7 @@ func inspectServicePlist(userHome *serviceDirectory, home string, config Service
 	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Mode&0o7777 != 0o600 || before.Uid != uint32(os.Geteuid()) || before.Nlink != 1 || before.Size <= 0 || before.Size > launchctlOutputLimit {
 		return servicePlistObservation{}, fmt.Errorf("%w: plist metadata", ErrServicePlist)
 	}
-	expected, _, err := ServicePlist(home, config.Label, relayOrigin)
+	expected, _, err := ServicePlist(home, config.Label, relayOrigin, developmentBrowserAddress)
 	if err != nil || int64(len(expected)) != before.Size {
 		return servicePlistObservation{}, fmt.Errorf("%w: plist size", ErrServicePlist)
 	}

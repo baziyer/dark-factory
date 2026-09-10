@@ -69,7 +69,7 @@ const (
   factoryctl init --home ABSOLUTE
   factoryctl doctor --home ABSOLUTE
   factoryctl service status --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE]
-  factoryctl service install --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE] [--relay-origin WSS_ORIGIN]
+  factoryctl service install --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE] [--relay-origin WSS_ORIGIN] [--development-browser-address LOOPBACK]
   factoryctl service start --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE]
   factoryctl service stop --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE]
   factoryctl service uninstall --home ABSOLUTE [--label LABEL] [--plist-dir ABSOLUTE]
@@ -130,6 +130,7 @@ type attemptCommand struct {
 	label           string
 	plistDir        string
 	relayOrigin     string
+	browserAddress  string
 	name            string
 	root            string
 	project         string
@@ -463,6 +464,11 @@ func parseServiceCommand(args []string) (attemptCommand, bool, bool) {
 				return attemptCommand{}, false, false
 			}
 			command.relayOrigin = value
+		case "--development-browser-address":
+			if command.kind != commandServiceInstall || !install.ValidDevelopmentBrowserAddress(value) || value == "" {
+				return attemptCommand{}, false, false
+			}
+			command.browserAddress = value
 		default:
 			return attemptCommand{}, false, false
 		}
@@ -480,6 +486,7 @@ func serviceConfigFor(command attemptCommand) install.ServiceConfig {
 	}
 	config.PlistDirectory = command.plistDir
 	config.RelayOrigin = command.relayOrigin
+	config.DevelopmentBrowserAddress = command.browserAddress
 	return config
 }
 

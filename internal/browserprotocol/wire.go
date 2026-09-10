@@ -56,6 +56,8 @@ const (
 	TypeTaskHistoryGet              MessageType = "TASK_HISTORY_GET"
 	TypeTaskHistory                 MessageType = "TASK_HISTORY"
 	TypeTaskDetailGet               MessageType = "TASK_DETAIL_GET"
+	TypeTaskListGet                 MessageType = "TASK_LIST_GET"
+	TypeTaskList                    MessageType = "TASK_LIST"
 	TypeTaskDetail                  MessageType = "TASK_DETAIL"
 	TypeTaskEnqueue                 MessageType = "TASK_ENQUEUE"
 	TypeTaskEnqueueResult           MessageType = "TASK_ENQUEUE_RESULT"
@@ -372,6 +374,10 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		body = new(TaskHistoryGet)
 	case TypeTaskHistory:
 		body = new(TaskHistory)
+	case TypeTaskListGet:
+		body = new(TaskListGet)
+	case TypeTaskList:
+		body = new(TaskList)
 	case TypeTaskDetailGet:
 		body = new(TaskDetailGet)
 	case TypeTaskDetail:
@@ -504,7 +510,7 @@ func idRequired(kind MessageType) bool {
 		TypeStateGet, TypeStateSnapshot, TypeStateWatch, TypeStateChanged,
 		TypeHumanRequestDetailGet, TypeHumanRequestDetail,
 		TypeHumanRequestReply, TypeHumanRequestReplyResult, TypeHumanRequestCancelRun, TypeHumanRequestCancelRunResult,
-		TypeTaskEnqueue, TypeTaskEnqueueResult, TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskDetailGet, TypeTaskDetail,
+		TypeTaskEnqueue, TypeTaskEnqueueResult, TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskListGet, TypeTaskList, TypeTaskDetailGet, TypeTaskDetail,
 		TypeAgentUpdate, TypeAgentUpdateResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
 		TypeRunPathsGet, TypeRunPaths,
 		TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult,
@@ -526,12 +532,12 @@ func typeAllowed(role senderRole, kind MessageType) bool {
 	if role == clientRole {
 		return kind == TypePairProve || kind == TypeAuthProve || kind == TypeStateGet ||
 			kind == TypeStateWatch || kind == TypeHumanRequestDetailGet || kind == TypeHumanRequestReply || kind == TypeHumanRequestCancelRun || kind == TypeTerminalTargetGet || kind == TypeTerminalAttach || kind == TypeTerminalAck || kind == TypeTerminalLeaseAcquire || kind == TypeTerminalLeaseRenew || kind == TypeTerminalLeaseRelease || kind == TypeTerminalResize || kind == TypeTerminalDetach || kind == TypeTaskEnqueue || kind == TypeRemoteInvite ||
-			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeAgentUpdate || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
+			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeTaskListGet || kind == TypeAgentUpdate || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
 			kind == TypeAccountsDiscover || kind == TypeAccountLink
 	}
 	return role == serverRole && (kind == TypeHello || kind == TypePairResult || kind == TypeAuthResult ||
 		kind == TypeStateSnapshot || kind == TypeStateChanged || kind == TypeHumanRequestDetail || kind == TypeHumanRequestReplyResult || kind == TypeHumanRequestCancelRunResult || kind == TypeTaskEnqueueResult || kind == TypeTerminalTarget || kind == TypeTerminalAttached || kind == TypeTerminalLeaseResult || kind == TypeTerminalResized || kind == TypeTerminalDetached || kind == TypeTerminalInputResult || kind == TypeTerminalEOF || kind == TypeTerminalExit || kind == TypeTerminalReset || kind == TypeRemoteInviteResult ||
-		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeAgentUpdateResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
+		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeTaskList || kind == TypeAgentUpdateResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
 		kind == TypeAccounts || kind == TypeAccountLinkResult)
 }
 
@@ -574,6 +580,10 @@ func dereferenceBody(body any) any {
 	case *TaskHistoryGet:
 		return *value
 	case *TaskHistory:
+		return *value
+	case *TaskListGet:
+		return *value
+	case *TaskList:
 		return *value
 	case *TaskDetailGet:
 		return *value
@@ -914,7 +924,7 @@ func validateBody(kind MessageType, body any) error {
 		return validTerminalControl(kind, body)
 	case TypeHumanRequestCancelRunResult:
 		return validTerminalControl(kind, body)
-	case TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskDetailGet, TypeTaskDetail:
+	case TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskListGet, TypeTaskList, TypeTaskDetailGet, TypeTaskDetail:
 		return validAgentControl(kind, body)
 	case TypeTaskEnqueue, TypeTaskEnqueueResult:
 		return validTaskControl(kind, body)

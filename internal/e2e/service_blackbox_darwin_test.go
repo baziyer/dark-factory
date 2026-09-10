@@ -3,6 +3,7 @@
 package e2e_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +38,11 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	serviceArgs := func(verb string) []string {
-		return []string{"service", verb, "--home", fixture.home, "--label", label, "--plist-dir", plistDir}
+		args := []string{"service", verb, "--home", fixture.home, "--label", label, "--plist-dir", plistDir}
+		if verb == "install" {
+			args = append(args, "--development-browser-address", "127.0.0.1:0")
+		}
+		return args
 	}
 	t.Cleanup(func() {
 		// Guaranteed teardown: the disposable label must not survive the test
@@ -57,7 +62,7 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 	// gives the child no PATH, so `open` is not findable and no browser can be
 	// launched — which is also what keeps this test from throwing a window onto
 	// the operator's screen.
-	if state.PairPage != "http://127.0.0.1:43123/pair" || state.BrowserOpened {
+	if state.BrowserOpened {
 		t.Fatalf("install pairing report = %+v (%s)", state, output)
 	}
 	stderr, err := os.Lstat(filepath.Join(install.ServiceDirectoryPath(fixture.home), "factoryd.stderr.log"))
@@ -69,6 +74,16 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 		t.Fatalf("service stderr metadata = mode %v uid %v", stderr.Mode(), stat)
 	}
 	client := fixture.waitClient(t)
+	web, err := client.WebStatus(context.Background())
+	if err != nil || !web.Ready || web.Address == "127.0.0.1:43123" {
+		t.Fatalf("disposable browser status = %+v, %v", web, err)
+	}
+	pairAddress := "http://" + web.Address + "/pair"
+	connection, err := net.DialTimeout("tcp", web.Address, time.Second)
+	if err != nil {
+		t.Fatalf("disposable pair listener %q: %v", pairAddress, err)
+	}
+	_ = connection.Close()
 
 	// The managed daemon serves a real task end to end.
 	project := fixture.operatorID(t, fixture.runFactoryctl(t, 0, "project", "create", "--name", "Managed", "--root", fixture.repo))

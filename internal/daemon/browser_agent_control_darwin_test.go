@@ -244,3 +244,23 @@ func TestBrowserTaskDetailRejectsEditBetweenBriefAndPeerReads(t *testing.T) {
 		t.Fatalf("mixed task detail = %v", err)
 	}
 }
+
+func TestBrowserTaskListRequiresPrivateCapabilityAndPagesCompletedWork(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		caps := kernel.BrowserCapabilityObserve
+		if private {
+			caps |= kernel.BrowserCapabilityPrivateHumanRequestDetail
+		}
+		fixture := newAdapterFixture(t, caps)
+		fixture.pair(t)
+		run := adapterRunningRun(t, fixture.store, 189)
+		result, err := fixture.backend.TaskList(context.Background(), rawBrowserClient(fixture.client.ID), browserprotocol.TaskListGet{AgentID: run.AgentID.String()})
+		if !private {
+			if !errors.Is(err, browser.ErrUnauthorized) {
+				t.Fatalf("unprivileged list = %+v %v", result, err)
+			}
+		} else if err != nil || result.AgentID != run.AgentID.String() || len(result.Tasks) != 0 || result.Total != 0 {
+			t.Fatalf("active task leaked to completed list = %+v %v", result, err)
+		}
+	}
+}

@@ -101,6 +101,8 @@ export const CONTROL_MANIFEST = [
   { type: "TASK_HISTORY", direction: "server", id: "required", fixture: "task_history.json" },
   { type: "TASK_DETAIL_GET", direction: "client", id: "required", fixture: "task_detail_get.json" },
   { type: "TASK_DETAIL", direction: "server", id: "required", fixture: "task_detail.json" },
+  { type: "TASK_LIST_GET", direction: "client", id: "required", fixture: "task_list_get.json" },
+  { type: "TASK_LIST", direction: "server", id: "required", fixture: "task_list.json" },
 ] as const;
 export const CONTROL_TYPES = CONTROL_MANIFEST.map((entry) => entry.type);
 export type ControlType = (typeof CONTROL_TYPES)[number];

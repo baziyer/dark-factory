@@ -4,6 +4,7 @@ import test from "node:test";
 import { createElement, StrictMode } from "react";
 import { act, create } from "react-test-renderer";
 import { FactoryApp } from "../dist/src/index.js";
+import { browserEndpoint } from "../dist/src/factory-app-controller.js";
 
 function runStrictCompositionProbe() {
   const loader = new URL("./fixtures/strict-composition-loader.mjs", import.meta.url);
@@ -21,6 +22,12 @@ function runStrictCompositionProbe() {
     child.on("close", (code, signal) => { clearTimeout(timeout); resolve({ code, signal, stdout, stderr }); });
   });
 }
+
+test("the default and isolated browser ports have exact loopback endpoints", () => {
+  assert.deepEqual(browserEndpoint(), { url: "ws://127.0.0.1:43123/browser", host: "127.0.0.1:43123" });
+  assert.deepEqual(browserEndpoint(45678), { url: "ws://127.0.0.1:45678/browser", host: "127.0.0.1:45678" });
+  for (const port of [0, 65536, 1.5]) assert.throws(() => browserEndpoint(port));
+});
 
 test("StrictMode mounts the public FactoryApp and closes each owned BrowserClient once", async () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -53,12 +60,12 @@ test("StrictMode mounts the public FactoryApp and closes each owned BrowserClien
   let renderer;
   try {
     await act(async () => {
-      renderer = create(createElement(StrictMode, null, createElement(FactoryApp, { onStatusChange: (status) => statuses.push(status) })));
+      renderer = create(createElement(StrictMode, null, createElement(FactoryApp, { browserPort: 45678, onStatusChange: (status) => statuses.push(status) })));
     });
     assert.equal(sockets.length, 2);
     assert.deepEqual(sockets.map((socket) => ({ url: socket.url, closeCount: socket.closeCount })), [
-      { url: "ws://127.0.0.1:43123/browser", closeCount: 1 },
-      { url: "ws://127.0.0.1:43123/browser", closeCount: 0 },
+      { url: "ws://127.0.0.1:45678/browser", closeCount: 1 },
+      { url: "ws://127.0.0.1:45678/browser", closeCount: 0 },
     ]);
     assert.deepEqual(statuses, [{ status: "connecting" }, { status: "connecting" }]);
 

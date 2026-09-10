@@ -309,6 +309,23 @@ published from, never main's live head: the reviewer's diff runs from the
 merge base of that commit and the pull request head, and its rules are that
 commit's `AGENTS.md`.
 
+When an exact-head gate receipt is available, pass its path without changing
+the review's read-only tools or permissions:
+
+```sh
+DARK_FACTORY_REVIEW_EVIDENCE_FILE=gate.json \
+DARK_FACTORY_REVIEW_OPERATION_ID=$(opid "$change_id" "review-$(printf '%s' "$HEAD_SHA" | cut -c1-8)") \
+    repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA "$base_commit" body.md "first review"
+```
+
+The JSON receipt supplements, never replaces, the required gate. The helper
+requires matching `head` and `base` strings and integer `exit_code: 0` before
+starting the reviewer. A blocking review finding needs a concrete reproducer or a
+reachable code path through the current guards to a missing or ineffective
+check. Reviewers inspect the documented threat model before security claims;
+an unverified hypothetical or an unavailable read-only test is a deferred
+note, not a block.
+
 The verdict is recorded under that operation id, so `observe_operation`
 with it answers `completed` with the verdict (`allow` or `block`) once a
 review exists, and nothing until then. The script exits 0 for ALLOW, 1 for
