@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { createElement, isValidElement } from "react";
+import { createElement, isValidElement, useEffect, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { act, create } from "react-test-renderer";
 import { ProtocolError, SessionError } from "@dark-factory/client";
@@ -55,7 +55,7 @@ const runSample = (agentId, paths, taskId = ids.task, taskRevision = fixtureStat
 
 test("error banner keeps its centered layout after the paragraph reset", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
-  assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
+  assert.match(css, /\.dfFactoryConsole :where\(h1, h2, p, dl, ul\),[\s\S]*?\.dfConsoleSidebar :where\(h1, h2, h3, p, dl, ul\)\s*\{\s*margin: 0;\s*\}/);
   assert.match(css, /\.dfFactoryConsole__error\s*\{[\s\S]*?margin: 0 auto 1\.25rem;/);
   assert.match(css, /\.dfFactoryScene__room--empty > rect,[\s\S]*?\.dfFactoryScene__room--empty > use \{ opacity: 0\.45; \}/);
   assert.match(css, /\.dfFactoryFloor \{ overflow-x: auto; \}/);
@@ -64,10 +64,10 @@ test("error banner keeps its centered layout after the paragraph reset", () => {
   assert.equal(css.includes("@keyframes dfFactoryScene"), false);
 });
 
-test("one screen keeps the roster, compact overview, and optional floor together", () => {
+test("one screen keeps Factory and the operator panels together", () => {
   const markup = render();
   assert.match(markup, /<main class="dfFactoryConsole" aria-label="Factory operator console">/);
-  for (const label of ["Factory counters", "Agents", "Factory overview", "NEEDS YOU", "Queue"]) {
+  for (const label of ["Factory counters", "Factory floor", "Selected detail", "NEEDS YOU", "Left view", "Right panel"]) {
     assert.match(markup, new RegExp(`aria-label="${label}"`));
   }
   // Counters read the served factory, not a second count of it.
@@ -77,6 +77,7 @@ test("one screen keeps the roster, compact overview, and optional floor together
   assert.match(markup, /Builder One asks/);
   assert.match(markup, /Review the state projection/);
   assert.match(markup, /North Workshop · Review the state projection/);
+  assert.match(render({ detail: "queue" }), /aria-label="Queue"/);
   // No screen union survives: there is no navigation away from this screen.
   assert.equal(markup.includes("dfFactoryConsole__homeLink"), false);
   assert.equal(markup.includes("BUILDING STATE UNAVAILABLE"), false);
@@ -85,10 +86,10 @@ test("one screen keeps the roster, compact overview, and optional floor together
 test("the roster stays visible while the optional floor opens and closes", () => {
   const floor = render();
   assert.match(floor, /aria-label="Dark Factory codebase floor"/);
-  assert.match(floor, /aria-label="OVERSEER"/);
 
   const agents = render({ view: "agents" });
   assert.match(agents, /aria-label="Agents"/);
+  assert.match(agents, /aria-label="OVERSEER"/);
   // Rank is the served role, oversight first, and nothing invents a new field.
   const overseer = agents.indexOf('aria-label="OVERSEER"');
   const worker = agents.indexOf('aria-label="WORKER"');
@@ -417,10 +418,10 @@ test("unknown and inherited error codes use a finite fallback", () => {
   }
 });
 
-test("compact overview keeps every needs-you and queue item reachable", () => {
+test("Needs You and Queue keep every served item reachable", () => {
   const emptyState = baseState({ projects: new Map(), agents: new Map(), tasks: new Map(), humanRequests: new Map() });
   assert.match(render({ state: emptyState }), /all quiet — nothing needs you/);
-  assert.match(render({ state: emptyState }), /the queue is empty/);
+  assert.match(render({ state: emptyState, detail: "queue" }), /THE QUEUE IS EMPTY/);
   assert.match(render({ state: emptyState, view: "agents" }), /no agents/);
 
   const agents = new Map();
@@ -438,23 +439,20 @@ test("compact overview keeps every needs-you and queue item reachable", () => {
   const bounded = baseState({ agents, tasks, humanRequests: requests });
   const markup = render({ state: bounded });
   assert.equal((markup.match(/class="dfFactoryConsole__card"/g) ?? []).length, 9);
-  assert.equal((markup.match(/class="dfConsoleRow"/g) ?? []).length, 18);
+  const queue = render({ state: bounded, detail: "queue" });
+  assert.equal((queue.match(/class="dfConsoleSidebar__task"/g) ?? []).length, 9);
   assert.equal((markup.match(/\+1 more/g) ?? []).length, 0);
   assert.match(markup, />9 ITEMS</);
-  assert.match(markup, />9 open</);
+  assert.match(queue, /aria-label="Queue for Agent 8"/);
   assert.equal((render({ state: bounded, view: "agents" }).match(/dfAgentList__row/g) ?? []).length, 0, "no handler, no button");
   assert.equal((render({ state: bounded, view: "agents", onSelectAgent: () => {} }).match(/dfAgentList__row/g) ?? []).length, 9);
 });
 
-test("stage meters fill only on store-backed stage", () => {
-  const markup = render();
-  assert.match(markup, /aria-label="stage: building"/);
-  assert.match(markup, /aria-label="stage: queued"/);
-  const buildingMeter = markup.split('aria-label="stage: building"')[1].split("</span></span>")[0];
-  assert.equal((buildingMeter.match(/dfStageMeter__segment--filled/g) ?? []).length, 2);
-  // Finished work has left the queue column entirely.
-  assert.equal(markup.includes('aria-label="stage: done"'), false);
-  assert.equal(markup.includes('aria-label="stage: failed"'), false);
+test("Queue keeps running tasks visible without a second queue", () => {
+  const markup = render({ detail: "queue" });
+  assert.match(markup, /aria-label="Running tasks"/);
+  assert.match(markup, /Review the state projection/);
+  assert.equal((markup.match(/aria-label="Queue"/g) ?? []).length, 1, "one queue panel");
 });
 
 test("a terminal blocked task is neither building nor current agent work", () => {
@@ -479,10 +477,10 @@ test("the production console exposes no speculative or unsupported surface", () 
 test("an unavailable snapshot is explicit and does not invent runtime state", () => {
   const markup = render({ state: undefined, status: "syncing" });
   assert.match(markup, /WAITING FOR SNAPSHOT/);
-  assert.match(markup, /waiting for snapshot/);
+  assert.match(markup, /WAITING FOR SNAPSHOT/);
   assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>—<\/dd>/);
   assert.match(markup, /<dt>QUEUED<\/dt><dd>—<\/dd>/);
-  assert.equal(markup.includes("the queue is empty"), false);
+  assert.equal(markup.includes("THE QUEUE IS EMPTY"), false);
   assert.equal(markup.includes("all quiet"), false);
   assert.match(render({ state: undefined, status: "syncing", view: "agents" }), /waiting for the factory/);
 });
@@ -500,33 +498,89 @@ test("HumanRequest delivery states remain visibly distinct", () => {
   }
 });
 
-test("the workbench keeps one terminal slot beside the persistent roster", () => {
+test("the two-column console keeps one mounted terminal slot", () => {
   const css = readFileSync(new URL("../src/factory-console.css", import.meta.url), "utf8");
   assert.match(css, /\.dfConsoleRow__agent\s*\{[^}]*min-width: 0;[^}]*overflow-wrap: anywhere;/);
-  assert.match(css, /\.dfConsoleShell\s*\{[^}]*display: flex;[^}]*align-items: flex-start;/);
   assert.match(css, /\.dfFactoryConsole__terminalPanel :where\(p\)\s*\{\s*margin: 0;/);
   assert.match(css, /\.dfConsoleRow\s*\{[^}]*flex-wrap: wrap;/);
-  assert.match(css, /\.dfCompactConsole\s*\{[^}]*grid-template-columns: minmax\(17rem, 0\.8fr\) minmax\(0, 2fr\);/);
-  assert.match(css, /\.dfCompactConsole__roster,[\s\S]*?\.dfCompactConsole__workbench\s*\{[^}]*max-height: calc\(100svh - 9rem\);[^}]*overflow: auto;/);
+  assert.match(css, /\.dfConsoleLayout\s*\{[^}]*grid-template-columns: minmax\(0, 2fr\) minmax\(0, 1fr\);/);
   assert.match(css, /\.dfFactoryConsole__instructionActions\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap;/);
-  for (const rule of [/\.dfConsoleDialog \*/, /\.dfConsoleDialog button,/, /\.dfConsoleDialog button:disabled \{/, /\.dfConsoleDialog\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleDialog\s*\{[^}]*color: var\(--df-console-text\)/]) {
+  for (const rule of [/\.dfConsoleDialog \*/, /\.dfConsoleDialog button,/, /\.dfConsoleDialog button:disabled,[\s\S]*?\{/, /\.dfConsoleDialog\s*\{[^}]*font-family: ui-monospace/, /\.dfConsoleDialog\s*\{[^}]*color: var\(--df-console-text\)/]) {
     assert.match(css, rule);
   }
   // The panel scrolls, never the <dialog>: a scrollbar click on the dialog
   // itself has event.target === the dialog and would close SETTINGS.
   assert.match(css, /\.dfConsoleDialog \.dfConsoleSidebar__panel \{[^}]*max-height:[^}]*overflow: auto;/);
   assert.equal(/\.dfConsoleDialog\s*\{[^}]*overflow: auto/.test(css), false);
-  assert.match(css, /@media \(max-width: 1024px\)[\s\S]*?\.dfConsoleShell \{ display: block; \}/);
   assert.match(css, /:focus-visible\s*\{\s*outline: 2px solid var\(--df-console-accent\);/);
 
   const withTerminal = render({ selectedAgent: agentSelection(), terminalContent: createElement("section", { "aria-label": "Agent terminal" }) });
   assert.match(withTerminal, /<h1>DARK FACTORY<\/h1>/);
-  assert.match(withTerminal, /dfCompactConsole__roster[\s\S]*?dfCompactConsole__workbench/);
-  assert.match(withTerminal, /dfConsoleSidebar__terminalSlot"><section aria-label="Agent terminal"><\/section>/);
+  assert.match(withTerminal, /dfConsoleLayout__left[\s\S]*?dfConsoleSidebar/);
+  assert.match(withTerminal, /dfConsoleSidebar__terminalSlot" aria-label="Terminal"><section aria-label="Agent terminal"><\/section>/);
   assert.equal(withTerminal.includes("dfConsoleLayout__right"), false);
 });
 
-test("selecting an agent opens one workbench with compact durable sections", () => {
+test("switching right panels keeps the selected terminal mounted", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  let mounted = 0;
+  let unmounted = 0;
+  function TerminalProbe() {
+    useEffect(() => { mounted += 1; return () => { unmounted += 1; }; }, []);
+    return createElement("section", { "aria-label": "Agent terminal" }, "terminal");
+  }
+  try {
+    const props = { status: "ready", state: baseState(), selectedAgent: agentSelection(), terminalContent: createElement(TerminalProbe) };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, { ...props, detail: "agent" })); });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, detail: "queue" })); });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, detail: "needs-you" })); });
+    assert.equal(mounted, 1);
+    assert.equal(unmounted, 0);
+    await act(async () => { renderer.unmount(); });
+    assert.equal(unmounted, 1);
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("opening a selected question restores that agent's terminal panel", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  function ConsoleHarness() {
+    const [detail, setDetail] = useState("agent");
+    const [panel, setPanel] = useState("terminal");
+    return createElement(FactoryConsole, {
+      status: "ready",
+      state: baseState(),
+      selectedAgent: agentSelection(),
+      selectedHumanRequest: selectedRequest(),
+      detail,
+      onDetail: setDetail,
+      agentPanel: panel,
+      onAgentPanel: setPanel,
+      onOpenTerminalForHumanRequest: () => { setDetail("agent"); setPanel("terminal"); },
+      terminalContent: createElement("p", null, "terminal"),
+    });
+  }
+  try {
+    let renderer;
+    await act(async () => { renderer = create(createElement(ConsoleHarness)); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "CONFIG").props.onClick(); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "NEEDS YOU").props.onClick(); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OPEN TERMINAL").props.onClick(); });
+    const terminal = renderer.root.findByProps({ "aria-label": "Terminal" });
+    const config = renderer.root.findByProps({ "aria-label": "Agent configuration" });
+    assert.equal(terminal.props.hidden, false);
+    assert.equal(config.props.hidden, true);
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("selecting an agent exposes terminal and configuration controls", () => {
   const markup = render({
     view: "agents",
     selectedAgent: agentSelection(),
@@ -536,15 +590,14 @@ test("selecting an agent opens one workbench with compact durable sections", () 
   });
   assert.match(markup, /aria-label="Agent Builder One"/);
   assert.match(markup, /Builder One[\s\S]*?claude_code · claude-opus-5/);
-  assert.match(markup, /PROJECT · North Workshop/);
+  assert.match(markup, /aria-label="Agent controls"/);
+  assert.match(markup, />TERMINAL</);
+  assert.match(markup, />CONFIG</);
   assert.match(markup, /aria-label="Agent configuration"/);
   assert.match(markup, /value="claude-opus-5"/);
   assert.match(markup, /value="high"/);
-  assert.match(markup, /aria-label="Agent queue"/);
-  assert.match(markup, /<details class="dfConsoleSidebar__section"/);
-  assert.match(markup, />CONFIG<\/summary>/);
-  // The roster stays present while this workbench is open.
-  assert.match(markup, /dfCompactConsole__roster/);
+  assert.equal(markup.includes("aria-label=\"Agent queue\""), false);
+  assert.match(markup, /dfConsoleLayout__left/);
   assert.equal(markup.includes("dfConsoleLayout__right"), false);
 
   // Without handlers the sidebar is a readout, never a dead form.
@@ -580,6 +633,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     const props = {
       status: "ready",
       state,
+      detail: "queue",
       selectedAgent: agentSelection(),
       onSaveAgentConfig: (config) => edits.push(["config", config]),
       onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
@@ -625,7 +679,6 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { await editBrief().props.onClick(); });
     const titleValue = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.value;
     const instructionValue = () => renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.value;
-    const modelInput = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-model-${ids.agent}`);
     await act(async () => { renderer.root.findAllByType("input").find((input) => input.props.id === `df-title-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this draft" } }); });
     await act(async () => { renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`).props.onChange({ currentTarget: { value: "Keep this instruction" } }); });
     assert.equal(titleValue(), "Keep this draft");
@@ -639,36 +692,6 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     assert.equal(instructionValue(), "Keep this instruction");
     assert.equal(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("TASK CHANGED")), true);
     assert.equal(renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.disabled, true);
-    // A refusal belongs to the form that earned it: the config form the
-    // operator is still typing into keeps what it holds.
-    await act(async () => { modelInput().props.onChange({ currentTarget: { value: "half-typed" } }); });
-    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: queued.id, pending: false, error: new SessionError("stale") } })); });
-    assert.equal(titleValue(), "Keep this draft");
-    assert.equal(instructionValue(), "Keep this instruction");
-    assert.equal(modelInput().props.value, "half-typed");
-    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: ids.agent, pending: false, error: new SessionError("stale") } })); });
-    assert.equal(modelInput().props.value, fixtureState.agents.get(ids.agent).model);
-    await act(async () => { renderer.update(createElement(FactoryConsole, props)); });
-
-    // A save carries only what changed. Sending an untouched model would make
-    // the daemon revalidate it, so an agent whose stored pair it no longer
-    // accepts could never be paused.
-    const config = () => renderer.root.findAllByType("form")[0];
-    const paused = renderer.root.findAllByType("input").find((input) => input.props.type === "checkbox");
-    await act(async () => { paused.props.onChange({ currentTarget: { checked: true } }); });
-    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
-    assert.deepEqual(edits.at(-1), ["config", { paused: true }]);
-
-    const model = renderer.root.findAllByType("input").find((input) => input.props.value === "claude-opus-5");
-    await act(async () => { model.props.onChange({ currentTarget: { value: "claude-sonnet-5" } }); });
-    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
-    assert.deepEqual(edits.at(-1), ["config", { model: "claude-sonnet-5", paused: true }]);
-
-    // Saving an untouched form is not a write at all.
-    await act(async () => { model.props.onChange({ currentTarget: { value: "claude-opus-5" } }); });
-    await act(async () => { paused.props.onChange({ currentTarget: { checked: false } }); });
-    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
-    assert.deepEqual(edits.at(-1), ["config", {}]);
     await act(async () => { renderer.unmount(); });
   } finally {
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
@@ -703,11 +726,11 @@ test("a rejected edit says plainly that the durable value did not change", () =>
   const markup = render({
     selectedAgent: agentSelection(),
     onSaveAgentConfig: () => {},
-    edit: { pending: false, error: new SessionError("stale") },
+    edit: { target: ids.agent, pending: false, error: new SessionError("stale") },
   });
   assert.match(markup, /SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN/);
   assert.match(markup, /role="alert"/);
-  const unknown = render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { pending: false, error: { code: "internal" } } });
+  const unknown = render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { target: ids.agent, pending: false, error: { code: "internal" } } });
   assert.match(unknown, /THE EDIT DID NOT COMPLETE/);
   assert.match(render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { pending: true } }), />SAVING</);
 });
@@ -767,14 +790,15 @@ test("SETTINGS opens and closes as a native modal, over whatever sidebar is open
   }
 });
 
-test("the floor disclosure rides beside the persistent roster, not the top bar", () => {
+test("Factory and Agents are explicit left-side alternatives", () => {
   const floor = render();
-  assert.match(floor, /class="dfCompactConsole__roster" aria-label="Agents">[\s\S]*?<details class="dfCompactConsole__floor" open=""><summary>FACTORY FLOOR<\/summary>/);
-  assert.match(render({ view: "agents" }), /<details class="dfCompactConsole__floor"><summary>FACTORY FLOOR<\/summary><\/details>/);
+  assert.match(floor, /aria-label="Left view"/);
+  assert.match(floor, /aria-pressed="true" disabled="">FACTORY/);
+  assert.match(render({ view: "agents" }), /aria-label="Agents"/);
   // The top bar keeps the wordmark, the counters, and SETTINGS.
   const actions = floor.split('class="dfConsoleBar__actions"')[1];
   assert.match(actions.slice(0, actions.indexOf("</div>")), />SETTINGS</);
-  assert.equal(floor.indexOf("FACTORY FLOOR") > floor.indexOf("dfCompactConsole__roster"), true);
+  assert.match(floor, /<h2>FACTORY FLOOR<\/h2>/);
 });
 
 test("FactoryApp server-renders without reading browser globals", () => {
@@ -870,9 +894,9 @@ test("the view toggle and settings forward exactly one intent each", () => {
     onToggleSettings: () => calls.push(["settings"]),
   }));
   const chrome = elements.filter((element) => element.type === "button" && element.props.disabled !== true);
-  assert.deepEqual(chrome.map((element) => element.props.children), ["SETTINGS"]);
+  assert.deepEqual(chrome.map((element) => element.props.children), ["SETTINGS", "FACTORY", "AGENTS"]);
   chrome[0].props.onClick();
-  elements.find((element) => element.type === "details" && element.props.className === "dfCompactConsole__floor").props.onToggle({ currentTarget: { open: false } });
+  chrome.find((element) => element.props.children === "AGENTS").props.onClick();
   assert.deepEqual(calls, [["settings"], ["view", "agents"]]);
 });
 
@@ -883,6 +907,7 @@ function expand(node, result = []) {
   }
   if (!isValidElement(node)) return result;
   if (typeof node.type === "function") {
+    if (node.type.name === "QueuePanel") return result;
     expand(node.type(node.props), result);
     return result;
   }
@@ -994,7 +1019,7 @@ test("the agent config offers its provider's linked accounts and the provider de
 
     // Only what the operator changed is sent, and "" clears the selection.
     await act(async () => { account.props.onChange({ currentTarget: { value: "" } }); });
-    const form = renderer.root.findAllByProps({ "aria-label": "Agent configuration" })[0];
+    const form = renderer.root.findAllByProps({ "aria-label": "Agent configuration" })[0].findByType("form");
     await act(async () => { form.props.onSubmit({ preventDefault() {} }); });
     assert.deepEqual(edits.at(-1), { accountId: "" });
 

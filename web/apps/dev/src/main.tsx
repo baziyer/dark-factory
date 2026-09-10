@@ -10,6 +10,7 @@ import { fixtureState, fixtureTopologies } from "../../../fixtures/state.mjs";
 // succeed.
 function FixtureTour() {
   const [view, setView] = useState<FactoryConsoleProps["view"]>("agents");
+  const [detail, setDetail] = useState<NonNullable<FactoryConsoleProps["detail"]>>("needs-you");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState<FactoryConsoleProps["selectedAgent"]>();
   const [selectedHumanRequest, setSelectedHumanRequest] = useState<FactoryConsoleProps["selectedHumanRequest"]>();
@@ -24,15 +25,19 @@ function FixtureTour() {
         topologies={fixtureTopologies}
         view={view}
         onView={setView}
+        detail={detail}
+        onDetail={setDetail}
         settingsOpen={settingsOpen}
         onToggleSettings={() => setSettingsOpen((open) => !open)}
         selectedAgent={selectedAgent}
         selectedHumanRequest={selectedHumanRequest}
         onSelectAgent={(agent) => {
+          setDetail("agent");
           setSelectedHumanRequest(undefined);
           setSelectedAgent({ id: agent.id, name: agent.name, revision: agent.revision });
         }}
         onSelectHumanRequest={(request) => {
+          setDetail("needs-you");
           setSelectedHumanRequest({
             request,
             phase: "ready",

@@ -9,8 +9,7 @@ type XtermModules = Readonly<{
 }>;
 
 type ResizeWindow = Readonly<{
-  addEventListener(type: "resize", listener: () => void): void;
-  removeEventListener(type: "resize", listener: () => void): void;
+  ResizeObserver: typeof ResizeObserver;
 }>;
 
 type XtermCallbacks = Readonly<{
@@ -119,17 +118,16 @@ function mountXtermTerminal(element: HTMLDivElement, modules: XtermModules, call
   let data: { dispose(): void } | undefined;
   let binary: { dispose(): void } | undefined;
   let resized: { dispose(): void } | undefined;
-  let listenerInstalled = false;
+  let observer: ResizeObserver | undefined;
   let surfacePublished = false;
   let disposed = false;
   const safe = (action: () => void): void => {
     try { action(); } catch { /* teardown continues through each owned resource */ }
   };
-  const onWindowResize = () => { if (!disposed) fit?.fit(); };
   const cleanup = () => {
     if (disposed) return;
     disposed = true;
-    if (listenerInstalled) safe(() => windowTarget.removeEventListener("resize", onWindowResize));
+    safe(() => observer?.disconnect());
     surface?.abort();
     safe(() => data?.dispose());
     safe(() => binary?.dispose());
@@ -156,8 +154,10 @@ function mountXtermTerminal(element: HTMLDivElement, modules: XtermModules, call
     callbacks.onSurface(surface);
     callbacks.onResize?.(terminal.rows, terminal.cols);
     terminal.focus();
-    listenerInstalled = true;
-    windowTarget.addEventListener("resize", onWindowResize);
+    observer = new windowTarget.ResizeObserver((entries) => {
+      if (!disposed && entries.some(({ contentRect }) => contentRect.width > 0 && contentRect.height > 0)) fit?.fit();
+    });
+    observer.observe(element);
   } catch (error) {
     cleanup();
     throw error;

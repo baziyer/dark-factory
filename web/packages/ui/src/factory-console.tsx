@@ -1,16 +1,21 @@
 import type { ReactNode } from "react";
 import type { AgentItem, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
-import { AgentList, FactoryFloor, StageMeter } from "./console-screens.js";
-import { AgentPanel, HumanRequestPanel, SettingsDialog, type AgentConfigEdit, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
+import { AgentList, FactoryFloor } from "./console-screens.js";
+import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
 
 export type ConsoleView = "floor" | "agents";
+export type ConsoleDetail = "needs-you" | "queue" | "agent";
 
 export type FactoryConsoleProps = FactoryAppSnapshot & {
   view?: ConsoleView;
   onView?: (view: ConsoleView) => void;
+  detail?: ConsoleDetail;
+  onDetail?: (detail: ConsoleDetail) => void;
+  agentPanel?: AgentPanelView;
+  onAgentPanel?: (panel: AgentPanelView) => void;
   settingsOpen?: boolean;
   onToggleSettings?: () => void;
   selectedAgent?: FactoryAgentSelection;
@@ -32,7 +37,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   address?: string;
   /** Overrides the pairing surface the settings modal mounts by default. */
   pairing?: ReactNode;
-  /** The selected agent's one mounted terminal and durable composer. */
+  /** The selected agent's mounted terminal and durable composer. */
   terminalContent?: ReactNode;
 };
 
@@ -65,7 +70,7 @@ const ERROR_LABELS = new Map<string, string>([
   ["unsupported", "The factory does not support this request yet."],
 ]);
 
-/** One screen: a roster, an optional map, and one selected-agent workbench. */
+/** One screen: a factory or agent list beside one operator detail panel. */
 export function FactoryConsole({
   status,
   state,
@@ -76,6 +81,10 @@ export function FactoryConsole({
   edit,
   view = "floor",
   onView,
+  detail,
+  onDetail,
+  agentPanel,
+  onAgentPanel,
   settingsOpen,
   onToggleSettings,
   selectedHumanRequest,
@@ -107,6 +116,8 @@ export function FactoryConsole({
   const ready = status === "ready";
   const counters = factoryCounters(state);
   const agent = selectedAgent === undefined ? undefined : state?.agents.get(selectedAgent.id);
+  const selectedDetail = detail ?? (selectedAgent === undefined ? "needs-you" : "agent");
+
   return (
     <div className="dfConsoleShell">
       <main className="dfFactoryConsole" aria-label="Factory operator console">
@@ -140,38 +151,66 @@ export function FactoryConsole({
           </p>
         )}
 
-        <div className="dfCompactConsole">
-          <aside className="dfCompactConsole__roster" aria-label="Agents">
+        <div className="dfConsoleLayout">
+          <section className="dfConsoleLayout__left dfFactoryConsole__section" aria-label={view === "floor" ? "Factory floor" : "Agents"}>
             <div className="dfFactoryConsole__sectionHeading">
-              <h2>AGENTS</h2>
+              <h2>{view === "floor" ? "FACTORY FLOOR" : "AGENTS"}</h2>
+              <div className="dfConsoleViewToggle" role="group" aria-label="Left view">
+                {(["floor", "agents"] as const).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    aria-pressed={view === option}
+                    disabled={!ready || onView === undefined}
+                    onClick={() => onView?.(option)}
+                  >
+                    {option === "floor" ? "FACTORY" : "AGENTS"}
+                  </button>
+                ))}
+              </div>
             </div>
-            <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={onSelectAgent} />
-            <details className="dfCompactConsole__floor" open={view === "floor"} onToggle={(event) => onView?.(event.currentTarget.open ? "floor" : "agents")}>
-              <summary>FACTORY FLOOR</summary>
-              {view !== "floor" ? null : <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />}
-            </details>
-          </aside>
+            {view === "floor"
+              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
+              : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={ready ? onSelectAgent : undefined} />}
+          </section>
 
-          <section className="dfCompactConsole__workbench" aria-label="Selected agent workbench">
-            <div className="dfCompactConsole__overview" aria-label="Factory overview">
-              <NeedsYouColumn state={state} status={status} selectedHumanRequestId={selectedHumanRequest?.request.id} onSelectHumanRequest={onSelectHumanRequest} />
-              <QueueColumn state={state} />
+          <aside className="dfConsoleSidebar" aria-label="Selected detail">
+            <div className="dfConsoleViewToggle" role="group" aria-label="Right panel">
+              <button type="button" aria-pressed={selectedDetail === "needs-you"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("needs-you")}>NEEDS YOU</button>
+              <button type="button" aria-pressed={selectedDetail === "queue"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("queue")}>QUEUE</button>
+              <button type="button" aria-pressed={selectedDetail === "agent"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("agent")}>AGENT</button>
             </div>
-            {selectedHumanRequest === undefined ? null : <HumanRequestPanel
-              selected={selectedHumanRequest}
-              project={projectLabel(state?.projects, selectedHumanRequest.request.project_id)}
-              agent={entityLabel(state?.agents, selectedHumanRequest.request.agent_id, "AGENT")}
-              task={entityLabel(state?.tasks, selectedHumanRequest.request.task_id, "TASK")}
-              onReplyChange={onHumanReplyChange}
-              onReply={onReplyHumanRequest}
-              onCancel={onCancelHumanRequest}
-              onClose={onCloseHumanRequest}
-              onOpenTerminal={onOpenTerminalForHumanRequest}
-              terminalReady={ready}
-            />}
-            {agent === undefined ? <p className="dfFactoryConsole__empty dfCompactConsole__empty">SELECT AN AGENT TO OPEN ITS WORKBENCH</p> : <>
-              <p className="dfCompactConsole__project">PROJECT · {projectLabel(state?.projects, agent.project_id)}</p>
-              <AgentPanel
+            <div hidden={selectedDetail !== "needs-you"}>
+              <NeedsYouColumn
+                state={state}
+                status={status}
+                selectedHumanRequestId={selectedHumanRequest?.request.id}
+                onSelectHumanRequest={onSelectHumanRequest}
+              />
+              {selectedHumanRequest === undefined ? null : <HumanRequestPanel
+                selected={selectedHumanRequest}
+                project={projectLabel(state?.projects, selectedHumanRequest.request.project_id)}
+                agent={entityLabel(state?.agents, selectedHumanRequest.request.agent_id, "AGENT")}
+                task={entityLabel(state?.tasks, selectedHumanRequest.request.task_id, "TASK")}
+                onReplyChange={onHumanReplyChange}
+                onReply={onReplyHumanRequest}
+                onCancel={onCancelHumanRequest}
+                onClose={onCloseHumanRequest}
+                onOpenTerminal={onOpenTerminalForHumanRequest}
+                terminalReady={ready}
+              />}
+            </div>
+            <div hidden={selectedDetail !== "queue"}>
+              <QueuePanel
+                state={state}
+                edit={edit}
+                ready={ready}
+                onEditTask={onEditTask}
+                onLoadTaskDetail={onLoadTaskDetail}
+              />
+            </div>
+            <div hidden={selectedDetail !== "agent"}>
+              {agent === undefined ? <p className="dfFactoryConsole__empty">SELECT AN AGENT TO OPEN CONTROLS</p> : <AgentPanel
                 key={agent.id}
                 agent={agent}
                 state={state}
@@ -181,9 +220,11 @@ export function FactoryConsole({
                 onEditTask={onEditTask}
                 onLoadTaskDetail={onLoadTaskDetail}
                 terminalContent={terminalContent}
-              />
-            </>}
-          </section>
+                panel={agentPanel}
+                onPanel={onAgentPanel}
+              />}
+            </div>
+          </aside>
         </div>
       </main>
       {settingsOpen !== true ? null : (
@@ -228,10 +269,9 @@ function NeedsYouColumn({
         <span>{requests?.length ?? "—"} {requests?.length === 1 ? "ITEM" : "ITEMS"}</span>
       </div>
       {requests === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
-        : requests.length === 0 ? <p className="dfFactoryConsole__empty">all quiet — nothing needs you</p> : <details className="dfCompactConsole__overviewList">
-          <summary>VIEW REQUESTS</summary>
+        : requests.length === 0 ? <p className="dfFactoryConsole__empty">all quiet — nothing needs you</p> : (
           <ul className="dfFactoryConsole__list dfFactoryConsole__list--requests">
-              {requests.map((request) => {
+            {requests.map((request) => {
               const selected = selectedHumanRequestId === request.id;
               const copy = humanRequestStatusCopy(request.status);
               return (
@@ -251,39 +291,7 @@ function NeedsYouColumn({
               );
             })}
           </ul>
-        </details>}
-    </section>
-  );
-}
-
-function QueueColumn({ state }: Pick<FactoryConsoleProps, "state">) {
-  const tasks = state === undefined ? undefined : [...state.tasks.values()]
-    .filter((task) => task.status === "queued" || task.status === "running")
-    .sort((left, right) => (left.status === right.status ? right.priority - left.priority : left.status === "running" ? -1 : 1));
-  return (
-    <section className="dfFactoryConsole__section" aria-label="Queue">
-      <div className="dfFactoryConsole__sectionHeading">
-        <h2>QUEUE</h2>
-        <span>{tasks === undefined ? "— queued" : `${tasks.length} open`}</span>
-      </div>
-      {tasks === undefined ? <p className="dfFactoryConsole__empty">waiting for snapshot</p>
-        : tasks.length === 0 ? <p className="dfFactoryConsole__empty">the queue is empty</p> : <details className="dfCompactConsole__overviewList">
-          <summary>VIEW OPEN TASKS</summary>
-          <ul className="dfConsoleRows">
-            {tasks.map((task) => (
-              <li key={task.id}>
-                <div className="dfConsoleRow">
-                  <span className="dfConsoleRow__glyph" aria-hidden="true">{task.status === "running" ? "░" : "▒"}</span>
-                  <span className="dfConsoleRow__title">{task.title}</span>
-                  <span className="dfConsoleRow__agent">
-                    {task.status === "running" ? entityLabel(state?.agents, task.assigned_agent_id, "AGENT") : `priority ${task.priority}`}
-                  </span>
-                  <StageMeter stage={stageOfTask(task)} />
-                </div>
-              </li>
-            ))}
-          </ul>
-        </details>}
+        )}
     </section>
   );
 }

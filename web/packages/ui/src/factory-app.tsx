@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
 import { FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
-import { FactoryConsole, type ConsoleView } from "./factory-console.js";
-import { TaskConversation } from "./console-sidebar.js";
+import { FactoryConsole, type ConsoleDetail, type ConsoleView } from "./factory-console.js";
+import { TaskConversation, type AgentPanelView } from "./console-sidebar.js";
 import { primaryAgent } from "./console-view.js";
 import { XtermTerminal } from "./xterm-terminal.js";
 
@@ -17,10 +17,9 @@ export type FactoryAppProps = {
 /** Complete browser application lifecycle; hosts only render this component. */
 export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   const [snapshot, setSnapshot] = useState<FactoryAppSnapshot>(INITIAL_SNAPSHOT);
-  // The roster is always visible. The view state now only controls whether
-  // the optional floor disclosure is open, which keeps its live polling tied
-  // to what the operator can see.
-  const [view, setView] = useState<ConsoleView>("agents");
+  const [view, setView] = useState<ConsoleView>("floor");
+  const [detail, setDetail] = useState<ConsoleDetail>("needs-you");
+  const [agentPanel, setAgentPanel] = useState<AgentPanelView>("terminal");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const owner = useRef<FactoryAppController | undefined>(undefined);
   const defaultedController = useRef<FactoryAppController | undefined>(undefined);
@@ -54,6 +53,13 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
     controller.selectAgent(agent);
   }, [snapshot]);
 
+  const selectedAgentID = snapshot.selectedAgent?.id;
+  const previousSelectedAgentID = useRef<string | undefined>(selectedAgentID);
+  useEffect(() => {
+    if (previousSelectedAgentID.current === undefined && selectedAgentID !== undefined) setDetail("agent");
+    previousSelectedAgentID.current = selectedAgentID;
+  }, [selectedAgentID]);
+
   // The floor's rooms are regenerable, so they are fetched when the floor is
   // shown, whenever a fresh session becomes ready, and whenever the set of
   // projects changes under them.
@@ -86,14 +92,18 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       {...snapshot}
       view={view}
       onView={setView}
+      detail={detail}
+      onDetail={setDetail}
+      agentPanel={agentPanel}
+      onAgentPanel={setAgentPanel}
       settingsOpen={settingsOpen}
       onToggleSettings={() => setSettingsOpen((open) => !open)}
-      onSelectAgent={(agent) => owner.current?.selectAgent(agent)}
+      onSelectAgent={(agent) => { setDetail("agent"); setAgentPanel("terminal"); owner.current?.selectAgent(agent); }}
       onSaveAgentConfig={(config) => { void owner.current?.updateAgentConfig(config); }}
       onEditTask={(task, change) => owner.current?.editTask(task, change) ?? Promise.resolve(false)}
       onLoadTaskDetail={(task, peerOffset, expectedHead) => owner.current?.taskDetail(task, peerOffset, expectedHead) ?? Promise.reject(new Error("closed"))}
-      onOpenTerminalForHumanRequest={(request) => owner.current?.openTerminalForHumanRequest(request)}
-      onSelectHumanRequest={(request) => { void owner.current?.selectHumanRequest(request); }}
+      onOpenTerminalForHumanRequest={(request) => { setDetail("agent"); setAgentPanel("terminal"); owner.current?.openTerminalForHumanRequest(request); }}
+      onSelectHumanRequest={(request) => { setDetail("needs-you"); void owner.current?.selectHumanRequest(request); }}
       onHumanReplyChange={(reply) => owner.current?.setHumanReply(reply)}
       onReplyHumanRequest={() => { void owner.current?.replyHumanRequest(); }}
       onCancelHumanRequest={() => { void owner.current?.cancelHumanRequest(); }}

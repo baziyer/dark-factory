@@ -18,7 +18,7 @@ function fakeModules({ throwOnDispose = false } = {}) {
     addonDisposes: 0,
     fitCalls: 0,
     writes: [],
-    resizeListeners: new Set(),
+    observers: new Set(),
   };
   class Terminal {
     rows = 24;
@@ -44,8 +44,11 @@ function fakeModules({ throwOnDispose = false } = {}) {
 
 function fakeWindow(state) {
   return {
-    addEventListener: (_type, listener) => state.resizeListeners.add(listener),
-    removeEventListener: (_type, listener) => state.resizeListeners.delete(listener),
+    ResizeObserver: class {
+      constructor(callback) { this.callback = callback; }
+      observe(element) { this.element = element; state.observers.add(this); }
+      disconnect() { state.observers.delete(this); }
+    },
   };
 }
 
@@ -129,7 +132,7 @@ test("module or mount failure is reported to the finite owner", async () => {
   assert.equal(published[1], undefined);
 });
 
-test("initial fit reports one size and each later window fit reports one size", async () => {
+test("terminal refits when its panel is revealed, skips hidden sizes, and stops observing on disposal", async () => {
   const modules = fakeModules();
   const resized = [];
   let surface;
@@ -142,12 +145,17 @@ test("initial fit reports one size and each later window fit reports one size", 
   await tick();
   assert.equal(modules.state.fitCalls, 1);
   assert.deepEqual(resized, [[30, 100]]);
-  for (const listener of modules.state.resizeListeners) listener();
+  const observer = [...modules.state.observers][0];
+  observer.callback([{ contentRect: { width: 0, height: 0 } }]);
+  assert.equal(modules.state.fitCalls, 1, "hidden panels must not resize the PTY");
+  observer.callback([{ contentRect: { width: 600, height: 300 } }]);
   assert.equal(modules.state.fitCalls, 2);
   assert.deepEqual(resized, [[30, 100], [30, 100]]);
   assert.ok(surface);
   stop();
-  assert.equal(modules.state.resizeListeners.size, 0);
+  assert.equal(modules.state.observers.size, 0);
+  observer.callback([{ contentRect: { width: 600, height: 300 } }]);
+  assert.equal(modules.state.fitCalls, 2, "late observer callbacks cannot resize a disposed terminal");
   assert.equal(modules.state.disposes, 1);
   assert.equal(modules.state.addonDisposes, 0);
 });

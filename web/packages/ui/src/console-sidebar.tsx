@@ -21,6 +21,7 @@ export type DiscoveredAccount = Readonly<{
 
 export type TaskEdit = Readonly<{ title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
 export type TaskBrief = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
+export type AgentPanelView = "terminal" | "config";
 
 /** One private peer-conversation page, shared by queued and completed work. */
 export function TaskConversation({ brief, onOlder, pending = false }: { brief: TaskBrief; onOlder?: () => void; pending?: boolean }) {
@@ -52,6 +53,8 @@ export function AgentPanel({
   onEditTask,
   onLoadTaskDetail,
   terminalContent,
+  panel: panelProp,
+  onPanel,
 }: {
   agent: AgentItem;
   state: StateView | undefined;
@@ -60,8 +63,10 @@ export function AgentPanel({
   onSaveConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
-  /** The workbench owns one terminal surface for this selected agent. */
+  /** The selected agent's mounted terminal and durable composer. */
   terminalContent?: ReactNode;
+  panel?: AgentPanelView;
+  onPanel?: (panel: AgentPanelView) => void;
 }) {
   const activity = state === undefined ? "ready" : agentStatus(agent, state);
   const current = state === undefined ? undefined : agentCurrentTask(agent, state);
@@ -70,14 +75,16 @@ export function AgentPanel({
     .sort((left, right) => right.priority - left.priority);
   const historyTasks = state === undefined ? [] : orderTasksForHome(state)
     .filter((task) => task.assigned_agent_id === agent.id && task.status !== "queued");
-  const peers = state === undefined ? [] : [...state.agents.values()].filter((peer) => peer.project_id === agent.project_id);
   const [conversation, setConversation] = useState<{ task: TaskItem; brief: TaskBrief }>();
   const [conversationError, setConversationError] = useState(false);
   const [conversationPending, setConversationPending] = useState(false);
   const [historyTaskID, setHistoryTaskID] = useState<string>();
+  const [localPanel, setLocalPanel] = useState<AgentPanelView>("terminal");
+  const panel = panelProp ?? localPanel;
+  const selectPanel = onPanel ?? setLocalPanel;
   useEffect(() => { setConversation(undefined); setConversationError(false); setHistoryTaskID(undefined); }, [agent.id]);
   const historyTask = historyTasks.find((task) => task.id === historyTaskID) ?? historyTasks[0];
-  const errorCopy = editErrorCopy(edit);
+  const errorCopy = edit?.target === agent.id ? editErrorCopy(edit) : undefined;
   const queueHint = agent.paused
     ? "QUEUE PAUSED"
     : current === undefined && queued.length > 0
@@ -92,49 +99,97 @@ export function AgentPanel({
     `${id}:${revision}:${errorCopy !== undefined && edit?.target === id ? "refused" : ""}`;
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
+      <div className="dfConsoleSidebar__heading">
+        <div>
+          <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
+          <h2>{agent.name}</h2>
+        </div>
+      </div>
+
       <p className="dfConsoleSidebar__status">{activity === "needs-you" ? "! needs you" : activity}</p>
       {queueHint === undefined ? null : <p className="dfConsoleSidebar__inherit">{queueHint}</p>}
 
       {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
 
-      {terminalContent === undefined ? null : <div className="dfConsoleSidebar__terminalSlot">{terminalContent}</div>}
+      <div className="dfConsoleViewToggle" role="group" aria-label="Agent controls">
+        <button type="button" aria-pressed={panel === "terminal"} onClick={() => selectPanel("terminal")}>TERMINAL</button>
+        <button type="button" aria-pressed={panel === "config"} onClick={() => selectPanel("config")}>CONFIG</button>
+      </div>
+      <section className="dfConsoleSidebar__section dfConsoleSidebar__terminalSlot" aria-label="Terminal" hidden={panel !== "terminal"}>
+        {terminalContent ?? <p className="dfFactoryConsole__empty">OPENING TERMINAL</p>}
+      </section>
 
-      <details className="dfConsoleSidebar__section" aria-label="Agent queue" open={queued.length > 0}>
-        <summary>QUEUE · {queued.length}</summary>
-        {queued.length === 0 ? <p className="dfFactoryConsole__empty">nothing queued</p> : (
-          <ul className="dfFactoryConsole__list">
-            {queued.map((task, index) => (
-              <QueuedTask
-                key={task.id}
-                task={task}
-                above={queued[index - 1]}
-                below={queued[index + 1]}
-                peers={peers}
-                pending={edit?.pending === true}
-                ready={ready}
-                onEditTask={onEditTask}
-				onLoadTaskDetail={onLoadTaskDetail}
-              />
-            ))}
-          </ul>
-        )}
-      </details>
-
-      <details className="dfConsoleSidebar__section">
-        <summary>CONFIG</summary>
+      <section className="dfConsoleSidebar__section" aria-label="Agent configuration" hidden={panel !== "config"}>
         <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} accounts={state === undefined ? [] : [...state.accounts.values()]} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
-      </details>
+      </section>
 
-      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <details className="dfConsoleSidebar__section" aria-label="Task history">
-        <summary>TASK HISTORY</summary>
+      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Task history">
+        <h3>TASK HISTORY</h3>
         <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-history-${agent.id}`}>TASK HISTORY</label>
         <select id={`df-history-${agent.id}`} value={historyTask.id} disabled={conversationPending} onChange={(event) => { setHistoryTaskID(event.currentTarget.value); setConversation(undefined); setConversationError(false); }}>{historyTasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select>
         <button type="button" disabled={conversationPending} onClick={async () => { setConversationPending(true); try { setConversation({ task: historyTask, brief: await onLoadTaskDetail(historyTask) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } }}>VIEW CONVERSATION</button>
         {conversationError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : null}
         {conversation === undefined ? null : <TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset, conversation.brief.head) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} />}
-      </details>}
+      </div>}
     </section>
   );
+}
+
+/** The single editable queue, grouped only to retain each agent's priority order. */
+export function QueuePanel({
+  state,
+  edit,
+  ready,
+  onEditTask,
+  onLoadTaskDetail,
+}: {
+  state: StateView | undefined;
+  edit?: FactoryEditView;
+  ready: boolean;
+  onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
+}) {
+  const agents = state === undefined ? [] : [...state.agents.values()];
+  const tasks = state === undefined ? [] : [...state.tasks.values()];
+  const running = tasks.filter((task) => task.status === "running");
+  const queued = agents.flatMap((agent) => {
+    const assigned = tasks
+      .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
+      .sort((left, right) => right.priority - left.priority);
+    return assigned.length === 0 ? [] : [{ agent, tasks: assigned }];
+  });
+  const errorCopy = edit === undefined || !tasks.some((task) => task.id === edit.target && task.status === "queued") ? undefined : editErrorCopy(edit);
+  return <section className="dfConsoleSidebar__panel" aria-label="Queue">
+    <div className="dfConsoleSidebar__heading"><h2>QUEUE</h2></div>
+    {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
+    {state === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
+      : <>
+        {running.length === 0 ? null : <section className="dfConsoleSidebar__section" aria-label="Running tasks">
+          <h3>RUNNING</h3>
+          <ul className="dfConsoleRows">{running.map((task) => <li key={task.id}><div className="dfConsoleRow">
+            <span className="dfConsoleRow__title">{task.title}</span>
+            <span className="dfConsoleRow__agent">{agents.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"}</span>
+          </div></li>)}</ul>
+        </section>}
+        {queued.length === 0 ? <p className="dfFactoryConsole__empty">THE QUEUE IS EMPTY</p> : queued.map(({ agent, tasks }) => {
+          const peers = agents.filter((peer) => peer.project_id === agent.project_id);
+          return <section className="dfConsoleSidebar__section" key={agent.id} aria-label={`Queue for ${agent.name}`}>
+            <h3>{agent.name}</h3>
+            <ul className="dfFactoryConsole__list">{tasks.map((task, index) => <QueuedTask
+              key={task.id}
+              task={task}
+              above={tasks[index - 1]}
+              below={tasks[index + 1]}
+              peers={peers}
+              pending={edit?.pending === true}
+              ready={ready}
+              onEditTask={onEditTask}
+              onLoadTaskDetail={onLoadTaskDetail}
+            />)}</ul>
+          </section>;
+        })}
+      </>}
+  </section>;
 }
 
 /**
