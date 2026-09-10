@@ -8,7 +8,7 @@
 # bridge on PATH and no GitHub credential: the head is fetched from the public
 # repository by its pull request ref, the base must be a commit that fetch
 # brought along, and the body is the file the caller wrote. When set,
-# DARK_FACTORY_REVIEW_EVIDENCE_FILE names an exact-head gate receipt copied
+# DARK_FACTORY_REVIEW_EVIDENCE_FILE names a JSON gate receipt (head, base, integer exit_code: 0) copied
 # into the read-only review directory; it adds no tools or permissions and
 # does not replace gates.
 #
@@ -144,6 +144,19 @@ fi
 cp "$body" "$work/body.md" || exit 5
 if [ -n "$evidence" ]; then
     cp "$evidence" "$work/evidence.md" || exit 5
+    python3 - "$work/evidence.md" "$head" "$base" <<'PY_EVIDENCE' || exit 2
+import json, sys
+try:
+    with open(sys.argv[1]) as source:
+        receipt = json.load(source)
+    valid = (isinstance(receipt, dict) and receipt.get("head") == sys.argv[2]
+             and receipt.get("base") == sys.argv[3]
+             and type(receipt.get("exit_code")) is int and receipt["exit_code"] == 0)
+except (OSError, ValueError):
+    valid = False
+if not valid:
+    sys.exit("review evidence must be a passing JSON receipt for the exact head and base")
+PY_EVIDENCE
     evidence_instruction="Read the exact-head gate evidence at $work/evidence.md. It records completed checks for this head; use it as evidence and do not rerun gates or tests merely because this read-only review environment cannot reproduce them."
 else
     evidence_instruction="No exact-head gate evidence file was supplied."

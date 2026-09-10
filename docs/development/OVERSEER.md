@@ -318,8 +318,9 @@ DARK_FACTORY_REVIEW_OPERATION_ID=$(opid "$change_id" "review-$(printf '%s' "$HEA
     repo/scripts/cold-review.sh OWNER/REPO PR HEAD_SHA "$base_commit" body.md "first review"
 ```
 
-The receipt supplements, never replaces, the required gate and must bind the
-same head and base. A blocking review finding needs a concrete reproducer or a
+The JSON receipt supplements, never replaces, the required gate. The helper
+requires matching `head` and `base` strings and integer `exit_code: 0` before
+starting the reviewer. A blocking review finding needs a concrete reproducer or a
 reachable code path through the current guards to a missing or ineffective
 check. Reviewers inspect the documented threat model before security claims;
 an unverified hypothetical or an unavailable read-only test is a deferred

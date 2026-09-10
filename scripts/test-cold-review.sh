@@ -175,12 +175,25 @@ grep -q "git -C .* diff $base $head" "$args" || fail "Codex prompt does not scop
 # A supplied exact-head receipt is copied into the isolated review directory
 # and tells the reviewer to use it rather than futile read-only reruns.
 evidence=$temporary/evidence.md
-printf 'head=%s\nbase=%s\nlocal-ci=exit 0\n' "$head" "$base" >"$evidence"
+printf '{"head":"%s","base":"%s","exit_code":0}\n' "$head" "$base" >"$evidence"
 : >"$args"
 (export DARK_FACTORY_REVIEW_EVIDENCE_FILE="$evidence"; review owner/repo 7 "$head" "$base" "$body") \
     || fail "review with exact-head gate evidence did not exit 0"
 grep -q 'gate evidence at .*/evidence.md' "$args" || fail "prompt does not name copied gate evidence"
 grep -q 'do not rerun gates or tests' "$args" || fail "prompt does not preserve exact-head gate evidence"
+# A stale or failed receipt must stop before provider execution.
+for bad_receipt in \
+    "{\"head\":\"$base\",\"base\":\"$base\",\"exit_code\":0}" \
+    "{\"head\":\"$head\",\"base\":\"$head\",\"exit_code\":0}" \
+    "{\"head\":\"$head\",\"base\":\"$base\",\"exit_code\":1}" \
+    "{\"head\":\"$head\",\"base\":\"$base\",\"exit_code\":false}" \
+    'malformed'; do
+    printf '%s\n' "$bad_receipt" >"$evidence"
+    : >"$args"
+    status=0
+    (export DARK_FACTORY_REVIEW_EVIDENCE_FILE="$evidence"; review owner/repo 7 "$head" "$base" "$body") || status=$?
+    [ "$status" -eq 2 ] && [ ! -s "$args" ] || fail "invalid evidence started a review"
+done
 # Claude remains available for the occasional review that needs it.
 : >"$args"
 DARK_FACTORY_REVIEW_PROVIDER=claude review owner/repo 7 "$head" "$base" "$body" || fail "Claude review did not exit 0"
