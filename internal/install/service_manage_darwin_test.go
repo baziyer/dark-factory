@@ -219,6 +219,9 @@ func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	if err != nil || status != (ServiceStatus{State: ServiceRunning, PID: 4500}) || len(loadedIdleStart.calls) != 5 || loadedIdleStart.calls[1][0] != "bootout" || loadedIdleStart.calls[3][0] != "bootstrap" {
 		t.Fatalf("loaded-idle start = %+v, %v, calls=%q", status, err, loadedIdleStart.calls)
 	}
+	if err := os.WriteFile(serviceStderrPath(fixture.home), []byte("factoryd: serve error\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// Uninstall removes every artifact and proves absence.
 	uninstall := &recordedLaunchctl{results: []launchctlResult{fixture.printRunning(4400), {status: 0}, {status: launchctlNotFound}}}

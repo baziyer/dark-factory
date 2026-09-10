@@ -442,7 +442,7 @@ func serviceUninstallLockedAt(ctx context.Context, home, userHome string, config
 				return ServiceStatus{State: ServiceAmbiguous}, err
 			}
 		}
-		for _, name := range []string{serviceReceiptName, "." + serviceReceiptName + ".stage"} {
+		for _, name := range []string{serviceReceiptName, "." + serviceReceiptName + ".stage", serviceStderrLogName} {
 			if err := removeOwnedFile(ServiceDirectoryPath(home), name); err != nil {
 				return ServiceStatus{State: ServiceAmbiguous}, err
 			}

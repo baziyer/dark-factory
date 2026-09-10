@@ -212,17 +212,50 @@ func writeTestUnacknowledgedOutcomeResponse(connection net.Conn, domain byte, bo
 	}
 	receipt := bytes.Repeat([]byte{'R'}, outcomeReceiptBytes)
 	if err := writeTestPayload(connection, receipt, nil); err != nil {
+		// The client rejects an invalid envelope before reading a receipt and
+		// may close before this deliberately offered receipt is written.
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+			return requireNoTestOutcomeReceipt(connection)
+		}
 		return err
 	}
 	unix, ok := connection.(*net.UnixConn)
 	if !ok || unix.CloseWrite() != nil {
 		return ErrTransport
 	}
+	return requireNoTestOutcomeReceipt(connection)
+}
+
+func requireNoTestOutcomeReceipt(connection net.Conn) error {
 	var extra [1]byte
 	if count, readErr := connection.Read(extra[:]); count != 0 || !errors.Is(readErr, io.EOF) {
 		return fmt.Errorf("invalid outcome response was acknowledged: count=%d error=%v", count, readErr)
 	}
 	return nil
+}
+
+type testPeerCloseAfterReceipt struct {
+	net.Conn
+	writes int
+}
+
+func (connection *testPeerCloseAfterReceipt) Read(value []byte) (int, error) {
+	value[0] = 'R'
+	return 1, io.EOF
+}
+
+func (connection *testPeerCloseAfterReceipt) Write(value []byte) (int, error) {
+	connection.writes++
+	if connection.writes == 1 {
+		return len(value), nil
+	}
+	return 0, syscall.EPIPE
+}
+
+func TestUnacknowledgedOutcomeFixtureDoesNotMaskReceiptBeforePeerClose(t *testing.T) {
+	if err := writeTestUnacknowledgedOutcomeResponse(&testPeerCloseAfterReceipt{}, wireAttemptDomain, `{"ok":true,"data":{"head":9,"revision":0}}`); err == nil || !strings.Contains(err.Error(), "acknowledged") {
+		t.Fatalf("peer-close receipt = %v", err)
+	}
 }
 
 func TestMutationResultUsesCanonicalHeadAndAllowsZero(t *testing.T) {
