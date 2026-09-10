@@ -859,7 +859,13 @@ func TestTerminalTransportResetAndDetachJoinAttachment(t *testing.T) {
 	if reset.Type != browserprotocol.TypeTerminalReset || reset.ID != "attach" {
 		t.Fatalf("reset frame=%+v", reset)
 	}
-	if attachment := backend.currentAttachment(t); attachment.closed.Load() != 1 || attachment.closeCalls.Load() != 1 {
+	attachment := backend.currentAttachment(t)
+	select {
+	case <-attachment.closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("reset attachment did not close")
+	}
+	if attachment.closed.Load() != 1 || attachment.closeCalls.Load() != 1 {
 		t.Fatalf("reset close count=%d calls=%d", attachment.closed.Load(), attachment.closeCalls.Load())
 	}
 	// A reset retires the attachment; a late queue event cannot become output.

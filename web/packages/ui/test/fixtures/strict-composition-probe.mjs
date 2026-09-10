@@ -10,6 +10,11 @@ globalThis.window = {
   history: { state: null, replaceState() {} },
   addEventListener: (_type, listener) => listeners.add(listener),
   removeEventListener: (_type, listener) => listeners.delete(listener),
+  ResizeObserver: class {
+    constructor(callback) { this.callback = callback; }
+    observe() {}
+    disconnect() {}
+  },
 };
 
 async function waitFor(predicate, label) {
@@ -29,9 +34,13 @@ try {
     });
   });
   await waitFor(() => counters.states === 2, "factory state did not render");
-  // The persistent agent roster is the keyboard-reachable terminal entry.
+  // Factory is the default view; the roster is its explicit alternative and
+  // remains the keyboard-reachable terminal entry.
   const agentRow = () => renderer.root.findAllByType("button").find((button) => typeof button.props.className === "string" && button.props.className.includes("dfAgentList__row"));
   const open = async () => {
+    const agents = renderer.root.findAllByType("button").find((button) => button.props.children === "AGENTS");
+    assert.ok(agents, "public FactoryApp must expose the Agents view");
+    await act(async () => { agents.props.onClick(); });
     const row = agentRow();
     assert.ok(row, "public FactoryApp must expose a selectable agent");
     await act(async () => { row.props.onClick(); });
