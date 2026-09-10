@@ -139,7 +139,6 @@ export function FactoryFloor({
     <FactoryScene
       topology={scene.topology}
       workers={scene.workers}
-      workItems={scene.workItems}
       omittedLocations={scene.omittedLocations}
       onSelectWorker={onSelectAgent === undefined || state === undefined ? undefined : (workerID) => {
         const agent = state.agents.get(workerID);

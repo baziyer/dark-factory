@@ -29,11 +29,6 @@ export type SceneWorker = Readonly<{
   nodeId?: string;
 }>;
 
-export type SceneWorkItem = Readonly<{
-  id: string;
-  stage: "staged" | "release-ready";
-}>;
-
 export type ScenePoint = Readonly<{ x: number; y: number }>;
 
 export type SceneRoomLayout = Readonly<{
@@ -52,6 +47,8 @@ export type SceneLayout = Readonly<{
   height: number;
   rooms: readonly SceneRoomLayout[];
   headings: readonly SceneHeading[];
+  /** Reserved only when resting workers need the area above the rooms. */
+  restingTop?: number;
 }>;
 
 export type SceneWorkerPlacement = Readonly<{
@@ -84,17 +81,21 @@ function centeredSlot(index: number) {
 }
 
 /** Rooms sit under their project's heading, projects in name order, then id. */
-export function layoutScene(topology: SceneTopology): SceneLayout {
+export function layoutScene(topology: SceneTopology, restingCount = 0): SceneLayout {
   const nodes = [...topology.nodes].sort((left, right) =>
     compareText(left.project?.name ?? "", right.project?.name ?? "") || compareText(left.project?.id ?? "", right.project?.id ?? "")
     || compareText(left.path, right.path) || compareText(left.id, right.id));
   const columns = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(nodes.length))));
   const width = PADDING * 2 + columns * ROOM_WIDTH + (columns - 1) * ROOM_GAP;
+  const outsideColumns = Math.max(1, Math.floor((width - PADDING * 2 - 16) / WORKER_GAP) + 1);
+  const restingTop = restingCount === 0 ? undefined : FLOOR_TOP + 28;
+  const restingRows = Math.ceil(restingCount / outsideColumns);
+  const restingHeight = restingTop === undefined ? 0 : Math.ceil((28 + restingRows * WORKER_GAP + PADDING) / spriteAtlas.frame) * spriteAtlas.frame;
   const groups = new Map<string, SceneNode[]>();
   for (const node of nodes) groups.set(node.project?.id ?? "", [...(groups.get(node.project?.id ?? "") ?? []), node]);
   const rooms: SceneRoomLayout[] = [];
   const headings: SceneHeading[] = [];
-  let top = FLOOR_TOP;
+  let top = FLOOR_TOP + restingHeight;
   for (const members of groups.values()) {
     const project = members[0]!.project;
     if (project !== undefined) {
@@ -108,7 +109,10 @@ export function layoutScene(topology: SceneTopology): SceneLayout {
     });
     top += Math.ceil(members.length / columns) * (ROOM_HEIGHT + ROOM_GAP);
   }
-  return { width, height: rooms.length === 0 ? FLOOR_TOP + 30 + PADDING : top - ROOM_GAP + PADDING, rooms, headings };
+  const height = rooms.length === 0
+    ? Math.max(FLOOR_TOP + 30 + PADDING, (restingTop ?? FLOOR_TOP) + restingRows * WORKER_GAP + PADDING * 2 + 8)
+    : top - ROOM_GAP + PADDING;
+  return { width, height, rooms, headings, ...(restingTop === undefined ? {} : { restingTop }) };
 }
 
 export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[]): readonly SceneWorkerPlacement[] {
@@ -148,8 +152,10 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
       y: room.y + 48 + Math.floor(roomSlot / roomColumns) * WORKER_GAP,
     });
   }
-  const restingTop = layout.height + 28;
-  const stagingTop = restingTop + restRows * WORKER_GAP + (resting.length === 0 || (staging.length === 0 && overflow.length === 0) ? 0 : 32);
+  const restingTop = layout.restingTop ?? layout.height + 28;
+  const stagingTop = layout.restingTop === undefined
+    ? restingTop + restRows * WORKER_GAP + (resting.length === 0 || (staging.length === 0 && overflow.length === 0) ? 0 : 32)
+    : layout.height + 28;
   const overflowTop = stagingTop + stagingRows * WORKER_GAP + (staging.length === 0 || overflow.length === 0 ? 0 : 32);
   return [...placed, ...outside(resting, "resting", restingTop), ...outside(staging, "staging", stagingTop), ...outside(overflow, "overflow", overflowTop)]
     .sort((left, right) => compareText(left.id, right.id));

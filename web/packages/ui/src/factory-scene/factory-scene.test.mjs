@@ -8,7 +8,7 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
-import { layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
+import { PADDING, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
 const topology = {
@@ -23,11 +23,6 @@ const topology = {
 const workers = [
   { id: "worker-b", name: "Builder", role: "worker", provider: "codex", activity: "busy", location: "working", nodeId: "src" },
   { id: "worker-a", name: "Planner", role: "orchestrator", activity: "needs-you", nodeId: "missing" },
-];
-
-const workItems = [
-  { id: "release", stage: "release-ready" },
-  { id: "staged", stage: "staged" },
 ];
 
 // Pinned outputs keep these tests independent of the hash implementation.
@@ -66,7 +61,7 @@ function frameName(worker) {
 }
 
 function render(props = {}) {
-  return renderToStaticMarkup(createElement(FactoryScene, { topology, workers, workItems, ...props }));
+  return renderToStaticMarkup(createElement(FactoryScene, { topology, workers, ...props }));
 }
 
 test("the pure scene model feeds a deterministic SVG renderer", () => {
@@ -93,18 +88,17 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   const reordered = render({
     topology: { ...topology, nodes: [...topology.nodes].reverse() },
     workers: [...workers].reverse(),
-    workItems: [...workItems].reverse(),
   });
   assert.equal(first, reordered);
   assert.match(first, /data-topology-digest="fixture-1"/);
+  for (const label of ["RESTING", "STAGED", "READY"]) assert.equal(first.includes(`>${label}</text>`), false, `${label} footer remains rendered`);
   assert.match(first, /data-room-id="src"/);
   // The room subtitle carries the served size bucket, and nothing when the
   // room stands for a project rather than a topology node.
   assert.match(first, />PACKAGE · MEDIUM</);
   assert.match(renderToStaticMarkup(createElement(FactoryScene, {
     topology: { digest: "d", nodes: [{ id: "p", parentId: "", path: "Project", label: "Project", kind: "repository" }] },
-    workers: [],
-    workItems: [],
+    workers: []
   })), />REPOSITORY<\/text>/);
   assert.match(first, /&lt;Shared &amp; Library…/);
   assert.equal(first.includes("�"), false);
@@ -128,6 +122,10 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   assert.match(unobserved, /WORKING · 1 LOCATION NOT YET OBSERVED/);
   assert.match(unobserved, /working; location not yet observed/);
   assert.match(first, /RESTING AREA · 1/);
+  const restingY = Number(first.match(/data-worker-id="worker-a"[^>]*transform="translate\([^ ]+ ([0-9.]+)\)"/)[1]);
+  const roomYs = [...first.matchAll(/data-room-id="[^"]+"[^>]*>[\s\S]*?<rect x="[^"]+" y="([0-9.]+)"/g)].map((match) => Number(match[1]));
+  assert.ok(restingY + 24 < Math.min(...roomYs), "resting area stays above every room with clearance");
+  for (const room of layoutScene(topology, 1).rooms) assert.equal(room.y % spriteAtlas.frame, 0, `resting offset moved ${room.id} off the tile grid`);
   const capped = render({ workers: [{ ...workers[0], location: "working", locationLabel: "Source", nodeId: undefined }], omittedLocations: 1 });
   assert.match(capped, /ROOM MAP AT CAPACITY · 1 LOCATIONS NOT SHOWN/);
   assert.match(capped, /working near observed changes in Source; room map at capacity/);
@@ -144,10 +142,10 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     assert.ok(cell.x % 16 === 0 && cell.y % 16 === 0, name);
     assert.ok(cell.x >= 0 && cell.y >= 0 && cell.x + 16 <= spriteSheetSize.width && cell.y + 16 <= spriteSheetSize.height, name);
   }
-  // Every packed frame is one a render can reach, so no symbol is dead weight.
+  // Every topology tile the renderer needs stays available in the shared sheet.
   assert.deepEqual(
-    Object.keys(spriteAtlas.frames).filter((name) => name.startsWith("tile.") || name.startsWith("bay.")).sort(),
-    ["bay.free", "bay.ready", "bay.staged", "tile.door", "tile.floor.0", "tile.floor.1", "tile.wall"]);
+    Object.keys(spriteAtlas.frames).filter((name) => name.startsWith("tile.")).sort(),
+    ["tile.door", "tile.floor.0", "tile.floor.1", "tile.wall"]);
 
   const denseWorkers = Array.from({ length: 100 }, (_, index) => ({
     id: `worker-${index}`,
@@ -178,6 +176,13 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   const restingBottom = Math.max(...mixedPlacements.filter((placement) => placement.area === "resting").map((placement) => placement.y + 8));
   const overflowTop = Math.min(...mixedPlacements.filter((placement) => placement.area === "overflow").map((placement) => placement.y));
   assert.ok(overflowTop - restingBottom >= 24, "resting and overflow areas have separate rows");
+  const directOutside = placeWorkers(layout, [
+    { ...workers[1], location: "resting" },
+    { ...workers[0], location: "unobserved", nodeId: undefined },
+  ]);
+  const directRestingBottom = Math.max(...directOutside.filter((placement) => placement.area === "resting").map((placement) => placement.y + 8));
+  const directStagingTop = Math.min(...directOutside.filter((placement) => placement.area === "staging").map((placement) => placement.y));
+  assert.ok(directStagingTop - directRestingBottom >= 24, "direct placement keeps resting and unobserved workers apart");
 
   const stackedLayout = {
     width: 176,
@@ -208,11 +213,25 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
   const emptyWorkers = denseWorkers.slice(0, 20).map(({ nodeId: _nodeId, location: _location, ...worker }) => ({ ...worker, location: "resting" }));
   const emptyPlacements = placeWorkers(emptyLayout, emptyWorkers);
   assert.equal(new Set(emptyPlacements.map(({ x, y }) => `${x},${y}`)).size, emptyWorkers.length);
-  const emptySvg = render({ topology: { digest: "empty", nodes: [] }, workers: emptyWorkers, workItems: [] });
+  const emptySvg = render({ topology: { digest: "empty", nodes: [] }, workers: emptyWorkers });
   assert.match(emptySvg, /EMPTY FLOOR/);
   // An empty floor in a wide column stays a panel, not a poster.
   assert.match(emptySvg, new RegExp(`min-width:${Math.min(emptyLayout.width * 3, 864)}px`));
   assert.match(emptySvg, /aria-label="RESTING AREA · 20"/);
+  const emptyArea = emptySvg.match(/aria-label="RESTING AREA · 20"><rect x="[^"]+" y="([0-9.]+)" width="[^"]+" height="([0-9.]+)"/);
+  const emptyLabel = emptySvg.match(/<text x="[^"]+" y="([0-9.]+)"[^>]*>EMPTY FLOOR<\/text>/);
+  const emptyHeight = Number(emptySvg.match(/viewBox="0 0 [^ ]+ ([0-9.]+)"/)[1]);
+  assert.ok(emptyArea !== null && emptyLabel !== null);
+  assert.ok(Number(emptyLabel[1]) > Number(emptyArea[1]) + Number(emptyArea[2]), "empty-floor label clears the resting area");
+  assert.ok(emptyHeight > Number(emptyLabel[1]), "empty-floor label remains inside the scene");
+  const emptyWithStaging = render({
+    topology: { digest: "empty", nodes: [] },
+    workers: [...emptyWorkers, { ...workers[0], location: "unobserved", nodeId: undefined }],
+  });
+  const stagingArea = emptyWithStaging.match(/aria-label="WORKING · 1 LOCATION NOT YET OBSERVED"><rect x="[^"]+" y="([0-9.]+)"/);
+  const stagingLabel = emptyWithStaging.match(/<text x="[^"]+" y="([0-9.]+)"[^>]*>EMPTY FLOOR<\/text>/);
+  assert.ok(stagingArea !== null && stagingLabel !== null);
+  assert.ok(Number(stagingLabel[1]) + PADDING <= Number(stagingArea[1]), "empty-floor label clears the staging area");
 });
 
 test("rooms group under their project's heading and stay on the tile grid", () => {
@@ -243,7 +262,7 @@ test("rooms group under their project's heading and stay on the tile grid", () =
   assert.deepEqual(twins.rooms.map((room) => room.id), layout.rooms.map((room) => room.id));
   // The heading is its own element at the row the layout gave it, and every
   // door sits on the tile grid like the room it opens.
-  const markup = renderToStaticMarkup(createElement(FactoryScene, { topology: grouped, workers: [], workItems: [] }));
+  const markup = renderToStaticMarkup(createElement(FactoryScene, { topology: grouped, workers: [] }));
   for (const heading of layout.headings) {
     assert.match(markup, new RegExp(`<text data-floor-heading="${heading.label}" x="${heading.x}" y="${heading.y + 11}"[^>]*>${heading.label}</text>`));
   }

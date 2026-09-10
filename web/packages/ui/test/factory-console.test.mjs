@@ -123,7 +123,6 @@ test("the floor maps topology to rooms and agents to workers deterministically",
     ["Dispatch Lead", "idle", "resting", undefined],
     ["Builder Two", "waiting", "resting", undefined],
   ]);
-  assert.deepEqual(scene.workItems.map((item) => item.stage), ["staged", "release-ready"]);
 
   // A live run stands its worker in the room of the code it is changing: the
   // deepest displayed room that prefixes a path, and the room most paths sit in.
@@ -163,7 +162,7 @@ test("the floor maps topology to rooms and agents to workers deterministically",
   assert.deepEqual(fallback.topology.nodes.map((node) => node.label), ["North Workshop", "South Workshop"]);
   assert.deepEqual(fallback.topology.nodes.map((node) => node.sizeBucket), [undefined, undefined]);
   assert.deepEqual(fallback.workers.map((worker) => worker.nodeId), [undefined, undefined, undefined]);
-  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], workItems: [], omittedLocations: 0 });
+  assert.deepEqual(floorScene(undefined, undefined), { topology: { digest: "", nodes: [] }, workers: [], omittedLocations: 0 });
   // The size bucket, not a file count, is what the room subtitle carries.
   const markup = render({ topologies: fixtureTopologies });
   assert.match(markup, />kernel<\/text>/);
@@ -747,28 +746,36 @@ test("a config refusal resets only its form and config saves remain partial", as
   }
 });
 
-test("task history selects every served finished task and pages one conversation", async () => {
+test("task history distinguishes duplicate titles and keeps private details through paging", async () => {
   const calls = [];
-  const task = fixtureState.tasks.get(ids.task);
+  const task = { ...fixtureState.tasks.get(ids.task), assigned_agent_id: ids.agent, title: "Direct instruction", status: "succeeded", revision: 11n };
+  const other = { ...task, id: "52".repeat(16), status: "failed", revision: 12n };
   const props = {
-    status: "ready", state: baseState(), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
+    status: "ready", state: baseState({ tasks: new Map([[task.id, task], [other.id, other]]) }), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
     onLoadTaskDetail: async (selected, peerOffset, expectedHead) => {
       calls.push([selected.id, peerOffset, expectedHead]);
       if (peerOffset !== undefined) throw new SessionError("stale");
-      return { taskId: selected.id, revision: selected.revision, head: expectedHead ?? 9n, instruction: "", feedback: "", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], ...(peerOffset === undefined ? { nextPeerOffset: 1n } : {}) };
+      return { taskId: selected.id, revision: selected.revision, head: expectedHead ?? 9n, instruction: `Original ${selected.id}`, feedback: `Feedback ${selected.id}`, peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], nextPeerOffset: 1n };
     },
   };
   let renderer;
   await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
   assert.ok(renderer.root.findAllByProps({ "aria-label": "Task history" }).length === 1);
-  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
+  const history = renderer.root.findByProps({ "aria-label": "Task history" });
+  const picker = history.findByType("select");
+  assert.deepEqual(picker.props.children.map((option) => option.props.children.join("")), [`Direct instruction · SUCCEEDED · ${task.id.slice(0, 8)}`, `Direct instruction · FAILED · ${other.id.slice(0, 8)}`]);
+  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW TASK").props.onClick(); });
   assert.deepEqual(calls, [[task.id, undefined, undefined]]);
+  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Original ${task.id}`));
+  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Feedback ${task.id}`));
   await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
   assert.deepEqual(calls, [[task.id, undefined, undefined], [task.id, 1n, 9n]]);
   assert.ok(renderer.root.findAllByType("span").some((item) => item.props.children === "Question"), "a stale continuation keeps the loaded conversation");
   assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("REFUSED THIS HISTORY")));
-  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW CONVERSATION").props.onClick(); });
-  assert.deepEqual(calls.at(-1), [task.id, undefined, undefined], "reloading starts a fresh first page without the stale head");
+  await act(async () => { picker.props.onChange({ currentTarget: { value: other.id } }); });
+  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW TASK").props.onClick(); });
+  assert.deepEqual(calls.at(-1), [other.id, undefined, undefined]);
+  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Original ${other.id}`), "the selected duplicate title loads its own private brief");
 });
 
 test("a rejected edit says plainly that the durable value did not change", () => {

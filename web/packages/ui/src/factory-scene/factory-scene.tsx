@@ -5,7 +5,6 @@ import {
   workerFrame,
   type SceneTopology,
   type SceneWorker,
-  type SceneWorkItem,
 } from "./scene.js";
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "./sprites/sprites.generated.js";
 
@@ -17,20 +16,17 @@ export type {
   SceneTopology,
   SceneWorker,
   SceneWorkerPlacement,
-  SceneWorkItem,
 } from "./scene.js";
 
 export type FactorySceneProps = Readonly<{
   topology: SceneTopology;
   workers: readonly SceneWorker[];
-  workItems: readonly SceneWorkItem[];
   /** Current changed locations omitted by the bounded room map. */
   omittedLocations?: number;
   /** Pointer convenience only; the AGENTS list is the keyboard path. */
   onSelectWorker?: (workerId: string) => void;
 }>;
 
-const SERVICE_HEIGHT = 52;
 const FRAME = spriteAtlas.frame;
 
 function shortLabel(label: string) {
@@ -44,8 +40,8 @@ function Frame({ name, x, y, className }: { name: string; x: number; y: number; 
 }
 
 /** A disposable SVG projection of topology and current factory state. */
-export function FactoryScene({ topology, workers, workItems, omittedLocations = 0, onSelectWorker }: FactorySceneProps) {
-  const layout = layoutScene(topology);
+export function FactoryScene({ topology, workers, omittedLocations = 0, onSelectWorker }: FactorySceneProps) {
+  const layout = layoutScene(topology, workers.filter((worker) => worker.location !== "working" && worker.location !== "unobserved").length);
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
@@ -53,13 +49,7 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
   const staging = placements.filter((placement) => placement.area === "staging");
   const overflow = placements.filter((placement) => placement.area === "overflow");
   const occupied = new Set(placements.filter((placement) => placement.area === "room").map((placement) => placement.roomId));
-  const workerBottom = Math.max(layout.height, ...placements.map((placement) => placement.y + 8));
-  const serviceY = workerBottom + PADDING;
-  const sceneHeight = serviceY + SERVICE_HEIGHT + PADDING;
-  const bayGap = 6;
-  const bayWidth = (layout.width - PADDING * 2 - bayGap * 2) / 3;
-  const staged = workItems.filter((item) => item.stage === "staged").length;
-  const ready = workItems.length - staged;
+  const sceneHeight = Math.max(layout.height, ...placements.map((placement) => placement.y + 8)) + PADDING;
   // A wide column must not blow 16px frames up to poster size: the scene stops
   // at three CSS pixels per sheet pixel and centres in whatever is left.
   const maxWidth = layout.width * 3;
@@ -73,7 +63,7 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
       style={{ display: "block", width: "100%", minWidth: Math.min(maxWidth, 864), maxWidth, height: "auto", margin: "0 auto", background: "#08131d" }}
     >
       <title>Dark Factory codebase floor</title>
-      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers, ${workItems.length} tasks${omittedLocations === 0 ? "" : `, ${omittedLocations} current locations omitted by the room cap`}`}</desc>
+      <desc>{`${layout.rooms.length} topology spaces, ${workers.length} workers${omittedLocations === 0 ? "" : `, ${omittedLocations} current locations omitted by the room cap`}`}</desc>
       <defs>
         {/* The sheet enters the document once; every frame is a window on it. */}
         <image id="df-sheet" href={spriteSheet} width={spriteSheetSize.width} height={spriteSheetSize.height} style={{ imageRendering: "pixelated" }} />
@@ -122,15 +112,15 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
         );
       })}
 
+      {resting.length === 0 ? null : <Area label={`RESTING AREA · ${resting.length}`} width={layout.width - PADDING * 2} top={Math.min(...resting.map((placement) => placement.y)) - 28} bottom={Math.max(...resting.map((placement) => placement.y + 8)) + PADDING} />}
+      {staging.length === 0 ? null : <Area label={`WORKING · ${staging.length} LOCATION${staging.length === 1 ? "" : "S"} NOT YET OBSERVED`} width={layout.width - PADDING * 2} top={Math.min(...staging.map((placement) => placement.y)) - 28} bottom={Math.max(...staging.map((placement) => placement.y + 8)) + PADDING} />}
+      {overflow.length === 0 ? null : <Area label={omittedLocations === 0 ? `WORKER AREA AT CAPACITY · ${overflow.length}` : `ROOM MAP AT CAPACITY · ${omittedLocations} LOCATIONS NOT SHOWN`} width={layout.width - PADDING * 2} top={Math.min(...overflow.map((placement) => placement.y)) - 28} bottom={Math.max(...overflow.map((placement) => placement.y + 8)) + PADDING} />}
+
       {layout.rooms.length === 0 ? (
-        <text x={layout.width / 2} y="52" textAnchor="middle" fill="#7890a2" fontFamily="ui-monospace, monospace" fontSize="10">
+        <text x={layout.width / 2} y={resting.length === 0 ? 52 : Math.max(...resting.map((placement) => placement.y + 8)) + PADDING * 2} textAnchor="middle" fill="#7890a2" fontFamily="ui-monospace, monospace" fontSize="10">
           EMPTY FLOOR
         </text>
       ) : null}
-
-      {resting.length === 0 ? null : <Area label={`RESTING AREA · ${resting.length}`} width={layout.width - PADDING * 2} top={layout.height} bottom={Math.max(...resting.map((placement) => placement.y + 8)) + PADDING} />}
-      {staging.length === 0 ? null : <Area label={`WORKING · ${staging.length} LOCATION${staging.length === 1 ? "" : "S"} NOT YET OBSERVED`} width={layout.width - PADDING * 2} top={Math.min(...staging.map((placement) => placement.y)) - 28} bottom={Math.max(...staging.map((placement) => placement.y + 8)) + PADDING} />}
-      {overflow.length === 0 ? null : <Area label={omittedLocations === 0 ? `WORKER AREA AT CAPACITY · ${overflow.length}` : `ROOM MAP AT CAPACITY · ${omittedLocations} LOCATIONS NOT SHOWN`} width={layout.width - PADDING * 2} top={Math.min(...overflow.map((placement) => placement.y)) - 28} bottom={Math.max(...overflow.map((placement) => placement.y + 8)) + PADDING} />}
 
       {placements.map((placement) => {
         const worker = workerById.get(placement.id);
@@ -159,32 +149,6 @@ export function FactoryScene({ topology, workers, workItems, omittedLocations = 
         );
       })}
 
-      {([[
-        "RESTING",
-        resting.length,
-        `${resting.length} workers in the resting area`,
-        "bay.free",
-      ], [
-        "STAGED",
-        staged,
-        `${staged} staged tasks`,
-        "bay.staged",
-      ], [
-        "READY",
-        ready,
-        `${ready} release-ready tasks`,
-        "bay.ready",
-      ]] as const).map(([label, count, ariaLabel, bay], index) => {
-        const x = PADDING + index * (bayWidth + bayGap);
-        return (
-          <g key={label} role="group" aria-label={ariaLabel}>
-            <rect x={x} y={serviceY} width={bayWidth} height={SERVICE_HEIGHT} rx="3" fill="#101f2b" stroke="#385164" />
-            <Frame name={bay} x={x + 6} y={serviceY + (SERVICE_HEIGHT - FRAME) / 2} />
-            <text x={x + bayWidth / 2} y={serviceY + 17} textAnchor="middle" fill="#9db1be" fontFamily="ui-monospace, monospace" fontSize="7">{label}</text>
-            <text x={x + bayWidth / 2} y={serviceY + 40} textAnchor="middle" fill="#f2f6f8" fontFamily="ui-monospace, monospace" fontSize="16" fontWeight="700">{count}</text>
-          </g>
-        );
-      })}
     </svg>
   );
 }
