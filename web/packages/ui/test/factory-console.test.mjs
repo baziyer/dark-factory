@@ -730,9 +730,25 @@ test("a rejected edit says plainly that the durable value did not change", () =>
   });
   assert.match(markup, /SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN/);
   assert.match(markup, /role="alert"/);
+  assert.equal((markup.match(/role="alert"/g) ?? []).length, 1, "a config refusal has one shared alert");
   const unknown = render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { target: ids.agent, pending: false, error: { code: "internal" } } });
   assert.match(unknown, /THE EDIT DID NOT COMPLETE/);
   assert.match(render({ selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, edit: { pending: true } }), />SAVING</);
+});
+
+test("a queued edit refusal remains visible after its task leaves the queue", () => {
+  const rejected = { target: ids.task, pending: false, error: new SessionError("stale") };
+  const task = fixtureState.tasks.get(ids.task);
+  const states = [
+    baseState({ tasks: new Map([[task.id, { ...task, status: "running" }]]) }),
+    baseState({ tasks: new Map([[task.id, { ...task, status: "cancelled" }]]) }),
+    baseState({ tasks: new Map() }),
+  ];
+  for (const state of states) {
+    const markup = render({ state, detail: "needs-you", edit: rejected });
+    assert.match(markup, /SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN/);
+    assert.equal((markup.match(/role="alert"/g) ?? []).length, 1);
+  }
 });
 
 test("the settings modal carries the factory readout and a pairing mount point", () => {

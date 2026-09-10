@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { AgentItem, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
-import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
+import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
 
@@ -117,6 +117,7 @@ export function FactoryConsole({
   const counters = factoryCounters(state);
   const agent = selectedAgent === undefined ? undefined : state?.agents.get(selectedAgent.id);
   const selectedDetail = detail ?? (selectedAgent === undefined ? "needs-you" : "agent");
+  const editError = editErrorCopy(edit);
 
   return (
     <div className="dfConsoleShell">
@@ -180,6 +181,7 @@ export function FactoryConsole({
               <button type="button" aria-pressed={selectedDetail === "queue"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("queue")}>QUEUE</button>
               <button type="button" aria-pressed={selectedDetail === "agent"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("agent")}>AGENT</button>
             </div>
+            {editError === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{editError}</p>}
             <div hidden={selectedDetail !== "needs-you"}>
               <NeedsYouColumn
                 state={state}

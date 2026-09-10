@@ -38,7 +38,7 @@ const EDIT_ERRORS = new Map<string, string>([
   ["unsupported", "THE FACTORY DOES NOT SUPPORT THIS YET"],
 ]);
 
-function editErrorCopy(edit: FactoryEditView | undefined): string | undefined {
+export function editErrorCopy(edit: FactoryEditView | undefined): string | undefined {
   if (edit?.error === undefined) return undefined;
   return EDIT_ERRORS.get(edit.error.code) ?? "THE EDIT DID NOT COMPLETE";
 }
@@ -109,8 +109,6 @@ export function AgentPanel({
       <p className="dfConsoleSidebar__status">{activity === "needs-you" ? "! needs you" : activity}</p>
       {queueHint === undefined ? null : <p className="dfConsoleSidebar__inherit">{queueHint}</p>}
 
-      {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
-
       <div className="dfConsoleViewToggle" role="group" aria-label="Agent controls">
         <button type="button" aria-pressed={panel === "terminal"} onClick={() => selectPanel("terminal")}>TERMINAL</button>
         <button type="button" aria-pressed={panel === "config"} onClick={() => selectPanel("config")}>CONFIG</button>
@@ -158,10 +156,8 @@ export function QueuePanel({
       .sort((left, right) => right.priority - left.priority);
     return assigned.length === 0 ? [] : [{ agent, tasks: assigned }];
   });
-  const errorCopy = edit === undefined || !tasks.some((task) => task.id === edit.target && task.status === "queued") ? undefined : editErrorCopy(edit);
   return <section className="dfConsoleSidebar__panel" aria-label="Queue">
     <div className="dfConsoleSidebar__heading"><h2>QUEUE</h2></div>
-    {errorCopy === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{errorCopy}</p>}
     {state === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
       : <>
         {running.length === 0 ? null : <section className="dfConsoleSidebar__section" aria-label="Running tasks">
