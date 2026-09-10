@@ -698,6 +698,55 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
   }
 });
 
+test("a config refusal resets only its form and config saves remain partial", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const edits = [];
+    const queued = [...fixtureState.tasks.values()].find((task) => task.status === "queued");
+    const agent = fixtureState.agents.get(ids.agent);
+    const props = {
+      status: "ready",
+      state: baseState(),
+      detail: "agent",
+      agentPanel: "config",
+      selectedAgent: agentSelection(),
+      onSaveAgentConfig: (config) => edits.push(config),
+    };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+    const model = () => renderer.root.findAllByType("input").find((input) => input.props.id === `df-model-${agent.id}`);
+    const config = () => renderer.root.findAllByType("form").find((form) => form.props["aria-label"] === "Agent configuration");
+    const paused = () => renderer.root.findAllByType("input").find((input) => input.props.type === "checkbox");
+
+    await act(async () => { model().props.onChange({ currentTarget: { value: "half-typed" } }); });
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: queued.id, pending: false, error: new SessionError("stale") } })); });
+    assert.equal(model().props.value, "half-typed", "a task refusal leaves the config draft intact");
+    assert.equal(renderer.root.findAllByProps({ role: "alert" }).length, 1, "the shared alert remains visible");
+
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, edit: { target: agent.id, pending: false, error: new SessionError("stale") } })); });
+    assert.equal(model().props.value, agent.model, "a config refusal remounts its own form");
+    assert.equal(renderer.root.findAllByProps({ role: "alert" }).length, 1, "a config refusal has one shared alert");
+    await act(async () => { renderer.update(createElement(FactoryConsole, props)); });
+
+    await act(async () => { paused().props.onChange({ currentTarget: { checked: true } }); });
+    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
+    assert.deepEqual(edits.at(-1), { paused: true });
+
+    await act(async () => { model().props.onChange({ currentTarget: { value: "claude-sonnet-5" } }); });
+    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
+    assert.deepEqual(edits.at(-1), { model: "claude-sonnet-5", paused: true });
+
+    await act(async () => { model().props.onChange({ currentTarget: { value: agent.model } }); });
+    await act(async () => { paused().props.onChange({ currentTarget: { checked: false } }); });
+    await act(async () => { config().props.onSubmit({ preventDefault() {} }); });
+    assert.deepEqual(edits.at(-1), {}, "an untouched config submits no changes");
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
 test("task history selects every served finished task and pages one conversation", async () => {
   const calls = [];
   const task = fixtureState.tasks.get(ids.task);
