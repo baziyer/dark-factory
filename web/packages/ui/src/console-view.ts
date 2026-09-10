@@ -1,5 +1,5 @@
 import type { AgentItem, StateView, TaskItem, TopologyView } from "@dark-factory/client";
-import { compareText, type SceneNode, type SceneTopology, type SceneWorker, type SceneWorkItem } from "./factory-scene/scene.js";
+import { compareText, type SceneNode, type SceneTopology, type SceneWorker } from "./factory-scene/scene.js";
 
 /** The task stages the daemon actually serves today. */
 export type TaskStage = "queued" | "building" | "blocked" | "done" | "failed";
@@ -127,7 +127,6 @@ const MAX_FLOOR_ROOMS = 24;
 export type FloorScene = Readonly<{
   topology: SceneTopology;
   workers: readonly SceneWorker[];
-  workItems: readonly SceneWorkItem[];
   omittedLocations: number;
 }>;
 
@@ -204,11 +203,8 @@ export function floorScene(
       ...(location === "working" && live !== undefined && kept.has(live) ? { nodeId: live } : {}),
     };
   });
-  const workItems = state === undefined ? [] : [...state.tasks.values()]
-    .filter((task) => task.status === "succeeded" || task.status === "running" || task.status === "blocked")
-    .map((task) => ({ id: task.id, stage: task.status === "succeeded" ? "release-ready" as const : "staged" as const }));
   const digest = projects.map((project) => topologies?.get(project.id)?.digest).filter((value) => value !== undefined).join(" ");
-  return { topology: { digest, nodes: rooms }, workers, workItems, omittedLocations: [...liveRooms].filter((id) => !kept.has(id)).length };
+  return { topology: { digest, nodes: rooms }, workers, omittedLocations: [...liveRooms].filter((id) => !kept.has(id)).length };
 }
 
 /**

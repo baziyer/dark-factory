@@ -622,6 +622,7 @@
 
 .dfConsoleViewToggle { display: flex; flex: 0 0 auto; }
 .dfConsoleViewToggle button + button { margin-left: -1px; }
+.dfConsoleViewToggle button:is([aria-pressed="true"], :focus-visible) { position: relative; z-index: 1; }
 .dfConsoleShell .dfConsoleViewToggle button[aria-pressed="true"],
 .dfConsoleShell .dfConsoleBar__actions > button[aria-pressed="true"] {
   color: var(--df-console-accent);
@@ -638,6 +639,8 @@
 
 .dfConsoleLayout .dfFactoryConsole__section { margin: 0; }
 .dfConsoleLayout__left { min-width: 0; }
+
+.dfConsoleSidebar__feedback { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .dfConsoleSidebar {
   position: sticky;
