@@ -26,9 +26,11 @@ no commit, push, pull-request, or repository-publication operation.
   a recorded intervention. Codex Interrupt stops generation while preserving the
   task; Stop ends it; Start new preserves its history and queues a replacement.
   Completed output stays visible. Add to queue accepts later work while busy.
-  Recent Work stays collapsed until opened, then lists completed and blocked
-  tasks by update time. Expand a row for its recorded outcome, reported PR
-  links, original instruction, review feedback, and intervention history.
+  Recent Work stays collapsed without reading private details. Opening it loads
+  authorized details for the newest ten completed or blocked tasks, showing
+  instruction and outcome excerpts; Show more loads the next ten. Expand a row
+  for the full outcome, reported PR links, instruction, and review feedback,
+  and to load its intervention history. Private prose stays out of public state.
   Project and agent setup stays in `factoryctl`.
 - Agent status is Ready, Working, Needs you, or Paused. Working means a task
   is running, including startup and cleanup. Queued work alone is Ready with
