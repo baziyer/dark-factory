@@ -242,6 +242,43 @@ func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	}
 }
 
+func TestServiceUninstallAcceptsAReceiptBoundPriorPlist(t *testing.T) {
+	fixture := newManageFixture(t)
+	fixture.install(t, (&recordedLaunchctl{results: append(fixture.printAbsent(), launchctlResult{status: 0}, fixture.printRunning(77))}).run)
+	current, err := os.ReadFile(fixture.plistPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := bytes.Replace(current, []byte("    <key>StandardErrorPath</key>\n    <string>"+serviceStderrPath(fixture.home)+"</string>\n"), nil, 1)
+	if bytes.Equal(prior, current) {
+		t.Fatal("current plist did not contain the new stderr path")
+	}
+	if err := os.WriteFile(fixture.plistPath(), prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(ServiceDirectoryPath(fixture.home), "bin", "current", "factoryctl")); err != nil {
+		t.Fatal(err)
+	}
+	priorDigest := sha256.Sum256(prior)
+	receipt, present, err := readServiceReceipt(fixture.home)
+	if err != nil || !present {
+		t.Fatalf("receipt = %+v present=%t err=%v", receipt, present, err)
+	}
+	receipt.PlistDigest = hex.EncodeToString(priorDigest[:])
+	receiptBody, err := encodeServiceReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ServiceDirectoryPath(fixture.home), serviceReceiptName), receiptBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed := &recordedLaunchctl{results: []launchctlResult{fixture.printRunning(77), {status: 0}, {status: launchctlNotFound}}}
+	status, err := serviceUninstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, removed.run)
+	if err != nil || status.State != ServiceAbsent {
+		t.Fatalf("prior plist uninstall = %+v, %v", status, err)
+	}
+}
+
 func TestServiceInstallRefusesForeignPlistAndResidue(t *testing.T) {
 	fixture := newManageFixture(t)
 	if err := os.WriteFile(fixture.plistPath(), []byte("foreign bytes"), 0o600); err != nil {

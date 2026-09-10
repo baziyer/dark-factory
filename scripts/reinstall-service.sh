@@ -129,12 +129,7 @@ echo "backup: $backup (user_version $(sqlite3 "$backup/factory.sqlite3" 'PRAGMA 
 
 refuse_dispatch_enabled
 refuse_active_runs
-# A receipt and plist are exact-version ownership evidence. Upgrade removal
-# therefore uses the binary that rendered an existing installation; recovery
-# without one falls back to the newly built control binary.
-uninstall_factoryctl="$home.service/bin/current/factoryctl"
-[ -x "$uninstall_factoryctl" ] || uninstall_factoryctl="$bin/factoryctl"
-"$uninstall_factoryctl" service uninstall --home "$home"
+"$bin/factoryctl" service uninstall --home "$home"
 # bootout returns once launchd forgets the job; factoryd unlinks its socket
 # before it closes the store and releases the home flock. A socket file that
 # nothing answers on is stale, and factoryd removes it on its next start.

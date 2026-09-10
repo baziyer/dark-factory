@@ -374,33 +374,40 @@ func serviceUninstallAt(ctx context.Context, home, userHome string, config Servi
 
 func serviceUninstallLockedAt(ctx context.Context, home, userHome string, config ServiceConfig, launchctl launchctlRun) (ServiceStatus, error) {
 	plistDirectory, plistPath := servicePlistLocation(userHome, config)
-	// The receipt names the argument list its plist was rendered from, so it
-	// is read before the re-render: the same binary then reproduces the exact
-	// installed bytes, relay origin included.
 	receipt, receiptPresent, receiptErr := readServiceReceipt(home)
-	renderedOrigin := ""
-	if receiptErr == nil && receiptPresent {
-		renderedOrigin = receipt.RelayOrigin
-	}
-	expectedPlist, expectedPlistDigest, err := ServicePlist(home, config.Label, renderedOrigin)
-	if err != nil {
-		return ServiceStatus{}, err
-	}
-	if receiptErr == nil && receiptPresent {
-		if receipt.Label != config.Label || receipt.PlistPath != plistPath || receipt.PlistDigest != hex.EncodeToString(expectedPlistDigest[:]) {
+	var expectedPlist []byte
+	var err error
+	evidence := receiptErr == nil && receiptPresent
+	if evidence {
+		if receipt.Label != config.Label || receipt.PlistPath != plistPath {
 			// The service directory belongs to a different installation target;
 			// removing it here would orphan that installation.
 			return ServiceStatus{State: ServiceAmbiguous}, fmt.Errorf("%w: the receipt names a different installation target", ErrServiceForeign)
 		}
-	}
-	evidence := receiptErr == nil && receiptPresent
-	if !evidence {
-		plistEvidence, err := uninstallPlistEvidence(home, config, plistDirectory, renderedOrigin)
+		var present bool
+		expectedPlist, present, err = readServicePlist(plistDirectory, config.plistName(), serviceMaxPlistBytes)
 		if err != nil {
-			// A foreign plist refuses before any mutation, launchctl included.
 			return ServiceStatus{State: ServiceAmbiguous}, err
 		}
-		evidence = plistEvidence
+		if present {
+			actual := sha256.Sum256(expectedPlist)
+			if hex.EncodeToString(actual[:]) != receipt.PlistDigest {
+				return ServiceStatus{State: ServiceAmbiguous}, fmt.Errorf("%w: %s holds different bytes; refusing removal", ErrServiceForeign, config.plistName())
+			}
+		}
+	} else {
+		expectedPlist, _, err = ServicePlist(home, config.Label, "")
+		if err != nil {
+			return ServiceStatus{}, err
+		}
+		actualPlist, present, err := readServicePlist(plistDirectory, config.plistName(), len(expectedPlist))
+		if err != nil {
+			return ServiceStatus{State: ServiceAmbiguous}, err
+		}
+		if present && !bytes.Equal(actualPlist, expectedPlist) {
+			return ServiceStatus{State: ServiceAmbiguous}, fmt.Errorf("%w: the plist at %s is not this installation's property", ErrServiceForeign, config.plistName())
+		}
+		evidence = present
 	}
 	if evidence {
 		service := "gui/" + strconv.Itoa(os.Geteuid()) + "/" + config.Label
@@ -457,32 +464,22 @@ func serviceUninstallLockedAt(ctx context.Context, home, userHome string, config
 	return ServiceStatus{State: ServiceAbsent}, nil
 }
 
-// uninstallPlistEvidence proves label-to-home ownership from the plist alone:
-// exact rendered bytes are evidence, absence is no evidence, and any other
-// bytes refuse the whole uninstall before a single mutation.
-func uninstallPlistEvidence(home string, config ServiceConfig, plistDirectory, relayOrigin string) (bool, error) {
-	expected, _, err := ServicePlist(home, config.Label, relayOrigin)
+func readServicePlist(directory, name string, limit int) ([]byte, bool, error) {
+	path := filepath.Join(directory, name)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, false, nil
+	}
 	if err != nil {
-		return false, err
+		return nil, false, fmt.Errorf("%w: open %s", ErrServiceAmbiguous, name)
 	}
-	path := filepath.Join(plistDirectory, config.plistName())
-	fd, openErr := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if errors.Is(openErr, unix.ENOENT) {
-		return false, nil
-	}
-	if openErr != nil {
-		return false, fmt.Errorf("%w: probe plist", ErrServiceAmbiguous)
-	}
-	file := os.NewFile(uintptr(fd), config.plistName())
-	body, readErr := io.ReadAll(io.LimitReader(file, int64(len(expected))+1))
+	file := os.NewFile(uintptr(fd), name)
+	body, readErr := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	closeErr := file.Close()
-	if readErr != nil || closeErr != nil {
-		return false, fmt.Errorf("%w: read plist", ErrServiceAmbiguous)
+	if readErr != nil || closeErr != nil || len(body) > limit {
+		return nil, false, fmt.Errorf("%w: read %s", ErrServiceAmbiguous, name)
 	}
-	if bytes.Equal(body, expected) {
-		return true, nil
-	}
-	return false, fmt.Errorf("%w: the plist at %s is not this installation's property", ErrServiceForeign, config.plistName())
+	return body, true, nil
 }
 
 func servicePlistLocation(userHome string, config ServiceConfig) (directory, path string) {
