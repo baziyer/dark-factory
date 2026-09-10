@@ -4,7 +4,7 @@ import test from "node:test";
 import { createElement, isValidElement, useEffect, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { act, create } from "react-test-renderer";
-import { ProtocolError, SessionError } from "@dark-factory/client";
+import { MAX_TASK_PRIORITY, ProtocolError, SessionError } from "@dark-factory/client";
 import { FactoryApp, FactoryConsole, floorScene } from "../dist/src/index.js";
 import { TerminalPanel } from "../dist/src/factory-app.js";
 import { fixtureState, fixtureTopologies, fixtureTopology } from "../../../fixtures/state.mjs";
@@ -618,14 +618,14 @@ test("a paused agent with queued work says the queue is paused", () => {
   assert.equal(markup.includes("QUEUED · WAITING FOR CAPACITY"), false);
 });
 
-test("the queued task row edits title, order, assignment, and cancellation", async () => {
+test("the queued task row keeps served order and changes its exact priority", async () => {
   const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   try {
     const edits = [];
     const detailReads = [];
-    const queued = fixtureState.tasks.get([...fixtureState.tasks.keys()][1]);
-    const other = { ...queued, id: "39".repeat(16), title: "Second in line", priority: 3, revision: 20n };
+    const queued = { ...fixtureState.tasks.get([...fixtureState.tasks.keys()][1]), title: "Served first", priority: 2 };
+    const other = { ...queued, id: "39".repeat(16), title: "Higher but served second", priority: 9, revision: 20n };
     const state = baseState({
       tasks: new Map([[queued.id, { ...queued, assigned_agent_id: ids.agent }], [other.id, { ...other, assigned_agent_id: ids.agent }]]),
     });
@@ -646,14 +646,22 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
     const buttons = renderer.root.findAllByType("button");
     const byLabel = (label) => buttons.find((button) => button.props["aria-label"] === label);
-    // Moving down takes the neighbour below's priority minus one.
-    await act(async () => { byLabel(`Move ${queued.title} down`).props.onClick(); });
-    assert.deepEqual(edits.at(-1), [queued.id, { priority: other.priority - 1 }]);
-    // Moving up takes the neighbour above's priority plus one.
-    await act(async () => { byLabel(`Move ${other.title} up`).props.onClick(); });
-    assert.deepEqual(edits.at(-1), [other.id, { priority: queued.priority + 1 }]);
-    assert.equal(byLabel(`Move ${queued.title} up`).props.disabled, true, "the first task cannot rise");
-    assert.equal(byLabel(`Move ${other.title} down`).props.disabled, true, "the last task cannot fall");
+    const queueRows = renderer.root.findByProps({ "aria-label": "Queue" }).findAllByType("details").filter((row) => row.props.className === "dfConsoleItem");
+    assert.deepEqual(queueRows.map((row) => row.findByType("strong").props.children), [queued.title, other.title], "the queue keeps the server's per-agent order, rather than re-sorting priority");
+    assert.ok(renderer.root.findAllByType("span").some((span) => (Array.isArray(span.props.children) ? span.props.children.join("") : String(span.props.children)).includes("QUEUED · PRIORITY 2")));
+    await act(async () => { byLabel(`Increase priority for ${queued.title}`).props.onClick(); });
+    assert.deepEqual(edits.at(-1), [queued.id, { priority: queued.priority + 1 }]);
+    await act(async () => { byLabel(`Decrease priority for ${other.title}`).props.onClick(); });
+    assert.deepEqual(edits.at(-1), [other.id, { priority: other.priority - 1 }]);
+
+    const highest = { ...queued, title: "Highest", priority: MAX_TASK_PRIORITY };
+    const lowest = { ...other, title: "Lowest", priority: -MAX_TASK_PRIORITY };
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, state: baseState({ tasks: new Map([[highest.id, highest], [lowest.id, lowest]]) }) })); });
+    const bounded = renderer.root.findAllByType("button");
+    assert.equal(bounded.find((button) => button.props["aria-label"] === `Increase priority for ${highest.title}`).props.disabled, true);
+    assert.equal(bounded.find((button) => button.props["aria-label"] === `Decrease priority for ${lowest.title}`).props.disabled, true);
+
+    await act(async () => { renderer.update(createElement(FactoryConsole, props)); });
 
     const editBrief = () => renderer.root.findAllByType("button").find((button) => button.props.children === "EDIT BRIEF");
     const firstRow = renderer.root.findByProps({ "aria-label": "Queue" }).findAllByType("details").find((row) => row.props.className === "dfConsoleItem");

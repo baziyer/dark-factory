@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { AccountItem, AgentItem, StateView, TaskHistoryView, TaskItem, TaskPeerQuestion } from "@dark-factory/client";
+import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type StateView, type TaskHistoryView, type TaskItem, type TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
 import { agentStatus, agentCurrentTask } from "./console-view.js";
@@ -73,8 +73,7 @@ export function AgentPanel({
   const activity = state === undefined ? "ready" : agentStatus(agent, state);
   const current = state === undefined ? undefined : agentCurrentTask(agent, state);
   const queued = state === undefined ? [] : [...state.tasks.values()]
-    .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
-    .sort((left, right) => right.priority - left.priority);
+    .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued");
   const [localPanel, setLocalPanel] = useState<AgentPanelView>("terminal");
   const panel = panelProp ?? localPanel;
   const selectPanel = onPanel ?? setLocalPanel;
@@ -238,7 +237,7 @@ function RecentWorkItem({
   </details></li>;
 }
 
-/** The single editable queue, grouped only to retain each agent's priority order. */
+/** The single editable queue keeps the authoritative served task order. */
 export function QueuePanel({
   state,
   edit,
@@ -257,8 +256,7 @@ export function QueuePanel({
   const running = tasks.filter((task) => task.status === "running");
   const queued = agents.flatMap((agent) => {
     const assigned = tasks
-      .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
-      .sort((left, right) => right.priority - left.priority);
+      .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued");
     return assigned.length === 0 ? [] : [{ agent, tasks: assigned }];
   });
   return <section className="dfConsoleSidebar__panel" aria-label="Queue">
@@ -274,11 +272,9 @@ export function QueuePanel({
         </section>}
         {queued.length === 0 ? <p className="dfFactoryConsole__empty">THE QUEUE IS EMPTY</p> : <ul className="dfConsoleItems">{queued.flatMap(({ agent, tasks }) => {
           const peers = agents.filter((peer) => peer.project_id === agent.project_id);
-          return tasks.map((task, index) => <QueuedTask
+          return tasks.map((task) => <QueuedTask
               key={task.id}
               task={task}
-              above={tasks[index - 1]}
-              below={tasks[index + 1]}
               peers={peers}
               pending={edit?.pending === true}
               ready={ready}
@@ -396,14 +392,11 @@ function AgentConfig({
 }
 
 /**
- * Reorder is expressed in the durable priority the daemon already orders by:
- * one step up is the neighbour above's priority plus one, one step down is the
- * neighbour below's minus one.
+ * A priority is durable global scheduling input. Increasing or decreasing it
+ * by one is honest about the effect even when several queued tasks tie.
  */
 function QueuedTask({
   task,
-  above,
-  below,
   peers,
   pending,
   ready,
@@ -411,8 +404,6 @@ function QueuedTask({
   onLoadTaskDetail,
 }: {
   task: TaskItem;
-  above?: TaskItem;
-  below?: TaskItem;
   peers: readonly AgentItem[];
   pending: boolean;
   ready: boolean;
@@ -453,7 +444,7 @@ function QueuedTask({
   return (
     <li>
       <details className="dfConsoleItem" onToggle={(event) => { if (event.currentTarget.open && brief === undefined && !loading) void load(); }}>
-        <summary className="dfConsoleItem__summary"><strong>{task.title}</strong><span className="dfConsoleItem__meta">{peers.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"} · QUEUED</span></summary>
+        <summary className="dfConsoleItem__summary"><strong>{task.title}</strong><span className="dfConsoleItem__meta">{peers.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"} · QUEUED · PRIORITY {task.priority}</span></summary>
         <div className="dfConsoleItem__detail">
         {open ? <>
           <label htmlFor={`df-title-${task.id}`}>TITLE</label>
@@ -471,8 +462,8 @@ function QueuedTask({
         </> : <button type="button" disabled={disabled || loading || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button>}
         {detailError ? <p role="alert">{open ? "COULD NOT LOAD DETAILS. SAVE OR DISCARD YOUR DRAFT, THEN REOPEN TO RETRY." : "COULD NOT LOAD DETAILS. REOPEN THE BRIEF TO RETRY."}</p> : null}
         <div className="dfConsoleSidebar__taskActions">
-          <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) void onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
-          <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) void onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>
+          <button type="button" aria-label={`Increase priority for ${task.title}`} disabled={disabled || task.priority === MAX_TASK_PRIORITY} onClick={() => { void onEditTask(task, { priority: task.priority + 1 }); }}>INCREASE PRIORITY</button>
+          <button type="button" aria-label={`Decrease priority for ${task.title}`} disabled={disabled || task.priority === -MAX_TASK_PRIORITY} onClick={() => { void onEditTask(task, { priority: task.priority - 1 }); }}>DECREASE PRIORITY</button>
           <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-assign-${task.id}`}>Agent for {task.title}</label>
           <select
             id={`df-assign-${task.id}`}
