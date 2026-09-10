@@ -50,6 +50,7 @@ function harness(overrides = {}) {
     cancelHumanRequest: overrides.cancel ?? (async () => ({ request_id: request.id })),
     updateAgent: overrides.updateAgent ?? (async () => { throw new SessionError("not_found"); }),
     updateTask: overrides.updateTask ?? (async () => { throw new SessionError("not_found"); }),
+    getTaskHistory: overrides.getTaskHistory ?? (async () => { throw new SessionError("not_found"); }),
     getTaskDetail: overrides.getTaskDetail ?? (async () => { throw new SessionError("not_found"); }),
     getTopology: overrides.getTopology ?? (async () => { throw new SessionError("not_found"); }),
     getRunPaths: overrides.getRunPaths ?? (async () => { throw new SessionError("not_found"); }),
@@ -139,6 +140,7 @@ test("task-detail pages keep one head across text chunks and peer continuation",
   const task = [...fixtureState.tasks.values()][0];
   const calls = [];
   const context = harness({
+    getTaskHistory: async (taskID) => ({ taskId: taskID, entries: [] }),
     getTaskDetail: async (taskID, revision, offsets) => {
       calls.push([taskID, revision, offsets]);
       if (offsets.peerOffset === 1n) {
@@ -147,10 +149,10 @@ test("task-detail pages keep one head across text chunks and peer continuation",
       }
       if (offsets.textOffset === 1n) {
         assert.equal(offsets.expectedHead, 9n);
-        return { taskId: taskID, revision, head: 9n, instruction: "second", feedback: "feedback", peerQuestions: [] };
+        return { taskId: taskID, revision, head: 9n, instruction: "second", feedback: "feedback", outcome: "come", peerQuestions: [] };
       }
       assert.equal(offsets.expectedHead, undefined);
-      return { taskId: taskID, revision, head: 9n, instruction: "first", feedback: "review ", peerQuestions: [], nextTextOffset: 1n, nextPeerOffset: 1n };
+      return { taskId: taskID, revision, head: 9n, instruction: "first", feedback: "review ", outcome: "out", peerQuestions: [], nextTextOffset: 1n, nextPeerOffset: 1n };
     },
   });
   context.controller.start();
@@ -160,6 +162,7 @@ test("task-detail pages keep one head across text chunks and peer continuation",
   assert.equal(first.head, 9n);
   assert.equal(first.instruction, "firstsecond");
   assert.equal(first.feedback, "review feedback");
+  assert.equal(first.outcome, "outcome");
   assert.deepEqual(calls, [
     [task.id, task.revision, { textOffset: 0n, peerOffset: 0n }],
     [task.id, task.revision, { textOffset: 1n, peerOffset: 0n, expectedHead: 9n }],
@@ -167,6 +170,8 @@ test("task-detail pages keep one head across text chunks and peer continuation",
 
   await context.controller.taskDetail(task, first.nextPeerOffset, first.head);
   assert.deepEqual(calls.at(-1), [task.id, task.revision, { textOffset: 0n, peerOffset: 1n, expectedHead: 9n }]);
+  const history = await context.controller.taskHistory(task);
+  assert.deepEqual(history, { taskId: task.id, entries: [] });
   context.controller.close();
 });
 

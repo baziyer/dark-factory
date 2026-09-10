@@ -750,13 +750,15 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 }
 
 func TestTaskDetailEscapedPageFitsControlBound(t *testing.T) {
-	answer := strings.Repeat("<", 2048)
+	escaped := strings.Repeat("\x00", 2048)
+	answer, outcome := escaped, escaped
 	page := TaskDetail{
 		TaskID:      strings.Repeat("02", 16),
 		Revision:    3,
 		Head:        4,
-		Instruction: strings.Repeat("😀", 2048),
-		Feedback:    strings.Repeat("😀", 2048),
+		Instruction: escaped,
+		Feedback:    escaped,
+		Outcome:     &outcome,
 		PeerQuestions: []TaskPeerQuestion{{
 			ID: strings.Repeat("03", 16), SourceTaskID: strings.Repeat("04", 16), TargetTaskID: strings.Repeat("02", 16), Question: answer, Answer: &answer,
 			RecipientDeliveryState: "delivered", AnswerDeliveryState: "delivered", Revision: 1, CreatedAtMillis: 1, UpdatedAtMillis: 1,

@@ -167,6 +167,7 @@ type TaskItem struct {
 	Status          string  `json:"status"`
 	Priority        int64   `json:"priority"`
 	Revision        Decimal `json:"revision"`
+	UpdatedAtMillis Decimal `json:"updated_at_ms,omitempty"`
 }
 
 // HumanRequestItem is deliberately only the public card projection. Private

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import type { AccountItem, AgentItem, StateView, TaskItem, TaskPeerQuestion } from "@dark-factory/client";
+import type { AccountItem, AgentItem, StateView, TaskHistoryView, TaskItem, TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
-import { agentStatus, agentCurrentTask, orderTasksForHome } from "./console-view.js";
+import { agentStatus, agentCurrentTask } from "./console-view.js";
 
 /** Only the controls the operator actually changed; the rest are left alone. */
 export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: "wait" | "standing_instruction"; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }>;
@@ -20,7 +20,7 @@ export type DiscoveredAccount = Readonly<{
 }>;
 
 export type TaskEdit = Readonly<{ title?: string; body?: string; priority?: number; assignedAgentId?: string; cancel?: boolean }>;
-export type TaskBrief = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
+export type TaskBrief = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; outcome?: string; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
 export type AgentPanelView = "terminal" | "config";
 
 /** One private peer-conversation page, shared by queued and completed work. */
@@ -52,6 +52,7 @@ export function AgentPanel({
   onSaveConfig,
   onEditTask,
   onLoadTaskDetail,
+  onLoadTaskHistory,
   terminalContent,
   panel: panelProp,
   onPanel,
@@ -63,6 +64,7 @@ export function AgentPanel({
   onSaveConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
+  onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
   /** The selected agent's mounted terminal and durable composer. */
   terminalContent?: ReactNode;
   panel?: AgentPanelView;
@@ -73,17 +75,9 @@ export function AgentPanel({
   const queued = state === undefined ? [] : [...state.tasks.values()]
     .filter((task) => task.assigned_agent_id === agent.id && task.status === "queued")
     .sort((left, right) => right.priority - left.priority);
-  const historyTasks = state === undefined ? [] : orderTasksForHome(state)
-    .filter((task) => task.assigned_agent_id === agent.id && task.status !== "queued");
-  const [conversation, setConversation] = useState<{ task: TaskItem; brief: TaskBrief }>();
-  const [conversationError, setConversationError] = useState(false);
-  const [conversationPending, setConversationPending] = useState(false);
-  const [historyTaskID, setHistoryTaskID] = useState<string>();
   const [localPanel, setLocalPanel] = useState<AgentPanelView>("terminal");
   const panel = panelProp ?? localPanel;
   const selectPanel = onPanel ?? setLocalPanel;
-  useEffect(() => { setConversation(undefined); setConversationError(false); setHistoryTaskID(undefined); }, [agent.id]);
-  const historyTask = historyTasks.find((task) => task.id === historyTaskID) ?? historyTasks[0];
   const errorCopy = edit?.target === agent.id ? editErrorCopy(edit) : undefined;
   const queueHint = agent.paused
     ? "QUEUE PAUSED"
@@ -121,16 +115,127 @@ export function AgentPanel({
         <AgentConfig key={formKey(agent.id, agent.revision)} agent={agent} accounts={state === undefined ? [] : [...state.accounts.values()]} pending={edit?.pending === true} ready={ready} onSave={onSaveConfig} />
       </section>
 
-      {historyTask === undefined || onLoadTaskDetail === undefined ? null : <div className="dfConsoleSidebar__section" aria-label="Task history">
-        <h3>TASK HISTORY</h3>
-        <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-history-${agent.id}`}>TASK HISTORY</label>
-        <select id={`df-history-${agent.id}`} value={historyTask.id} disabled={conversationPending} onChange={(event) => { setHistoryTaskID(event.currentTarget.value); setConversation(undefined); setConversationError(false); }}>{historyTasks.map((task) => <option key={task.id} value={task.id}>{task.title} · {task.status.toUpperCase()} · {task.id.slice(0, 8)}</option>)}</select>
-        <button type="button" disabled={conversationPending} onClick={async () => { setConversationPending(true); try { setConversation({ task: historyTask, brief: await onLoadTaskDetail(historyTask) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } }}>VIEW TASK</button>
-        {conversationError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : null}
-        {conversation === undefined ? null : <>{conversation.brief.instruction === "" ? null : <><h4>ORIGINAL INSTRUCTION</h4><pre className="dfConsoleSidebar__feedback">{conversation.brief.instruction}</pre></>}{conversation.brief.feedback === "" ? null : <><h4>RETAINED REVIEW FEEDBACK</h4><pre className="dfConsoleSidebar__feedback">{conversation.brief.feedback}</pre></>}<TaskConversation brief={conversation.brief} pending={conversationPending} onOlder={conversation.brief.nextPeerOffset === undefined ? undefined : () => { void (async () => { setConversationPending(true); try { setConversation({ task: conversation.task, brief: await onLoadTaskDetail(conversation.task, conversation.brief.nextPeerOffset, conversation.brief.head) }); setConversationError(false); } catch { setConversationError(true); } finally { setConversationPending(false); } })(); }} /></>}
-      </div>}
+      <RecentWork
+        tasks={state === undefined ? [] : [...state.tasks.values()].filter((task) => task.assigned_agent_id === agent.id)}
+        onLoadTaskDetail={onLoadTaskDetail}
+        onLoadTaskHistory={onLoadTaskHistory}
+      />
     </section>
   );
+}
+
+const RECENT_WORK_PAGE = 10;
+
+function terminalTask(task: TaskItem): boolean {
+  return task.status === "blocked" || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled";
+}
+
+function recentTasks(tasks: readonly TaskItem[]): readonly TaskItem[] {
+  return tasks.filter(terminalTask).sort((left, right) => {
+    const leftAt = left.updated_at_ms ?? 0n;
+    const rightAt = right.updated_at_ms ?? 0n;
+    return leftAt === rightAt ? left.id.localeCompare(right.id) : leftAt > rightAt ? -1 : 1;
+  });
+}
+
+function dateLabel(value: bigint | undefined): string {
+  if (value === undefined || value > BigInt(Number.MAX_SAFE_INTEGER)) return "DATE UNAVAILABLE";
+  const date = new Date(Number(value));
+  return Number.isNaN(date.valueOf()) ? "DATE UNAVAILABLE" : date.toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+function excerpt(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length <= 180 ? compact : `${compact.slice(0, 177)}…`;
+}
+
+function pullRequests(value: string): readonly Readonly<{ href: string; label: string }>[] {
+  const found = new Map<string, string>();
+  for (const match of value.matchAll(/https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)\b/g)) {
+    const [, owner, repository, number] = match;
+    const href = `https://github.com/${owner}/${repository}/pull/${number}`;
+    found.set(href, `${owner}/${repository}#${number}`);
+  }
+  return [...found].map(([href, label]) => ({ href, label }));
+}
+
+/** Private completed-task detail, kept bounded until the operator opens it. */
+function RecentWork({
+  tasks,
+  onLoadTaskDetail,
+  onLoadTaskHistory,
+}: {
+  tasks: readonly TaskItem[];
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
+  onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [shown, setShown] = useState(RECENT_WORK_PAGE);
+  const recent = recentTasks(tasks);
+  const visible = recent.slice(0, shown);
+  return <details className="dfConsoleRecentWork dfConsoleSidebar__section" onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary>RECENT WORK · {recent.length}</summary>
+    {!open ? null : <>
+      {visible.length === 0 ? <p className="dfFactoryConsole__empty">NO COMPLETED OR BLOCKED TASKS</p> : <ol className="dfConsoleItems">{visible.map((task) => <RecentWorkItem key={`${task.id}:${task.revision}`} task={task} onLoadTaskDetail={onLoadTaskDetail} onLoadTaskHistory={onLoadTaskHistory} />)}</ol>}
+      {shown >= recent.length ? null : <button type="button" onClick={() => setShown((count) => count + RECENT_WORK_PAGE)}>SHOW MORE</button>}
+    </>}
+  </details>;
+}
+
+function RecentWorkItem({
+  task,
+  onLoadTaskDetail,
+  onLoadTaskHistory,
+}: {
+  task: TaskItem;
+  onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
+  onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
+}) {
+  const detailLoader = useRef(onLoadTaskDetail);
+  const historyLoader = useRef(onLoadTaskHistory);
+  detailLoader.current = onLoadTaskDetail;
+  historyLoader.current = onLoadTaskHistory;
+  const [brief, setBrief] = useState<TaskBrief>();
+  const [detailError, setDetailError] = useState(false);
+  const [history, setHistory] = useState<TaskHistoryView>();
+  const [historyError, setHistoryError] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [olderPending, setOlderPending] = useState(false);
+  useEffect(() => {
+    const load = detailLoader.current;
+    if (load === undefined) return;
+    let live = true;
+    void load(task).then((loaded) => {
+      if (!live) return;
+      setBrief(loaded);
+      setDetailError(false);
+    }).catch(() => { if (live) setDetailError(true); });
+    return () => { live = false; };
+  }, [task.id, task.revision]);
+  useEffect(() => {
+    if (!expanded || history !== undefined || historyError || historyLoader.current === undefined) return;
+    let live = true;
+    void historyLoader.current(task).then((loaded) => { if (live) setHistory(loaded); }).catch(() => { if (live) setHistoryError(true); });
+    return () => { live = false; };
+  }, [expanded, task.id, task.revision, history, historyError]);
+  const links = brief === undefined ? [] : pullRequests(`${brief.outcome ?? ""}\n${brief.feedback}`);
+  const instruction = brief?.instruction === "" || brief === undefined ? undefined : excerpt(brief.instruction);
+  const outcome = brief?.outcome === "" || brief?.outcome === undefined ? undefined : excerpt(brief.outcome);
+  const detailState = detailError || onLoadTaskDetail === undefined ? "DETAIL UNAVAILABLE" : brief === undefined ? "LOADING DETAILS" : undefined;
+  return <li className="dfConsoleItem"><details onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary className="dfConsoleItem__summary"><span>{instruction ?? task.title}</span><small className="dfConsoleItem__meta">{instruction === undefined || instruction === task.title ? "" : `${task.title} · `}{task.status.toUpperCase()} · {dateLabel(task.updated_at_ms)} · {task.id.slice(0, 8)}</small>{outcome === undefined ? null : <small>OUTCOME · {outcome}</small>}{detailState === undefined ? null : <small>{detailState}</small>}</summary>
+    {!expanded ? null : <div className="dfConsoleItem__detail">
+      {detailError || onLoadTaskDetail === undefined ? <p role="alert">DETAIL UNAVAILABLE</p> : brief === undefined ? <p>LOADING DETAILS</p> : <>
+        {brief.outcome === undefined || brief.outcome === "" ? <p>NO RECORDED OUTCOME</p> : <><h4>OUTCOME</h4><pre className="dfConsoleSidebar__feedback">{brief.outcome}</pre></>}
+        {brief.instruction === "" ? null : <><h4>ORIGINAL INSTRUCTION</h4><pre className="dfConsoleSidebar__feedback">{brief.instruction}</pre></>}
+        {brief.feedback === "" ? null : <><h4>RETAINED REVIEW FEEDBACK</h4><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
+        {links.length === 0 ? null : <p>{links.map((link) => <a key={link.href} href={link.href} target="_blank" rel="noreferrer">PR · {link.label}</a>)}</p>}
+        <TaskConversation brief={brief} pending={olderPending} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { const load = detailLoader.current; if (load === undefined) return; setOlderPending(true); void load(task, brief.nextPeerOffset, brief.head).then((loaded) => { setBrief(loaded); setDetailError(false); }).catch(() => setDetailError(true)).finally(() => setOlderPending(false)); }} />
+      </>}
+      <h4>INTERVENTION HISTORY</h4>
+      {historyError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : onLoadTaskHistory === undefined ? <p>HISTORY UNAVAILABLE</p> : history === undefined ? <p>LOADING HISTORY</p> : history.entries.length === 0 ? <p>NO DURABLE CONTROLS</p> : <><ol>{history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span><small>{dateLabel(entry.createdAtMs)}</small></li>)}</ol>{history.entries.length === 32 ? <p>SHOWING THE NEWEST 32 EVENTS.</p> : null}</>}
+    </div>}
+  </details></li>;
 }
 
 /** The single editable queue, grouped only to retain each agent's priority order. */
@@ -157,21 +262,19 @@ export function QueuePanel({
     return assigned.length === 0 ? [] : [{ agent, tasks: assigned }];
   });
   return <section className="dfConsoleSidebar__panel" aria-label="Queue">
-    <div className="dfConsoleSidebar__heading"><h2>QUEUE</h2></div>
+    <div className="dfFactoryConsole__sectionHeading"><h2>QUEUE</h2><span>{state === undefined ? "—" : queued.reduce((count, group) => count + group.tasks.length, 0)} TASKS</span></div>
     {state === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
       : <>
         {running.length === 0 ? null : <section className="dfConsoleSidebar__section" aria-label="Running tasks">
           <h3>RUNNING</h3>
-          <ul className="dfConsoleRows">{running.map((task) => <li key={task.id}><div className="dfConsoleRow">
+          <ul className="dfConsoleItems">{running.map((task) => <li className="dfConsoleItem" key={task.id}><div className="dfConsoleItem__summary">
             <span className="dfConsoleRow__title">{task.title}</span>
-            <span className="dfConsoleRow__agent">{agents.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"}</span>
+            <span className="dfConsoleItem__meta">{agents.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"} · RUNNING</span>
           </div></li>)}</ul>
         </section>}
-        {queued.length === 0 ? <p className="dfFactoryConsole__empty">THE QUEUE IS EMPTY</p> : queued.map(({ agent, tasks }) => {
+        {queued.length === 0 ? <p className="dfFactoryConsole__empty">THE QUEUE IS EMPTY</p> : <ul className="dfConsoleItems">{queued.flatMap(({ agent, tasks }) => {
           const peers = agents.filter((peer) => peer.project_id === agent.project_id);
-          return <section className="dfConsoleSidebar__section" key={agent.id} aria-label={`Queue for ${agent.name}`}>
-            <h3>{agent.name}</h3>
-            <ul className="dfFactoryConsole__list">{tasks.map((task, index) => <QueuedTask
+          return tasks.map((task, index) => <QueuedTask
               key={task.id}
               task={task}
               above={tasks[index - 1]}
@@ -181,9 +284,8 @@ export function QueuePanel({
               ready={ready}
               onEditTask={onEditTask}
               onLoadTaskDetail={onLoadTaskDetail}
-            />)}</ul>
-          </section>;
-        })}
+            />);
+        })}</ul>}
       </>}
   </section>;
 }
@@ -346,39 +448,44 @@ function QueuedTask({
     }
   };
   if (onEditTask === undefined) {
-    return <li className="dfConsoleSidebar__task"><p className="dfConsoleRow__title">{task.title}</p></li>;
+    return <li className="dfConsoleItem"><p className="dfConsoleItem__summary">{task.title}</p></li>;
   }
   return (
-    <li className="dfConsoleSidebar__task">
-      {open ? <>
-        <label htmlFor={`df-title-${task.id}`}>TITLE</label>
-        <input id={`df-title-${task.id}`} value={title} disabled={disabled || loading || stale} onChange={(event) => setTitle(event.currentTarget.value)} />
-        <label htmlFor={`df-instruction-${task.id}`}>INSTRUCTION</label>
-        <textarea id={`df-instruction-${task.id}`} rows={4} value={instruction} disabled={disabled || loading || stale} onChange={(event) => setInstruction(event.currentTarget.value)} />
-        {brief?.feedback === "" || brief === undefined ? null : <><label>RETAINED REVIEW FEEDBACK</label><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
-		{brief === undefined ? null : <TaskConversation brief={brief} pending={loading} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { void load(brief.nextPeerOffset, brief.head); }} />}
-		{stale ? <p role="alert">TASK CHANGED — REOPEN BRIEF TO SAVE</p> : null}
+    <li>
+      <details className="dfConsoleItem" onToggle={(event) => { if (event.currentTarget.open && brief === undefined && !loading) void load(); }}>
+        <summary className="dfConsoleItem__summary"><strong>{task.title}</strong><span className="dfConsoleItem__meta">{peers.find((agent) => agent.id === task.assigned_agent_id)?.name ?? "AGENT"} · QUEUED</span></summary>
+        <div className="dfConsoleItem__detail">
+        {open ? <>
+          <label htmlFor={`df-title-${task.id}`}>TITLE</label>
+          <input id={`df-title-${task.id}`} value={title} disabled={disabled || loading || stale} onChange={(event) => setTitle(event.currentTarget.value)} />
+          <label htmlFor={`df-instruction-${task.id}`}>INSTRUCTION</label>
+          <textarea id={`df-instruction-${task.id}`} rows={4} value={instruction} disabled={disabled || loading || stale} onChange={(event) => setInstruction(event.currentTarget.value)} />
+          {brief?.feedback === "" || brief === undefined ? null : <><label>RETAINED REVIEW FEEDBACK</label><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
+        {brief === undefined ? null : <TaskConversation brief={brief} pending={loading} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { void load(brief.nextPeerOffset, brief.head); }} />}
+        {stale ? <p role="alert">TASK CHANGED — REOPEN BRIEF TO SAVE</p> : null}
+          <div className="dfConsoleSidebar__taskActions">
+            <button type="button" disabled={disabled || loading || stale || title.trim() === ""} onClick={async () => { if (await onEditTask(task, { title, body: instruction })) setOpen(false); }}>{pending ? "SAVING" : "SAVE BRIEF"}</button>
+            {stale ? <button type="button" disabled={loading} onClick={() => { void load(); }}>REOPEN BRIEF</button> : null}
+            <button type="button" disabled={loading} onClick={() => setOpen(false)}>DISCARD</button>
+          </div>
+        </> : <button type="button" disabled={disabled || loading || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button>}
+        {detailError ? <p role="alert">{open ? "COULD NOT LOAD DETAILS. SAVE OR DISCARD YOUR DRAFT, THEN REOPEN TO RETRY." : "COULD NOT LOAD DETAILS. REOPEN THE BRIEF TO RETRY."}</p> : null}
         <div className="dfConsoleSidebar__taskActions">
-          <button type="button" disabled={disabled || loading || stale || title.trim() === ""} onClick={async () => { if (await onEditTask(task, { title, body: instruction })) setOpen(false); }}>{pending ? "SAVING" : "SAVE BRIEF"}</button>
-          {stale ? <button type="button" disabled={loading} onClick={() => { void load(); }}>REOPEN BRIEF</button> : null}
-          <button type="button" disabled={loading} onClick={() => setOpen(false)}>DISCARD</button>
+          <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) void onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
+          <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) void onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>
+          <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-assign-${task.id}`}>Agent for {task.title}</label>
+          <select
+            id={`df-assign-${task.id}`}
+            value={task.assigned_agent_id}
+            disabled={disabled}
+            onChange={(event) => { void onEditTask(task, { assignedAgentId: event.currentTarget.value }); }}
+          >
+            {peers.map((peer) => <option key={peer.id} value={peer.id}>{peer.name}</option>)}
+          </select>
+          <button type="button" disabled={disabled} onClick={() => { void onEditTask(task, { cancel: true }); }}>CANCEL</button>
         </div>
-      </> : <><p className="dfConsoleRow__title">{task.title}</p><button type="button" disabled={disabled || onLoadTaskDetail === undefined} onClick={() => { void load(); }}>{loading ? "LOADING BRIEF" : "EDIT BRIEF"}</button></>}
-      {detailError ? <p role="alert">{open ? "COULD NOT LOAD DETAILS. SAVE OR DISCARD YOUR DRAFT, THEN REOPEN TO RETRY." : "COULD NOT LOAD DETAILS. REOPEN THE BRIEF TO RETRY."}</p> : null}
-      <div className="dfConsoleSidebar__taskActions">
-        <button type="button" aria-label={`Move ${task.title} up`} disabled={disabled || above === undefined} onClick={() => { if (above !== undefined) void onEditTask(task, { priority: above.priority + 1 }); }}>▲</button>
-        <button type="button" aria-label={`Move ${task.title} down`} disabled={disabled || below === undefined} onClick={() => { if (below !== undefined) void onEditTask(task, { priority: below.priority - 1 }); }}>▼</button>
-        <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-assign-${task.id}`}>Agent for {task.title}</label>
-        <select
-          id={`df-assign-${task.id}`}
-          value={task.assigned_agent_id}
-          disabled={disabled}
-          onChange={(event) => { void onEditTask(task, { assignedAgentId: event.currentTarget.value }); }}
-        >
-          {peers.map((peer) => <option key={peer.id} value={peer.id}>{peer.name}</option>)}
-        </select>
-        <button type="button" disabled={disabled} onClick={() => { void onEditTask(task, { cancel: true }); }}>CANCEL</button>
-      </div>
+        </div>
+      </details>
     </li>
   );
 }
@@ -533,12 +640,9 @@ function AccountsSection({
   );
 }
 
-/** The decision card: one question, its answer, and the two exits. */
+/** Private question and controls inside the selected Needs You row. */
 export function HumanRequestPanel({
   selected,
-  project,
-  agent,
-  task,
   onReplyChange,
   onReply,
   onCancel,
@@ -547,9 +651,6 @@ export function HumanRequestPanel({
   terminalReady,
 }: {
   selected: FactoryHumanRequestView;
-  project: string;
-  agent: string;
-  task: string;
   onReplyChange?: (reply: string) => void;
   onReply?: () => void;
   onCancel?: () => void;
@@ -560,15 +661,7 @@ export function HumanRequestPanel({
   const busy = selected.phase === "replying" || selected.phase === "cancelling";
   const submit = (event: FormEvent) => { event.preventDefault(); onReply?.(); };
   return (
-    <article className="dfConsoleSidebar__panel dfFactoryConsole__humanRequest" aria-label="Selected question" aria-live="polite">
-      <div className="dfConsoleSidebar__heading">
-        <div>
-          <p className="dfFactoryConsole__eyebrow">{project} · {task}</p>
-          <h2>{agent} needs you</h2>
-        </div>
-        <button type="button" disabled={busy || onClose === undefined} onClick={onClose}>CLOSE</button>
-      </div>
-      <p className="dfConsoleSidebar__status">{selected.phase === "replying" ? "ANSWERING" : selected.phase.toUpperCase()}</p>
+    <article className="dfFactoryConsole__humanRequest" aria-label="Selected question" aria-live="polite">
       {selected.phase === "loading" ? <p className="dfFactoryConsole__empty">LOADING THE QUESTION…</p> : (
         <>
           <p className="dfFactoryConsole__question">{selected.question}</p>
@@ -591,6 +684,7 @@ export function HumanRequestPanel({
           </div>
         </>
       )}
+      <button type="button" disabled={busy || onClose === undefined} onClick={onClose}>CLOSE</button>
     </article>
   );
 }

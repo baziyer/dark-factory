@@ -437,12 +437,12 @@ test("Needs You and Queue keep every served item reachable", () => {
   }
   const bounded = baseState({ agents, tasks, humanRequests: requests });
   const markup = render({ state: bounded });
-  assert.equal((markup.match(/class="dfFactoryConsole__card"/g) ?? []).length, 9);
+  assert.equal((markup.match(/<details class="dfConsoleItem"/g) ?? []).length, 9);
   const queue = render({ state: bounded, detail: "queue" });
-  assert.equal((queue.match(/class="dfConsoleSidebar__task"/g) ?? []).length, 9);
+  assert.equal((queue.match(/<li class="dfConsoleItem"/g) ?? []).length, 9);
   assert.equal((markup.match(/\+1 more/g) ?? []).length, 0);
   assert.match(markup, />9 ITEMS</);
-  assert.match(queue, /aria-label="Queue for Agent 8"/);
+  assert.match(queue, /Task 8/);
   assert.equal((render({ state: bounded, view: "agents" }).match(/dfAgentList__row/g) ?? []).length, 0, "no handler, no button");
   assert.equal((render({ state: bounded, view: "agents", onSelectAgent: () => {} }).match(/dfAgentList__row/g) ?? []).length, 9);
 });
@@ -486,14 +486,13 @@ test("an unavailable snapshot is explicit and does not invent runtime state", ()
 
 test("HumanRequest delivery states remain visibly distinct", () => {
   const request = fixtureState.humanRequests.get(ids.request);
-  for (const [status, label, description] of [
-    ["open", "OPEN", "Awaiting your answer"],
-    ["delivering", "DELIVERING", "Answer delivery in progress"],
-    ["delivery_unknown", "DELIVERY UNKNOWN", "Answer delivery could not be confirmed"],
+  for (const [status, label] of [
+    ["open", "OPEN"],
+    ["delivering", "DELIVERING"],
+    ["delivery_unknown", "DELIVERY UNKNOWN"],
   ]) {
     const markup = render({ state: baseState({ humanRequests: new Map([[request.id, { ...request, status }]]) }) });
-    assert.match(markup, new RegExp(`>${label}<`));
-    assert.match(markup, new RegExp(`>${description}<`));
+    assert.match(markup, new RegExp(`>${label} ·`));
   }
 });
 
@@ -624,6 +623,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   try {
     const edits = [];
+    const detailReads = [];
     const queued = fixtureState.tasks.get([...fixtureState.tasks.keys()][1]);
     const other = { ...queued, id: "39".repeat(16), title: "Second in line", priority: 3, revision: 20n };
     const state = baseState({
@@ -637,6 +637,7 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
       onSaveAgentConfig: (config) => edits.push(["config", config]),
       onEditTask: async (task, change) => { edits.push([task.id, change]); return true; },
       onLoadTaskDetail: async (task, peerOffset, expectedHead) => {
+        detailReads.push(task.id);
         if (peerOffset !== undefined) throw new SessionError("stale");
         return { taskId: task.id, revision: task.revision, head: expectedHead ?? 7n, instruction: "Original brief", feedback: "Review this carefully", peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: queued.id, target_task_id: other.id, question: "What changed?", recipient_delivery_state: "delivered", answer_delivery_state: "pending", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], nextPeerOffset: 1n };
       },
@@ -655,7 +656,11 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
     assert.equal(byLabel(`Move ${other.title} down`).props.disabled, true, "the last task cannot fall");
 
     const editBrief = () => renderer.root.findAllByType("button").find((button) => button.props.children === "EDIT BRIEF");
-    await act(async () => { await editBrief().props.onClick(); });
+    const firstRow = renderer.root.findByProps({ "aria-label": "Queue" }).findAllByType("details").find((row) => row.props.className === "dfConsoleItem");
+    assert.equal(firstRow.props.open, undefined, "queue rows start collapsed");
+    assert.deepEqual(detailReads, [], "collapsed queued rows do not read private briefs");
+    await act(async () => { firstRow.props.onToggle({ currentTarget: { open: true } }); });
+    assert.deepEqual(detailReads, [queued.id]);
     const title = renderer.root.findAllByType("input").find((input) => input.props.value === queued.title);
     await act(async () => { title.props.onChange({ currentTarget: { value: "Renamed" } }); });
     const instruction = renderer.root.findAllByType("textarea").find((input) => input.props.id === `df-instruction-${queued.id}`);
@@ -663,6 +668,8 @@ test("the queued task row edits title, order, assignment, and cancellation", asy
 		assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === "Review this carefully"));
     await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "SAVE BRIEF").props.onClick(); });
     assert.deepEqual(edits.at(-1), [queued.id, { title: "Renamed", body: "Replacement brief" }]);
+    await act(async () => { firstRow.props.onToggle({ currentTarget: { open: false } }); firstRow.props.onToggle({ currentTarget: { open: true } }); });
+    assert.deepEqual(detailReads, [queued.id], "reopening a cached row does not overwrite the brief");
 
     const assign = renderer.root.findAllByType("select").find((select) => select.props.id === `df-assign-${queued.id}`);
     // Reassignment offers only agents in the same project.
@@ -746,36 +753,91 @@ test("a config refusal resets only its form and config saves remain partial", as
   }
 });
 
-test("task history distinguishes duplicate titles and keeps private details through paging", async () => {
-  const calls = [];
-  const task = { ...fixtureState.tasks.get(ids.task), assigned_agent_id: ids.agent, title: "Direct instruction", status: "succeeded", revision: 11n };
-  const other = { ...task, id: "52".repeat(16), status: "failed", revision: 12n };
+test("recent work remains collapsed, bounded, and private until opened", async () => {
+  const tasks = new Map(Array.from({ length: 12 }, (_, index) => {
+    const task = {
+      ...fixtureState.tasks.get(ids.task),
+      id: String(index + 1).padStart(32, "0"),
+      assigned_agent_id: ids.agent,
+      title: "Direct instruction",
+      status: index % 3 === 0 ? "blocked" : index % 3 === 1 ? "succeeded" : "failed",
+      revision: BigInt(index + 1),
+      updated_at_ms: BigInt(1_700_000_000_000 + index),
+    };
+    return [task.id, task];
+  }));
+  const detailCalls = [];
+  const historyCalls = [];
   const props = {
-    status: "ready", state: baseState({ tasks: new Map([[task.id, task], [other.id, other]]) }), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
-    onLoadTaskDetail: async (selected, peerOffset, expectedHead) => {
-      calls.push([selected.id, peerOffset, expectedHead]);
-      if (peerOffset !== undefined) throw new SessionError("stale");
-      return { taskId: selected.id, revision: selected.revision, head: expectedHead ?? 9n, instruction: `Original ${selected.id}`, feedback: `Feedback ${selected.id}`, peerQuestions: [{ id: `${peerOffset ?? 0n}`.padStart(32, "0"), source_task_id: selected.id, target_task_id: "32".repeat(16), question: "Question", answer: "Answer", recipient_delivery_state: "delivered", answer_delivery_state: "unknown", revision: 1n, created_at_ms: 1n, updated_at_ms: 1n }], nextPeerOffset: 1n };
+    status: "ready", state: baseState({ tasks }), selectedAgent: agentSelection(), onSaveAgentConfig: () => {}, onEditTask: async () => true,
+    onLoadTaskDetail: async (task, peerOffset, expectedHead) => {
+      detailCalls.push([task.id, peerOffset, expectedHead]);
+      return {
+        taskId: task.id, revision: task.revision, head: expectedHead ?? 9n,
+        instruction: `Instruction ${task.id}`,
+        feedback: "https://github.com/dark-factory/runtime/pull/42 https://example.test/not-a-pr",
+        outcome: `Outcome ${task.id}`,
+        peerQuestions: [],
+      };
+    },
+    onLoadTaskHistory: async (task) => {
+      historyCalls.push(task.id);
+      return { taskId: task.id, entries: [{ operationId: "91".repeat(16), kind: "message", actor: "operator", body: "reviewed", status: "delivered", createdAtMs: 1_700_000_000_012n }] };
     },
   };
   let renderer;
   await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
-  assert.ok(renderer.root.findAllByProps({ "aria-label": "Task history" }).length === 1);
-  const history = renderer.root.findByProps({ "aria-label": "Task history" });
-  const picker = history.findByType("select");
-  assert.deepEqual(picker.props.children.map((option) => option.props.children.join("")), [`Direct instruction · SUCCEEDED · ${task.id.slice(0, 8)}`, `Direct instruction · FAILED · ${other.id.slice(0, 8)}`]);
-  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW TASK").props.onClick(); });
-  assert.deepEqual(calls, [[task.id, undefined, undefined]]);
-  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Original ${task.id}`));
-  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Feedback ${task.id}`));
-  await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OLDER CONVERSATION").props.onClick(); });
-  assert.deepEqual(calls, [[task.id, undefined, undefined], [task.id, 1n, 9n]]);
-  assert.ok(renderer.root.findAllByType("span").some((item) => item.props.children === "Question"), "a stale continuation keeps the loaded conversation");
-  assert.ok(renderer.root.findAllByProps({ role: "alert" }).some((item) => String(item.props.children).includes("REFUSED THIS HISTORY")));
-  await act(async () => { picker.props.onChange({ currentTarget: { value: other.id } }); });
-  await act(async () => { await renderer.root.findAllByType("button").find((button) => button.props.children === "VIEW TASK").props.onClick(); });
-  assert.deepEqual(calls.at(-1), [other.id, undefined, undefined]);
-  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Original ${other.id}`), "the selected duplicate title loads its own private brief");
+  const recent = renderer.root.findByProps({ className: "dfConsoleRecentWork dfConsoleSidebar__section" });
+  assert.equal(recent.props.open, undefined, "recent work starts collapsed");
+  assert.deepEqual(detailCalls, [], "the collapsed list requests no private detail");
+  assert.deepEqual(historyCalls, [], "the collapsed list requests no intervention history");
+  await act(async () => { recent.props.onToggle({ currentTarget: { open: true } }); });
+  assert.equal(detailCalls.length, 10, "opening fetches the bounded first page only");
+  assert.deepEqual(historyCalls, [], "row history remains lazy");
+  const items = () => recent.findByProps({ className: "dfConsoleItems" }).findAllByType("li").filter((item) => item.props.className === "dfConsoleItem");
+  assert.equal(items().length, 10);
+  assert.ok(items()[0].findAllByType("small").some((item) => String(item.children).includes("00000000000000000000000000000012")), "newest updated task is first");
+  const firstDetails = items()[0].findByType("details");
+  await act(async () => { firstDetails.props.onToggle({ currentTarget: { open: true } }); });
+  assert.deepEqual(historyCalls, [detailCalls[0][0]], "intervention receipts load only for the expanded row");
+  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Outcome ${detailCalls[0][0]}`));
+  const links = items()[0].findAllByType("a");
+  assert.deepEqual(links.map((link) => link.props.href), ["https://github.com/dark-factory/runtime/pull/42"], "only an exact GitHub pull URL becomes a link");
+  await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "SHOW MORE").props.onClick(); });
+  assert.equal(detailCalls.length, 12, "show more loads exactly the next bounded page");
+  assert.equal(items().length, 12);
+  await act(async () => { renderer.unmount(); });
+});
+
+test("late recent-work detail never crosses an agent remount", async () => {
+  const first = fixtureState.agents.get(ids.agent);
+  const second = fixtureState.agents.get(ids.idleAgent);
+  const firstTask = { ...fixtureState.tasks.get(ids.task), assigned_agent_id: first.id, status: "succeeded", revision: 21n, updated_at_ms: 21n };
+  const secondTask = { ...firstTask, id: "52".repeat(16), assigned_agent_id: second.id, status: "failed", revision: 22n, updated_at_ms: 22n };
+  const pending = new Map();
+  const props = {
+    status: "ready", state: baseState({ tasks: new Map([[firstTask.id, firstTask], [secondTask.id, secondTask]]) }), selectedAgent: agentSelection(first.id), onSaveAgentConfig: () => {},
+    onLoadTaskDetail: (task) => new Promise((resolve) => pending.set(task.id, resolve)),
+  };
+  let renderer;
+  await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+  const openRecent = async () => {
+    const recent = renderer.root.findByProps({ className: "dfConsoleRecentWork dfConsoleSidebar__section" });
+    await act(async () => { recent.props.onToggle({ currentTarget: { open: true } }); });
+  };
+  await openRecent();
+  assert.equal(pending.has(firstTask.id), true);
+  await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, selectedAgent: agentSelection(second.id) })); });
+  await openRecent();
+  pending.get(secondTask.id)({ taskId: secondTask.id, revision: secondTask.revision, head: 9n, instruction: "SECOND DETAIL", feedback: "", outcome: "SECOND OUTCOME", peerQuestions: [] });
+  await act(async () => {});
+  pending.get(firstTask.id)({ taskId: firstTask.id, revision: firstTask.revision, head: 9n, instruction: "FIRST DETAIL", feedback: "", outcome: "FIRST OUTCOME", peerQuestions: [] });
+  await act(async () => {});
+  const text = renderer.toJSON();
+  const markup = JSON.stringify(text);
+  assert.match(markup, /SECOND DETAIL/);
+  assert.equal(markup.includes("FIRST DETAIL"), false, "the late prior-agent detail has no new panel to update");
+  await act(async () => { renderer.unmount(); });
 });
 
 test("a rejected edit says plainly that the durable value did not change", () => {
@@ -891,9 +953,10 @@ test("selected hostile private detail is escaped and actions remain semantic", (
   });
   assert.match(markup, /aria-label="Selected question"/);
   assert.match(markup, /aria-label="Answer this question"/);
-  // The decision card is a sidebar panel, headed like the agent panel.
-  assert.match(markup, /<article class="dfConsoleSidebar__panel dfFactoryConsole__humanRequest"/);
-  assert.match(markup, /<div class="dfConsoleSidebar__heading"><div><p class="dfFactoryConsole__eyebrow">North Workshop · Review the state projection<\/p><h2>Builder One needs you<\/h2><\/div><button type="button">CLOSE<\/button>/);
+  // Selected detail expands in its original list row, with one heading.
+  assert.match(markup, /<details class="dfConsoleItem" open=""><summary[^>]*><strong>Builder One asks<\/strong>/);
+  assert.match(markup, /<article class="dfFactoryConsole__humanRequest"/);
+  assert.match(markup, /OPEN · North Workshop · Review the state projection/);
   assert.match(markup, /&lt;script&gt;steal\(authority\)&lt;\/script&gt;/);
   assert.equal(markup.includes("<script>"), false);
   assert.match(markup, /<textarea[^>]*>&lt;reply&gt;<\/textarea>/);
@@ -916,9 +979,14 @@ test("request, reply, cancel, and close controls forward only presentation inten
   };
 
   const requestElements = expand(FactoryConsole(baseProps));
-  requestElements.find((element) => element.type === "button" && element.props.children === "VIEW").props.onClick();
+  requestElements.find((element) => element.type === "summary" && element.props.className === "dfConsoleItem__summary").props.onClick({ preventDefault() {} });
   assert.equal(calls[0][0], "select");
   assert.equal(calls[0][1], request);
+  const busyElements = expand(FactoryConsole({ ...baseProps, selectedHumanRequest: selectedRequest({ phase: "replying" }) }));
+  const busySummary = busyElements.find((element) => element.type === "summary" && element.props.className === "dfConsoleItem__summary");
+  assert.equal(busySummary.props["aria-disabled"], true);
+  busySummary.props.onClick({ preventDefault() {} });
+  assert.equal(calls.length, 1, "an in-flight answer cannot be collapsed or switched");
 
   const selectedElements = expand(FactoryConsole({ ...baseProps, selectedHumanRequest: selectedRequest() }));
   selectedElements.find((element) => element.type === "textarea").props.onChange({ currentTarget: { value: "Proceed." } });

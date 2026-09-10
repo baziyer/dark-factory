@@ -253,13 +253,8 @@
 .dfFactoryConsole__card button { margin-top: 0.75rem; }
 .dfFactoryConsole__empty { color: var(--df-console-muted); font-size: 0.75rem; }
 
-.dfFactoryConsole__humanRequest {
-  padding: 1rem;
-  border: 1px solid var(--df-console-accent);
-}
-
 .dfFactoryConsole__humanRequest .dfFactoryConsole__question {
-  margin-top: 1rem;
+  margin-top: 0;
   color: var(--df-console-text);
   font-size: 1rem;
   line-height: 1.5;
@@ -704,12 +699,33 @@
   font-size: 0.875rem;
 }
 
-.dfConsoleSidebar__task {
+.dfConsoleItems {
   display: grid;
   gap: 0.5rem;
-  padding: 0.7rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dfConsoleRecentWork > .dfConsoleItems {
+  max-height: 28rem;
+  overflow-y: auto;
+  margin-top: 0.75rem;
+}
+
+.dfConsoleItem {
+  min-width: 0;
   border: 1px solid var(--df-console-rule);
 }
+
+.dfConsoleItem__summary { padding: 0.7rem; overflow-wrap: anywhere; }
+summary.dfConsoleItem__summary, .dfConsoleRecentWork > summary { cursor: pointer; }
+.dfConsoleItem__summary[aria-disabled="true"] { cursor: default; opacity: 0.6; }
+.dfConsoleItem__summary:focus-visible, .dfConsoleRecentWork > summary:focus-visible { outline: 2px solid var(--df-console-accent); outline-offset: -2px; }
+.dfConsoleItem__summary small, .dfConsoleItem__meta { display: block; margin-top: 0.3rem; color: var(--df-console-muted); font-size: 0.75rem; }
+.dfConsoleItem__detail { display: grid; gap: 0.5rem; min-width: 0; padding: 0.7rem; border-top: 1px solid var(--df-console-rule); overflow-wrap: anywhere; }
+.dfConsoleItem__detail h4, .dfConsoleItem__detail p { margin: 0; }
+.dfConsoleItem__detail a { display: block; color: var(--df-console-accent); }
 
 .dfConsoleSidebar__taskActions {
   display: flex;

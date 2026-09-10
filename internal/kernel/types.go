@@ -641,6 +641,7 @@ type TaskSummary struct {
 	Status          string
 	Priority        int64
 	Revision        Revision
+	UpdatedAt       UnixMillis
 }
 
 type FactorySummary struct {

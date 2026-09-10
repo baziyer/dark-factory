@@ -69,6 +69,28 @@ func TestBrowserTaskDetailSeparatesEditableInstructionFromFeedback(t *testing.T)
 	}
 }
 
+func TestBrowserTaskDetailRequiresPrivateTextCapability(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve)
+	fixture.pair(t)
+	run := adapterRunningRun(t, fixture.store, 174)
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.TaskDetail(context.Background(), rawBrowserClient(fixture.client.ID), browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision)}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("private outcome detail exposed: %v", err)
+	}
+}
+
+func TestTaskDetailTextChunkPagesOutcomeWithTheExistingCursor(t *testing.T) {
+	outcome := strings.Repeat("x", 2049)
+	first, more := taskDetailTextChunk(outcome, 0)
+	second, final := taskDetailTextChunk(outcome, 2048)
+	if !more || final || first+second != outcome {
+		t.Fatalf("outcome page = %q/%q, more=%v/%v", first, second, more, final)
+	}
+}
+
 func TestBrowserTaskDetailRejectsEditBetweenBriefAndPeerReads(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail)

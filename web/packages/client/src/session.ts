@@ -171,7 +171,7 @@ export type AgentControlRequest = Readonly<{
 }>;
 export type AgentControlResult = Readonly<{ operationId: string; taskId: string; runId: string; status: AgentControlResultBody["status"]; successorTaskId: string }>;
 export type TaskHistoryView = Readonly<{ taskId: string; entries: readonly Readonly<{ operationId: string; kind: AgentControlAction; actor: string; body: string; status: "pending" | "delivered" | "unknown" | "rejected"; createdAtMs: bigint }>[] }>;
-export type TaskDetailView = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; nextTextOffset?: bigint; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
+export type TaskDetailView = Readonly<{ taskId: string; revision: bigint; head: bigint; instruction: string; feedback: string; outcome?: string; nextTextOffset?: bigint; peerQuestions: readonly TaskPeerQuestion[]; nextPeerOffset?: bigint }>;
 export type TopologyView = Readonly<{ projectId: string; digest: string; sourceRevision: string; nodes: readonly TopologyBody["nodes"][number][] }>;
 /** One agent's live run and the repository directories it has changed. */
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
@@ -1180,7 +1180,7 @@ export class BrowserSession {
     const pending = this.#taskDetailPending.get(id);
     if (pending === undefined || body.task_id !== pending.taskId || body.revision !== pending.expectedRevision) throw new ProtocolError("malformed");
     this.#taskDetailPending.delete(id);
-    pending.resolve(Object.freeze({ taskId: body.task_id, revision: body.revision, head: body.head, instruction: body.instruction, feedback: body.feedback, ...(body.next_text_offset === undefined ? {} : { nextTextOffset: body.next_text_offset }), peerQuestions: Object.freeze(body.peer_questions.map((question) => Object.freeze({ ...question }))), ...(body.next_peer_offset === undefined ? {} : { nextPeerOffset: body.next_peer_offset }) }));
+    pending.resolve(Object.freeze({ taskId: body.task_id, revision: body.revision, head: body.head, instruction: body.instruction, feedback: body.feedback, ...(body.outcome === undefined ? {} : { outcome: body.outcome }), ...(body.next_text_offset === undefined ? {} : { nextTextOffset: body.next_text_offset }), peerQuestions: Object.freeze(body.peer_questions.map((question) => Object.freeze({ ...question }))), ...(body.next_peer_offset === undefined ? {} : { nextPeerOffset: body.next_peer_offset }) }));
   }
 
   #mintTarget(descriptor: TerminalTargetDescriptor): TerminalTarget {

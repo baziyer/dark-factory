@@ -43,6 +43,7 @@ type TaskDetail struct {
 	Head           Decimal            `json:"head"`
 	Instruction    string             `json:"instruction"`
 	Feedback       string             `json:"feedback"`
+	Outcome        *string            `json:"outcome,omitempty"`
 	NextTextOffset *Decimal           `json:"next_text_offset,omitempty"`
 	PeerQuestions  []TaskPeerQuestion `json:"peer_questions"`
 	NextPeerOffset *Decimal           `json:"next_peer_offset,omitempty"`
@@ -156,7 +157,7 @@ func validAgentControl(kind MessageType, body any) error {
 			return bad()
 		}
 	case TaskDetail:
-		if validateDynamicID(v.TaskID) != nil || v.Revision == 0 || v.Head == 0 || validateBoundedText(v.Instruction, 0, MaxTaskInstructionBytes) != nil || validateBoundedText(v.Feedback, 0, MaxTaskInstructionBytes) != nil || len(v.PeerQuestions) > 1 || v.PeerQuestions == nil || v.NextTextOffset != nil && *v.NextTextOffset == 0 || v.NextPeerOffset != nil && *v.NextPeerOffset == 0 {
+		if validateDynamicID(v.TaskID) != nil || v.Revision == 0 || v.Head == 0 || validateBoundedText(v.Instruction, 0, MaxTaskInstructionBytes) != nil || validateBoundedText(v.Feedback, 0, MaxTaskInstructionBytes) != nil || v.Outcome != nil && validateBoundedText(*v.Outcome, 0, MaxTaskInstructionBytes) != nil || len(v.PeerQuestions) > 1 || v.PeerQuestions == nil || v.NextTextOffset != nil && *v.NextTextOffset == 0 || v.NextPeerOffset != nil && *v.NextPeerOffset == 0 {
 			return bad()
 		}
 		for _, question := range v.PeerQuestions {
