@@ -210,7 +210,7 @@ func ServicePlist(home, label, relayOrigin, developmentBrowserAddress string) ([
     <array>
         <string>` + escapedProgram.String() + `</string>
         <string>--home</string>
-		<string>` + escapedHome.String() + `</string>` + relay + address + `
+        <string>` + escapedHome.String() + `</string>` + relay + address + `
     </array>
     <key>WorkingDirectory</key>
     <string>` + escapedHome.String() + `</string>
