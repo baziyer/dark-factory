@@ -11,6 +11,22 @@ import (
 // ErrSnapshotTooLarge rather than a truncated projection.
 const PublicStateEntityLimit = 4096
 
+// Active work, unresolved requests, and one completion per agent keep terminal
+// settlement visible. Older completions are read only through ReadTaskList.
+// ponytail: the completion window scans task history; add a matching history
+// index if measured snapshot latency warrants a schema migration.
+const publicTaskIDs = `WITH public_task_ids AS (
+ SELECT id FROM tasks WHERE status IN ('queued', 'running')
+ UNION SELECT r.task_id FROM human_requests h JOIN runs r ON r.id = h.run_id WHERE h.status IN ('open', 'delivering', 'delivery_unknown')
+ UNION SELECT id FROM (
+  SELECT id, ROW_NUMBER() OVER (PARTITION BY assigned_agent_id ORDER BY updated_at_ms DESC, id DESC) AS rank
+  FROM tasks WHERE status NOT IN ('queued', 'running')
+ ) WHERE rank = 1
+) `
+
+const taskReplacementOrder = `EXISTS (SELECT 1 FROM task_interventions WHERE state = 'delivered' AND successor_task_id = tasks.id) DESC, `
+const publicTaskColumns = `id, project_id, assigned_agent_id, title, status, priority, revision, updated_at_ms`
+
 // PublicSnapshot is one transactionally pinned, complete public projection of
 // the Factory. Every field is a positive allowlist: durable rows carry private
 // columns (project roots, task bodies, agent budgets) that this projection
@@ -79,10 +95,10 @@ func (store *Store) ReadPublicSnapshot(ctx context.Context) (PublicSnapshot, err
 // pinned read so the counted rows are exactly the rows the snapshot returns.
 func enforcePublicStateCount(ctx context.Context, connection *sql.Conn) error {
 	var projects, agents, tasks, requests, accounts int64
-	err := connection.QueryRowContext(ctx, `SELECT
+	err := connection.QueryRowContext(ctx, publicTaskIDs+`SELECT
         (SELECT COUNT(*) FROM projects),
         (SELECT COUNT(*) FROM agents),
-        (SELECT COUNT(*) FROM tasks),
+        (SELECT COUNT(*) FROM public_task_ids),
         (SELECT COUNT(*) FROM human_requests WHERE status IN ('open', 'delivering', 'delivery_unknown')),
         (SELECT COUNT(*) FROM accounts)`).Scan(&projects, &agents, &tasks, &requests, &accounts)
 	if err != nil {
@@ -159,11 +175,15 @@ func readPublicAgents(ctx context.Context, connection *sql.Conn) ([]AgentSummary
 }
 
 func readPublicTasks(ctx context.Context, connection *sql.Conn) ([]TaskSummary, error) {
-	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, assigned_agent_id, title, status, priority, revision, updated_at_ms FROM tasks ORDER BY id`)
+	rows, err := connection.QueryContext(ctx, publicTaskIDs+`SELECT `+publicTaskColumns+` FROM tasks WHERE id IN (SELECT id FROM public_task_ids) ORDER BY `+taskReplacementOrder+taskQueueOrder)
 	if err != nil {
 		return nil, fmt.Errorf("read public tasks: %w", err)
 	}
 	defer rows.Close()
+	return scanPublicTasks(rows)
+}
+
+func scanPublicTasks(rows *sql.Rows) ([]TaskSummary, error) {
 	result := make([]TaskSummary, 0)
 	for rows.Next() {
 		var rawID, rawProjectID, rawAgentID []byte

@@ -257,3 +257,41 @@ func (backend *browserBackend) prepareAgentInstruction(ctx context.Context, agen
 	}
 	return nil
 }
+
+func (backend *browserBackend) TaskList(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskListGet) (browserprotocol.TaskList, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityPrivateHumanRequestDetail)
+	if err != nil {
+		return browserprotocol.TaskList{}, err
+	}
+	defer release()
+	agentID, err := browserID(request.AgentID, kernel.AgentIDFromBytes)
+	if err != nil {
+		return browserprotocol.TaskList{}, browser.ErrStale
+	}
+	var beforeID kernel.TaskID
+	var beforeAt kernel.UnixMillis
+	if request.BeforeTaskID != "" {
+		if request.BeforeUpdatedAt == nil {
+			return browserprotocol.TaskList{}, browser.ErrStale
+		}
+		beforeID, err = browserID(request.BeforeTaskID, kernel.TaskIDFromBytes)
+		if err != nil {
+			return browserprotocol.TaskList{}, browser.ErrStale
+		}
+		beforeAt, err = kernel.NewUnixMillis(int64(*request.BeforeUpdatedAt))
+		if err != nil {
+			return browserprotocol.TaskList{}, browser.ErrStale
+		}
+	} else if request.BeforeUpdatedAt != nil {
+		return browserprotocol.TaskList{}, browser.ErrStale
+	}
+	page, err := backend.store.ReadTaskList(ctx, agentID, beforeAt, beforeID)
+	if err != nil {
+		return browserprotocol.TaskList{}, mapBrowserError(err)
+	}
+	result := browserprotocol.TaskList{AgentID: request.AgentID, Head: browserprotocol.Decimal(page.Head.Int64()), Total: browserprotocol.Decimal(page.Total), Tasks: []browserprotocol.TaskItem{}, HasMore: browserprotocol.Bool(page.HasMore)}
+	for _, task := range page.Tasks {
+		result.Tasks = append(result.Tasks, projectTask(task))
+	}
+	return result, nil
+}

@@ -92,6 +92,8 @@ export type TaskHistoryBody = { task_id: string; entries: TaskHistoryEntry[] };
 export type TaskDetailGetBody = { task_id: string; expected_revision: bigint; text_offset?: bigint; peer_offset?: bigint; expected_head?: bigint };
 export type TaskPeerQuestion = { id: string; source_task_id: string; target_task_id: string; question: string; answer?: string; recipient_delivery_state: string; answer_delivery_state: string; revision: bigint; created_at_ms: bigint; updated_at_ms: bigint };
 export type TaskDetailBody = { task_id: string; revision: bigint; head: bigint; instruction: string; feedback: string; outcome?: string; next_text_offset?: bigint; peer_questions: TaskPeerQuestion[]; next_peer_offset?: bigint };
+export type TaskListGetBody = { agent_id: string; before_updated_at_ms?: bigint; before_task_id?: string };
+export type TaskListBody = { agent_id: string; head: bigint; total: bigint; tasks: TaskItem[]; has_more: boolean };
 export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean; idle_policy?: IdlePolicy; idle_after_seconds?: number; idle_instruction?: string; idle_run_budget?: number };
 export type AgentUpdateResultBody = { agent_id: string; revision: bigint };
 export type TaskUpdateBody = { task_id: string; expected_revision: bigint; title?: string; body?: string; priority?: number; assigned_agent_id?: string; status?: "cancelled" };
@@ -169,6 +171,7 @@ export type ServerControlFrame = HelloFrame | PairResultFrame | AuthResultFrame 
   | { type: "AGENT_CONTROL_RESULT"; id: string; body: AgentControlResultBody }
   | { type: "TASK_HISTORY"; id: string; body: TaskHistoryBody }
   | { type: "TASK_DETAIL"; id: string; body: TaskDetailBody }
+  | { type: "TASK_LIST"; id: string; body: TaskListBody }
   | { type: "AGENT_UPDATE_RESULT"; id: string; body: AgentUpdateResultBody }
   | { type: "TASK_UPDATE_RESULT"; id: string; body: TaskUpdateResultBody }
   | { type: "TOPOLOGY"; id: string; body: TopologyBody }
@@ -185,6 +188,7 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
   | { type: "AGENT_CONTROL"; id: string; body: AgentControlBody }
   | { type: "TASK_HISTORY_GET"; id: string; body: TaskHistoryGetBody }
   | { type: "TASK_DETAIL_GET"; id: string; body: TaskDetailGetBody }
+  | { type: "TASK_LIST_GET"; id: string; body: TaskListGetBody }
   | { type: "AGENT_UPDATE"; id: string; body: AgentUpdateBody }
   | { type: "TASK_UPDATE"; id: string; body: TaskUpdateBody }
   | { type: "TOPOLOGY_GET"; id: string; body: TopologyGetBody }
@@ -197,8 +201,8 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
 type ControlBody = ClientControlFrame["body"] | ServerControlFrame["body"];
 
 const HEX_BYTES = { daemon_id: 16, boot_id: 16, connection_nonce: 32, challenge: 32, client_id: 16, public_key_sec1: 65, signature: 64 } as const;
-const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "AGENT_UPDATE", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
-const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "AGENT_UPDATE_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
+const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
+const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
 
 export function encodeClientControl(frame: ClientControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "client"))); }
 export function encodePairProve(id: string, body: PairProveBody): string { return encodeClientControl({ type: "PAIR_PROVE", id, body }); }
@@ -212,6 +216,7 @@ export function encodeTaskEnqueue(id: string, body: TaskEnqueueBody): string { r
 export function encodeAgentControl(id: string, body: AgentControlBody): string { return encodeClientControl({ type: "AGENT_CONTROL", id, body }); }
 export function encodeTaskHistoryGet(id: string, body: TaskHistoryGetBody): string { return encodeClientControl({ type: "TASK_HISTORY_GET", id, body }); }
 export function encodeTaskDetailGet(id: string, body: TaskDetailGetBody): string { return encodeClientControl({ type: "TASK_DETAIL_GET", id, body }); }
+export function encodeTaskListGet(id: string, body: TaskListGetBody): string { return encodeClientControl({ type: "TASK_LIST_GET", id, body }); }
 export function encodeTerminalTargetGet(id: string, body: TerminalTargetGetBody): string { return encodeClientControl({ type: "TERMINAL_TARGET_GET", id, body }); }
 export function encodeTerminalAttach(id: string, body: TerminalAttachBody): string { return encodeClientControl({ type: "TERMINAL_ATTACH", id, body }); }
 export function encodeTerminalAck(body: TerminalAckBody): string { return encodeClientControl({ type: "TERMINAL_ACK", body }); }
@@ -236,6 +241,7 @@ export function encodeTaskEnqueueResult(id: string, body: TaskEnqueueResultBody)
 export function encodeAgentControlResult(id: string, body: AgentControlResultBody): string { return encodeServerControl({ type: "AGENT_CONTROL_RESULT", id, body }); }
 export function encodeTaskHistory(id: string, body: TaskHistoryBody): string { return encodeServerControl({ type: "TASK_HISTORY", id, body }); }
 export function encodeTaskDetail(id: string, body: TaskDetailBody): string { return encodeServerControl({ type: "TASK_DETAIL", id, body }); }
+export function encodeTaskList(id: string, body: TaskListBody): string { return encodeServerControl({ type: "TASK_LIST", id, body }); }
 export function encodeTerminalTarget(id: string, body: TerminalTargetBody): string { return encodeServerControl({ type: "TERMINAL_TARGET", id, body }); }
 export function encodeTerminalAttached(id: string, body: TerminalAttachedBody): string { return encodeServerControl({ type: "TERMINAL_ATTACHED", id, body }); }
 export function encodeTerminalLeaseResult(id: string, body: TerminalLeaseResultBody): string { return encodeServerControl({ type: "TERMINAL_LEASE_RESULT", id, body }); }
@@ -369,6 +375,23 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     }
     case "TASK_DETAIL_GET": { requireKeys(body, ["task_id", "expected_revision"], wire, ["text_offset", "peer_offset", "expected_head"]); const result: TaskDetailGetBody = { task_id: dynamicID(body.task_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "text_offset")) result.text_offset = decimal(body.text_offset, wire); if (present(body, "peer_offset")) result.peer_offset = decimal(body.peer_offset, wire); if (present(body, "expected_head")) result.expected_head = decimal(body.expected_head, wire, true); if ((result.peer_offset ?? 0n) !== 0n && result.expected_head === undefined) malformed(); return result; }
     case "TASK_DETAIL": requireKeys(body, ["task_id", "revision", "head", "instruction", "feedback", "peer_questions"], wire, ["outcome", "next_text_offset", "next_peer_offset"]); { if (!Array.isArray(body.peer_questions) || body.peer_questions.length > 1) malformed(); const result: TaskDetailBody = { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true), head: decimal(body.head, wire, true), instruction: boundedText(body.instruction, 0, MAX_TASK_INSTRUCTION_BYTES), feedback: boundedText(body.feedback, 0, MAX_TASK_INSTRUCTION_BYTES), peer_questions: body.peer_questions.map((item) => taskPeerQuestion(item, wire)) }; if (present(body, "outcome")) result.outcome = boundedText(body.outcome, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "next_text_offset")) result.next_text_offset = decimal(body.next_text_offset, wire, true); if (present(body, "next_peer_offset")) result.next_peer_offset = decimal(body.next_peer_offset, wire, true); return result; }
+    case "TASK_LIST_GET": {
+      requireKeys(body, ["agent_id"], wire, ["before_updated_at_ms", "before_task_id"]);
+      const result: TaskListGetBody = { agent_id: dynamicID(body.agent_id) };
+      if (present(body, "before_updated_at_ms")) result.before_updated_at_ms = decimal(body.before_updated_at_ms, wire, true);
+      if (present(body, "before_task_id")) result.before_task_id = dynamicID(body.before_task_id);
+      if ((result.before_updated_at_ms === undefined) !== (result.before_task_id === undefined)) malformed();
+      return result;
+    }
+    case "TASK_LIST": {
+      requireKeys(body, ["agent_id", "head", "total", "tasks", "has_more"], wire);
+      if (!Array.isArray(body.tasks) || body.tasks.length > 10 || typeof body.has_more !== "boolean") malformed();
+      const agent_id = dynamicID(body.agent_id);
+      const tasks = body.tasks.map((item) => taskListItem(item, wire, agent_id));
+      const total = decimal(body.total, wire);
+      if (total < BigInt(tasks.length) || (body.has_more && tasks.length !== 10)) malformed();
+      return { agent_id, head: decimal(body.head, wire, true), total, tasks, has_more: body.has_more };
+    }
     case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } if (present(body, "idle_policy")) result.idle_policy = idlePolicy(body.idle_policy); if (present(body, "idle_after_seconds")) result.idle_after_seconds = integer(body.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS); if (present(body, "idle_instruction")) result.idle_instruction = boundedText(body.idle_instruction, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "idle_run_budget")) result.idle_run_budget = integer(body.idle_run_budget, 0, MAX_IDLE_RUN_BUDGET); return result; }
     case "AGENT_UPDATE_RESULT": requireKeys(body, ["agent_id", "revision"], wire); return { agent_id: dynamicID(body.agent_id), revision: decimal(body.revision, wire, true) };
     case "TASK_UPDATE": requireKeys(body, ["task_id", "expected_revision"], wire, ["title", "body", "priority", "assigned_agent_id", "status"]); { const result: TaskUpdateBody = { task_id: dynamicID(body.task_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "title")) result.title = boundedText(body.title, 1, MAX_TASK_TITLE_BYTES); if (present(body, "body")) result.body = boundedText(body.body, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "priority")) result.priority = integer(body.priority, -MAX_TASK_PRIORITY, MAX_TASK_PRIORITY); if (present(body, "assigned_agent_id")) result.assigned_agent_id = dynamicID(body.assigned_agent_id); if (present(body, "status")) { if (body.status !== "cancelled") malformed(); result.status = body.status; } return result; }
@@ -488,6 +511,13 @@ function taskItem(value: unknown, wire: boolean): TaskItem {
   if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "assigned_agent_id", "title", "status", "priority", "revision"], wire, ["updated_at_ms"]);
   if (typeof value.status !== "string" || !["queued", "running", "blocked", "succeeded", "failed", "cancelled"].includes(value.status)) malformed();
   return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), assigned_agent_id: dynamicID(value.assigned_agent_id), title: boundedText(value.title, 1, MAX_TASK_TITLE_BYTES), status: value.status as TaskItem["status"], priority: integer(value.priority, -MAX_TASK_PRIORITY, MAX_TASK_PRIORITY), revision: decimal(value.revision, wire, true), ...(present(value, "updated_at_ms") ? { updated_at_ms: decimal(value.updated_at_ms, wire, true) } : {}) };
+}
+function taskListItem(value: unknown, wire: boolean, agentID: string): TaskItem {
+  if (!isObject(value)) malformed();
+  requireKeys(value, ["id", "project_id", "assigned_agent_id", "title", "status", "priority", "revision", "updated_at_ms"], wire);
+  const task = taskItem(value, wire);
+  if (task.assigned_agent_id !== agentID || task.updated_at_ms === undefined || task.status === "queued" || task.status === "running") malformed();
+  return task;
 }
 function agentControlAction(value: unknown): AgentControlAction {
   if (value !== "message" && value !== "interrupt" && value !== "stop" && value !== "replace") malformed();

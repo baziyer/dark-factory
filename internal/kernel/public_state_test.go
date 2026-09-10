@@ -12,9 +12,9 @@ import (
 	"testing"
 )
 
-// One snapshot carries every public kind, in raw identity order, with nothing
-// dropped. Traversal used to be paged; the coherent read replaces it.
-func TestPublicSnapshotKeepsEveryKindInRawIDOrder(t *testing.T) {
+// Every public kind remains coherent; tasks use admission order, while other
+// entity collections retain raw identity order.
+func TestPublicSnapshotKeepsEveryKindInCanonicalOrder(t *testing.T) {
 	store, run, _ := runningOrchestratorRun(t)
 	defer store.Close()
 	ctx := context.Background()
@@ -84,7 +84,7 @@ func TestPublicSnapshotKeepsEveryKindInRawIDOrder(t *testing.T) {
 		requests = append(requests, item.ID.String())
 	}
 	wantAgents := append([]string{run.AgentID.String()}, publicIDs(9, func(index int) string { return publicAgentID(t, index).String() })...)
-	wantTasks := append([]string{run.TaskID.String()}, publicIDs(9, func(index int) string { return publicTaskID(t, index).String() })...)
+	wantTasks := append(publicIDs(9, func(index int) string { return publicTaskID(t, index).String() }), run.TaskID.String())
 	wantRequests := publicIDs(9, func(index int) string { return publicHumanRequestID(t, index).String() })
 	if !reflect.DeepEqual(agents, wantAgents) || !reflect.DeepEqual(tasks, wantTasks) || !reflect.DeepEqual(requests, wantRequests) {
 		t.Fatalf("snapshot = agents %v, tasks %v, requests %v", agents, tasks, requests)

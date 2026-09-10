@@ -31,6 +31,7 @@ import {
   type StateChangedFrame,
   type StateSnapshotFrame,
   type TaskEnqueueResultBody,
+  type TaskItem,
   type TaskHistoryBody,
   type TaskDetailBody,
   type TaskPeerQuestion,
@@ -155,7 +156,7 @@ type TaskPending = { taskId: string; expectedAgentRevision: bigint; resolve: (va
 type AgentControlPending = { operationId: string; taskId: string; runId: string; resolve: (value: AgentControlResult) => void; reject: (error: unknown) => void };
 type TaskHistoryPending = { taskId: string; resolve: (value: TaskHistoryView) => void; reject: (error: unknown) => void };
 type TaskDetailPending = { taskId: string; expectedRevision: bigint; resolve: (value: TaskDetailView) => void; reject: (error: unknown) => void };
-type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
+type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 export type AgentUpdateResult = Readonly<{ agentId: string; revision: bigint }>;
 export type TaskUpdateResult = Readonly<{ taskId: string; revision: bigint }>;
@@ -175,6 +176,7 @@ export type TaskDetailView = Readonly<{ taskId: string; revision: bigint; head: 
 export type TopologyView = Readonly<{ projectId: string; digest: string; sourceRevision: string; nodes: readonly TopologyBody["nodes"][number][] }>;
 /** One agent's live run and the repository directories it has changed. */
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
+export type TaskListView = Readonly<{ agentId: string; head: bigint; total: bigint; tasks: readonly TaskItem[]; hasMore: boolean }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
 type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT"; resolve: (value: never) => void; reject: (error: unknown) => void };
 
@@ -399,6 +401,21 @@ export class BrowserSession {
   /** The directories one agent's live run has changed; no run, no paths. */
   getRunPaths(agentId: string): Promise<RunPathsView> {
     return this.#consoleRequest("RUN_PATHS", agentId, 1n, "run-paths", (id) => encodeClientControl({ type: "RUN_PATHS_GET", id, body: { agent_id: agentId } }));
+  }
+
+  /** Private, cursor-paged completed work for one agent. */
+  getTaskList(agentId: string, cursor: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string } = {}): Promise<TaskListView> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated || (this.#capabilities & CAPABILITIES.private_human_request_detail) === 0) return Promise.reject(new SessionError("unauthorized"));
+    if (!validDynamicID(agentId) || (cursor.beforeUpdatedAtMs === undefined) !== (cursor.beforeTaskId === undefined) || (cursor.beforeUpdatedAtMs !== undefined && (cursor.beforeUpdatedAtMs < 1n || cursor.beforeUpdatedAtMs > MAX_SQLITE_INTEGER)) || (cursor.beforeTaskId !== undefined && !validDynamicID(cursor.beforeTaskId))) return Promise.reject(new SessionError("invalid_request"));
+    if (this.#consolePending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID("task-list");
+    const body = { agent_id: agentId, ...(cursor.beforeUpdatedAtMs === undefined ? {} : { before_updated_at_ms: cursor.beforeUpdatedAtMs, before_task_id: cursor.beforeTaskId! }) };
+    let payload: string;
+    try { payload = encodeClientControl({ type: "TASK_LIST_GET", id, body }); } catch (error) { return Promise.reject(error); }
+    const result = new Promise<TaskListView>((resolve, reject) => this.#consolePending.set(id, { kind: "TASK_LIST", entityId: agentId, resolve: resolve as (value: never) => void, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
   }
 
   /** The provider logins present on the daemon's machine. A linked one
@@ -727,7 +744,7 @@ export class BrowserSession {
       this.#taskDetailResult(frame.body, frame.id);
       return;
     }
-    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS") {
+    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS" || frame.type === "TASK_LIST") {
       this.#consoleResult(frame);
       return;
     }
@@ -1095,15 +1112,16 @@ export class BrowserSession {
     return result;
   }
 
-  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" }>): void {
+  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST" }>): void {
     const pending = this.#consolePending.get(frame.id);
     if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
-    const identity = frame.type === "AGENT_UPDATE_RESULT" || frame.type === "RUN_PATHS" ? frame.body.agent_id : frame.type === "TASK_UPDATE_RESULT" ? frame.body.task_id : frame.body.project_id;
+    const identity = frame.type === "AGENT_UPDATE_RESULT" || frame.type === "RUN_PATHS" || frame.type === "TASK_LIST" ? frame.body.agent_id : frame.type === "TASK_UPDATE_RESULT" ? frame.body.task_id : frame.body.project_id;
     if (identity !== pending.entityId) throw new ProtocolError("malformed");
     this.#consolePending.delete(frame.id);
     if (frame.type === "AGENT_UPDATE_RESULT") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, revision: frame.body.revision }) as never); return; }
     if (frame.type === "TASK_UPDATE_RESULT") { pending.resolve(Object.freeze({ taskId: frame.body.task_id, revision: frame.body.revision }) as never); return; }
     if (frame.type === "RUN_PATHS") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, runId: frame.body.run_id, paths: Object.freeze([...frame.body.paths]) }) as never); return; }
+    if (frame.type === "TASK_LIST") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, head: frame.body.head, total: frame.body.total, tasks: Object.freeze(frame.body.tasks.map((task) => Object.freeze({ ...task }))), hasMore: frame.body.has_more }) as never); return; }
     pending.resolve(Object.freeze({ projectId: frame.body.project_id, digest: frame.body.digest, sourceRevision: frame.body.source_revision, nodes: Object.freeze(frame.body.nodes.map((node) => Object.freeze({ ...node }))) }) as never);
   }
 

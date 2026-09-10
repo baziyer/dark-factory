@@ -235,3 +235,8 @@ type AgentControlBackend interface {
 	TaskHistory(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskHistoryGet) (browserprotocol.TaskHistory, error)
 	TaskDetail(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskDetailGet) (browserprotocol.TaskDetail, error)
 }
+
+// TaskListBackend serves bounded completed work independently of live state.
+type TaskListBackend interface {
+	TaskList(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.TaskListGet) (browserprotocol.TaskList, error)
+}

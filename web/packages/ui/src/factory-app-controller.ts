@@ -19,6 +19,7 @@ import {
   type DiscoveredAccountView,
   type StateView,
   type TaskItem,
+  type TaskListView,
   type TerminalReset,
   type RunPathsView,
   randomOperationID,
@@ -130,7 +131,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "discoverAccounts" | "linkAccount">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -262,6 +263,10 @@ export class FactoryAppController {
   }
 
   get snapshot(): FactoryAppSnapshot { return this.#snapshot(); }
+
+  taskList(agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }): Promise<TaskListView> {
+    return this.#client?.session?.getTaskList(agentId, cursor) ?? Promise.reject(new SessionError("closed"));
+  }
 
   start(): void {
     if (this.#started || this.#closed) return;

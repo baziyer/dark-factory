@@ -386,6 +386,15 @@ test("console edits and topology carry exact bodies and correlate their results"
   socket.reply(encodeServerControl({ type: "RUN_PATHS", id: runPathsFrame.id, body: { agent_id: agentId, run_id: runId, paths: ["internal/kernel", "web/packages/ui/src"] } }));
   assert.deepEqual(await runPathsPending, { agentId, runId, paths: ["internal/kernel", "web/packages/ui/src"] });
 
+  const listPending = session.getTaskList(agentId, { beforeUpdatedAtMs: 20n, beforeTaskId: taskId });
+  const listFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(listFrame.type, "TASK_LIST_GET");
+  assert.deepEqual(listFrame.body, { agent_id: agentId, before_updated_at_ms: 20n, before_task_id: taskId });
+  const listed = { id: taskId, project_id: projectId, assigned_agent_id: agentId, title: "completed", status: "succeeded", priority: 0, revision: 3n, updated_at_ms: 19n };
+  socket.reply(encodeServerControl({ type: "TASK_LIST", id: listFrame.id, body: { agent_id: agentId, head: 10n, total: 1n, tasks: [listed], has_more: false } }));
+  assert.deepEqual(await listPending, { agentId, head: 10n, total: 1n, tasks: [listed], hasMore: false });
+  await assert.rejects(session.getTaskList(agentId, { beforeUpdatedAtMs: 20n }), (error) => error instanceof SessionError && error.code === "invalid_request");
+
   // A result for another entity is a protocol fault, not a resolution.
   const mismatched = session.updateAgent({ agentId, expectedRevision: 9n, paused: false });
   const mismatchedFrame = decodeClientControl(socket.sent.at(-1));

@@ -2,8 +2,6 @@ import {
   CAPABILITIES,
   type BrowserSession,
   type DiscoveredAccountView,
-  type ProtocolError,
-  type SessionError,
 } from "@dark-factory/client";
 
 const LOOPBACK_GRANT = CAPABILITIES.human_actions | CAPABILITIES.terminal_input;

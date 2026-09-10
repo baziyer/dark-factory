@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type StateView, type TaskHistoryView, type TaskItem, type TaskPeerQuestion } from "@dark-factory/client";
+import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type StateView, type TaskHistoryView, type TaskItem, type TaskListView, type TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
 import { agentStatus, agentCurrentTask } from "./console-view.js";
@@ -53,6 +53,7 @@ export function AgentPanel({
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
+  onLoadTaskList,
   terminalContent,
   panel: panelProp,
   onPanel,
@@ -65,6 +66,7 @@ export function AgentPanel({
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
+  onLoadTaskList?: (agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }) => Promise<TaskListView>;
   /** The selected agent's mounted terminal and durable composer. */
   terminalContent?: ReactNode;
   panel?: AgentPanelView;
@@ -115,26 +117,14 @@ export function AgentPanel({
       </section>
 
       <RecentWork
-        tasks={state === undefined ? [] : [...state.tasks.values()].filter((task) => task.assigned_agent_id === agent.id)}
+        agent={agent}
+        completionRevision={state === undefined ? "" : [...state.tasks.values()].filter((task) => task.assigned_agent_id === agent.id).map((task) => `${task.id}:${task.revision}`).join(" ")}
+        onLoadTaskList={onLoadTaskList}
         onLoadTaskDetail={onLoadTaskDetail}
         onLoadTaskHistory={onLoadTaskHistory}
       />
     </section>
   );
-}
-
-const RECENT_WORK_PAGE = 10;
-
-function terminalTask(task: TaskItem): boolean {
-  return task.status === "blocked" || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled";
-}
-
-function recentTasks(tasks: readonly TaskItem[]): readonly TaskItem[] {
-  return tasks.filter(terminalTask).sort((left, right) => {
-    const leftAt = left.updated_at_ms ?? 0n;
-    const rightAt = right.updated_at_ms ?? 0n;
-    return leftAt === rightAt ? left.id.localeCompare(right.id) : leftAt > rightAt ? -1 : 1;
-  });
 }
 
 function dateLabel(value: bigint | undefined): string {
@@ -160,23 +150,54 @@ function pullRequests(value: string): readonly Readonly<{ href: string; label: s
 
 /** Private completed-task detail, kept bounded until the operator opens it. */
 function RecentWork({
-  tasks,
+  agent,
+  completionRevision,
+  onLoadTaskList,
   onLoadTaskDetail,
   onLoadTaskHistory,
 }: {
-  tasks: readonly TaskItem[];
+  agent: AgentItem;
+  completionRevision: string;
+  onLoadTaskList?: (agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }) => Promise<TaskListView>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
 }) {
   const [open, setOpen] = useState(false);
-  const [shown, setShown] = useState(RECENT_WORK_PAGE);
-  const recent = recentTasks(tasks);
-  const visible = recent.slice(0, shown);
+  const [page, setPage] = useState<readonly TaskItem[]>([]);
+  const [total, setTotal] = useState<bigint>();
+  const [hasMore, setHasMore] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const request = useRef(0);
+  const load = (append: boolean) => {
+    const loader = onLoadTaskList;
+    if (loader === undefined || (append && (pending || !hasMore))) return;
+    const cursor = append ? page.at(-1) : undefined;
+    if (append && (cursor?.updated_at_ms === undefined)) return;
+    const token = ++request.current;
+    setPending(true);
+    setFailed(false);
+    void loader(agent.id, cursor === undefined ? undefined : { beforeUpdatedAtMs: cursor.updated_at_ms, beforeTaskId: cursor.id }).then((result) => {
+      if (request.current !== token) return;
+      setPage((prior) => append ? [...prior, ...result.tasks] : result.tasks);
+      setTotal(result.total);
+      setHasMore(result.hasMore);
+    }).catch(() => { if (request.current === token) setFailed(true); }).finally(() => { if (request.current === token) setPending(false); });
+  };
+  useEffect(() => {
+    if (!open) return;
+    load(false);
+    return () => { ++request.current; };
+  }, [open, agent.id, completionRevision]);
+  const count = total === undefined ? "—" : total.toString();
   return <details className="dfConsoleRecentWork dfConsoleSidebar__section" onToggle={(event) => setOpen(event.currentTarget.open)}>
-    <summary>RECENT WORK · {recent.length}</summary>
+    <summary>RECENT WORK · {count}</summary>
     {!open ? null : <>
-      {visible.length === 0 ? <p className="dfFactoryConsole__empty">NO COMPLETED OR BLOCKED TASKS</p> : <ol className="dfConsoleItems">{visible.map((task) => <RecentWorkItem key={`${task.id}:${task.revision}`} task={task} onLoadTaskDetail={onLoadTaskDetail} onLoadTaskHistory={onLoadTaskHistory} />)}</ol>}
-      {shown >= recent.length ? null : <button type="button" onClick={() => setShown((count) => count + RECENT_WORK_PAGE)}>SHOW MORE</button>}
+      {failed ? <p role="alert">RECENT WORK UNAVAILABLE <button type="button" onClick={() => load(false)}>RETRY</button></p>
+        : pending && page.length === 0 ? <p>LOADING RECENT WORK</p>
+          : page.length === 0 ? <p className="dfFactoryConsole__empty">NO COMPLETED OR BLOCKED TASKS</p>
+            : <ol className="dfConsoleItems">{page.map((task) => <RecentWorkItem key={`${task.id}:${task.revision}`} task={task} onLoadTaskDetail={onLoadTaskDetail} onLoadTaskHistory={onLoadTaskHistory} />)}</ol>}
+      {!hasMore ? null : <button type="button" disabled={pending} onClick={() => load(true)}>SHOW MORE</button>}
     </>}
   </details>;
 }

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { AgentItem, TaskHistoryView, TaskItem } from "@dark-factory/client";
+import type { AgentItem, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
 import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
@@ -24,6 +24,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
+  onLoadTaskList?: (agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }) => Promise<TaskListView>;
   onOpenTerminalForHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onSelectHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onHumanReplyChange?: (reply: string) => void;
@@ -95,6 +96,7 @@ export function FactoryConsole({
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
+  onLoadTaskList,
   onOpenTerminalForHumanRequest,
   onSelectHumanRequest,
   onHumanReplyChange,
@@ -222,6 +224,7 @@ export function FactoryConsole({
                 onEditTask={onEditTask}
                 onLoadTaskDetail={onLoadTaskDetail}
                 onLoadTaskHistory={onLoadTaskHistory}
+                onLoadTaskList={onLoadTaskList}
                 terminalContent={terminalContent}
                 panel={agentPanel}
                 onPanel={onAgentPanel}
