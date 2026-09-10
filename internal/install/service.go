@@ -25,7 +25,7 @@ const serviceStderrLogName = "factoryd.stderr.log"
 const (
 	serviceMaxPathBytes  = 4096
 	serviceMaxLabelBytes = 127
-	serviceMaxPlistBytes = 3*serviceMaxPathBytes*6 + MaxRelayOriginBytes*6 + 4096
+	serviceMaxPlistBytes = 4*serviceMaxPathBytes*6 + MaxRelayOriginBytes*6 + 4096
 )
 
 // MaxRelayOriginBytes is the one bound on ServiceConfig.RelayOrigin, shared

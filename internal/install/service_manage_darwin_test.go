@@ -279,6 +279,29 @@ func TestServiceUninstallAcceptsAReceiptBoundPriorPlist(t *testing.T) {
 	}
 }
 
+func TestServicePlistReadBoundCoversFourEscapedHomePaths(t *testing.T) {
+	fixture := newManageFixture(t)
+	home := "/" + strings.Repeat(`"`, serviceMaxPathBytes-1)
+	body, _, err := ServicePlist(home, fixture.config.Label, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyLimit := 3*serviceMaxPathBytes*6 + MaxRelayOriginBytes*6 + 4096
+	if len(body) <= legacyLimit {
+		t.Fatalf("maximal plist = %d bytes, old bound = %d", len(body), legacyLimit)
+	}
+	if err := os.WriteFile(fixture.plistPath(), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readServicePlist(fixture.plistDir, fixture.config.plistName(), legacyLimit); err == nil {
+		t.Fatal("old plist read bound accepted four escaped home paths")
+	}
+	read, present, err := readServicePlist(fixture.plistDir, fixture.config.plistName(), serviceMaxPlistBytes)
+	if err != nil || !present || !bytes.Equal(read, body) {
+		t.Fatalf("maximal plist read = %d bytes present=%t err=%v", len(read), present, err)
+	}
+}
+
 func TestServiceInstallRefusesForeignPlistAndResidue(t *testing.T) {
 	fixture := newManageFixture(t)
 	if err := os.WriteFile(fixture.plistPath(), []byte("foreign bytes"), 0o600); err != nil {
