@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -71,13 +73,16 @@ type ServiceConfig struct {
 	// ServiceInstall only: every other verb recovers the origin from the
 	// receipt, because uninstall and status are invoked without the flag.
 	RelayOrigin string
+	// DevelopmentBrowserAddress, when set, adds factoryd's existing
+	// --development-browser-address argument to the installed job.
+	DevelopmentBrowserAddress string
 }
 
 // DefaultServiceConfig is the production configuration.
 func DefaultServiceConfig() ServiceConfig { return ServiceConfig{Label: DefaultServiceLabel} }
 
 func (config ServiceConfig) valid() bool {
-	if !validServiceLabel(config.Label) || !validServiceRelayOrigin(config.RelayOrigin) {
+	if !validServiceLabel(config.Label) || !validServiceRelayOrigin(config.RelayOrigin) || !ValidDevelopmentBrowserAddress(config.DevelopmentBrowserAddress) {
 		return false
 	}
 	return config.PlistDirectory == "" || validServicePath(config.PlistDirectory)
@@ -168,16 +173,16 @@ func ServiceUninstall(ctx context.Context, home string, config ServiceConfig) (S
 
 // ServicePlist renders the one Go-v1 launchd job. Exact byte comparison is the
 // parser: accepting a plist means accepting precisely this finite allowlist.
-// An empty relayOrigin renders the job with no relay argument at all.
-func ServicePlist(home, label, relayOrigin string) ([]byte, [sha256.Size]byte, error) {
+// Empty optional arguments render no extra factoryd flags.
+func ServicePlist(home, label, relayOrigin, developmentBrowserAddress string) ([]byte, [sha256.Size]byte, error) {
 	if !validServicePath(home) || filepath.Base(home) == string(filepath.Separator) {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: home path", ErrServicePlist)
 	}
 	if !validServiceLabel(label) {
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: label", ErrServicePlist)
 	}
-	if !validServiceRelayOrigin(relayOrigin) {
-		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: relay origin", ErrServicePlist)
+	if !validServiceRelayOrigin(relayOrigin) || !ValidDevelopmentBrowserAddress(developmentBrowserAddress) {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: arguments", ErrServicePlist)
 	}
 	program := serviceProgramPath(home)
 	stderrPath := serviceStderrPath(home)
@@ -191,6 +196,10 @@ func ServicePlist(home, label, relayOrigin string) ([]byte, [sha256.Size]byte, e
 		escapeXML(&escapedRelay, relayOrigin)
 		relay = "\n        <string>--relay-origin</string>\n        <string>" + escapedRelay.String() + "</string>"
 	}
+	address := ""
+	if developmentBrowserAddress != "" {
+		address = "\n        <string>--development-browser-address</string>\n        <string>" + developmentBrowserAddress + "</string>"
+	}
 	body := []byte(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -201,7 +210,7 @@ func ServicePlist(home, label, relayOrigin string) ([]byte, [sha256.Size]byte, e
     <array>
         <string>` + escapedProgram.String() + `</string>
         <string>--home</string>
-        <string>` + escapedHome.String() + `</string>` + relay + `
+		<string>` + escapedHome.String() + `</string>` + relay + address + `
     </array>
     <key>WorkingDirectory</key>
     <string>` + escapedHome.String() + `</string>
@@ -234,6 +243,9 @@ type serviceReceipt struct {
 	// was rendered with. It is last and omitted when empty so a receipt
 	// written before this member existed still round-trips byte for byte.
 	RelayOrigin string `json:"relay_origin,omitempty"`
+	// DevelopmentBrowserAddress is the exact development-only browser address
+	// the installed plist requested. It is omitted for production installs.
+	DevelopmentBrowserAddress string `json:"development_browser_address,omitempty"`
 }
 
 const (
@@ -246,7 +258,7 @@ func (receipt serviceReceipt) valid() bool {
 	return receipt.Version == serviceReceiptVersion && validServiceLabel(receipt.Label) &&
 		validServicePath(receipt.PlistPath) && filepath.Base(receipt.PlistPath) == receipt.Label+".plist" &&
 		validDigestHex(receipt.PlistDigest) && validDigestHex(receipt.ProgramDigest) &&
-		validServiceRelayOrigin(receipt.RelayOrigin)
+		validServiceRelayOrigin(receipt.RelayOrigin) && ValidDevelopmentBrowserAddress(receipt.DevelopmentBrowserAddress)
 }
 
 func validDigestHex(value string) bool {
@@ -304,6 +316,20 @@ func ValidRelayOrigin(value string) bool {
 // validServiceRelayOrigin additionally accepts the empty origin, which renders
 // a job with no relay argument at all.
 func validServiceRelayOrigin(value string) bool { return value == "" || ValidRelayOrigin(value) }
+
+// ValidDevelopmentBrowserAddress accepts factoryd's exact development-only
+// loopback listener grammar, including port zero for an ephemeral listener.
+func ValidDevelopmentBrowserAddress(value string) bool {
+	if value == "" {
+		return true
+	}
+	host, rawPort, err := net.SplitHostPort(value)
+	if err != nil || host != "127.0.0.1" || rawPort == "" {
+		return false
+	}
+	port, err := strconv.Atoi(rawPort)
+	return err == nil && port >= 0 && port <= 65535 && strconv.Itoa(port) == rawPort
+}
 
 func validServicePath(value string) bool {
 	return value != "" && len(value) <= serviceMaxPathBytes && utf8.ValidString(value) && filepath.IsAbs(value) && filepath.Clean(value) == value && validXMLText(value) && !strings.ContainsRune(value, 0)

@@ -295,14 +295,14 @@ func TestLaunchctlPrintRequiresExactOwnedFields(t *testing.T) {
 
 func TestServicePlistIsOneFiniteAllowlist(t *testing.T) {
 	home := "/private/tmp/factory & <operator>"
-	body, digest, err := ServicePlist(home, DefaultServiceLabel, "")
+	body, digest, err := ServicePlist(home, DefaultServiceLabel, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sha256.Sum256(body) != digest || bytes.Count(body, []byte("<key>AbandonProcessGroup</key>")) != 1 || bytes.Count(body, []byte("<true/>")) != 2 {
 		t.Fatalf("plist identity or required keys invalid: %s", body)
 	}
-	for _, forbidden := range []string{"KeepAlive", "EnvironmentVariables", "Sockets", "NetworkState", "StandardOutPath", "*"} {
+	for _, forbidden := range []string{"KeepAlive", "EnvironmentVariables", "Sockets", "NetworkState", "StandardOutPath", "--development-browser-address", "*"} {
 		if bytes.Contains(body, []byte(forbidden)) {
 			t.Fatalf("plist contains forbidden %q", forbidden)
 		}
@@ -314,31 +314,32 @@ func TestServicePlistIsOneFiniteAllowlist(t *testing.T) {
 			t.Fatalf("plist omitted %q", expected)
 		}
 	}
-	if _, _, err := ServicePlist("relative", DefaultServiceLabel, ""); !errors.Is(err, ErrServicePlist) {
+	if _, _, err := ServicePlist("relative", DefaultServiceLabel, "", ""); !errors.Is(err, ErrServicePlist) {
 		t.Fatalf("relative home = %v", err)
 	}
 	for _, home := range []string{"/private/tmp/invalid-\x00", "/private/tmp/invalid-\x01", "/private/tmp/invalid-\xff"} {
-		if _, _, err := ServicePlist(home, DefaultServiceLabel, ""); !errors.Is(err, ErrServicePlist) {
+		if _, _, err := ServicePlist(home, DefaultServiceLabel, "", ""); !errors.Is(err, ErrServicePlist) {
 			t.Fatalf("invalid plist path %q accepted: %v", home, err)
 		}
 	}
 }
 
-func TestServicePlistRendersTheRelayOriginArgumentExactly(t *testing.T) {
+func TestServicePlistRendersOptionalArgumentsExactly(t *testing.T) {
 	const home = "/private/tmp/factory"
 	const origin = "wss://relay.darkfactory.build"
+	const address = "127.0.0.1:0"
 	arguments := func(extra string) string {
 		return "    <array>\n        <string>" + serviceProgramPath(home) + "</string>\n" +
 			"        <string>--home</string>\n        <string>" + home + "</string>" + extra + "\n    </array>\n"
 	}
-	plain, _, err := ServicePlist(home, DefaultServiceLabel, "")
+	plain, _, err := ServicePlist(home, DefaultServiceLabel, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(plain, []byte(arguments(""))) || bytes.Contains(plain, []byte("relay")) {
 		t.Fatalf("plist without the flag = %s", plain)
 	}
-	relayed, digest, err := ServicePlist(home, DefaultServiceLabel, origin)
+	relayed, digest, err := ServicePlist(home, DefaultServiceLabel, origin, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,6 +349,14 @@ func TestServicePlistRendersTheRelayOriginArgumentExactly(t *testing.T) {
 	}
 	if sha256.Sum256(relayed) != digest || len(relayed) != len(plain)+len(extra) {
 		t.Fatal("the relay argument is not the only rendered difference")
+	}
+	developed, _, err := ServicePlist(home, DefaultServiceLabel, "", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	developmentExtra := "\n        <string>--development-browser-address</string>\n        <string>" + address + "</string>"
+	if !bytes.Contains(developed, []byte(arguments(developmentExtra))) || len(developed) != len(plain)+len(developmentExtra) {
+		t.Fatalf("plist with development browser address = %s", developed)
 	}
 	// The bound is the exact origin grammar: anything that would render a job
 	// factoryd refuses at boot, or smuggle a second flag into
@@ -359,8 +368,13 @@ func TestServicePlistRendersTheRelayOriginArgumentExactly(t *testing.T) {
 		"wss://relay .build", "wss://relay\nx", "wss://relay\x00",
 		"wss://" + strings.Repeat("a", MaxRelayOriginBytes),
 	} {
-		if _, _, err := ServicePlist(home, DefaultServiceLabel, bad); !errors.Is(err, ErrServicePlist) {
+		if _, _, err := ServicePlist(home, DefaultServiceLabel, bad, ""); !errors.Is(err, ErrServicePlist) {
 			t.Fatalf("invalid relay origin %q accepted: %v", bad, err)
+		}
+	}
+	for _, bad := range []string{"localhost:43123", "127.0.0.1:65536", "127.0.0.1:-1", "127.0.0.1:01"} {
+		if _, _, err := ServicePlist(home, DefaultServiceLabel, "", bad); !errors.Is(err, ErrServicePlist) {
+			t.Fatalf("invalid development browser address %q accepted: %v", bad, err)
 		}
 	}
 }
@@ -376,7 +390,7 @@ func TestServiceStatusRejectsDetachedLaunchAgentsDuringRead(t *testing.T) {
 	if _, err := Init(context.Background(), home); err != nil {
 		t.Fatal(err)
 	}
-	plistBody, _, err := ServicePlist(home, DefaultServiceLabel, "")
+	plistBody, _, err := ServicePlist(home, DefaultServiceLabel, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +547,7 @@ func TestServiceStatusRefusesPlistMutationsAndPresentJobs(t *testing.T) {
 	if _, err := Init(context.Background(), home); err != nil {
 		t.Fatal(err)
 	}
-	plistBody, _, err := ServicePlist(home, DefaultServiceLabel, "")
+	plistBody, _, err := ServicePlist(home, DefaultServiceLabel, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +589,7 @@ func TestServiceStatusRejectsPlistMetadataWithoutLaunchctl(t *testing.T) {
 	if _, err := Init(context.Background(), home); err != nil {
 		t.Fatal(err)
 	}
-	body, _, err := ServicePlist(home, DefaultServiceLabel, "")
+	body, _, err := ServicePlist(home, DefaultServiceLabel, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

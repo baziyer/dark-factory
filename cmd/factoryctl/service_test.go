@@ -55,15 +55,16 @@ func TestParseServiceStatusIsOneExplicitCommand(t *testing.T) {
 	}
 }
 
-func TestParseServiceInstallRelayOriginIsInstallOnlyAndExact(t *testing.T) {
+func TestParseServiceInstallConfigurationIsInstallOnlyAndExact(t *testing.T) {
 	home := "/private/tmp/factory"
 	const origin = "wss://relay&.example"
-	command, help, ok := parse([]string{"service", "install", "--home", home, "--relay-origin", origin})
-	if !ok || help || command != (attemptCommand{kind: commandServiceInstall, home: home, relayOrigin: origin}) {
+	const address = "127.0.0.1:0"
+	command, help, ok := parse([]string{"service", "install", "--home", home, "--relay-origin", origin, "--development-browser-address", address})
+	if !ok || help || command != (attemptCommand{kind: commandServiceInstall, home: home, relayOrigin: origin, browserAddress: address}) {
 		t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 	}
-	if config := serviceConfigFor(command); config.RelayOrigin != origin {
-		t.Fatalf("service config relay origin = %q", config.RelayOrigin)
+	if config := serviceConfigFor(command); config.RelayOrigin != origin || config.DevelopmentBrowserAddress != address {
+		t.Fatalf("service config = %+v", config)
 	}
 	// Omitting the flag installs exactly as before.
 	command, _, ok = parse([]string{"service", "install", "--home", home})
@@ -74,6 +75,8 @@ func TestParseServiceInstallRelayOriginIsInstallOnlyAndExact(t *testing.T) {
 		// Only install renders a plist; the other verbs read the receipt.
 		{"service", "status", "--home", home, "--relay-origin", origin},
 		{"service", "uninstall", "--home", home, "--relay-origin", origin},
+		{"service", "status", "--home", home, "--development-browser-address", address},
+		{"service", "uninstall", "--home", home, "--development-browser-address", address},
 		// The connector's own grammar bounds the flag.
 		{"service", "install", "--home", home, "--relay-origin", ""},
 		{"service", "install", "--home", home, "--relay-origin", "https://relay.darkfactory.build"},
@@ -81,6 +84,9 @@ func TestParseServiceInstallRelayOriginIsInstallOnlyAndExact(t *testing.T) {
 		{"service", "install", "--home", home, "--relay-origin", "wss://relay.darkfactory.build?x=1"},
 		{"service", "install", "--home", home, "--relay-origin", "wss://user@relay.darkfactory.build"},
 		{"service", "install", "--home", home, "--relay-origin", "wss://"},
+		{"service", "install", "--home", home, "--development-browser-address", "localhost:43124"},
+		{"service", "install", "--home", home, "--development-browser-address", "127.0.0.1:65536"},
+		{"service", "install", "--home", home, "--development-browser-address", ""},
 		{"service", "install", "--home", home, "--relay-origin", strings.Repeat("w", install.MaxRelayOriginBytes)},
 		// Repeating any service flag is a syntax error, this one included.
 		{"service", "install", "--home", home, "--relay-origin", origin, "--relay-origin", origin},
