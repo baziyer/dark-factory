@@ -26,7 +26,7 @@ no commit, push, pull-request, or repository-publication operation.
   a recorded intervention. Codex Interrupt stops generation while preserving the
   task; Stop ends it; Start new preserves its history and queues a replacement.
   Completed output stays visible. Add to queue accepts later work while busy.
-  Queue order follows admission; the displayed numeric priority can be raised or
+  Queues are grouped by agent and follow its admission order; numeric priority can be raised or
   lowered explicitly. Recent Work stays collapsed without reading private details. Opening it loads
   authorized details for the newest ten completed or blocked tasks, showing
   instruction and outcome excerpts; Show more loads the next ten. Expand a row

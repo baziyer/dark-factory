@@ -648,6 +648,7 @@ test("the queued task row keeps served order and changes its exact priority", as
     const byLabel = (label) => buttons.find((button) => button.props["aria-label"] === label);
     const queueRows = renderer.root.findByProps({ "aria-label": "Queue" }).findAllByType("details").filter((row) => row.props.className === "dfConsoleItem");
     assert.deepEqual(queueRows.map((row) => row.findByType("strong").props.children), [queued.title, other.title], "the queue keeps the server's per-agent order, rather than re-sorting priority");
+    assert.ok(renderer.root.findAllByType("span").some((span) => (Array.isArray(span.props.children) ? span.props.children.join("") : String(span.props.children)).includes("2 TASKS · BY AGENT")));
     assert.ok(renderer.root.findAllByType("span").some((span) => (Array.isArray(span.props.children) ? span.props.children.join("") : String(span.props.children)).includes("QUEUED · PRIORITY 2")));
     await act(async () => { byLabel(`Increase priority for ${queued.title}`).props.onClick(); });
     assert.deepEqual(edits.at(-1), [queued.id, { priority: queued.priority + 1 }]);

@@ -24,6 +24,9 @@ const publicTaskIDs = `WITH public_task_ids AS (
  ) WHERE rank = 1
 ) `
 
+// taskReplacementOrder only orders work for the same agent. AdmitNext first
+// chooses that agent's candidate, then compares candidates across agents by
+// taskQueueOrder; promoting it globally would present a false next-start order.
 const taskReplacementOrder = `EXISTS (SELECT 1 FROM task_interventions WHERE state = 'delivered' AND successor_task_id = tasks.id) DESC, `
 const publicTaskColumns = `id, project_id, assigned_agent_id, title, status, priority, revision, updated_at_ms`
 
@@ -175,7 +178,7 @@ func readPublicAgents(ctx context.Context, connection *sql.Conn) ([]AgentSummary
 }
 
 func readPublicTasks(ctx context.Context, connection *sql.Conn) ([]TaskSummary, error) {
-	rows, err := connection.QueryContext(ctx, publicTaskIDs+`SELECT `+publicTaskColumns+` FROM tasks WHERE id IN (SELECT id FROM public_task_ids) ORDER BY `+taskReplacementOrder+taskQueueOrder)
+	rows, err := connection.QueryContext(ctx, publicTaskIDs+`SELECT `+publicTaskColumns+` FROM tasks WHERE id IN (SELECT id FROM public_task_ids) ORDER BY assigned_agent_id, `+taskReplacementOrder+taskQueueOrder)
 	if err != nil {
 		return nil, fmt.Errorf("read public tasks: %w", err)
 	}

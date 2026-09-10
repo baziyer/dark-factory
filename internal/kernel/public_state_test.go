@@ -84,7 +84,7 @@ func TestPublicSnapshotKeepsEveryKindInCanonicalOrder(t *testing.T) {
 		requests = append(requests, item.ID.String())
 	}
 	wantAgents := append([]string{run.AgentID.String()}, publicIDs(9, func(index int) string { return publicAgentID(t, index).String() })...)
-	wantTasks := append(publicIDs(9, func(index int) string { return publicTaskID(t, index).String() }), run.TaskID.String())
+	wantTasks := append([]string{run.TaskID.String()}, publicIDs(9, func(index int) string { return publicTaskID(t, index).String() })...)
 	wantRequests := publicIDs(9, func(index int) string { return publicHumanRequestID(t, index).String() })
 	if !reflect.DeepEqual(agents, wantAgents) || !reflect.DeepEqual(tasks, wantTasks) || !reflect.DeepEqual(requests, wantRequests) {
 		t.Fatalf("snapshot = agents %v, tasks %v, requests %v", agents, tasks, requests)

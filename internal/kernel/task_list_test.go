@@ -1,7 +1,9 @@
 package kernel
 
 import (
+	"bytes"
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -70,5 +72,60 @@ func TestPublicQueueOrderMatchesAdmissionForTiedPriorities(t *testing.T) {
 	admitted, err := store.AdmitNext(ctx, admissionKeys(t, 100, nil), mustTime(t, 20))
 	if err != nil || admitted.Run == nil || admitted.Run.TaskID != snapshot.Tasks[0].ID {
 		t.Fatalf("admission = %+v, %v", admitted, err)
+	}
+}
+
+func TestPublicQueueKeepsReplacementAheadOnlyWithinItsAgent(t *testing.T) {
+	ctx := context.Background()
+	store, running, _ := runningWorkerRun(t)
+	defer store.Close()
+	task, found, err := store.Task(ctx, running.TaskID)
+	if err != nil || !found {
+		t.Fatalf("running task = %+v, found=%v, err=%v", task, found, err)
+	}
+	queued, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 240), ProjectID: task.ProjectID, AssignedAgentID: task.AssignedAgentID, IncarnationID: incarnationID(t, 241), Title: "same worker later", Priority: 9}, mustTime(t, 30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 242), ProjectID: task.ProjectID, Name: "other worker", Role: RoleWorker, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	global, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 243), ProjectID: task.ProjectID, AssignedAgentID: other.ID, IncarnationID: incarnationID(t, 244), Title: "other worker first", Priority: 1}, mustTime(t, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := humanQuestionClient(t, store, 245, BrowserCapabilityObserve|BrowserCapabilityHumanActions)
+	operation, err := TaskInterventionIDFromBytes(bytes.Repeat([]byte{246}, IDBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := NewTask{ID: taskID(t, 247), IncarnationID: incarnationID(t, 248), Body: "replacement"}
+	if _, err := store.StopRunForBrowser(ctx, client.ID, TaskInterventionRequest{OperationID: operation, TaskID: task.ID, RunID: running.ID, ExpectedTaskRevision: task.Revision, ExpectedRunRevision: running.Revision, Kind: TaskInterventionReplace}, &successor, mustTime(t, 40)); err != nil {
+		t.Fatal(err)
+	}
+	observeMissingProcessExits(t, store, running.ID, 41)
+	releaseAllRunResources(t, store, running.ID, 44)
+	finalizing := closeTerminalSessionAtCurrent(t, store, running.ID, 47)
+	if _, err := finalizeTestRun(t, store, finalizing, 50); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := store.ReadPublicSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]TaskID, 0, 3)
+	for _, item := range snapshot.Tasks {
+		if item.Status == TaskQueued.String() {
+			got = append(got, item.ID)
+		}
+	}
+	if want := []TaskID{successor.ID, queued.ID, global.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("public per-agent queue = %v, want %v", got, want)
+	}
+	admitted, err := store.AdmitNext(ctx, admissionKeys(t, 249, nil), mustTime(t, 51))
+	if err != nil || !admitted.Admitted() || admitted.Run.TaskID != global.ID {
+		t.Fatalf("global candidate remains first = %+v, err=%v", admitted, err)
 	}
 }

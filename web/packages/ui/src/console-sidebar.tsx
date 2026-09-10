@@ -258,7 +258,7 @@ function RecentWorkItem({
   </details></li>;
 }
 
-/** The single editable queue keeps the authoritative served task order. */
+/** The single editable queue keeps the authoritative per-agent task order. */
 export function QueuePanel({
   state,
   edit,
@@ -281,7 +281,7 @@ export function QueuePanel({
     return assigned.length === 0 ? [] : [{ agent, tasks: assigned }];
   });
   return <section className="dfConsoleSidebar__panel" aria-label="Queue">
-    <div className="dfFactoryConsole__sectionHeading"><h2>QUEUE</h2><span>{state === undefined ? "—" : queued.reduce((count, group) => count + group.tasks.length, 0)} TASKS</span></div>
+    <div className="dfFactoryConsole__sectionHeading"><h2>QUEUE</h2><span>{state === undefined ? "—" : `${queued.reduce((count, group) => count + group.tasks.length, 0)} TASKS · BY AGENT`}</span></div>
     {state === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
       : <>
         {running.length === 0 ? null : <section className="dfConsoleSidebar__section" aria-label="Running tasks">

@@ -97,9 +97,10 @@ The browser reads one bounded, transactionally pinned active-state snapshot
 and is told only that the durable head moved. A client holds one coherent
 snapshot or none; a change notification carries only a head. Tasks include
 queued/running work, unresolved request origins, and the most recent completion
-per agent so terminal settlement remains visible. Queue order comes from the
-same priority/creation-time/ID ordering as admission, including an explicit
-replacement ahead of the agent's queued work.
+per agent so terminal settlement remains visible. The console groups queues
+by agent; within each queue, the priority/creation-time/ID ordering matches
+admission, including an explicit replacement ahead of that agent's queued
+work. These groups do not predict the global order of starts across agents.
 
 Completed history is a separate private read: `TASK_LIST_GET` returns at most
 ten public task summaries for one agent, newest first, with a total count.
@@ -127,7 +128,9 @@ the loopback path is `/browser`, and `/pair` beside it is the one HTML page
 the daemon serves: a script-free confirm page whose form mints a pairing
 challenge and redirects to the hosted console. A control frame carrying a
 member this build does not know is served, so the hosted console and the
-daemon can be installed in either order without a mismatch window.
+daemon tolerate additive members in either installation order. New message
+types still require daemon support; deploy that support before a console
+that uses them.
 
 An ignored member is an ASCII name that is not a known name under any case. A
 non-ASCII name is refused outright, and a member differing from a known one
