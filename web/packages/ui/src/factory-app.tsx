@@ -102,6 +102,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       onSaveAgentConfig={(config) => { void owner.current?.updateAgentConfig(config); }}
       onEditTask={(task, change) => owner.current?.editTask(task, change) ?? Promise.resolve(false)}
       onLoadTaskDetail={(task, peerOffset, expectedHead) => owner.current?.taskDetail(task, peerOffset, expectedHead) ?? Promise.reject(new Error("closed"))}
+      onLoadTaskHistory={(task) => owner.current?.taskHistory(task) ?? Promise.reject(new Error("closed"))}
       onOpenTerminalForHumanRequest={(request) => { setDetail("agent"); setAgentPanel("terminal"); owner.current?.openTerminalForHumanRequest(request); }}
       onSelectHumanRequest={(request) => { setDetail("needs-you"); void owner.current?.selectHumanRequest(request); }}
       onHumanReplyChange={(reply) => owner.current?.setHumanReply(reply)}

@@ -18,14 +18,19 @@ no commit, push, pull-request, or repository-publication operation.
   launch path is fixture-proven for an existing local CLI and signed-in account;
   its real-provider smoke remains outstanding. See the [provider
   contract](docs/providers.md).
-- The browser opens on the overseer, with every worker directly accessible in
-  the persistent roster. Its selected-agent workbench keeps the terminal and
-  task controls together; the floor is an optional disclosure. Send an
+- The browser opens on the overseer, with agent selection in either the factory
+  floor or roster. Needs You, Queue, and the selected agent's controls share the
+  right panel. Needs You and Queue expand rows in place. Send an
   instruction in a ready agent's terminal pane to create a durable
   task. Type in a live terminal to work with that session, or use Message for
   a recorded intervention. Codex Interrupt stops generation while preserving the
   task; Stop ends it; Start new preserves its history and queues a replacement.
   Completed output stays visible. Add to queue accepts later work while busy.
+  Recent Work stays collapsed without reading private details. Opening it loads
+  authorized details for the newest ten completed or blocked tasks, showing
+  instruction and outcome excerpts; Show more loads the next ten. Expand a row
+  for the full outcome, reported PR links, instruction, and review feedback,
+  and to load its intervention history. Private prose stays out of public state.
   Project and agent setup stays in `factoryctl`.
 - Agent status is Ready, Working, Needs you, or Paused. Working means a task
   is running, including startup and cleanup. Queued work alone is Ready with

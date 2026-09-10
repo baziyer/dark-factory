@@ -224,6 +224,26 @@ func TestBrowserStateSnapshotCannotCarryPrivateData(t *testing.T) {
 	}
 }
 
+func TestBrowserStateSnapshotIncludesPublicTaskRecency(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve)
+	connection := fixture.pair(t)
+	run := adapterRunningRun(t, fixture.store, 150)
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	snapshot, _ := adapterSnapshot(t, fixture, connection, "recency")
+	for _, item := range snapshot.Tasks {
+		if item.ID == task.ID.String() {
+			if item.UpdatedAtMillis != decimalMillis(task.UpdatedAt) {
+				t.Fatalf("task recency = %d, want %d", item.UpdatedAtMillis, task.UpdatedAt)
+			}
+			return
+		}
+	}
+	t.Fatal("task missing from snapshot")
+}
+
 // TASK_ENQUEUE commits the durable task, advances the head, and the very next
 // snapshot contains its public card without its private instruction.
 func TestBrowserTaskEnqueueAppearsInTheNextSnapshotWithoutItsInstruction(t *testing.T) {

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { AgentItem, TaskItem } from "@dark-factory/client";
+import type { AgentItem, TaskHistoryView, TaskItem } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
 import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
@@ -23,6 +23,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onSaveAgentConfig?: (config: AgentConfigEdit) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
+  onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
   onOpenTerminalForHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onSelectHumanRequest?: (request: FactoryHumanRequestView["request"]) => void;
   onHumanReplyChange?: (reply: string) => void;
@@ -93,6 +94,7 @@ export function FactoryConsole({
   onSaveAgentConfig,
   onEditTask,
   onLoadTaskDetail,
+  onLoadTaskHistory,
   onOpenTerminalForHumanRequest,
   onSelectHumanRequest,
   onHumanReplyChange,
@@ -186,21 +188,19 @@ export function FactoryConsole({
               <NeedsYouColumn
                 state={state}
                 status={status}
-                selectedHumanRequestId={selectedHumanRequest?.request.id}
+                selectedHumanRequest={selectedHumanRequest}
                 onSelectHumanRequest={onSelectHumanRequest}
+                onCloseHumanRequest={onCloseHumanRequest}
+                selectedContent={selectedHumanRequest === undefined ? null : <HumanRequestPanel
+                  selected={selectedHumanRequest}
+                  onReplyChange={onHumanReplyChange}
+                  onReply={onReplyHumanRequest}
+                  onCancel={onCancelHumanRequest}
+                  onClose={onCloseHumanRequest}
+                  onOpenTerminal={onOpenTerminalForHumanRequest}
+                  terminalReady={ready}
+                />}
               />
-              {selectedHumanRequest === undefined ? null : <HumanRequestPanel
-                selected={selectedHumanRequest}
-                project={projectLabel(state?.projects, selectedHumanRequest.request.project_id)}
-                agent={entityLabel(state?.agents, selectedHumanRequest.request.agent_id, "AGENT")}
-                task={entityLabel(state?.tasks, selectedHumanRequest.request.task_id, "TASK")}
-                onReplyChange={onHumanReplyChange}
-                onReply={onReplyHumanRequest}
-                onCancel={onCancelHumanRequest}
-                onClose={onCloseHumanRequest}
-                onOpenTerminal={onOpenTerminalForHumanRequest}
-                terminalReady={ready}
-              />}
             </div>
             <div hidden={selectedDetail !== "queue"}>
               <QueuePanel
@@ -221,6 +221,7 @@ export function FactoryConsole({
                 onSaveConfig={onSaveAgentConfig}
                 onEditTask={onEditTask}
                 onLoadTaskDetail={onLoadTaskDetail}
+                onLoadTaskHistory={onLoadTaskHistory}
                 terminalContent={terminalContent}
                 panel={agentPanel}
                 onPanel={onAgentPanel}
@@ -260,35 +261,40 @@ function Counter({ label, value, alert }: { label: string; value: string; alert?
 function NeedsYouColumn({
   state,
   status,
-  selectedHumanRequestId,
+  selectedHumanRequest,
   onSelectHumanRequest,
-}: Pick<FactoryConsoleProps, "state" | "status" | "onSelectHumanRequest"> & { selectedHumanRequestId?: string }) {
+  onCloseHumanRequest,
+  selectedContent,
+}: Pick<FactoryConsoleProps, "state" | "status" | "selectedHumanRequest" | "onSelectHumanRequest" | "onCloseHumanRequest"> & { selectedContent?: ReactNode }) {
   const requests = state === undefined ? undefined : [...state.humanRequests.values()];
+  const busy = selectedHumanRequest?.phase === "replying" || selectedHumanRequest?.phase === "cancelling";
   return (
-    <section className="dfFactoryConsole__section" aria-label="NEEDS YOU">
+    <section className="dfConsoleSidebar__panel" aria-label="NEEDS YOU">
       <div className="dfFactoryConsole__sectionHeading">
         <h2>NEEDS YOU</h2>
         <span>{requests?.length ?? "—"} {requests?.length === 1 ? "ITEM" : "ITEMS"}</span>
       </div>
       {requests === undefined ? <p className="dfFactoryConsole__empty">WAITING FOR SNAPSHOT</p>
         : requests.length === 0 ? <p className="dfFactoryConsole__empty">all quiet — nothing needs you</p> : (
-          <ul className="dfFactoryConsole__list dfFactoryConsole__list--requests">
+          <ul className="dfConsoleItems">
             {requests.map((request) => {
-              const selected = selectedHumanRequestId === request.id;
-              const copy = humanRequestStatusCopy(request.status);
+              const selected = selectedHumanRequest?.request.id === request.id;
+              const label = request.status.replaceAll("_", " ").toUpperCase();
+              const disabled = status !== "ready" || busy || (selected ? onCloseHumanRequest === undefined : onSelectHumanRequest === undefined);
               return (
-                <li className="dfFactoryConsole__card" key={request.id}>
-                  <div className="dfFactoryConsole__cardTitle">
-                    <strong>{entityLabel(state?.agents, request.agent_id, "AGENT")} asks</strong>
-                    <span>{copy.label}</span>
-                  </div>
-                  <p>{projectLabel(state?.projects, request.project_id)} · {entityLabel(state?.tasks, request.task_id, "TASK")}</p>
-                  <small>{copy.description}</small>
-                  {onSelectHumanRequest === undefined ? null : (
-                    <button type="button" aria-pressed={selected} disabled={selected || status !== "ready"} onClick={() => onSelectHumanRequest(request)}>
-                      {selected ? "OPEN" : "VIEW"}
-                    </button>
-                  )}
+                <li key={request.id}>
+                  <details className="dfConsoleItem" open={selected}>
+                    <summary className="dfConsoleItem__summary" aria-disabled={disabled} onClick={(event) => {
+                      event.preventDefault();
+                      if (disabled) return;
+                      if (selected) onCloseHumanRequest?.();
+                      else onSelectHumanRequest?.(request);
+                    }}>
+                      <strong>{entityLabel(state?.agents, request.agent_id, "AGENT")} asks</strong>
+                      <span className="dfConsoleItem__meta">{label} · {projectLabel(state?.projects, request.project_id)} · {entityLabel(state?.tasks, request.task_id, "TASK")}</span>
+                    </summary>
+                    {selected ? <div className="dfConsoleItem__detail">{selectedContent}</div> : null}
+                  </details>
                 </li>
               );
             })}
@@ -309,15 +315,4 @@ function entityLabel(entities: ReadonlyMap<string, { name?: string; title?: stri
 
 function shortID(value: string): string {
   return value.slice(0, 8);
-}
-
-function humanRequestStatusCopy(status: FactoryHumanRequestView["request"]["status"]): Readonly<{ label: string; description: string }> {
-  switch (status) {
-    case "open":
-      return { label: "OPEN", description: "Awaiting your answer" };
-    case "delivering":
-      return { label: "DELIVERING", description: "Answer delivery in progress" };
-    case "delivery_unknown":
-      return { label: "DELIVERY UNKNOWN", description: "Answer delivery could not be confirmed" };
-  }
 }

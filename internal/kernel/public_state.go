@@ -159,7 +159,7 @@ func readPublicAgents(ctx context.Context, connection *sql.Conn) ([]AgentSummary
 }
 
 func readPublicTasks(ctx context.Context, connection *sql.Conn) ([]TaskSummary, error) {
-	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, assigned_agent_id, title, status, priority, revision FROM tasks ORDER BY id`)
+	rows, err := connection.QueryContext(ctx, `SELECT id, project_id, assigned_agent_id, title, status, priority, revision, updated_at_ms FROM tasks ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("read public tasks: %w", err)
 	}
@@ -168,8 +168,8 @@ func readPublicTasks(ctx context.Context, connection *sql.Conn) ([]TaskSummary, 
 	for rows.Next() {
 		var rawID, rawProjectID, rawAgentID []byte
 		var title, rawStatus string
-		var priority, rawRevision int64
-		if err := rows.Scan(&rawID, &rawProjectID, &rawAgentID, &title, &rawStatus, &priority, &rawRevision); err != nil {
+		var priority, rawRevision, rawUpdatedAt int64
+		if err := rows.Scan(&rawID, &rawProjectID, &rawAgentID, &title, &rawStatus, &priority, &rawRevision, &rawUpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan public task: %w", err)
 		}
 		id, idErr := TaskIDFromBytes(rawID)
@@ -177,11 +177,12 @@ func readPublicTasks(ctx context.Context, connection *sql.Conn) ([]TaskSummary, 
 		agentID, agentErr := AgentIDFromBytes(rawAgentID)
 		status, statusErr := parseTaskStatus(rawStatus)
 		revision, revisionErr := NewRevision(rawRevision)
+		updatedAt, updatedAtErr := NewUnixMillis(rawUpdatedAt)
 		if idErr != nil || projectErr != nil || agentErr != nil || statusErr != nil || revisionErr != nil ||
-			byteLen(title) < 1 || byteLen(title) > 1024 || priority < -1_000_000 || priority > 1_000_000 {
+			updatedAtErr != nil || byteLen(title) < 1 || byteLen(title) > 1024 || priority < -1_000_000 || priority > 1_000_000 {
 			return nil, fmt.Errorf("%w: invalid public task", ErrCorruptState)
 		}
-		result = append(result, TaskSummary{ID: id, ProjectID: projectID, AssignedAgentID: agentID, Title: title, Status: status.String(), Priority: priority, Revision: revision})
+		result = append(result, TaskSummary{ID: id, ProjectID: projectID, AssignedAgentID: agentID, Title: title, Status: status.String(), Priority: priority, Revision: revision, UpdatedAt: updatedAt})
 	}
 	return result, rows.Err()
 }

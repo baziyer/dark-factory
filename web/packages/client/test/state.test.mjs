@@ -97,6 +97,13 @@ test("the Go-produced snapshot fixture becomes one complete TypeScript state vie
   assert.throws(() => { view.head = 0n; }, TypeError);
 });
 
+test("task recency is optional for legacy snapshots and exact when served", () => {
+  const legacy = decodeServerControl(encodeStateSnapshot("state", snapshotBody())).body;
+  assert.equal(legacy.tasks[0].updated_at_ms, undefined);
+  const current = decodeServerControl(encodeStateSnapshot("state", snapshotBody({ tasks: [{ ...taskItem(), updated_at_ms: 17n }] }))).body;
+  assert.equal(current.tasks[0].updated_at_ms, 17n);
+});
+
 test("factory capacity counts workers while active runs include the overseer", () => {
   const body = snapshotBody({ factory: { dispatch_enabled: true, capacity: 1, active_runs: 2, revision: 1n } });
   const frame = { type: "STATE_SNAPSHOT", id: "state", body };

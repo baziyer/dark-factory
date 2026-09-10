@@ -540,6 +540,13 @@ export class FactoryAppController {
     return this.#readTaskDetail(session, task.id, task.revision, peerOffset, expectedHead);
   }
 
+  /** Read one task's durable interventions only after the operator opens it. */
+  taskHistory(task: Pick<TaskItem, "id">): Promise<TaskHistoryView> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined) return Promise.reject(new SessionError("closed"));
+    return session.getTaskHistory(task.id);
+  }
+
   clearAgentTerminal(): void {
     if (this.#closed) return;
     this.#replaceTerminal({});
@@ -1310,11 +1317,13 @@ export class FactoryAppController {
     let textOffset = 0n;
     let instruction = "";
     let feedback = "";
+    let outcome = "";
+    let hasOutcome = false;
     let peerQuestions: TaskDetailView["peerQuestions"] = [];
     let nextPeerOffset: bigint | undefined;
     let head = expectedHead;
-    // Task bodies are limited to 128 KiB and each page is 2,048 runes, so 64
-    // pages cover every valid body without treating conversation pagination as
+    // Task bodies and results are limited to 128 KiB; pages are 2,048 runes,
+    // so 64 pages cover valid text without treating conversation pagination as
     // an unbounded background load.
     for (let page = 0; page < 64; page += 1) {
       const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset, ...(head === undefined ? {} : { expectedHead: head }) });
@@ -1322,11 +1331,15 @@ export class FactoryAppController {
       head = detail.head;
       instruction += detail.instruction;
       feedback += detail.feedback;
+      if (detail.outcome !== undefined) {
+        outcome += detail.outcome;
+        hasOutcome = true;
+      }
       if (page === 0) {
         peerQuestions = detail.peerQuestions;
         nextPeerOffset = detail.nextPeerOffset;
       }
-      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, head, instruction, feedback, peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
+      if (detail.nextTextOffset === undefined) return Object.freeze({ taskId: taskID, revision, head, instruction, feedback, ...(hasOutcome ? { outcome } : {}), peerQuestions, ...(nextPeerOffset === undefined ? {} : { nextPeerOffset }) });
       textOffset = detail.nextTextOffset;
     }
     throw new ProtocolError("malformed");

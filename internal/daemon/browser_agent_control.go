@@ -192,11 +192,19 @@ func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browse
 	}
 	instruction, instructionMore := taskDetailTextChunk(kernel.TaskInstruction(task), uint64(request.TextOffset))
 	feedback, feedbackMore := taskDetailTextChunk(kernel.TaskFeedback(task), uint64(request.TextOffset))
+	outcomeText := task.Result
+	if outcomeText == "" {
+		outcomeText = task.BlockedReason
+	}
+	outcome, outcomeMore := taskDetailTextChunk(outcomeText, uint64(request.TextOffset))
 	questions, nextPeerOffset, head, err := backend.store.PeerQuestionsForTask(ctx, task.ID, uint64(request.PeerOffset), expectedHead)
 	if err != nil {
 		return browserprotocol.TaskDetail{}, mapBrowserError(err)
 	}
 	result := browserprotocol.TaskDetail{TaskID: task.ID.String(), Revision: decimalRevision(task.Revision), Head: decimalSequence(head), Instruction: instruction, Feedback: feedback, PeerQuestions: []browserprotocol.TaskPeerQuestion{}}
+	if outcomeText != "" {
+		result.Outcome = &outcome
+	}
 	for _, question := range questions {
 		item := browserprotocol.TaskPeerQuestion{
 			ID: question.ID.String(), SourceTaskID: question.SourceTaskID.String(), TargetTaskID: question.TargetTaskID.String(),
@@ -209,7 +217,7 @@ func (backend *browserBackend) TaskDetail(ctx context.Context, rawClient [browse
 		}
 		result.PeerQuestions = append(result.PeerQuestions, item)
 	}
-	if instructionMore || feedbackMore {
+	if instructionMore || feedbackMore || outcomeMore {
 		next := browserprotocol.Decimal(uint64(request.TextOffset) + 2048)
 		result.NextTextOffset = &next
 	}

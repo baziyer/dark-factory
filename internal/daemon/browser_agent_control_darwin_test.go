@@ -69,6 +69,151 @@ func TestBrowserTaskDetailSeparatesEditableInstructionFromFeedback(t *testing.T)
 	}
 }
 
+func TestBrowserTaskDetailRequiresPrivateTextCapability(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve)
+	fixture.pair(t)
+	run := adapterRunningRun(t, fixture.store, 174)
+	task, found, err := fixture.store.Task(context.Background(), run.TaskID)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.TaskDetail(context.Background(), rawBrowserClient(fixture.client.ID), browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision)}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("private outcome detail exposed: %v", err)
+	}
+}
+
+func TestTaskDetailTextChunkPagesOutcomeWithTheExistingCursor(t *testing.T) {
+	outcome := strings.Repeat("x", 2049)
+	first, more := taskDetailTextChunk(outcome, 0)
+	second, final := taskDetailTextChunk(outcome, 2048)
+	if !more || final || first+second != outcome {
+		t.Fatalf("outcome page = %q/%q, more=%v/%v", first, second, more, final)
+	}
+}
+
+func TestBrowserTaskDetailPagesMaximumResultPastTheFormerCursorLimit(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail)
+	fixture.pair(t)
+	run := adapterRunningRun(t, fixture.store, 175)
+	result := strings.Repeat("x", 131072)
+	completed := completeAdapterRun(t, fixture.store, run, result)
+	task, found, err := fixture.store.Task(context.Background(), completed.TaskID)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	var rebuilt string
+	passedFormerLimit := false
+	for offset := 0; ; offset += 2048 {
+		encoded, err := browserprotocol.EncodeTaskDetailGet("detail", browserprotocol.TaskDetailGet{TaskID: task.ID.String(), ExpectedRevision: decimalRevision(task.Revision), TextOffset: browserprotocol.Decimal(offset)})
+		if err != nil {
+			t.Fatalf("page %d request = %v", offset, err)
+		}
+		frame, err := browserprotocol.DecodeClientControl(encoded)
+		if err != nil {
+			t.Fatalf("page %d decode = %v", offset, err)
+		}
+		if offset == 34816 {
+			passedFormerLimit = true
+		}
+		detail, err := fixture.backend.TaskDetail(context.Background(), rawBrowserClient(fixture.client.ID), frame.Body.(browserprotocol.TaskDetailGet))
+		if err != nil || detail.Outcome == nil {
+			t.Fatalf("page %d detail = %+v, %v", offset, detail, err)
+		}
+		rebuilt += *detail.Outcome
+		if _, err := browserprotocol.EncodeTaskDetail("detail", detail); err != nil {
+			t.Fatalf("page %d response = %v", offset, err)
+		}
+		if detail.NextTextOffset == nil {
+			break
+		}
+		if *detail.NextTextOffset != browserprotocol.Decimal(offset+2048) {
+			t.Fatalf("page %d continuation = %d", offset, *detail.NextTextOffset)
+		}
+	}
+	if rebuilt != result {
+		t.Fatalf("result reconstruction = %d bytes, want %d", len(rebuilt), len(result))
+	}
+	if !passedFormerLimit {
+		t.Fatal("never requested a page past the former 32768-rune cursor limit")
+	}
+}
+
+func completeAdapterRun(t *testing.T, store *kernel.Store, run kernel.Run, resultText string) kernel.Run {
+	t.Helper()
+	ctx := context.Background()
+	proposal, err := kernel.NewSuccessProposal(resultText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.ProposeAttemptOutcome(ctx, run.CredentialDigest, proposal, adapterTime(t, 400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := store.Resources(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runtime, provider, runner kernel.Resource
+	for _, resource := range resources {
+		switch resource.Kind {
+		case kernel.ResourceRuntimeRoot:
+			runtime = resource
+		case kernel.ResourceProviderProcess:
+			provider = resource
+		case kernel.ResourceRunnerProcess:
+			runner = resource
+		}
+	}
+	providerExit, err := kernel.NewAttemptResultExitCode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptResult, err := kernel.NewInnerConvergedAttemptResult(run.ID, run.CredentialDigest, run.ResultProofDigest(), runtime.Identity, provider.Identity, providerExit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.ConsumeAttemptResult(ctx, attemptResult, current.Revision, adapterTime(t, 401))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err = store.Resources(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range resources {
+		switch resource.Kind {
+		case kernel.ResourceRuntimeRoot:
+			runtime = resource
+		case kernel.ResourceRunnerProcess:
+			runner = resource
+		}
+	}
+	runnerExit, err := kernel.NewProcessExitCode(1, 0, adapterTime(t, 402))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _, err = store.RecordLiveRunnerExitAndRelease(ctx, run.ID, runner.ID, current.Revision, runner.Revision, runner.Identity, runnerExit, adapterTime(t, 403))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReleaseResource(ctx, run.ID, runtime.ID, runtime.Revision, runtime.Identity, adapterTime(t, 404)); err != nil {
+		t.Fatal(err)
+	}
+	session, found, err := store.TerminalSessionForRun(ctx, run.ID)
+	if err != nil || !found {
+		t.Fatalf("terminal session = %+v, found=%v, err=%v", session, found, err)
+	}
+	current, _, err = store.CloseTerminalAfterRunner(ctx, attemptResult, current.Revision, session.Revision, adapterTime(t, 405))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.FinalizeRun(ctx, run.ID, current.Revision, adapterTime(t, 406))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return terminal
+}
+
 func TestBrowserTaskDetailRejectsEditBetweenBriefAndPeerReads(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityPrivateHumanRequestDetail)

@@ -336,8 +336,8 @@ test("agent controls and private task history keep exact task and run identities
   const taskDetail = session.getTaskDetail(taskId, 2n, { peerOffset: 1n, expectedHead: 9n });
   const taskDetailGet = decodeClientControl(socket.sent.at(-1));
   assert.deepEqual(taskDetailGet.body, { task_id: taskId, expected_revision: 2n, peer_offset: 1n, expected_head: 9n });
-  socket.reply(encodeTaskDetail(taskDetailGet.id, { task_id: taskId, revision: 2n, head: 9n, instruction: "", feedback: "", peer_questions: [] }));
-  assert.deepEqual(await taskDetail, { taskId, revision: 2n, head: 9n, instruction: "", feedback: "", peerQuestions: [] });
+  socket.reply(encodeTaskDetail(taskDetailGet.id, { task_id: taskId, revision: 2n, head: 9n, instruction: "", feedback: "", outcome: "completed", peer_questions: [] }));
+  assert.deepEqual(await taskDetail, { taskId, revision: 2n, head: 9n, instruction: "", feedback: "", outcome: "completed", peerQuestions: [] });
   await assert.rejects(session.getTaskDetail(taskId, 2n, { peerOffset: 1n }), (error) => error instanceof ProtocolError && error.code === "malformed");
   session.close();
 });
