@@ -775,7 +775,7 @@ test("recent work remains collapsed, bounded, and private until opened", async (
       return {
         taskId: task.id, revision: task.revision, head: expectedHead ?? 9n,
         instruction: `Instruction ${task.id}`,
-        feedback: "https://github.com/dark-factory/runtime/pull/42 https://example.test/not-a-pr",
+        feedback: "https://github.com/example-owner/example-repo/pull/42 https://example.test/not-a-pr",
         outcome: `Outcome ${task.id}`,
         peerQuestions: [],
       };
@@ -802,7 +802,7 @@ test("recent work remains collapsed, bounded, and private until opened", async (
   assert.deepEqual(historyCalls, [detailCalls[0][0]], "intervention receipts load only for the expanded row");
   assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Outcome ${detailCalls[0][0]}`));
   const links = items()[0].findAllByType("a");
-  assert.deepEqual(links.map((link) => link.props.href), ["https://github.com/dark-factory/runtime/pull/42"], "only an exact GitHub pull URL becomes a link");
+  assert.deepEqual(links.map((link) => link.props.href), ["https://github.com/example-owner/example-repo/pull/42"], "only an exact GitHub pull URL becomes a link");
   await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "SHOW MORE").props.onClick(); });
   assert.equal(detailCalls.length, 12, "show more loads exactly the next bounded page");
   assert.equal(items().length, 12);
