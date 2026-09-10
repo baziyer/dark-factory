@@ -136,7 +136,8 @@ test("status changes are deduplicated without affecting snapshot updates", () =>
   assert.equal(context.snapshots.length, 3);
 });
 
-test("task-detail pages keep one head across text chunks and peer continuation", async () => {
+test("task-detail pages cover a maximum outcome with one head and peer continuation", async () => {
+  const outcome = "x".repeat(131_072);
   const task = [...fixtureState.tasks.values()][0];
   const calls = [];
   const context = harness({
@@ -147,12 +148,16 @@ test("task-detail pages keep one head across text chunks and peer continuation",
         assert.equal(offsets.expectedHead, 9n);
         return { taskId: taskID, revision, head: 9n, instruction: "", feedback: "", peerQuestions: [], nextPeerOffset: undefined };
       }
-      if (offsets.textOffset === 1n) {
-        assert.equal(offsets.expectedHead, 9n);
-        return { taskId: taskID, revision, head: 9n, instruction: "second", feedback: "feedback", outcome: "come", peerQuestions: [] };
-      }
-      assert.equal(offsets.expectedHead, undefined);
-      return { taskId: taskID, revision, head: 9n, instruction: "first", feedback: "review ", outcome: "out", peerQuestions: [], nextTextOffset: 1n, nextPeerOffset: 1n };
+      const offset = Number(offsets.textOffset);
+      assert.equal(offsets.expectedHead, offset === 0 ? undefined : 9n);
+      return {
+        taskId: taskID, revision, head: 9n,
+        instruction: offset === 0 ? "first" : offset === 2048 ? "second" : "",
+        feedback: offset === 0 ? "review " : offset === 2048 ? "feedback" : "",
+        outcome: outcome.slice(offset, offset + 2048), peerQuestions: [],
+        ...(offset + 2048 < outcome.length ? { nextTextOffset: BigInt(offset + 2048) } : {}),
+        ...(offset === 0 ? { nextPeerOffset: 1n } : {}),
+      };
     },
   });
   context.controller.start();
@@ -162,11 +167,11 @@ test("task-detail pages keep one head across text chunks and peer continuation",
   assert.equal(first.head, 9n);
   assert.equal(first.instruction, "firstsecond");
   assert.equal(first.feedback, "review feedback");
-  assert.equal(first.outcome, "outcome");
-  assert.deepEqual(calls, [
-    [task.id, task.revision, { textOffset: 0n, peerOffset: 0n }],
-    [task.id, task.revision, { textOffset: 1n, peerOffset: 0n, expectedHead: 9n }],
-  ]);
+  assert.equal(first.outcome, outcome, "all 128 KiB survive the 64-page boundary");
+  assert.deepEqual(calls, Array.from({ length: 64 }, (_, index) => [
+    task.id, task.revision,
+    { textOffset: BigInt(index * 2048), peerOffset: 0n, ...(index === 0 ? {} : { expectedHead: 9n }) },
+  ]));
 
   await context.controller.taskDetail(task, first.nextPeerOffset, first.head);
   assert.deepEqual(calls.at(-1), [task.id, task.revision, { textOffset: 0n, peerOffset: 1n, expectedHead: 9n }]);

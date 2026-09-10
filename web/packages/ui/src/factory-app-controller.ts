@@ -1322,8 +1322,8 @@ export class FactoryAppController {
     let peerQuestions: TaskDetailView["peerQuestions"] = [];
     let nextPeerOffset: bigint | undefined;
     let head = expectedHead;
-    // Task bodies are limited to 128 KiB and each page is 2,048 runes, so 64
-    // pages cover every valid body without treating conversation pagination as
+    // Task bodies and results are limited to 128 KiB; pages are 2,048 runes,
+    // so 64 pages cover valid text without treating conversation pagination as
     // an unbounded background load.
     for (let page = 0; page < 64; page += 1) {
       const detail = await session.getTaskDetail(taskID, revision, { textOffset, peerOffset, ...(head === undefined ? {} : { expectedHead: head }) });

@@ -2,6 +2,10 @@ package browserprotocol
 
 import "fmt"
 
+// MaxTaskDetailTextOffset covers a whole task body or result. Text offsets
+// count runes, and valid UTF-8 task text has no more runes than its byte cap.
+const MaxTaskDetailTextOffset = 131072
+
 // AgentControl targets one observed task/run pair. Replacement IDs belong to
 // the caller so retrying a lost response cannot create a second successor.
 type AgentControl struct {
@@ -153,7 +157,7 @@ func validAgentControl(kind MessageType, body any) error {
 			return bad()
 		}
 	case TaskDetailGet:
-		if validateDynamicID(v.TaskID) != nil || v.ExpectedRevision == 0 || v.TextOffset > MaxTaskInstructionBytes || v.PeerOffset > MaxJSONArray || v.ExpectedHead != nil && *v.ExpectedHead == 0 || v.PeerOffset != 0 && v.ExpectedHead == nil {
+		if validateDynamicID(v.TaskID) != nil || v.ExpectedRevision == 0 || v.TextOffset > MaxTaskDetailTextOffset || v.PeerOffset > MaxJSONArray || v.ExpectedHead != nil && *v.ExpectedHead == 0 || v.PeerOffset != 0 && v.ExpectedHead == nil {
 			return bad()
 		}
 	case TaskDetail:
