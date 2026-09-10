@@ -348,26 +348,53 @@ func TestServiceInstallRefusesForeignPlistAndResidue(t *testing.T) {
 }
 
 func TestServiceInstallRefusesPlantedStderrLog(t *testing.T) {
-	fixture := newManageFixture(t)
-	serviceDir := ServiceDirectoryPath(fixture.home)
-	if err := os.Mkdir(serviceDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(fixture.root, "redirected-stderr.log"), serviceStderrPath(fixture.home)); err != nil {
-		t.Fatal(err)
-	}
-	refused := &recordedLaunchctl{results: fixture.printAbsent()}
-	status, err := serviceInstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, fixture.sourceDir, refused.run)
-	if status.State != ServiceAmbiguous || !errors.Is(err, ErrServiceResidue) {
-		t.Fatalf("planted stderr log = %+v, %v", status, err)
-	}
-	for _, call := range refused.calls {
-		if len(call) > 0 && call[0] == "bootstrap" {
-			t.Fatal("install bootstrapped with planted stderr log")
-		}
-	}
-	if info, err := os.Lstat(serviceStderrPath(fixture.home)); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("planted stderr log = %v, %v", info, err)
+	for _, test := range []struct {
+		name    string
+		plant   func(*manageFixture, string, []byte) error
+		symlink bool
+	}{
+		{name: "symlink", plant: func(fixture *manageFixture, path string, _ []byte) error {
+			return os.Symlink(filepath.Join(fixture.root, "redirected-stderr.log"), path)
+		}, symlink: true},
+		{name: "regular file", plant: func(_ *manageFixture, path string, contents []byte) error {
+			return os.WriteFile(path, contents, 0o600)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newManageFixture(t)
+			if err := os.Mkdir(ServiceDirectoryPath(fixture.home), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			contents := []byte("preexisting stderr\n")
+			path := serviceStderrPath(fixture.home)
+			if err := test.plant(fixture, path, contents); err != nil {
+				t.Fatal(err)
+			}
+			refused := &recordedLaunchctl{results: fixture.printAbsent()}
+			status, err := serviceInstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, fixture.sourceDir, refused.run)
+			if status.State != ServiceAmbiguous || !errors.Is(err, ErrServiceResidue) {
+				t.Fatalf("planted stderr log = %+v, %v", status, err)
+			}
+			for _, call := range refused.calls {
+				if len(call) > 0 && call[0] == "bootstrap" {
+					t.Fatal("install bootstrapped with planted stderr log")
+				}
+			}
+			info, err := os.Lstat(path)
+			if err != nil || test.symlink != (info.Mode()&os.ModeSymlink != 0) {
+				t.Fatalf("planted stderr log = %v, %v", info, err)
+			}
+			if !test.symlink {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, contents) {
+					t.Fatalf("regular stderr log = %q, %v", got, err)
+				}
+			}
+			for _, artifact := range []string{filepath.Join(ServiceDirectoryPath(fixture.home), serviceReceiptName), fixture.plistPath()} {
+				if _, err := os.Lstat(artifact); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("refused install published %s: %v", artifact, err)
+				}
+			}
+		})
 	}
 }
 
