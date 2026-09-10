@@ -29,10 +29,17 @@ import type { RunPathSample } from "./console-view.js";
 import { FactorySettingsCoordinator, type FactoryRemoteInvite } from "./factory-settings-coordinator.js";
 import { MAX_PENDING_INPUT_BYTES, TerminalController, type TerminalControllerSnapshot, type TerminalSurface } from "./terminal-controller.js";
 
-const BROWSER_ENDPOINT = new URL("ws://127.0.0.1:43123/browser");
-const BROWSER_URL = BROWSER_ENDPOINT.toString();
-/** The one loopback address this console dials; SETTINGS shows exactly it. */
-export const BROWSER_HOST = BROWSER_ENDPOINT.host;
+type BrowserEndpoint = Readonly<{ url: string; host: string }>;
+
+export function browserEndpoint(port = 43123): BrowserEndpoint {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new SessionError("connection");
+  const host = `127.0.0.1:${port}`;
+  return { url: `ws://${host}/browser`, host };
+}
+
+const DEFAULT_BROWSER_ENDPOINT = browserEndpoint();
+/** The default production loopback address; settings may show an isolated development listener. */
+export const BROWSER_HOST = DEFAULT_BROWSER_ENDPOINT.host;
 // The daemon caches run paths for five seconds, so one timer at ten never
 // outruns the cache and never lets a room go more than a cycle stale.
 const RUN_PATHS_POLL_MS = 10_000;
@@ -142,6 +149,8 @@ export type FactoryAppControllerOptions = {
   history: Pick<History, "replaceState" | "state">;
   onChange: (snapshot: FactoryAppSnapshot) => void;
   onStatusChange?: (status: FactoryAppStatus) => void;
+  /** Package-internal endpoint chosen by FactoryApp's validated public prop. */
+  browser?: BrowserEndpoint;
   /** Package-internal construction boundary used by DOM-free causal tests. */
   clientFactory?: ClientFactory;
 };
@@ -286,9 +295,10 @@ export class FactoryAppController {
     const factory = this.#options.clientFactory ?? createBrowserClient;
     let client: ControlledClient;
     try {
+      const browser = this.#options.browser ?? DEFAULT_BROWSER_ENDPOINT;
       client = factory({
-        url: BROWSER_URL,
-        host: BROWSER_HOST,
+        url: browser.url,
+        host: browser.host,
         origin: this.#options.origin,
         challenge: challenge ?? undefined,
         onStatus: (status) => this.#receiveStatus(generation, status),

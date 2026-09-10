@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
-import { FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type SyntheticEvent } from "react";
+import { browserEndpoint, FactoryAppController, type FactoryAppSnapshot, type FactoryAppStatus, type FactoryTerminalView } from "./factory-app-controller.js";
 import { FactoryConsole, type ConsoleDetail, type ConsoleView } from "./factory-console.js";
 import { TaskConversation, type AgentPanelView } from "./console-sidebar.js";
 import { primaryAgent } from "./console-view.js";
@@ -12,15 +12,18 @@ const INITIAL_SNAPSHOT: FactoryAppSnapshot = { status: "idle" };
 export type FactoryAppProps = {
   /** Receives the finite connection lifecycle exposed by the owned controller. */
   onStatusChange?: (status: FactoryAppStatus) => void;
+  /** Optional loopback port for an isolated development listener. */
+  browserPort?: number;
 };
 
 /** Complete browser application lifecycle; hosts only render this component. */
-export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
+export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}) {
   const [snapshot, setSnapshot] = useState<FactoryAppSnapshot>(INITIAL_SNAPSHOT);
   const [view, setView] = useState<ConsoleView>("floor");
   const [detail, setDetail] = useState<ConsoleDetail>("needs-you");
   const [agentPanel, setAgentPanel] = useState<AgentPanelView>("terminal");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const browser = useMemo(() => browserEndpoint(browserPort), [browserPort]);
   const owner = useRef<FactoryAppController | undefined>(undefined);
   const defaultedController = useRef<FactoryAppController | undefined>(undefined);
   const statusChange = useRef(onStatusChange);
@@ -33,6 +36,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       history: window.history,
       onChange: setSnapshot,
       onStatusChange: (status) => statusChange.current?.(status),
+      browser,
     });
     owner.current = controller;
     controller.start();
@@ -40,7 +44,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
       if (owner.current === controller) owner.current = undefined;
       controller.close();
     };
-  }, []);
+  }, [browser]);
 
   // The primary overseer is useful immediately, but only once per owned
   // controller: closing a pane remains the operator's choice.
@@ -90,6 +94,7 @@ export function FactoryApp({ onStatusChange }: FactoryAppProps = {}) {
   return (
     <FactoryConsole
       {...snapshot}
+      address={browser.host}
       view={view}
       onView={setView}
       detail={detail}
