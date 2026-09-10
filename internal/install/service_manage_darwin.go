@@ -261,6 +261,13 @@ func serviceInstallLockedAt(ctx context.Context, home, userHome string, config S
 	if err := writeExactFile(plistDirectory, config.plistName(), plistBytes, 0o600); err != nil {
 		return ServiceStatus{}, err
 	}
+	stderr, err := os.OpenFile(serviceStderrPath(home), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return ServiceStatus{}, fmt.Errorf("%w: reserve stderr log: %v", ErrServiceAmbiguous, err)
+	}
+	if err := stderr.Close(); err != nil {
+		return ServiceStatus{}, fmt.Errorf("%w: close stderr log: %v", ErrServiceAmbiguous, err)
+	}
 	uid := strconv.Itoa(os.Geteuid())
 	result := launchctl(ctx, "bootstrap", "gui/"+uid, plistPath)
 	if result.err != nil || result.status != 0 {

@@ -139,7 +139,15 @@ func TestServiceLabelValidationIsExact(t *testing.T) {
 func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	fixture := newManageFixture(t)
 	install := &recordedLaunchctl{results: append(fixture.printAbsent(), launchctlResult{status: 0}, fixture.printRunning(4321))}
-	status := fixture.install(t, install.run)
+	status := fixture.install(t, func(ctx context.Context, args ...string) launchctlResult {
+		if len(args) > 0 && args[0] == "bootstrap" {
+			var stat unix.Stat_t
+			if err := unix.Lstat(serviceStderrPath(fixture.home), &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
+				t.Fatalf("stderr log before bootstrap: stat=%+v err=%v", stat, err)
+			}
+		}
+		return install.run(ctx, args...)
+	})
 	if status != (ServiceStatus{State: ServiceRunning, PID: 4321}) {
 		t.Fatalf("install status = %+v", status)
 	}
@@ -336,6 +344,30 @@ func TestServiceInstallRefusesForeignPlistAndResidue(t *testing.T) {
 	status, err = serviceUninstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, resolve.run)
 	if err != nil || status.State != ServiceAbsent {
 		t.Fatalf("uninstall residue = %+v, %v", status, err)
+	}
+}
+
+func TestServiceInstallRefusesPlantedStderrLog(t *testing.T) {
+	fixture := newManageFixture(t)
+	serviceDir := ServiceDirectoryPath(fixture.home)
+	if err := os.Mkdir(serviceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(fixture.root, "redirected-stderr.log"), serviceStderrPath(fixture.home)); err != nil {
+		t.Fatal(err)
+	}
+	refused := &recordedLaunchctl{results: fixture.printAbsent()}
+	status, err := serviceInstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, fixture.sourceDir, refused.run)
+	if status.State != ServiceAmbiguous || !errors.Is(err, ErrServiceResidue) {
+		t.Fatalf("planted stderr log = %+v, %v", status, err)
+	}
+	for _, call := range refused.calls {
+		if len(call) > 0 && call[0] == "bootstrap" {
+			t.Fatal("install bootstrapped with planted stderr log")
+		}
+	}
+	if info, err := os.Lstat(serviceStderrPath(fixture.home)); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("planted stderr log = %v, %v", info, err)
 	}
 }
 
