@@ -141,7 +141,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if err := serve(ctx, configuration); err != nil {
-		_, _ = io.WriteString(stderr, "factoryd: runtime unavailable\n")
+		_, _ = fmt.Fprintf(stderr, "factoryd: %v\n", err)
 		return exitFailure
 	}
 	return 0

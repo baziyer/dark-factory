@@ -223,7 +223,7 @@ func TestOwnedListenerFailuresStopAndReleaseWholeProcess(t *testing.T) {
 	}
 }
 
-func TestRunRedactsStartupFailureAndReportsUsage(t *testing.T) {
+func TestRunReportsStartupFailureAndUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exit := run(context.Background(), nil, &stdout, &stderr); exit != exitUsage || stdout.Len() != 0 || stderr.String() != usage {
 		t.Fatalf("usage = exit %d stdout %q stderr %q", exit, stdout.String(), stderr.String())
@@ -231,7 +231,7 @@ func TestRunRedactsStartupFailureAndReportsUsage(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	home := filepath.Join(t.TempDir(), "missing")
-	if exit := run(context.Background(), []string{"--home", home}, &stdout, &stderr); exit != exitFailure || stdout.Len() != 0 || stderr.String() != "factoryd: runtime unavailable\n" || strings.Contains(stderr.String(), home) {
+	if exit := run(context.Background(), []string{"--home", home}, &stdout, &stderr); exit != exitFailure || stdout.Len() != 0 || !strings.HasPrefix(stderr.String(), "factoryd: ") || !strings.Contains(stderr.String(), "open home parent component") || stderr.String() == "factoryd: runtime unavailable\n" {
 		t.Fatalf("failure = exit %d stdout %q stderr %q", exit, stdout.String(), stderr.String())
 	}
 }

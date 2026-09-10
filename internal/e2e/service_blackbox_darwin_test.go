@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,6 +59,14 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 	// the operator's screen.
 	if state.PairPage != "http://127.0.0.1:43123/pair" || state.BrowserOpened {
 		t.Fatalf("install pairing report = %+v (%s)", state, output)
+	}
+	stderr, err := os.Lstat(filepath.Join(install.ServiceDirectoryPath(fixture.home), "factoryd.stderr.log"))
+	if err != nil {
+		t.Fatalf("service stderr = %v", err)
+	}
+	stat, ok := stderr.Sys().(*syscall.Stat_t)
+	if !ok || stderr.Mode().Type() != 0 || stderr.Mode().Perm() != 0o600 || stat.Uid != uint32(os.Geteuid()) {
+		t.Fatalf("service stderr metadata = mode %v uid %v", stderr.Mode(), stat)
 	}
 	client := fixture.waitClient(t)
 

@@ -20,9 +20,12 @@ const DefaultServiceLabel = "com.dark-factory.factoryd"
 
 const serviceLabel = DefaultServiceLabel
 
+const serviceStderrLogName = "factoryd.stderr.log"
+
 const (
 	serviceMaxPathBytes  = 4096
 	serviceMaxLabelBytes = 127
+	serviceMaxPlistBytes = 4*serviceMaxPathBytes*6 + MaxRelayOriginBytes*6 + 4096
 )
 
 // MaxRelayOriginBytes is the one bound on ServiceConfig.RelayOrigin, shared
@@ -108,6 +111,10 @@ func serviceProgramPath(home string) string {
 	return filepath.Join(ServiceDirectoryPath(home), "bin", "current", "factoryd")
 }
 
+func serviceStderrPath(home string) string {
+	return filepath.Join(ServiceDirectoryPath(home), serviceStderrLogName)
+}
+
 // ServiceStatus contains no home, executable, plist, socket, token, or
 // launchctl diagnostic text. PID is reported only after a strict launchctl
 // parse and does not grant process authority.
@@ -173,9 +180,11 @@ func ServicePlist(home, label, relayOrigin string) ([]byte, [sha256.Size]byte, e
 		return nil, [sha256.Size]byte{}, fmt.Errorf("%w: relay origin", ErrServicePlist)
 	}
 	program := serviceProgramPath(home)
-	var escapedHome, escapedProgram bytes.Buffer
+	stderrPath := serviceStderrPath(home)
+	var escapedHome, escapedProgram, escapedStderr bytes.Buffer
 	escapeXML(&escapedHome, home)
 	escapeXML(&escapedProgram, program)
+	escapeXML(&escapedStderr, stderrPath)
 	relay := ""
 	if relayOrigin != "" {
 		var escapedRelay bytes.Buffer
@@ -196,6 +205,8 @@ func ServicePlist(home, label, relayOrigin string) ([]byte, [sha256.Size]byte, e
     </array>
     <key>WorkingDirectory</key>
     <string>` + escapedHome.String() + `</string>
+    <key>StandardErrorPath</key>
+    <string>` + escapedStderr.String() + `</string>
     <key>RunAtLoad</key>
     <true/>
     <key>AbandonProcessGroup</key>

@@ -139,7 +139,15 @@ func TestServiceLabelValidationIsExact(t *testing.T) {
 func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	fixture := newManageFixture(t)
 	install := &recordedLaunchctl{results: append(fixture.printAbsent(), launchctlResult{status: 0}, fixture.printRunning(4321))}
-	status := fixture.install(t, install.run)
+	status := fixture.install(t, func(ctx context.Context, args ...string) launchctlResult {
+		if len(args) > 0 && args[0] == "bootstrap" {
+			var stat unix.Stat_t
+			if err := unix.Lstat(serviceStderrPath(fixture.home), &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
+				t.Fatalf("stderr log before bootstrap: stat=%+v err=%v", stat, err)
+			}
+		}
+		return install.run(ctx, args...)
+	})
 	if status != (ServiceStatus{State: ServiceRunning, PID: 4321}) {
 		t.Fatalf("install status = %+v", status)
 	}
@@ -219,6 +227,9 @@ func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	if err != nil || status != (ServiceStatus{State: ServiceRunning, PID: 4500}) || len(loadedIdleStart.calls) != 5 || loadedIdleStart.calls[1][0] != "bootout" || loadedIdleStart.calls[3][0] != "bootstrap" {
 		t.Fatalf("loaded-idle start = %+v, %v, calls=%q", status, err, loadedIdleStart.calls)
 	}
+	if err := os.WriteFile(serviceStderrPath(fixture.home), []byte("factoryd: serve error\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// Uninstall removes every artifact and proves absence.
 	uninstall := &recordedLaunchctl{results: []launchctlResult{fixture.printRunning(4400), {status: 0}, {status: launchctlNotFound}}}
@@ -236,6 +247,66 @@ func TestServiceInstallLifecycleConvergesThroughEveryVerb(t *testing.T) {
 	status, err = inspectServiceAtHome(context.Background(), fixture.home, fixture.userHome, fixture.config, final.run)
 	if err != nil || status.State != ServiceAbsent {
 		t.Fatalf("final status = %+v, %v", status, err)
+	}
+}
+
+func TestServiceUninstallAcceptsAReceiptBoundPriorPlist(t *testing.T) {
+	fixture := newManageFixture(t)
+	fixture.install(t, (&recordedLaunchctl{results: append(fixture.printAbsent(), launchctlResult{status: 0}, fixture.printRunning(77))}).run)
+	current, err := os.ReadFile(fixture.plistPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := bytes.Replace(current, []byte("    <key>StandardErrorPath</key>\n    <string>"+serviceStderrPath(fixture.home)+"</string>\n"), nil, 1)
+	if bytes.Equal(prior, current) {
+		t.Fatal("current plist did not contain the new stderr path")
+	}
+	if err := os.WriteFile(fixture.plistPath(), prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(ServiceDirectoryPath(fixture.home), "bin", "current", "factoryctl")); err != nil {
+		t.Fatal(err)
+	}
+	priorDigest := sha256.Sum256(prior)
+	receipt, present, err := readServiceReceipt(fixture.home)
+	if err != nil || !present {
+		t.Fatalf("receipt = %+v present=%t err=%v", receipt, present, err)
+	}
+	receipt.PlistDigest = hex.EncodeToString(priorDigest[:])
+	receiptBody, err := encodeServiceReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ServiceDirectoryPath(fixture.home), serviceReceiptName), receiptBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed := &recordedLaunchctl{results: []launchctlResult{fixture.printRunning(77), {status: 0}, {status: launchctlNotFound}}}
+	status, err := serviceUninstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, removed.run)
+	if err != nil || status.State != ServiceAbsent {
+		t.Fatalf("prior plist uninstall = %+v, %v", status, err)
+	}
+}
+
+func TestServicePlistReadBoundCoversFourEscapedHomePaths(t *testing.T) {
+	fixture := newManageFixture(t)
+	home := "/" + strings.Repeat(`"`, serviceMaxPathBytes-1)
+	body, _, err := ServicePlist(home, fixture.config.Label, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyLimit := 3*serviceMaxPathBytes*6 + MaxRelayOriginBytes*6 + 4096
+	if len(body) <= legacyLimit {
+		t.Fatalf("maximal plist = %d bytes, old bound = %d", len(body), legacyLimit)
+	}
+	if err := os.WriteFile(fixture.plistPath(), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readServicePlist(fixture.plistDir, fixture.config.plistName(), legacyLimit); err == nil {
+		t.Fatal("old plist read bound accepted four escaped home paths")
+	}
+	read, present, err := readServicePlist(fixture.plistDir, fixture.config.plistName(), serviceMaxPlistBytes)
+	if err != nil || !present || !bytes.Equal(read, body) {
+		t.Fatalf("maximal plist read = %d bytes present=%t err=%v", len(read), present, err)
 	}
 }
 
@@ -273,6 +344,57 @@ func TestServiceInstallRefusesForeignPlistAndResidue(t *testing.T) {
 	status, err = serviceUninstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, resolve.run)
 	if err != nil || status.State != ServiceAbsent {
 		t.Fatalf("uninstall residue = %+v, %v", status, err)
+	}
+}
+
+func TestServiceInstallRefusesPlantedStderrLog(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		plant   func(*manageFixture, string, []byte) error
+		symlink bool
+	}{
+		{name: "symlink", plant: func(fixture *manageFixture, path string, _ []byte) error {
+			return os.Symlink(filepath.Join(fixture.root, "redirected-stderr.log"), path)
+		}, symlink: true},
+		{name: "regular file", plant: func(_ *manageFixture, path string, contents []byte) error {
+			return os.WriteFile(path, contents, 0o600)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newManageFixture(t)
+			if err := os.Mkdir(ServiceDirectoryPath(fixture.home), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			contents := []byte("preexisting stderr\n")
+			path := serviceStderrPath(fixture.home)
+			if err := test.plant(fixture, path, contents); err != nil {
+				t.Fatal(err)
+			}
+			refused := &recordedLaunchctl{results: fixture.printAbsent()}
+			status, err := serviceInstallAt(context.Background(), fixture.home, fixture.userHome, fixture.config, fixture.sourceDir, refused.run)
+			if status.State != ServiceAmbiguous || !errors.Is(err, ErrServiceResidue) {
+				t.Fatalf("planted stderr log = %+v, %v", status, err)
+			}
+			for _, call := range refused.calls {
+				if len(call) > 0 && call[0] == "bootstrap" {
+					t.Fatal("install bootstrapped with planted stderr log")
+				}
+			}
+			info, err := os.Lstat(path)
+			if err != nil || test.symlink != (info.Mode()&os.ModeSymlink != 0) {
+				t.Fatalf("planted stderr log = %v, %v", info, err)
+			}
+			if !test.symlink {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, contents) {
+					t.Fatalf("regular stderr log = %q, %v", got, err)
+				}
+			}
+			for _, artifact := range []string{filepath.Join(ServiceDirectoryPath(fixture.home), serviceReceiptName), fixture.plistPath()} {
+				if _, err := os.Lstat(artifact); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("refused install published %s: %v", artifact, err)
+				}
+			}
+		})
 	}
 }
 
