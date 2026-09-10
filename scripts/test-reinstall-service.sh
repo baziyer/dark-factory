@@ -23,7 +23,7 @@ umask 022
 test_repository=$temporary/repository
 fake_bin=$temporary/fake-bin
 fake_home=$temporary/home
-mkdir -p "$test_repository/scripts" "$fake_bin" "$fake_home/.dark-factory"
+mkdir -p "$test_repository/scripts" "$fake_bin" "$fake_home/.dark-factory" "$fake_home/.dark-factory.service/bin/current"
 cp "$repository_root/scripts/reinstall-service.sh" "$test_repository/scripts/reinstall-service.sh"
 
 git -C "$test_repository" init -q -b main
@@ -146,17 +146,25 @@ case "$1 $2" in
         ;;
 esac
 FAKE
+cat >"$fake_home/.dark-factory.service/bin/current/factoryctl" <<'FAKE'
+#!/bin/sh
+set -eu
+echo "$*" >>"$DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG"
+exec "$DARK_FACTORY_TEST_CURRENT_FACTORYCTL" "$@"
+FAKE
 # The script's bounded waits poll 60 times with sleep between. A no-op sleep
 # makes a timeout case take about a second (macOS stretches short real sleeps
 # to well over 100 ms), and the probe each poll spawns still outlasts the fake
 # listener's 200 ms of startup.
 printf '#!/bin/sh\n' >"$fake_bin/sleep"
-chmod 755 "$fake_bin"/*
+chmod 755 "$fake_bin"/* "$fake_home/.dark-factory.service/bin/current/factoryctl"
 export PATH="$fake_bin:$PATH" HOME="$fake_home"
 export DARK_FACTORY_TEST_ACTIVE_RUNS="$temporary/active-runs"
 export DARK_FACTORY_TEST_DISPATCH_ENABLED="$temporary/dispatch-enabled"
 export DARK_FACTORY_TEST_BACKUP_MODES="$temporary/backup-modes"
 export DARK_FACTORY_TEST_FACTORYCTL_LOG="$temporary/factoryctl.log"
+export DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG="$temporary/installed-factoryctl.log"
+export DARK_FACTORY_TEST_CURRENT_FACTORYCTL="$fake_bin/factoryctl"
 export DARK_FACTORY_TEST_GO_LOG="$temporary/go.log"
 export DARK_FACTORY_TEST_PIDS="$temporary/pids"
 script=$test_repository/scripts/reinstall-service.sh
@@ -237,7 +245,18 @@ printf '%s\n' \
     "remote status" >"$temporary/expected.log"
 cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
     || fail "factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
+printf '%s\n' "service uninstall --home $fake_home/.dark-factory" >"$temporary/expected-installed.log"
+cmp -s "$temporary/expected-installed.log" "$DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG" \
+    || fail "installed factoryctl did not uninstall first: $(tr '\n' ';' <"$DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG")"
 grep -q '^user_version now: 7$' "$temporary/stdout" || fail "user_version not printed"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG" "$DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG"
+
+# Recovery without an installed control binary still uses the newly built one.
+rm "$fake_home/.dark-factory.service/bin/current/factoryctl"
+"$script" "$sha" >"$temporary/stdout" || fail "recovery reinstall exited non-zero"
+cmp -s "$temporary/expected.log" "$DARK_FACTORY_TEST_FACTORYCTL_LOG" \
+    || fail "recovery factoryctl calls: $(tr '\n' ';' <"$DARK_FACTORY_TEST_FACTORYCTL_LOG")"
+[ ! -e "$DARK_FACTORY_TEST_INSTALLED_FACTORYCTL_LOG" ] || fail "recovery used missing installed factoryctl"
 rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
 
 # An absent receipt member is a local-only install: factoryctl rejects an
