@@ -607,7 +607,7 @@ function ProjectLimitsSection({ state, edit, ready, onSave }: {
   const projects = state === undefined ? [] : [...state.projects.values()];
   return <div className="dfConsoleSidebar__section" aria-label="PROJECT LIMITS">
     <h3>PROJECT LIMITS</h3>
-    <p className="dfConsoleSidebar__inherit">UNATTENDED ISSUE INTAKE REQUIRES BOTH LIMITS.</p>
+    <p className="dfConsoleSidebar__inherit">AUTONOMOUS GITHUB ISSUE WORK REQUIRES BOTH LIMITS.</p>
     {projects.length === 0 ? <p className="dfFactoryConsole__empty">NO PROJECTS</p> : projects.map((project) => <ProjectLimitsForm key={`${project.id}:${project.revision}:${edit?.target === project.id && edit.error !== undefined ? "refused" : ""}`} project={project} edit={edit} ready={ready} onSave={onSave} />)}
   </div>;
 }
