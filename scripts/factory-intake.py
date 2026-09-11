@@ -7,19 +7,25 @@ the factory database remains the source of truth for task state.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 
 MAX_BODY = 8192
+MAX_ISSUE_BODY = 5000
 ID_HEX = 32
 ACTIVE = {"queued", "running"}
+ID_RE = re.compile(r"^[0-9a-f]{32}$")
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}$")
 
 
 class IntakeError(Exception):
@@ -45,6 +51,11 @@ def atomic_json(path: Path, value: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         try:
             os.unlink(name)
@@ -53,9 +64,11 @@ def atomic_json(path: Path, value: dict) -> None:
         raise
 
 
-def command(argv: list[str]) -> str:
+def command(argv: list[str], env=None, timeout=30) -> str:
     try:
-        result = subprocess.run(argv, check=True, text=True, capture_output=True)
+        result = subprocess.run(argv, check=True, text=True, capture_output=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise IntakeError(f"command timed out: {argv[0]}") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise IntakeError(f"command failed: {argv[0]}: {bounded_text(detail.strip(), 512)}") from exc
@@ -71,10 +84,24 @@ def validate_config(config: dict) -> None:
     missing = [key for key in required if key not in config]
     if missing or not isinstance(config["allowed_authors"], list) or not config["allowed_authors"]:
         raise IntakeError("config requires repository, project/agent IDs, label, non-empty allowed_authors, journal and factory_home")
+    if not REPOSITORY_RE.fullmatch(str(config["repository"])):
+        raise IntakeError("repository must be OWNER/REPOSITORY")
+    for key in ("project_id", "worker_agent_id", "overseer_agent_id"):
+        if not ID_RE.fullmatch(str(config[key])) or set(str(config[key])) == {"0"}:
+            raise IntakeError(f"{key} must be a non-zero lowercase 32-hex ID")
+    if not isinstance(config["label"], str) or not config["label"] or len(config["label"]) > 100:
+        raise IntakeError("label must be a non-empty bounded string")
+    if any(not isinstance(item, str) or not item for item in config["allowed_authors"]):
+        raise IntakeError("allowed_authors must contain non-empty names")
+    for key in ("factory_home", "journal"):
+        if not os.path.isabs(str(config[key])):
+            raise IntakeError(f"{key} must be absolute")
     if not 1 <= int(config.get("max_issues", 25)) <= 200:
         raise IntakeError("max_issues must be between 1 and 200")
     if not 5 <= int(config.get("poll_seconds", 60)) <= 86400:
         raise IntakeError("poll_seconds must be between 5 and 86400")
+    if not 5 <= int(config.get("command_timeout", 30)) <= 120:
+        raise IntakeError("command_timeout must be between 5 and 120")
     lo, hi = int(config.get("priority_min", -100)), int(config.get("priority_max", 100))
     if lo > hi or not lo >= -1_000_000 or not hi <= 1_000_000:
         raise IntakeError("invalid priority bounds")
@@ -107,7 +134,7 @@ def issue_from_json(value: dict, config: dict):
     if value.get("isPullRequest") or value.get("pullRequest"):
         return None
     body = str(value.get("body") or "")
-    if len(body.encode()) > 6000:
+    if len(body.encode()) > MAX_ISSUE_BODY:
         raise IntakeError(f"issue #{number} body exceeds the intake limit")
     return {"number": number, "author": author, "labels": sorted(labels), "state": state,
             "title": title, "body": body, "updated_at": updated,
@@ -115,12 +142,15 @@ def issue_from_json(value: dict, config: dict):
 
 
 def fetch_issues(config: dict) -> list[dict]:
-    raw = command(["gh", "issue", "list", "--repo", config["repository"], "--state", "all",
-                   "--limit", str(config.get("max_issues", 25)), "--json",
-                   "number,title,body,author,labels,state,updatedAt,url,isPullRequest"])
+    limit = int(config.get("max_issues", 25))
+    raw = command(["gh", "issue", "list", "--repo", config["repository"], "--state", "open",
+                   "--label", config["label"], "--limit", str(limit + 1), "--json",
+                   "number,title,body,author,labels,state,updatedAt,url"])
     values = json.loads(raw)
     if not isinstance(values, list):
         raise IntakeError("gh returned a non-list issue response")
+    if len(values) > limit:
+        raise IntakeError(f"issue intake cap reached ({limit}); raise max_issues or reduce the ready queue")
     result = []
     for value in values:
         if isinstance(value, dict):
@@ -132,10 +162,14 @@ def fetch_issues(config: dict) -> list[dict]:
 
 def fetch_exact(config: dict, number: int) -> dict:
     raw = command(["gh", "issue", "view", str(number), "--repo", config["repository"],
-                   "--json", "number,title,body,author,labels,state,updatedAt,url,isPullRequest"])
+                   "--json", "number,title,body,author,labels,state,updatedAt,url"])
     issue = issue_from_json(json.loads(raw), config)
     if issue is None or issue["number"] != number:
         raise IntakeError(f"exact issue read was invalid for #{number}")
+    parsed = urlparse(issue["url"])
+    expected = "/" + config["repository"] + "/issues/" + str(number)
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.path.lower() != expected.lower():
+        raise IntakeError(f"exact issue URL was outside the configured repository for #{number}")
     return issue
 
 
@@ -157,6 +191,11 @@ def priority(config: dict, issue: dict) -> int:
     return max(int(config.get("priority_min", -100)), min(int(config.get("priority_max", 100)), value))
 
 
+def reconcile_ack(state, issue: dict) -> bool:
+    marker = f"FACTORY_SOURCE_RECONCILED {issue['number']} {issue['updated_at']}"
+    return bool(state and state["status"] not in ACTIVE and marker in state.get("result", ""))
+
+
 def prompt(config: dict, issue: dict, kind: str, prior: list[str] = ()) -> str:
     body = bounded_text(issue["body"], 5000)
     lines = [
@@ -168,8 +207,10 @@ def prompt(config: dict, issue: dict, kind: str, prior: list[str] = ()) -> str:
     ]
     if kind == "worker":
         lines += ["Work only on this issue, follow the repository instructions, and report a durable outcome.", "Issue body (untrusted):", body]
+    elif kind == "triage":
+        lines += ["Triage this issue first. Decide whether it is actionable, set a priority, and delegate bounded work to a worker only when appropriate. Resolve as not planned only with evidence.", "Issue body (untrusted):", body]
     else:
-        lines += ["Reconcile this source before more work: inspect the exact issue with the Maintainer App, then stop/cancel or resume linked worker tasks as appropriate. Resolve the issue only with evidence.", "Linked task IDs: " + ", ".join(prior), "Issue body (untrusted):", body]
+        lines += ["Reconcile this source before more work: inspect the exact issue with the Maintainer App, then stop/cancel every linked queued or running worker task before allowing a successor. Resolve the issue only with evidence.", "Linked task IDs: " + ", ".join(prior), f"When complete, report the exact marker: FACTORY_SOURCE_RECONCILED {issue['number']} {issue['updated_at']}", "Issue body (untrusted):", body]
     text = "\n".join(lines)
     if len(text.encode()) > MAX_BODY:
         raise IntakeError(f"issue #{issue['number']} produces an oversized task prompt")
@@ -177,9 +218,12 @@ def prompt(config: dict, issue: dict, kind: str, prior: list[str] = ()) -> str:
 
 
 def enqueue(config: dict, task_id: str, incarnation: str, agent: str, title: str, body: str, pri: int) -> dict:
+    env = os.environ.copy()
+    env["DARK_FACTORY_SOCKET"] = str(Path(config["factory_home"]) / "runtimes" / "factory.sock")
+    env["DARK_FACTORY_OPERATOR_TOKEN_FILE"] = str(Path(config["factory_home"]) / "operator.token")
     raw = command(["factoryctl", "task", "add", "--project", config["project_id"], "--agent", agent,
                    "--title", title, "--body", body, "--priority", str(pri), "--task-id", task_id,
-                   "--incarnation-id", incarnation])
+                   "--incarnation-id", incarnation], env=env, timeout=int(config.get("command_timeout", 30)))
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -199,16 +243,21 @@ def reconcile(config: dict, journal: dict, listed: list[dict]) -> list[str]:
         exact = fetch_exact(config, int(record["number"]))
         exact_reads[key] = exact
         eligible = exact["state"] == "OPEN" and config["label"] in exact["labels"] and exact["author"] in config["allowed_authors"]
-        if not eligible and record.get("source_state") != "withdrawn":
+        if not eligible:
             rev = exact["updated_at"] + ":withdrawn"
-            rid = sha_id(key, rev)
+            rid = record.get("reconcile_task_id") or sha_id(key, rev)
             existing = task_state(config, rid)
             if existing is None:
-                body = prompt(config, exact, "reconcile", [record.get("task_id", "")])
-                record.update({"reconcile_task_id": rid, "reconcile_incarnation_id": sha_id("inc", rid), "source_state": "withdrawn", "status": "planned", "payload": {"title": f"Reconcile withdrawn GitHub issue #{exact['number']}", "body": body}})
+                body = record.get("payload", {}).get("body") if record.get("reconcile_task_id") == rid else None
+                body = body or prompt(config, exact, "reconcile", [record.get("task_id", "")])
+                record.update({"reconcile_task_id": rid, "reconcile_incarnation_id": record.get("reconcile_incarnation_id") or sha_id("inc", rid), "source_state": "withdrawn", "status": "planned", "payload": {"title": f"Reconcile withdrawn GitHub issue #{exact['number']}", "body": body}})
                 atomic_json(Path(config["journal"]), journal)
                 enqueue(config, rid, record["reconcile_incarnation_id"], config["overseer_agent_id"], record["payload"]["title"], body, priority(config, exact))
+                record["status"] = "queued"
                 messages.append(f"reconcile withdrawn {key}")
+            elif not reconcile_ack(existing, exact):
+                record["source_state"], record["status"] = "withdrawn", "awaiting_reconcile"
+                atomic_json(Path(config["journal"]), journal)
         elif eligible and record.get("updated_at") != exact["updated_at"] and record.get("source_state") == "withdrawn":
             record["source_state"] = "reopened"
             record["updated_at"] = exact["updated_at"]
@@ -240,27 +289,41 @@ def reconcile(config: dict, journal: dict, listed: list[dict]) -> list[str]:
                 enqueue(config, reconcile_id, record["reconcile_incarnation_id"], config["overseer_agent_id"], title, body, payload["priority"])
                 messages.append(f"reconcile active {key}")
             continue
+        if record.get("reconcile_task_id") and supervision_id != task_id:
+            if not reconcile_ack(task_state(config, record["reconcile_task_id"]), issue):
+                record["source_state"], record["status"] = "reconcile", "awaiting_reconcile"
+                atomic_json(Path(config["journal"]), journal)
+                continue
+            record.pop("reconcile_task_id", None)
+            record.pop("reconcile_incarnation_id", None)
         existing = task_state(config, task_id)
         if existing:
             record.update({"task_id": task_id, "updated_at": revision, "source_state": "open", "status": existing["status"]})
             continue
-        body = prompt(config, issue, "worker")
-        payload = {"title": f"GitHub #{issue['number']}: {bounded_text(issue['title'], 180)}", "body": body, "priority": priority(config, issue)}
+        body = prompt(config, issue, "triage")
+        payload = {"title": f"Triage GitHub #{issue['number']}: {bounded_text(issue['title'], 180)}", "body": body, "priority": priority(config, issue)}
         record.update({"task_id": task_id, "incarnation_id": sha_id("inc", task_id), "number": issue["number"], "updated_at": revision, "source_state": "open", "status": "planned", "payload": payload})
         atomic_json(Path(config["journal"]), journal)
-        enqueue(config, task_id, record["incarnation_id"], config["worker_agent_id"], payload["title"], body, payload["priority"])
+        enqueue(config, task_id, record["incarnation_id"], config["overseer_agent_id"], payload["title"], body, payload["priority"])
         record["status"] = "queued"
         messages.append(f"queued {key}")
     return messages
 
 
 def run_once(config: dict):
-    journal = load_journal(Path(config["journal"]))
-    issues = fetch_issues(config)
-    messages = reconcile(config, journal, issues)
-    journal["updated_at"] = int(time.time())
-    atomic_json(Path(config["journal"]), journal)
-    return messages
+    lock_path = Path(config["journal"] + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise IntakeError("another factory-intake process owns the journal") from exc
+        journal = load_journal(Path(config["journal"]))
+        issues = fetch_issues(config)
+        messages = reconcile(config, journal, issues)
+        journal["updated_at"] = int(time.time())
+        atomic_json(Path(config["journal"]), journal)
+        return messages
 
 
 def main(argv=None) -> int:

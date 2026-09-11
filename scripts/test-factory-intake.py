@@ -37,7 +37,7 @@ class IntakeTest(unittest.TestCase):
         INTAKE.task_state = self.real_state
         self.temp.cleanup()
 
-    def command(self, argv):
+    def command(self, argv, **_kwargs):
         self.calls.append(argv)
         if argv[0] == "gh" and argv[2] == "list":
             return json.dumps([issue()])
@@ -51,16 +51,17 @@ class IntakeTest(unittest.TestCase):
     def test_first_enqueue_is_replayed_without_duplicate(self):
         INTAKE.command = self.command
         self.assertEqual(["queued o/r#7"], INTAKE.run_once(self.config))
+        self.assertTrue(any(call[0] == "factoryctl" and self.config["overseer_agent_id"] in call for call in self.calls))
         self.calls.clear()
         self.assertEqual([], INTAKE.run_once(self.config))
         self.assertEqual(2, sum(call[0] == "gh" for call in self.calls))
         self.assertEqual(0, sum(call[0] == "factoryctl" for call in self.calls))
 
     def test_lost_enqueue_response_leaves_planned_payload(self):
-        def lost(argv):
+        def lost(argv, **kwargs):
             if argv[0] == "factoryctl":
                 raise INTAKE.IntakeError("transport lost")
-            return self.command(argv)
+            return self.command(argv, **kwargs)
         INTAKE.command = lost
         with self.assertRaises(INTAKE.IntakeError):
             INTAKE.run_once(self.config)
@@ -76,12 +77,12 @@ class IntakeTest(unittest.TestCase):
             "updated_at": "old", "status": "running"}}}
         INTAKE.atomic_json(Path(self.config["journal"]), journal)
         old = INTAKE.command
-        def closed(argv):
+        def closed(argv, **kwargs):
             if argv[0] == "gh" and argv[2] == "list":
                 return json.dumps([issue(state="CLOSED")])
             if argv[0] == "gh":
                 return json.dumps(issue(state="CLOSED"))
-            return old(argv)
+            return old(argv, **kwargs)
         INTAKE.command = closed
         self.assertEqual(["reconcile withdrawn o/r#7"], INTAKE.run_once(self.config))
         self.assertTrue(any(call[0] == "factoryctl" and self.config["overseer_agent_id"] in call for call in self.calls))
@@ -93,7 +94,7 @@ class IntakeTest(unittest.TestCase):
         INTAKE.atomic_json(Path(self.config["journal"]), {"version": 1, "updated_at": 0, "issues": {"o/r#7": {
             "number": 7, "task_id": prior, "source_state": "open", "updated_at": "old", "status": "running"}}})
         old = INTAKE.command
-        INTAKE.command = lambda argv: json.dumps([issue(updated="2026-09-11T11:00:00Z")]) if argv[0] == "gh" and argv[2] == "list" else (json.dumps(issue(updated="2026-09-11T11:00:00Z")) if argv[0] == "gh" else old(argv))
+        INTAKE.command = lambda argv, **kwargs: json.dumps([issue(updated="2026-09-11T11:00:00Z")]) if argv[0] == "gh" and argv[2] == "list" else (json.dumps(issue(updated="2026-09-11T11:00:00Z")) if argv[0] == "gh" else old(argv, **kwargs))
         self.assertEqual(["reconcile active o/r#7"], INTAKE.run_once(self.config))
         self.assertTrue(any(call[0] == "factoryctl" and self.config["overseer_agent_id"] in call for call in self.calls))
         self.assertFalse(any(call[0] == "factoryctl" and self.config["worker_agent_id"] in call for call in self.calls))
@@ -107,6 +108,26 @@ class IntakeTest(unittest.TestCase):
         with self.assertRaisesRegex(INTAKE.IntakeError, "rate limited"):
             INTAKE.run_once(self.config)
         self.assertFalse(Path(self.config["journal"]).exists())
+
+    def test_issue_cap_is_visible(self):
+        self.config["max_issues"] = 1
+        INTAKE.command = lambda argv, **kwargs: json.dumps([issue(), issue()])
+        with self.assertRaisesRegex(INTAKE.IntakeError, "cap reached"):
+            INTAKE.run_once(self.config)
+
+    def test_reconcile_must_ack_before_successor(self):
+        INTAKE.command = self.command
+        prior = INTAKE.sha_id("o/r#7", "old")
+        reconcile = INTAKE.sha_id("o/r#7", "2026-09-11T11:00:00Z:reconcile")
+        self.states[prior] = {"id": prior, "status": "running", "revision": 2, "result": "", "blocked_reason": ""}
+        self.states[reconcile] = {"id": reconcile, "status": "completed", "revision": 2, "result": "done", "blocked_reason": ""}
+        INTAKE.atomic_json(Path(self.config["journal"]), {"version": 1, "updated_at": 0, "issues": {"o/r#7": {
+            "number": 7, "task_id": prior, "reconcile_task_id": reconcile, "source_state": "reconcile",
+            "updated_at": "old", "status": "awaiting_reconcile"}}})
+        old = INTAKE.command
+        INTAKE.command = lambda argv, **kwargs: json.dumps([issue(updated="2026-09-11T11:00:00Z")]) if argv[0] == "gh" and argv[2] == "list" else (json.dumps(issue(updated="2026-09-11T11:00:00Z")) if argv[0] == "gh" else old(argv, **kwargs))
+        self.assertEqual([], INTAKE.run_once(self.config))
+        self.assertFalse(any(call[0] == "factoryctl" for call in self.calls))
 
 
 if __name__ == "__main__":
