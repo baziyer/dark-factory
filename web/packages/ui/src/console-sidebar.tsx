@@ -696,11 +696,11 @@ export function HumanRequestPanel({
         <>
           <h3>DECISION NEEDED</h3>
           <p className="dfFactoryConsole__question">{selected.question}</p>
+          {selected.options.length === 0 ? null : <div className="dfFactoryConsole__answerOptions" role="group" aria-label="Suggested answers">
+            {selected.options.map((option, index) => <button type="button" key={option} disabled={busy || !selected.canReply || onReplyChange === undefined} onClick={() => onReplyChange?.(option)}>{option}{index === 0 ? " · RECOMMENDED" : ""}</button>)}
+          </div>}
           {selected.canReply ? (
             <form className="dfFactoryConsole__reply" aria-label="Answer this question" onSubmit={submit}>
-              {selected.options.length === 0 ? null : <div className="dfFactoryConsole__answerOptions" role="group" aria-label="Suggested answers">
-                {selected.options.map((option, index) => <button type="button" key={option} disabled={busy || onReplyChange === undefined} onClick={() => onReplyChange?.(option)}>{option}{index === 0 ? " · RECOMMENDED" : ""}</button>)}
-              </div>}
               <label htmlFor="dfHumanRequestReply">YOUR ANSWER</label>
               <textarea
                 id="dfHumanRequestReply"
@@ -711,7 +711,7 @@ export function HumanRequestPanel({
               />
               <button type="submit" disabled={busy || onReply === undefined}>{selected.phase === "replying" ? "ANSWERING…" : "ANSWER"}</button>
             </form>
-          ) : null}
+          ) : <p className="dfFactoryConsole__empty">{selected.request.status === "open" ? "THIS OPEN DECISION IS READ-ONLY IN THIS VIEW." : `THIS DECISION IS ${selected.request.status.replaceAll("_", " ").toUpperCase()}.`}</p>}
           <div className="dfFactoryConsole__humanActions">
             {selected.canCancel ? <button type="button" disabled={busy || onCancel === undefined} onClick={onCancel}>STOP TASK</button> : null}
             {onOpenTerminal === undefined ? null : <button type="button" disabled={busy || !terminalReady} onClick={() => onOpenTerminal(selected.request)}>OPEN TERMINAL</button>}
