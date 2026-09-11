@@ -44,7 +44,7 @@ const (
   factoryctl attempt fail [--detail TEXT]
   factoryctl attempt request-human --idempotency-key HEX32 --question TEXT [--option TEXT ...]
   factoryctl attempt peer status [--offset N] [--target-offset N] [--head HEAD]
-  factoryctl attempt peer ask --task ID --idempotency-key HEX32 --question TEXT [--option TEXT ...]
+  factoryctl attempt peer ask --task ID --idempotency-key HEX32 --question TEXT
   factoryctl attempt peer answer --question ID --revision REVISION --idempotency-key HEX32 --answer TEXT
   factoryctl attempt send-back --task ID --note TEXT
   factoryctl overseer status [--task ID] [--offset N --head HEAD] [--text-offset RUNES --head HEAD]

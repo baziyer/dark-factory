@@ -42,6 +42,7 @@ function FixtureTour() {
             request,
             phase: "ready",
             question: "Should the migration also cover the users table? The plan only names accounts.",
+            options: ["Keep the migration limited to accounts", "Include users too"],
             canReply: false,
             canCancel: false,
             replyMaxBytes: request.reply_max_bytes,
