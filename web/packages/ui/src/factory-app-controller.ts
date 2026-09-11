@@ -9,6 +9,8 @@ import {
   type BrowserSession,
   type BrowserSessionOptions,
   type AgentItem,
+  type SpriteAppearance,
+  type ProjectItem,
   type AgentControlAction,
   type TaskHistoryView,
   type TaskDetailView,
@@ -139,7 +141,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount" | "updateAccount">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "setProjectLimits" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount" | "updateAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -496,6 +498,47 @@ export class FactoryAppController {
     } catch (error) {
       if (!this.#current(generation) || this.#edit !== edit) return;
       this.#edit = { target: selected.agent.id, pending: false, error: finiteError(error) };
+    }
+    this.#publish();
+  }
+
+  async updateAgentAppearance(agentId: string, appearance: SpriteAppearance): Promise<boolean> {
+    const session = this.#client?.session;
+    const agent = this.#state?.agents.get(agentId);
+    if (this.#closed || this.#status !== "ready" || session === undefined || agent === undefined || this.#edit?.pending === true) return false;
+    const generation = this.#generation;
+    const edit: FactoryEditView = { target: agent.id, pending: true };
+    this.#edit = edit;
+    this.#publish();
+    try {
+      await session.updateAgent({ agentId: agent.id, expectedRevision: agent.revision, appearance });
+      if (!this.#current(generation) || this.#edit !== edit) return false;
+      this.#edit = undefined;
+      this.#publish();
+      return true;
+    } catch (error) {
+      if (!this.#current(generation) || this.#edit !== edit) return false;
+      this.#edit = { target: agent.id, pending: false, error: finiteError(error) };
+    }
+    this.#publish();
+    return false;
+  }
+
+  /** Save one project's future allowance against its exact revision. */
+  async updateProjectLimits(project: Pick<ProjectItem, "id" | "revision">, limits: { runBudget: bigint; maxRunSeconds: number }): Promise<void> {
+    const session = this.#client?.session;
+    if (this.#closed || this.#status !== "ready" || session === undefined || this.#edit?.pending === true) return;
+    const generation = this.#generation;
+    const edit: FactoryEditView = { target: project.id, pending: true };
+    this.#edit = edit;
+    this.#publish();
+    try {
+      await session.setProjectLimits({ projectId: project.id, expectedRevision: project.revision, ...limits });
+      if (!this.#current(generation) || this.#edit !== edit) return;
+      this.#edit = undefined;
+    } catch (error) {
+      if (!this.#current(generation) || this.#edit !== edit) return;
+      this.#edit = { target: project.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
   }

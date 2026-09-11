@@ -333,6 +333,9 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 		return browserprotocol.AgentUpdateResult{}, mapBrowserError(err)
 	}
 	patch := kernel.AgentPatch{Model: request.Model, ReasoningEffort: request.ReasoningEffort}
+	if request.Appearance != nil {
+		patch.Appearance = &kernel.AgentAppearance{Automatic: bool(request.Appearance.Automatic), Skin: request.Appearance.Skin, Hair: request.Appearance.Hair, HairColour: request.Appearance.HairColour, Face: request.Appearance.Face, Outfit: request.Appearance.Outfit, ClothesColour: request.Appearance.ClothesColour, Shoes: request.Appearance.Shoes, Tool: request.Appearance.Tool, Headwear: request.Appearance.Headwear}
+	}
 	if request.AccountID != nil {
 		// An empty account clears the selection back to the provider default;
 		// anything else must be one canonical account identity.
@@ -361,6 +364,34 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 		backend.owner.notifyScheduler()
 	}
 	return browserprotocol.AgentUpdateResult{AgentID: agent.ID.String(), Revision: decimalRevision(agent.Revision)}, nil
+}
+
+func (backend *browserBackend) SetProjectLimits(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.ProjectLimits) (browserprotocol.ProjectLimitsResult, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, err
+	}
+	defer release()
+	projectID, err := browserID(request.ProjectID, kernel.ProjectIDFromBytes)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, browser.ErrStale
+	}
+	expected, err := browserDecimal(request.ExpectedRevision)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, browser.ErrStale
+	}
+	at, err := backend.timestamp()
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, mapBrowserError(err)
+	}
+	project, err := backend.store.SetProjectLimits(ctx, projectID, expected, uint64(request.RunBudget), request.MaxRunSeconds, at)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, consoleUpdateError(err)
+	}
+	if backend.owner != nil {
+		backend.owner.notifyScheduler()
+	}
+	return browserprotocol.ProjectLimitsResult{ProjectID: project.ID.String(), Revision: decimalRevision(project.Revision)}, nil
 }
 
 func (backend *browserBackend) UpdateTask(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskUpdate) (browserprotocol.TaskUpdateResult, error) {
@@ -854,7 +885,7 @@ func projectAgent(item kernel.AgentSummary, configHome string, providerDefaults 
 	if item.Model != "" {
 		source = "agent"
 	}
-	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision),
+	projected := browserprotocol.AgentItem{ID: item.ID.String(), ProjectID: item.ProjectID.String(), Name: item.Name, Role: item.Role, Provider: item.Provider, Paused: browserprotocol.Bool(item.Paused), Appearance: browserprotocol.SpriteAppearance{Automatic: browserprotocol.Bool(item.Appearance.Automatic), Skin: item.Appearance.Skin, Hair: item.Appearance.Hair, HairColour: item.Appearance.HairColour, Face: item.Appearance.Face, Outfit: item.Appearance.Outfit, ClothesColour: item.Appearance.ClothesColour, Shoes: item.Appearance.Shoes, Tool: item.Appearance.Tool, Headwear: item.Appearance.Headwear}, Model: item.Model, ReasoningEffort: item.ReasoningEffort, EffectiveModel: effectiveModel, EffectiveReasoningEffort: effectiveEffort, ModelSource: source, Revision: decimalRevision(item.Revision),
 		IdlePolicy: string(item.Idle.Policy), IdleAfterSeconds: item.Idle.AfterSeconds, IdleInstruction: item.Idle.Instruction, IdleRunBudget: item.Idle.RunBudget, IdleRunsUsed: item.Idle.RunsUsed}
 	if (item.AccountID != kernel.AccountID{}) {
 		projected.AccountID = item.AccountID.String()

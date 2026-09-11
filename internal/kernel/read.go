@@ -91,14 +91,14 @@ func agentByID(ctx context.Context, connection *sql.Conn, id AgentID) (Agent, bo
 	return scanAgent(connection.QueryRowContext(ctx, `SELECT `+agentColumns+` FROM agents WHERE id = ?`, id.Bytes()))
 }
 
-const agentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used`
+const agentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, appearance, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used`
 
 func scanAgent(scanner rowScanner) (Agent, bool, error) {
 	var rawID, rawProjectID, rawAccountID []byte
-	var name, rawRole, rawProvider, rawIdlePolicy, idleInstruction string
+	var name, rawRole, rawProvider, rawAppearance, rawIdlePolicy, idleInstruction string
 	var model, effort sql.NullString
 	var paused, budget, used, revision, createdAt, updatedAt, idleAfter, idleBudget, idleUsed int64
-	if err := scanner.Scan(&rawID, &rawProjectID, &name, &rawRole, &rawProvider, &model, &effort, &rawAccountID, &paused, &budget, &used, &revision, &createdAt, &updatedAt, &rawIdlePolicy, &idleAfter, &idleInstruction, &idleBudget, &idleUsed); err != nil {
+	if err := scanner.Scan(&rawID, &rawProjectID, &name, &rawRole, &rawProvider, &model, &effort, &rawAccountID, &paused, &rawAppearance, &budget, &used, &revision, &createdAt, &updatedAt, &rawIdlePolicy, &idleAfter, &idleInstruction, &idleBudget, &idleUsed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Agent{}, false, nil
 		}
@@ -119,7 +119,8 @@ func scanAgent(scanner rowScanner) (Agent, bool, error) {
 		return Agent{}, false, fmt.Errorf("%w: invalid agent idle rule", ErrCorruptState)
 	}
 	accountID, accountErr := optionalAccountID(rawAccountID)
-	if accountErr != nil || provider == ProviderShell && !accountID.zero() {
+	appearance, appearanceErr := decodeAgentAppearance(rawAppearance)
+	if accountErr != nil || appearanceErr != nil || provider == ProviderShell && !accountID.zero() {
 		return Agent{}, false, fmt.Errorf("%w: invalid agent account", ErrCorruptState)
 	}
 	rev, revisionErr := NewRevision(revision)
@@ -131,7 +132,7 @@ func scanAgent(scanner rowScanner) (Agent, bool, error) {
 	return Agent{
 		ID: id, ProjectID: projectID, Name: name, Role: role, Provider: provider,
 		Model: nullStringValue(model), ReasoningEffort: nullStringValue(effort), AccountID: accountID, Idle: idle,
-		Paused: paused == 1, ToolBudgetLimit: uint64(budget), ToolCallsUsed: uint64(used),
+		Paused: paused == 1, Appearance: appearance, ToolBudgetLimit: uint64(budget), ToolCallsUsed: uint64(used),
 		Revision: rev, CreatedAt: created, UpdatedAt: updated,
 	}, true, nil
 }

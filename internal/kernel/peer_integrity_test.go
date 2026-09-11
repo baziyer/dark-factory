@@ -80,6 +80,9 @@ func TestV6MigrationPreservesSendBackAndSupervision(t *testing.T) {
 	if _, err := connection.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
+	if err := rebuildTable(ctx, connection, expectedSchemaOf(v6SchemaStatements()), "agents", v7AgentColumns, "agents_id_project_unique", "", ""); err != nil {
+		t.Fatal(err)
+	}
 	if err := rebuildTable(ctx, connection, expectedSchemaOf(v6SchemaStatements()), "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 		t.Fatal(err)
 	}

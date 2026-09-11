@@ -9,7 +9,7 @@ import (
 
 const (
 	applicationID = 0x4446474f
-	userVersion   = 9
+	userVersion   = 10
 
 	// SQLite reserves the exact lower-case "sqlite_" prefix. Use a literal,
 	// binary prefix test: LIKE would treat '_' as a wildcard and hide names
@@ -64,6 +64,7 @@ var schemaStatements = []string{
     reasoning_effort TEXT CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')),
     account_id BLOB CHECK (account_id IS NULL OR length(account_id) = 16) REFERENCES accounts(id),
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    appearance TEXT NOT NULL CHECK (length(CAST(appearance AS BLOB)) <= 35),
     idle_policy TEXT NOT NULL CHECK (idle_policy IN ('wait', 'standing_instruction')),
     idle_after_seconds INTEGER NOT NULL CHECK (idle_after_seconds BETWEEN 0 AND 604800),
     idle_instruction TEXT NOT NULL CHECK (length(CAST(idle_instruction AS BLOB)) <= 32768),

@@ -9,10 +9,11 @@ import (
 // ReasoningEffort and Paused are each optional: an absent member leaves the
 // durable value alone, so one console screen can edit one control at a time.
 type AgentUpdate struct {
-	AgentID          string  `json:"agent_id"`
-	ExpectedRevision Decimal `json:"expected_revision"`
-	Model            *string `json:"model,omitempty"`
-	ReasoningEffort  *string `json:"reasoning_effort,omitempty"`
+	AgentID          string            `json:"agent_id"`
+	ExpectedRevision Decimal           `json:"expected_revision"`
+	Appearance       *SpriteAppearance `json:"appearance,omitempty"`
+	Model            *string           `json:"model,omitempty"`
+	ReasoningEffort  *string           `json:"reasoning_effort,omitempty"`
 	// AccountID selects a linked provider login; an empty string clears the
 	// selection back to that provider's default configuration directory.
 	AccountID *string `json:"account_id,omitempty"`
@@ -27,6 +28,20 @@ type AgentUpdate struct {
 type AgentUpdateResult struct {
 	AgentID  string  `json:"agent_id"`
 	Revision Decimal `json:"revision"`
+}
+
+// ProjectLimits replaces the future run allowance and per-run ceiling. A zero
+// allowance or duration explicitly means unlimited.
+type ProjectLimits struct {
+	ProjectID        string  `json:"project_id"`
+	ExpectedRevision Decimal `json:"expected_revision"`
+	RunBudget        Decimal `json:"run_budget"`
+	MaxRunSeconds    uint32  `json:"max_run_seconds"`
+}
+
+type ProjectLimitsResult struct {
+	ProjectID string  `json:"project_id"`
+	Revision  Decimal `json:"revision"`
 }
 
 // TaskUpdate edits one still-queued task. Status is the only member that is
@@ -139,6 +154,10 @@ func EncodeAgentUpdateResult(id string, value AgentUpdateResult) ([]byte, error)
 	return encodeControl(TypeAgentUpdateResult, id, value)
 }
 
+func EncodeProjectLimitsResult(id string, value ProjectLimitsResult) ([]byte, error) {
+	return encodeControl(TypeProjectLimitsResult, id, value)
+}
+
 func EncodeTaskUpdateResult(id string, value TaskUpdateResult) ([]byte, error) {
 	return encodeControl(TypeTaskUpdateResult, id, value)
 }
@@ -179,6 +198,10 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case *AgentUpdateResult:
 		return validConsoleControl(kind, *value)
+	case *ProjectLimits:
+		return validConsoleControl(kind, *value)
+	case *ProjectLimitsResult:
+		return validConsoleControl(kind, *value)
 	case *TaskUpdate:
 		return validConsoleControl(kind, *value)
 	case *TaskUpdateResult:
@@ -205,6 +228,7 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
+			value.Appearance != nil && validateSpriteAppearance(*value.Appearance) != nil ||
 			value.Model != nil && validateBoundedText(*value.Model, 0, MaxAgentModelBytes) != nil ||
 			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil ||
 			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil ||
@@ -216,6 +240,14 @@ func validConsoleControl(kind MessageType, body any) error {
 		}
 	case AgentUpdateResult:
 		if validateDynamicID(value.AgentID) != nil || value.Revision == 0 {
+			return bad()
+		}
+	case ProjectLimits:
+		if validateDynamicID(value.ProjectID) != nil || value.ExpectedRevision == 0 || uint64(value.RunBudget) > MaxSQLiteInteger || value.MaxRunSeconds > 86400 {
+			return bad()
+		}
+	case ProjectLimitsResult:
+		if validateDynamicID(value.ProjectID) != nil || value.Revision == 0 {
 			return bad()
 		}
 	case TaskUpdate:

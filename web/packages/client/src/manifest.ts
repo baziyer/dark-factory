@@ -82,6 +82,8 @@ export const CONTROL_MANIFEST = [
   { type: "TERMINAL_RESET", direction: "server", id: "required", fixture: "terminal_reset.json" },
   { type: "AGENT_UPDATE", direction: "client", id: "required", fixture: "agent_update.json" },
   { type: "AGENT_UPDATE_RESULT", direction: "server", id: "required", fixture: "agent_update_result.json" },
+  { type: "PROJECT_LIMITS", direction: "client", id: "required", fixture: "project_limits.json" },
+  { type: "PROJECT_LIMITS_RESULT", direction: "server", id: "required", fixture: "project_limits_result.json" },
   { type: "TASK_UPDATE", direction: "client", id: "required", fixture: "task_update.json" },
   { type: "TASK_UPDATE_RESULT", direction: "server", id: "required", fixture: "task_update_result.json" },
   { type: "TOPOLOGY_GET", direction: "client", id: "required", fixture: "topology_get.json" },

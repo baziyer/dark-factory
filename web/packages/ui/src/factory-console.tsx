@@ -1,10 +1,11 @@
 import type { ReactNode } from "react";
-import type { AccountItem, AgentItem, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
+import type { AccountItem, AgentItem, ProjectItem, SpriteAppearance, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
 import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
 import { RemoteInvitePanel } from "./remote-invite.js";
 import { factoryCounters, stageOfTask } from "./console-view.js";
+import { SpriteEditor } from "./factory-scene/sprite-editor.js";
 
 export type ConsoleView = "floor" | "agents";
 export type ConsoleDetail = "needs-you" | "queue" | "agent";
@@ -21,6 +22,11 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   selectedAgent?: FactoryAgentSelection;
   onSelectAgent?: (agent: AgentItem) => void;
   onSaveAgentConfig?: (config: AgentConfigEdit) => void;
+  onSaveAgentAppearance?: (agentId: string, appearance: SpriteAppearance) => Promise<boolean>;
+  appearanceAgentId?: string;
+  onEditAppearance?: (agent: AgentItem) => void;
+  onCloseAppearance?: () => void;
+  onSaveProjectLimits?: (project: Pick<ProjectItem, "id" | "revision">, limits: { runBudget: bigint; maxRunSeconds: number }) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
@@ -94,6 +100,11 @@ export function FactoryConsole({
   selectedAgent,
   onSelectAgent,
   onSaveAgentConfig,
+  onSaveAgentAppearance,
+  appearanceAgentId,
+  onEditAppearance,
+  onCloseAppearance,
+  onSaveProjectLimits,
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
@@ -123,7 +134,8 @@ export function FactoryConsole({
   const counters = factoryCounters(state);
   const agent = selectedAgent === undefined ? undefined : state?.agents.get(selectedAgent.id);
   const selectedDetail = detail ?? (selectedAgent === undefined ? "needs-you" : "agent");
-  const editError = editErrorCopy(edit);
+  const appearanceAgent = appearanceAgentId === undefined ? undefined : state?.agents.get(appearanceAgentId);
+  const editError = edit !== undefined && state?.projects.has(edit.target) ? undefined : editErrorCopy(edit);
 
   return (
     <div className="dfConsoleShell">
@@ -175,7 +187,7 @@ export function FactoryConsole({
               </div>
             </div>
             {view === "floor"
-              ? <FactoryFloor selectedAgentId={selectedDetail === "agent" ? selectedAgent?.id : undefined} state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
+              ? <FactoryFloor selectedAgentId={selectedDetail === "agent" ? selectedAgent?.id : undefined} state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} onEditAppearance={ready ? onEditAppearance : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={ready ? onSelectAgent : undefined} />}
           </section>
 
@@ -220,6 +232,7 @@ export function FactoryConsole({
                 edit={edit}
                 ready={ready}
                 onSaveConfig={onSaveAgentConfig}
+                onEditAppearance={ready ? onEditAppearance : undefined}
                 onEditTask={onEditTask}
                 onLoadTaskDetail={onLoadTaskDetail}
                 onLoadTaskHistory={onLoadTaskHistory}
@@ -235,6 +248,7 @@ export function FactoryConsole({
       {settingsOpen !== true ? null : (
         <SettingsDialog
           state={state}
+          ready={ready}
           address={address}
           accounts={accounts}
           accountsPending={accountsPending}
@@ -242,12 +256,15 @@ export function FactoryConsole({
           onLoadAccounts={onLoadAccounts}
           onLinkAccount={onLinkAccount}
           onUpdateAccount={onUpdateAccount}
+          edit={edit}
+          onSaveProjectLimits={onSaveProjectLimits}
           pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
             <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
           ))}
           onClose={onToggleSettings}
         />
       )}
+      {appearanceAgent === undefined || onSaveAgentAppearance === undefined || onCloseAppearance === undefined ? null : <SpriteEditor agent={appearanceAgent} pending={edit?.target === appearanceAgent.id && edit.pending} error={edit?.target === appearanceAgent.id ? editError : undefined} onSave={(appearance) => onSaveAgentAppearance(appearanceAgent.id, appearance)} onClose={onCloseAppearance} />}
     </div>
   );
 }

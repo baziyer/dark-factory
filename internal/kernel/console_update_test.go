@@ -55,6 +55,22 @@ func TestUpdateAgentValidatesLaunchControlsAtTheObservedRevision(t *testing.T) {
 	}
 }
 
+func TestUpdateAgentAppearancePersistsAndResetsAtomically(t *testing.T) {
+	store, _, _, agent := newAdmissionStore(t, RoleOrchestrator, 2)
+	defer store.Close()
+	ctx := context.Background()
+	custom := AgentAppearance{Skin: 3, Hair: 2, HairColour: 1, Face: 1, Outfit: 3, ClothesColour: 2, Shoes: 1, Tool: 4, Headwear: 2}
+	updated, err := store.UpdateAgent(ctx, agent.ID, agent.Revision, AgentPatch{Appearance: &custom}, mustTime(t, 6))
+	if err != nil || updated.Appearance != custom {
+		t.Fatalf("custom appearance = %+v, %v", updated.Appearance, err)
+	}
+	automatic := AgentAppearance{Automatic: true}
+	reset, err := store.UpdateAgent(ctx, agent.ID, updated.Revision, AgentPatch{Appearance: &automatic}, mustTime(t, 7))
+	if err != nil || reset.Appearance != automatic {
+		t.Fatalf("automatic appearance = %+v, %v", reset.Appearance, err)
+	}
+}
+
 // A stored row may hold a combination new launches refuse. Pausing such an
 // agent touches no launch control, so the launch rules do not apply to it.
 func TestUpdateAgentPausesALegacyAgentItCouldNotRelaunch(t *testing.T) {

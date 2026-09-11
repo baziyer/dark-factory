@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type StateView, type TaskHistoryView, type TaskItem, type TaskListView, type TaskPeerQuestion } from "@dark-factory/client";
+import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type ProjectItem, type StateView, type TaskHistoryView, type TaskItem, type TaskListView, type TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
 import { AgentSprite } from "./factory-scene/factory-scene.js";
@@ -51,6 +51,7 @@ export function AgentPanel({
   edit,
   ready,
   onSaveConfig,
+  onEditAppearance,
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
@@ -64,6 +65,7 @@ export function AgentPanel({
   edit?: FactoryEditView;
   ready: boolean;
   onSaveConfig?: (config: AgentConfigEdit) => void;
+  onEditAppearance?: (agent: AgentItem) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
@@ -96,7 +98,10 @@ export function AgentPanel({
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
       <div className="dfConsoleSidebar__heading">
-        <AgentSprite agent={agent} activity={state === undefined ? "waiting" : agentActivity(agent, state)} />
+        <button type="button" className="dfAgentSpriteEdit" aria-label={`Edit appearance for ${agent.name}`} onClick={() => onEditAppearance?.(agent)} disabled={onEditAppearance === undefined}>
+          <AgentSprite agent={agent} activity={state === undefined ? "waiting" : agentActivity(agent, state)} />
+          <svg className="dfAgentSpriteEdit__icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 11.5 10.5 4 12 5.5 4.5 13 2 14Zm7-8L11.5 2 14 4.5 12.5 6Z" /></svg>
+        </button>
         <div>
           <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
           <h2>{agent.name}</h2>
@@ -504,7 +509,10 @@ function QueuedTask({
  */
 export function SettingsDialog({
   state,
+  ready,
   address,
+  edit,
+  onSaveProjectLimits,
   accounts,
   accountsPending,
   accountsError,
@@ -515,7 +523,10 @@ export function SettingsDialog({
   onClose,
 }: {
   state: StateView | undefined;
+  ready: boolean;
   address: string;
+  edit?: FactoryEditView;
+  onSaveProjectLimits?: (project: Pick<ProjectItem, "id" | "revision">, limits: { runBudget: bigint; maxRunSeconds: number }) => void;
   /** The logins the daemon found, once it has been asked. */
   accounts?: readonly DiscoveredAccount[];
   accountsPending?: boolean;
@@ -568,6 +579,7 @@ export function SettingsDialog({
           <h3>THIS FACTORY</h3>
           <p className="dfConsoleSidebar__address">{address}</p>
         </div>
+        <ProjectLimitsSection state={state} edit={edit} ready={ready} onSave={onSaveProjectLimits} />
         <AccountsSection
           state={state}
           accounts={accounts}
@@ -584,6 +596,65 @@ export function SettingsDialog({
       </div>
     </dialog>
   );
+}
+
+function ProjectLimitsSection({ state, edit, ready, onSave }: {
+  state: StateView | undefined;
+  edit?: FactoryEditView;
+  ready: boolean;
+  onSave?: (project: { id: string; revision: bigint }, limits: { runBudget: bigint; maxRunSeconds: number }) => void;
+}) {
+  const projects = state === undefined ? [] : [...state.projects.values()];
+  return <div className="dfConsoleSidebar__section" aria-label="PROJECT LIMITS">
+    <h3>PROJECT LIMITS</h3>
+    <p className="dfConsoleSidebar__inherit">AUTONOMOUS GITHUB ISSUE WORK REQUIRES BOTH LIMITS.</p>
+    {projects.length === 0 ? <p className="dfFactoryConsole__empty">NO PROJECTS</p> : projects.map((project) => <ProjectLimitsForm key={`${project.id}:${project.revision}:${edit?.target === project.id && edit.error !== undefined ? "refused" : ""}`} project={project} edit={edit} ready={ready} onSave={onSave} />)}
+  </div>;
+}
+
+function ProjectLimitsForm({ project, edit, ready, onSave }: {
+  project: ProjectItem;
+  edit?: FactoryEditView;
+  ready: boolean;
+  onSave?: (project: { id: string; revision: bigint }, limits: { runBudget: bigint; maxRunSeconds: number }) => void;
+}) {
+  const remaining = project.run_budget_limit === 0n ? 0n : project.run_budget_limit > project.runs_used ? project.run_budget_limit - project.runs_used : 0n;
+  const [unlimited, setUnlimited] = useState(project.run_budget_limit === 0n);
+  const [runs, setRuns] = useState(project.run_budget_limit === 0n ? "" : remaining.toString());
+  const [seconds, setSeconds] = useState(String(project.max_run_seconds));
+  const [localError, setLocalError] = useState<string>();
+  const pending = edit?.pending === true;
+  const refused = edit?.target === project.id && edit.error !== undefined;
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (unlimited) {
+      const duration = Number(seconds);
+      if (!/^\d+$/.test(seconds) || !Number.isSafeInteger(duration) || duration > 86400) { setLocalError("DURATION MUST BE 0–86400 SECONDS"); return; }
+      setLocalError(undefined);
+      onSave?.(project, { runBudget: 0n, maxRunSeconds: duration });
+      return;
+    }
+    let allowance: bigint;
+    try { allowance = BigInt(runs); } catch { setLocalError("ENTER A WHOLE NUMBER OF FUTURE RUNS"); return; }
+    const duration = Number(seconds);
+    if (allowance < 1n) { setLocalError("FINITE ALLOWANCE MUST BE AT LEAST 1 FUTURE RUN"); return; }
+    if (!/^\d+$/.test(seconds) || !Number.isSafeInteger(duration) || duration > 86400) { setLocalError("DURATION MUST BE 0–86400 SECONDS"); return; }
+    setLocalError(undefined);
+    onSave?.(project, { runBudget: allowance, maxRunSeconds: duration });
+  };
+  const error = localError ?? (refused ? editErrorCopy(edit) : undefined);
+  return <form className="dfConsoleSidebar__config" onSubmit={submit} aria-label={`Limits for ${project.name}`}>
+    <h4>{project.name}</h4>
+    <p className="dfConsoleSidebar__inherit">{project.runs_used.toString()} RUNS USED · {project.run_budget_limit === 0n ? "UNLIMITED" : `${remaining.toString()} FUTURE RUNS LEFT`}</p>
+    <label><input type="checkbox" checked={unlimited} disabled={pending || !ready} onChange={(event) => { setUnlimited(event.currentTarget.checked); setLocalError(undefined); }} /> UNLIMITED RUNS</label>
+    <label htmlFor={`df-project-runs-${project.id}`}>REMAINING RUN ALLOWANCE</label>
+    <input id={`df-project-runs-${project.id}`} inputMode="numeric" value={runs} disabled={pending || !ready || unlimited} onChange={(event) => { setRuns(event.currentTarget.value); setLocalError(undefined); }} />
+    <label htmlFor={`df-project-seconds-${project.id}`}>MAX SECONDS PER RUN (0 = UNLIMITED)</label>
+    <input id={`df-project-seconds-${project.id}`} inputMode="numeric" value={seconds} disabled={pending || !ready} onChange={(event) => { setSeconds(event.currentTarget.value); setLocalError(undefined); }} />
+    {error === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{error}</p>}
+    {remaining === 0n && project.run_budget_limit !== 0n && !unlimited ? <p className="dfConsoleSidebar__inherit">THIS ALLOWANCE IS EXHAUSTED · ENTER A POSITIVE RENEWAL OR CHECK UNLIMITED</p> : null}
+    <button type="submit" disabled={pending || !ready || onSave === undefined}>{pending ? "SAVING" : "SAVE"}</button>
+  </form>;
 }
 
 /**

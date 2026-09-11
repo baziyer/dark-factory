@@ -18,9 +18,11 @@ import {
   type AccountUpdateResultBody,
   type AccountsBody,
   type AgentUpdateBody,
+  type ProjectLimitsBody,
   type AgentControlAction,
   type AgentControlResultBody,
   type IdlePolicy,
+  type SpriteAppearance,
   type AuthResultFrame,
   type ErrorFrame,
   type HelloBody,
@@ -157,9 +159,10 @@ type TaskPending = { taskId: string; expectedAgentRevision: bigint; resolve: (va
 type AgentControlPending = { operationId: string; taskId: string; runId: string; resolve: (value: AgentControlResult) => void; reject: (error: unknown) => void };
 type TaskHistoryPending = { taskId: string; resolve: (value: TaskHistoryView) => void; reject: (error: unknown) => void };
 type TaskDetailPending = { taskId: string; expectedRevision: bigint; resolve: (value: TaskDetailView) => void; reject: (error: unknown) => void };
-type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
+type ConsolePending = { kind: "AGENT_UPDATE_RESULT" | "PROJECT_LIMITS_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST"; entityId: string; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 export type AgentUpdateResult = Readonly<{ agentId: string; revision: bigint }>;
+export type ProjectLimitsResult = Readonly<{ projectId: string; revision: bigint }>;
 export type TaskUpdateResult = Readonly<{ taskId: string; revision: bigint }>;
 export type AgentControlRequest = Readonly<{
   operationId: string;
@@ -361,8 +364,9 @@ export class BrowserSession {
   }
 
   /** Edit one agent's configuration. An omitted member is left alone. */
-  updateAgent(request: { agentId: string; expectedRevision: bigint; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: IdlePolicy; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }): Promise<AgentUpdateResult> {
+  updateAgent(request: { agentId: string; expectedRevision: bigint; appearance?: SpriteAppearance; model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: IdlePolicy; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }): Promise<AgentUpdateResult> {
     const body: AgentUpdateBody = { agent_id: request.agentId, expected_revision: request.expectedRevision };
+    if (request.appearance !== undefined) body.appearance = request.appearance;
     if (request.model !== undefined) body.model = request.model;
     if (request.reasoningEffort !== undefined) body.reasoning_effort = request.reasoningEffort;
     if (request.accountId !== undefined) body.account_id = request.accountId;
@@ -377,6 +381,14 @@ export class BrowserSession {
     // Which login an agent runs as is administration, like the logins themselves.
     if (request.accountId !== undefined && (this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
     return this.#consoleRequest("AGENT_UPDATE_RESULT", request.agentId, request.expectedRevision, "agent-update", (id) => encodeClientControl({ type: "AGENT_UPDATE", id, body }));
+  }
+
+  /** Edit one project's future allowance and per-run duration. */
+  setProjectLimits(request: { projectId: string; expectedRevision: bigint; runBudget: bigint; maxRunSeconds: number }): Promise<ProjectLimitsResult> {
+    const body: ProjectLimitsBody = { project_id: request.projectId, expected_revision: request.expectedRevision, run_budget: request.runBudget, max_run_seconds: request.maxRunSeconds };
+    if (request.runBudget < 0n || request.runBudget > MAX_SQLITE_INTEGER || !Number.isSafeInteger(request.maxRunSeconds) || request.maxRunSeconds < 0 || request.maxRunSeconds > 86400) return Promise.reject(new SessionError("invalid_request"));
+    if ((this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
+    return this.#consoleRequest("PROJECT_LIMITS_RESULT", request.projectId, request.expectedRevision, "project-limits", (id) => encodeClientControl({ type: "PROJECT_LIMITS", id, body }));
   }
 
   /** Edit one still-queued task: its brief, priority, assignment, or cancel it. */
@@ -757,7 +769,7 @@ export class BrowserSession {
       this.#taskDetailResult(frame.body, frame.id);
       return;
     }
-    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS" || frame.type === "TASK_LIST") {
+    if (frame.type === "AGENT_UPDATE_RESULT" || frame.type === "PROJECT_LIMITS_RESULT" || frame.type === "TASK_UPDATE_RESULT" || frame.type === "TOPOLOGY" || frame.type === "RUN_PATHS" || frame.type === "TASK_LIST") {
       this.#consoleResult(frame);
       return;
     }
@@ -1110,11 +1122,11 @@ export class BrowserSession {
     this.#taskDetailPending.clear();
   }
 
-  /** One shape for the four console request/result pairs. */
+  /** One shape for the console request/result pairs. */
   #consoleRequest<T>(kind: ConsolePending["kind"], entityId: string, expectedRevision: bigint, prefix: string, encode: (id: string) => string): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
     if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
-    const capability = kind === "TOPOLOGY" || kind === "RUN_PATHS" ? CAPABILITIES.observe : CAPABILITIES.human_actions;
+    const capability = kind === "TOPOLOGY" || kind === "RUN_PATHS" ? CAPABILITIES.observe : kind === "PROJECT_LIMITS_RESULT" ? CAPABILITIES.administration : CAPABILITIES.human_actions;
     if ((this.#capabilities & capability) === 0) return Promise.reject(new SessionError("unauthorized"));
     if (!validDynamicID(entityId) || expectedRevision < 1n || expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
     if (this.#consolePending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
@@ -1126,13 +1138,14 @@ export class BrowserSession {
     return result;
   }
 
-  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST" }>): void {
+  #consoleResult(frame: Extract<ServerControlFrame, { type: "AGENT_UPDATE_RESULT" | "PROJECT_LIMITS_RESULT" | "TASK_UPDATE_RESULT" | "TOPOLOGY" | "RUN_PATHS" | "TASK_LIST" }>): void {
     const pending = this.#consolePending.get(frame.id);
     if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
     const identity = frame.type === "AGENT_UPDATE_RESULT" || frame.type === "RUN_PATHS" || frame.type === "TASK_LIST" ? frame.body.agent_id : frame.type === "TASK_UPDATE_RESULT" ? frame.body.task_id : frame.body.project_id;
     if (identity !== pending.entityId) throw new ProtocolError("malformed");
     this.#consolePending.delete(frame.id);
     if (frame.type === "AGENT_UPDATE_RESULT") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, revision: frame.body.revision }) as never); return; }
+    if (frame.type === "PROJECT_LIMITS_RESULT") { pending.resolve(Object.freeze({ projectId: frame.body.project_id, revision: frame.body.revision }) as never); return; }
     if (frame.type === "TASK_UPDATE_RESULT") { pending.resolve(Object.freeze({ taskId: frame.body.task_id, revision: frame.body.revision }) as never); return; }
     if (frame.type === "RUN_PATHS") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, runId: frame.body.run_id, paths: Object.freeze([...frame.body.paths]) }) as never); return; }
     if (frame.type === "TASK_LIST") { pending.resolve(Object.freeze({ agentId: frame.body.agent_id, head: frame.body.head, total: frame.body.total, tasks: Object.freeze(frame.body.tasks.map((task) => Object.freeze({ ...task }))), hasMore: frame.body.has_more }) as never); return; }

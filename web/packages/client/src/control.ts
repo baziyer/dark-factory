@@ -51,7 +51,8 @@ export type ProjectItem = { id: string; name: string; run_budget_limit: bigint; 
  * login it launches under; empty means that provider's default directory.
  */
 export type IdlePolicy = "wait" | "standing_instruction";
-export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string; idle_policy: IdlePolicy; idle_after_seconds: number; idle_instruction: string; idle_run_budget: number; idle_runs_used: number };
+export type SpriteAppearance = { automatic: boolean; skin: number; hair: number; hair_colour: number; face: number; outfit: number; clothes_colour: number; shoes: number; tool: number; headwear: number };
+export type AgentItem = { id: string; project_id: string; name: string; role: "orchestrator" | "worker"; provider: "claude_code" | "codex" | "shell"; appearance: SpriteAppearance; paused: boolean; model: string; reasoning_effort: string; effective_model: string; effective_reasoning_effort: string; model_source: string; revision: bigint; account_id: string; idle_policy: IdlePolicy; idle_after_seconds: number; idle_instruction: string; idle_run_budget: number; idle_runs_used: number };
 export type AccountItem = { id: string; provider: "claude_code" | "codex"; home: string; label: string; revision: bigint };
 export type TaskItem = { id: string; project_id: string; assigned_agent_id: string; title: string; status: "queued" | "running" | "blocked" | "succeeded" | "failed" | "cancelled"; priority: number; revision: bigint; updated_at_ms?: bigint };
 export type HumanRequestItem = {
@@ -94,8 +95,10 @@ export type TaskPeerQuestion = { id: string; source_task_id: string; target_task
 export type TaskDetailBody = { task_id: string; revision: bigint; head: bigint; instruction: string; feedback: string; outcome?: string; next_text_offset?: bigint; peer_questions: TaskPeerQuestion[]; next_peer_offset?: bigint };
 export type TaskListGetBody = { agent_id: string; before_updated_at_ms?: bigint; before_task_id?: string };
 export type TaskListBody = { agent_id: string; head: bigint; total: bigint; tasks: TaskItem[]; has_more: boolean };
-export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean; idle_policy?: IdlePolicy; idle_after_seconds?: number; idle_instruction?: string; idle_run_budget?: number };
+export type AgentUpdateBody = { agent_id: string; expected_revision: bigint; appearance?: SpriteAppearance; model?: string; reasoning_effort?: string; account_id?: string; paused?: boolean; idle_policy?: IdlePolicy; idle_after_seconds?: number; idle_instruction?: string; idle_run_budget?: number };
 export type AgentUpdateResultBody = { agent_id: string; revision: bigint };
+export type ProjectLimitsBody = { project_id: string; expected_revision: bigint; run_budget: bigint; max_run_seconds: number };
+export type ProjectLimitsResultBody = { project_id: string; revision: bigint };
 export type TaskUpdateBody = { task_id: string; expected_revision: bigint; title?: string; body?: string; priority?: number; assigned_agent_id?: string; status?: "cancelled" };
 export type TaskUpdateResultBody = { task_id: string; revision: bigint };
 export type TopologyGetBody = { project_id: string };
@@ -175,6 +178,7 @@ export type ServerControlFrame = HelloFrame | PairResultFrame | AuthResultFrame 
   | { type: "TASK_DETAIL"; id: string; body: TaskDetailBody }
   | { type: "TASK_LIST"; id: string; body: TaskListBody }
   | { type: "AGENT_UPDATE_RESULT"; id: string; body: AgentUpdateResultBody }
+  | { type: "PROJECT_LIMITS_RESULT"; id: string; body: ProjectLimitsResultBody }
   | { type: "TASK_UPDATE_RESULT"; id: string; body: TaskUpdateResultBody }
   | { type: "TOPOLOGY"; id: string; body: TopologyBody }
   | { type: "RUN_PATHS"; id: string; body: RunPathsBody }
@@ -193,6 +197,7 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
   | { type: "TASK_DETAIL_GET"; id: string; body: TaskDetailGetBody }
   | { type: "TASK_LIST_GET"; id: string; body: TaskListGetBody }
   | { type: "AGENT_UPDATE"; id: string; body: AgentUpdateBody }
+  | { type: "PROJECT_LIMITS"; id: string; body: ProjectLimitsBody }
   | { type: "TASK_UPDATE"; id: string; body: TaskUpdateBody }
   | { type: "TOPOLOGY_GET"; id: string; body: TopologyGetBody }
   | { type: "RUN_PATHS_GET"; id: string; body: RunPathsGetBody }
@@ -205,8 +210,8 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
 type ControlBody = ClientControlFrame["body"] | ServerControlFrame["body"];
 
 const HEX_BYTES = { daemon_id: 16, boot_id: 16, connection_nonce: 32, challenge: 32, client_id: 16, public_key_sec1: 65, signature: 64 } as const;
-const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "ACCOUNT_UPDATE", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
-const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "ACCOUNT_UPDATE_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
+const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "PROJECT_LIMITS", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "ACCOUNT_UPDATE", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
+const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "PROJECT_LIMITS_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "ACCOUNT_UPDATE_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
 
 export function encodeClientControl(frame: ClientControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "client"))); }
 export function encodePairProve(id: string, body: PairProveBody): string { return encodeClientControl({ type: "PAIR_PROVE", id, body }); }
@@ -397,8 +402,10 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
       if (total < BigInt(tasks.length) || (body.has_more && tasks.length !== 10)) malformed();
       return { agent_id, head: decimal(body.head, wire, true), total, tasks, has_more: body.has_more };
     }
-    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } if (present(body, "idle_policy")) result.idle_policy = idlePolicy(body.idle_policy); if (present(body, "idle_after_seconds")) result.idle_after_seconds = integer(body.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS); if (present(body, "idle_instruction")) result.idle_instruction = boundedText(body.idle_instruction, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "idle_run_budget")) result.idle_run_budget = integer(body.idle_run_budget, 0, MAX_IDLE_RUN_BUDGET); return result; }
+    case "AGENT_UPDATE": requireKeys(body, ["agent_id", "expected_revision"], wire, ["appearance", "model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"]); { const result: AgentUpdateBody = { agent_id: dynamicID(body.agent_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "appearance")) result.appearance = spriteAppearance(body.appearance, wire); if (present(body, "model")) result.model = boundedText(body.model, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "reasoning_effort")) result.reasoning_effort = boundedText(body.reasoning_effort, 0, MAX_AGENT_MODEL_BYTES); if (present(body, "account_id")) result.account_id = body.account_id === "" ? "" : dynamicID(body.account_id); if (present(body, "paused")) { if (typeof body.paused !== "boolean") malformed(); result.paused = body.paused; } if (present(body, "idle_policy")) result.idle_policy = idlePolicy(body.idle_policy); if (present(body, "idle_after_seconds")) result.idle_after_seconds = integer(body.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS); if (present(body, "idle_instruction")) result.idle_instruction = boundedText(body.idle_instruction, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "idle_run_budget")) result.idle_run_budget = integer(body.idle_run_budget, 0, MAX_IDLE_RUN_BUDGET); return result; }
     case "AGENT_UPDATE_RESULT": requireKeys(body, ["agent_id", "revision"], wire); return { agent_id: dynamicID(body.agent_id), revision: decimal(body.revision, wire, true) };
+    case "PROJECT_LIMITS": requireKeys(body, ["project_id", "expected_revision", "run_budget", "max_run_seconds"], wire); return { project_id: dynamicID(body.project_id), expected_revision: decimal(body.expected_revision, wire, true), run_budget: decimal(body.run_budget, wire), max_run_seconds: integer(body.max_run_seconds, 0, 86400) };
+    case "PROJECT_LIMITS_RESULT": requireKeys(body, ["project_id", "revision"], wire); return { project_id: dynamicID(body.project_id), revision: decimal(body.revision, wire, true) };
     case "TASK_UPDATE": requireKeys(body, ["task_id", "expected_revision"], wire, ["title", "body", "priority", "assigned_agent_id", "status"]); { const result: TaskUpdateBody = { task_id: dynamicID(body.task_id), expected_revision: decimal(body.expected_revision, wire, true) }; if (present(body, "title")) result.title = boundedText(body.title, 1, MAX_TASK_TITLE_BYTES); if (present(body, "body")) result.body = boundedText(body.body, 0, MAX_TASK_INSTRUCTION_BYTES); if (present(body, "priority")) result.priority = integer(body.priority, -MAX_TASK_PRIORITY, MAX_TASK_PRIORITY); if (present(body, "assigned_agent_id")) result.assigned_agent_id = dynamicID(body.assigned_agent_id); if (present(body, "status")) { if (body.status !== "cancelled") malformed(); result.status = body.status; } return result; }
     case "TASK_UPDATE_RESULT": requireKeys(body, ["task_id", "revision"], wire); return { task_id: dynamicID(body.task_id), revision: decimal(body.revision, wire, true) };
     case "TOPOLOGY_GET": requireKeys(body, ["project_id"], wire); return { project_id: dynamicID(body.project_id) };
@@ -472,11 +479,19 @@ function projectItem(value: unknown, wire: boolean): ProjectItem {
   if (run_budget_limit !== 0n && runs_used > run_budget_limit) malformed();
   return { id: dynamicID(value.id), name: boundedText(value.name, 1, MAX_PROJECT_NAME_BYTES), run_budget_limit, runs_used, max_run_seconds, revision: decimal(value.revision, wire, true) };
 }
+function spriteAppearance(value: unknown, wire: boolean): SpriteAppearance {
+  if (!isObject(value)) malformed();
+  requireKeys(value, ["automatic", "skin", "hair", "hair_colour", "face", "outfit", "clothes_colour", "shoes", "tool", "headwear"], wire);
+  if (typeof value.automatic !== "boolean") malformed();
+  const result = { automatic: value.automatic, skin: integer(value.skin, 0, 255), hair: integer(value.hair, 0, 255), hair_colour: integer(value.hair_colour, 0, 255), face: integer(value.face, 0, 255), outfit: integer(value.outfit, 0, 255), clothes_colour: integer(value.clothes_colour, 0, 255), shoes: integer(value.shoes, 0, 255), tool: integer(value.tool, 0, 255), headwear: integer(value.headwear, 0, 255) };
+  if (result.automatic && [result.skin, result.hair, result.hair_colour, result.face, result.outfit, result.clothes_colour, result.shoes, result.tool, result.headwear].some((slot) => slot !== 0)) malformed();
+  return result;
+}
 function agentItem(value: unknown, wire: boolean): AgentItem {
   // An older daemon does not send the launch controls, the resolved model or
   // the account; they read as unset, which the console shows as an unknowable
   // CLI default under that provider's own directory.
-  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget", "idle_runs_used"]);
+  if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "name", "role", "provider", "paused", "revision"], wire, ["appearance", "model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source", "account_id", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget", "idle_runs_used"]);
   // An older daemon serves no idle rule; every agent then waits.
   const idle_policy = present(value, "idle_policy") ? idlePolicy(value.idle_policy) : "wait";
   const idle_after_seconds = present(value, "idle_after_seconds") ? integer(value.idle_after_seconds, 0, MAX_IDLE_AFTER_SECONDS) : 0;
@@ -492,7 +507,8 @@ function agentItem(value: unknown, wire: boolean): AgentItem {
   const model_source = present(value, "model_source") ? boundedText(value.model_source, 0, MAX_MODEL_SOURCE_BYTES) : "";
   const account_id = present(value, "account_id") && value.account_id !== "" ? dynamicID(value.account_id) : "";
   if (account_id !== "" && value.provider === "shell") malformed();
-  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used };
+  const appearance = present(value, "appearance") ? spriteAppearance(value.appearance, wire) : { automatic: true, skin: 0, hair: 0, hair_colour: 0, face: 0, outfit: 0, clothes_colour: 0, shoes: 0, tool: 0, headwear: 0 };
+  return { id: dynamicID(value.id), project_id: dynamicID(value.project_id), name: boundedText(value.name, 1, MAX_AGENT_NAME_BYTES), role: value.role, provider: value.provider, appearance, paused: value.paused, model, reasoning_effort, effective_model, effective_reasoning_effort, model_source, revision: decimal(value.revision, wire, true), account_id, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used };
 }
 function accountProvider(value: unknown): "claude_code" | "codex" { if (value !== "claude_code" && value !== "codex") malformed(); return value; }
 /** One absolute configuration directory, bounded exactly as the daemon does. */

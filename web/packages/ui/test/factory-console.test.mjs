@@ -966,6 +966,32 @@ test("the settings modal carries the factory readout and a pairing mount point",
   assert.match(both, /aria-label="Agent Builder One"/);
 });
 
+test("settings edits project limits as future runs with an explicit unlimited choice", () => {
+  const markup = render({ settingsOpen: true, onToggleSettings: () => {}, onSaveProjectLimits: () => {} });
+  assert.match(markup, /aria-label="PROJECT LIMITS"/);
+  assert.match(markup, /value="7"/);
+  assert.match(markup, /REMAINING RUN ALLOWANCE/);
+  assert.match(markup, /UNLIMITED RUNS/);
+  assert.match(markup, /value="0"/);
+  assert.match(markup, /MAX SECONDS PER RUN \(0 = UNLIMITED\)/);
+  assert.match(markup, /AUTONOMOUS GITHUB ISSUE WORK REQUIRES BOTH LIMITS/);
+});
+
+test("settings rejects a blank per-run duration before saving", async () => {
+  const calls = [];
+  let renderer;
+  await act(async () => {
+    renderer = create(createElement(FactoryConsole, { status: "ready", state: baseState(), settingsOpen: true, onToggleSettings: () => {}, onSaveProjectLimits: (...args) => calls.push(args) }));
+  });
+  const form = renderer.root.findByProps({ "aria-label": `Limits for ${fixtureState.projects.get(ids.project).name}` });
+  const inputs = form.findAllByType("input");
+  await act(async () => { inputs[2].props.onChange({ currentTarget: { value: "" } }); });
+  await act(async () => { form.props.onSubmit({ preventDefault: () => {} }); });
+  assert.equal(calls.length, 0);
+  assert.match(JSON.stringify(renderer.toJSON()), /DURATION MUST BE 0–86400 SECONDS/);
+  await act(async () => { renderer.unmount(); });
+});
+
 test("SETTINGS opens and closes as a native modal, over whatever sidebar is open", async () => {
   const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -1000,6 +1026,59 @@ test("SETTINGS opens and closes as a native modal, over whatever sidebar is open
   } finally {
     globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
   }
+});
+
+test("one sprite editor previews categories and saves one atomic appearance", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const saved = [];
+    const node = { showModal: () => {}, close: () => {} };
+    let renderer;
+    await act(async () => {
+      renderer = create(createElement(FactoryConsole, {
+        status: "ready",
+        state: baseState(),
+        appearanceAgentId: ids.agent,
+        onSaveAgentAppearance: (agentId, appearance) => { saved.push([agentId, appearance]); return Promise.resolve(true); },
+        onCloseAppearance: () => {},
+      }), { createNodeMock: () => node });
+    });
+    const dialog = renderer.root.findByProps({ "aria-label": "Edit appearance for Builder One" });
+    assert.deepEqual(dialog.findAllByType("label").map((label) => label.findByType("span").children.join("")), ["SKIN TONE", "HAIR STYLE", "HAIR COLOUR", "FACE DETAIL", "CLOTHING STYLE", "CLOTHING COLOUR", "SHOES", "TOOL", "HEADWEAR"]);
+    assert.equal(dialog.findAllByProps({ className: "dfAgentSprite" }).length, 1);
+    await act(async () => { dialog.findAllByType("select")[0].props.onChange({ target: { value: "3" } }); });
+    await act(async () => { dialog.findByType("form").props.onSubmit({ preventDefault() {} }); });
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0][0], ids.agent);
+    assert.equal(saved[0][1].automatic, false);
+    assert.equal(saved[0][1].skin, 3);
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("a refused appearance edit keeps the editor and its draft", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    let closes = 0;
+    const node = { showModal: () => {}, close: () => { closes += 1; } };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, {
+      status: "ready", state: baseState(), appearanceAgentId: ids.agent,
+      edit: { target: ids.agent, pending: false, error: { code: "stale" } },
+      onSaveAgentAppearance: () => Promise.resolve(false), onCloseAppearance: () => {},
+    }), { createNodeMock: () => node }); });
+    const dialog = renderer.root.findByProps({ "aria-label": "Edit appearance for Builder One" });
+    await act(async () => { dialog.findAllByType("select")[0].props.onChange({ target: { value: "3" } }); });
+    await act(async () => { await dialog.findByType("form").props.onSubmit({ preventDefault() {} }); });
+    assert.equal(closes, 0);
+    assert.equal(dialog.findByProps({ role: "alert" }).children.join(""), "SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN");
+    assert.equal(dialog.findAllByType("select")[0].props.value, 3);
+    await act(async () => { renderer.unmount(); });
+  } finally { globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct; }
 });
 
 test("Factory and Agents are explicit left-side alternatives", () => {

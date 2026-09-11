@@ -17,6 +17,7 @@ type consoleDispatchBackend struct {
 	mu            sync.Mutex
 	client        [browserprotocol.ClientIDSize]byte
 	agent         browserprotocol.AgentUpdateResult
+	limits        browserprotocol.ProjectLimitsResult
 	task          browserprotocol.TaskUpdateResult
 	topology      browserprotocol.Topology
 	account       browserprotocol.AccountLinkResult
@@ -32,6 +33,7 @@ func newConsoleDispatchBackend() *consoleDispatchBackend {
 	base.authentication.Capabilities |= browserprotocol.CapabilityHumanActions
 	backend := &consoleDispatchBackend{fakeBackend: base}
 	backend.agent = browserprotocol.AgentUpdateResult{AgentID: consoleAgentID, Revision: 8}
+	backend.limits = browserprotocol.ProjectLimitsResult{ProjectID: consoleProjectID, Revision: 8}
 	backend.task = browserprotocol.TaskUpdateResult{TaskID: consoleTaskID, Revision: 4}
 	backend.account = browserprotocol.AccountLinkResult{AccountID: consoleAccountID, Revision: 1}
 	backend.accountUpdate = browserprotocol.AccountUpdateResult{AccountID: consoleAccountID, Revision: 2}
@@ -68,6 +70,13 @@ func (backend *consoleDispatchBackend) UpdateTask(_ context.Context, client [bro
 		return browserprotocol.TaskUpdateResult{}, err
 	}
 	return backend.task, nil
+}
+
+func (backend *consoleDispatchBackend) SetProjectLimits(_ context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.ProjectLimits) (browserprotocol.ProjectLimitsResult, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.ProjectLimitsResult{}, err
+	}
+	return backend.limits, nil
 }
 
 func (backend *consoleDispatchBackend) Topology(ctx context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.TopologyGet) (browserprotocol.Topology, error) {
@@ -153,6 +162,8 @@ var consoleRequests = []struct {
 }{
 	{browserprotocol.TypeAgentUpdate, browserprotocol.TypeAgentUpdateResult,
 		`{"type":"AGENT_UPDATE","id":"console-agent","body":{"agent_id":"` + consoleAgentID + `","expected_revision":"7","paused":true}}`},
+	{browserprotocol.TypeProjectLimits, browserprotocol.TypeProjectLimitsResult,
+		`{"type":"PROJECT_LIMITS","id":"console-limits","body":{"project_id":"` + consoleProjectID + `","expected_revision":"7","run_budget":"12","max_run_seconds":900}}`},
 	{browserprotocol.TypeTaskUpdate, browserprotocol.TypeTaskUpdateResult,
 		`{"type":"TASK_UPDATE","id":"console-task","body":{"task_id":"` + consoleTaskID + `","expected_revision":"3","status":"cancelled"}}`},
 	{browserprotocol.TypeTopologyGet, browserprotocol.TypeTopology,
@@ -230,6 +241,8 @@ func TestConsoleControlFailsClosedWithoutBackendAndOnBackendRefusal(t *testing.T
 		}{
 			{browserprotocol.TypeAgentUpdate, func(backend *consoleDispatchBackend) { backend.agent.Revision = 7 }},
 			{browserprotocol.TypeAgentUpdate, func(backend *consoleDispatchBackend) { backend.agent.AgentID = consoleTaskID }},
+			{browserprotocol.TypeProjectLimits, func(backend *consoleDispatchBackend) { backend.limits.Revision = 7 }},
+			{browserprotocol.TypeProjectLimits, func(backend *consoleDispatchBackend) { backend.limits.ProjectID = consoleTaskID }},
 			{browserprotocol.TypeTaskUpdate, func(backend *consoleDispatchBackend) { backend.task.Revision = 3 }},
 			{browserprotocol.TypeTaskUpdate, func(backend *consoleDispatchBackend) { backend.task.TaskID = consoleAgentID }},
 			{browserprotocol.TypeAccountUpdate, func(backend *consoleDispatchBackend) { backend.accountUpdate.Revision = 1 }},
