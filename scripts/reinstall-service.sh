@@ -89,6 +89,13 @@ install_stalled() {
 [ -f "$db" ] || { echo "no store at $db" >&2; exit 1; }
 refuse_dispatch_enabled
 refuse_active_runs
+# The old verifier profile was under the strict runtime-home census. Only
+# inspect it when an old entry or unsafe home path exists, so normal installs
+# retain no Node dependency.
+legacy_profile="$home/verification-browser"
+if [ -L "$home" ] || { [ -e "$home" ] && [ ! -d "$home" ]; } || [ -e "$legacy_profile" ] || [ -L "$legacy_profile" ]; then
+    node "$repository_root/scripts/verification-profile.mjs"
+fi
 
 git -C "$repository_root" fetch -q origin
 # An empty hooksPath, as new-worktree.sh: the repository's configured hooks

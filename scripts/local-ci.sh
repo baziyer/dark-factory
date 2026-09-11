@@ -14,6 +14,7 @@ echo "local-ci: repository contract fixtures"
 ./scripts/test-new-worktree.sh
 ./scripts/test-reinstall-service.sh
 ./scripts/test-deploy-site.sh
+node ./scripts/test-verification-profile.mjs
 ./scripts/test-cold-review.sh
 python3 ./scripts/test-factory-intake.py
 python3 ./scripts/test-factory-notify.py
