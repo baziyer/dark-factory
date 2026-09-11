@@ -1,0 +1,20 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "project_id": "32-hex-project-id",
+  "overseer_agent_id": "32-hex-overseer-id",
+  "label": "factory:ready",
+  "allowed_authors": [
+    "trusted-maintainer"
+  ],
+  "priority_default": 0,
+  "priority_by_label": {
+    "priority:high": 50,
+    "priority:low": -25
+  },
+  "max_issues": 25,
+  "poll_seconds": 120,
+  "factory_home": "/Users/you/.dark-factory",
+  "journal": "/Users/you/.dark-factory/github-intake.json",
+  "review_mirror_root": "/Users/you/.dark-factory-mirrors",
+  "release_configs": []
+}

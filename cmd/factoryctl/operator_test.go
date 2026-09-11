@@ -19,13 +19,17 @@ func TestParseExactOperatorCommands(t *testing.T) {
 		args []string
 	}{
 		{name: "project create", args: []string{"project", "create", "--name", "North Workshop", "--root", "/private/tmp/repo"}},
+		{name: "project limits", args: []string{"project", "limits", "--project", id, "--revision", "7", "--run-budget", "20", "--max-run-seconds", "900"}},
 		{name: "agent create shell default role", args: []string{"agent", "create", "--project", id, "--name", "Builder One", "--provider", "shell", "--tool-budget", "100"}},
 		{name: "agent create codex controls", args: []string{"agent", "create", "--project", id, "--name", "Foreman", "--provider", "codex", "--model", "gpt-5.6-luna", "--reasoning-effort", "medium", "--tool-budget", "100", "--role", "orchestrator"}},
 		{name: "task add minimal", args: []string{"task", "add", "--project", id, "--agent", id, "--title", "Tighten the queue ordering"}},
 		{name: "task add full", args: []string{"task", "add", "--project", id, "--agent", id, "--title", "t", "--body", "b", "--priority", "-5"}},
+		{name: "task add supplied identities", args: []string{"task", "add", "--project", id, "--agent", id, "--title", "t", "--task-id", id, "--incarnation-id", strings.Repeat("cd", 16)}},
+		{name: "status", args: []string{"status"}},
 		{name: "task send back", args: []string{"task", "send-back", "--task", id, "--note", "five findings"}},
 		{name: "dispatch on", args: []string{"dispatch", "on"}},
 		{name: "dispatch off", args: []string{"dispatch", "off"}},
+		{name: "dispatch guarded", args: []string{"dispatch", "on", "--revision", "7"}},
 	}
 	for _, test := range valid {
 		t.Run(test.name, func(t *testing.T) {
@@ -44,6 +48,8 @@ func TestParseExactOperatorCommands(t *testing.T) {
 		{"project", "create", "--name", "n", "--root", "relative"},
 		{"project", "create", "--name", "n", "--root", "/r", "--name", "n"},
 		{"project", "create", "--name", "n", "--root", "/r", "--project", id},
+		{"project", "limits", "--project", id, "--revision", "0", "--run-budget", "1", "--max-run-seconds", "1"},
+		{"project", "limits", "--project", id, "--revision", "1", "--run-budget", "1", "--max-run-seconds", "86401"},
 		{"agent", "create", "--project", id, "--name", "n"},
 		{"agent", "create", "--project", id, "--name", "n", "--tool-budget", "1"},
 		{"agent", "create", "--project", id, "--name", "n", "--provider", "unknown", "--tool-budget", "1"},
@@ -62,12 +68,15 @@ func TestParseExactOperatorCommands(t *testing.T) {
 		{"task", "add", "--project", id, "--agent", id, "--title", ""},
 		{"task", "add", "--project", id, "--agent", id, "--title", "t", "--priority", "1000001"},
 		{"task", "add", "--project", id, "--agent", id, "--title", "t", "--priority", "+1"},
+		{"task", "add", "--project", id, "--agent", id, "--title", "t", "--task-id", id},
 		{"task", "send-back", "--task", id},
 		{"task", "send-back", "--note", "n"},
 		{"task", "send-back", "--task", id, "--note", ""},
 		{"task", "send-back", "--task", "short", "--note", "n"},
 		{"task", "send-back", "--task", id, "--note", strings.Repeat("n", 8193)},
 		{"dispatch", "toggle"},
+		{"dispatch", "on", "--revision", "0"},
+		{"dispatch", "on", "--revision", "01"},
 		{"dispatch"},
 		{"project", "make", "--name", "n", "--root", "/r"},
 	}
@@ -281,6 +290,30 @@ func TestDispatchReadsExactFactoryRevisionThenSets(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"enabled":true`) || !strings.Contains(stdout.String(), `"revision":22`) {
 		t.Fatalf("printed %q", stdout.String())
+	}
+}
+
+func TestDispatchExplicitRevisionDoesNotRefreshOrOverrideTheGuard(t *testing.T) {
+	fixture := newAPIFixture(t)
+	defer fixture.close(t)
+	done := serveOne(fixture.listener, func(call api.Call) api.Reply {
+		revision, enabled, ok := call.Dispatch()
+		if !ok || call.Kind() != api.CallSetDispatch || revision != 19 || !enabled {
+			t.Errorf("guarded dispatch = kind=%v revision=%d enabled=%v ok=%v", call.Kind(), revision, enabled, ok)
+		}
+		reply, err := api.NewErrorReply(api.RemoteConflict)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reply
+	})
+	var stdout, stderr bytes.Buffer
+	exit := run(context.Background(), []string{"dispatch", "on", "--revision", "19"}, webEnvironment(fixture), &stdout, &stderr)
+	if result := awaitServer(t, done); result.err != nil {
+		t.Fatal(result.err)
+	}
+	if exit == 0 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "not accepted") {
+		t.Fatalf("guarded stale dispatch = exit %d stdout %q stderr %q", exit, stdout.String(), stderr.String())
 	}
 }
 

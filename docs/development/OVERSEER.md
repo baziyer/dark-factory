@@ -84,6 +84,8 @@ without any remote credential, and the Maintainer App as the one MCP server
   attempt alive for the reply (section 6). The request is the NEEDS YOU card
   on the operator's console while the run lives.
 
+For unattended projects, also follow [UNATTENDED.md](UNATTENDED.md).
+
 ## 1. Find what a worker finished
 
 The daemon home is two directories above `$DARK_FACTORY_SOCKET`. Its store is
@@ -250,6 +252,10 @@ review_base=$(git -C repo merge-base "$base_commit" "$HEAD_SHA")
 git -C repo diff --numstat "$review_base" "$HEAD_SHA"
 ```
 
+For source-linked work, preserve the exact `Refs #NUMBER` (deployment required)
+or `Closes #NUMBER` source footer as the final line of the replacement body.
+A body update does not reconstruct that link automatically.
+
 The supplied body must be the fresh text only: do not copy an App operation
 marker or a `Dark-Factory-Review:` line from the old body. Write it to
 `body.md`, call `observe_operation` for `body-HEAD8`, and if it is not
@@ -267,13 +273,18 @@ curl -s "https://api.github.com/repos/OWNER/REPO/pulls/$PR" | python3 -c 'import
 A resumed first publication whose `pr` is completed but whose `body.md` is
 not in this run's directory takes its body the same way. Then go to the review.
 
+For GitHub-imported work, preserve its `FACTORY_SOURCE OWNER/REPO#NUMBER` marker in
+worker tasks and reuse that issue here. Observe its current state before
+publication; withdrawn or changed sources require reconciliation. Create a new
+tracking issue only when the task has no source issue.
+
 `create_pull_request` needs an issue. `create_issue` with `opid "$change_id" issue`, the
 task title (cut to 256 characters, the App's bound), and a body of the task
 text plus the change id; it returns the issue number. Then read
 `observe_ref` for `main` again, immediately before the call, and use that
 answer: `create_pull_request` with `opid "$change_id" pr`, `issue_number` from that
 result, `head = branch`, `head_sha` = the last published commit, `base =
-main`, `base_sha` = main's head as just read (the App verifies the base
+main`, `close_on_merge = false` when acceptance requires deployment, `base_sha` = main's head as just read (the App verifies the base
 branch is at that commit at that moment; `base_commit` is wrong whenever
 main moved, and a stale read is wrong whenever main moves between the read
 and the call), `draft = false`, the same title, and a body in this

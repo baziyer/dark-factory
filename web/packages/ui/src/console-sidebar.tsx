@@ -535,6 +535,9 @@ export function SettingsDialog({
   load.current = onLoadAccounts;
   useEffect(() => { load.current?.(); }, []);
   const close = () => dialog.current?.close();
+  const projects = state === undefined ? [] : [...state.projects.values()];
+  const allowance = projects.length === 0 ? "NOT LIMITED" : projects.map((project) => project.run_budget_limit === 0n ? `${project.name}: NOT LIMITED (${project.runs_used} USED)` : `${project.name}: ${project.run_budget_limit > project.runs_used ? project.run_budget_limit - project.runs_used : 0n} LEFT (${project.runs_used} USED)`).join(" · ");
+  const duration = projects.length === 0 ? "NOT LIMITED" : projects.map((project) => project.max_run_seconds === 0 ? `${project.name}: NOT LIMITED` : `${project.name}: ${project.max_run_seconds} SECONDS`).join(" · ");
   return (
     <dialog
       className="dfConsoleDialog"
@@ -555,6 +558,8 @@ export function SettingsDialog({
               <div><dt>DISPATCH</dt><dd>{state.factory.dispatch_enabled ? "ENABLED" : "PAUSED"}</dd></div>
               <div><dt>WORKER SLOTS</dt><dd>{String(state.factory.capacity)}</dd></div>
               <div><dt>ACTIVE RUNS</dt><dd>{`${state.factory.active_runs} TOTAL`}</dd></div>
+              <div><dt>RUN ALLOWANCE</dt><dd>{allowance}</dd></div>
+              <div><dt>PER-RUN LIMIT</dt><dd>{duration}</dd></div>
               <div><dt>REVISION</dt><dd>{state.factory.revision.toString()}</dd></div>
             </dl>
           )}
@@ -667,13 +672,12 @@ function AccountsSection({
   );
 }
 
-/** Private question and controls inside the selected Needs You row. */
+/** Private decision and controls inside the selected Needs You row. */
 export function HumanRequestPanel({
   selected,
   onReplyChange,
   onReply,
   onCancel,
-  onClose,
   onOpenTerminal,
   terminalReady,
 }: {
@@ -681,7 +685,6 @@ export function HumanRequestPanel({
   onReplyChange?: (reply: string) => void;
   onReply?: () => void;
   onCancel?: () => void;
-  onClose?: () => void;
   onOpenTerminal?: (request: FactoryHumanRequestView["request"]) => void;
   terminalReady: boolean;
 }) {
@@ -691,9 +694,13 @@ export function HumanRequestPanel({
     <article className="dfFactoryConsole__humanRequest" aria-label="Selected question" aria-live="polite">
       {selected.phase === "loading" ? <p className="dfFactoryConsole__empty">LOADING THE QUESTION…</p> : (
         <>
+          <h3>DECISION NEEDED</h3>
           <p className="dfFactoryConsole__question">{selected.question}</p>
           {selected.canReply ? (
             <form className="dfFactoryConsole__reply" aria-label="Answer this question" onSubmit={submit}>
+              {selected.options.length === 0 ? null : <div className="dfFactoryConsole__answerOptions" role="group" aria-label="Suggested answers">
+                {selected.options.map((option, index) => <button type="button" key={option} disabled={busy || onReplyChange === undefined} onClick={() => onReplyChange?.(option)}>{option}{index === 0 ? " · RECOMMENDED" : ""}</button>)}
+              </div>}
               <label htmlFor="dfHumanRequestReply">YOUR ANSWER</label>
               <textarea
                 id="dfHumanRequestReply"
@@ -706,12 +713,11 @@ export function HumanRequestPanel({
             </form>
           ) : null}
           <div className="dfFactoryConsole__humanActions">
-            {selected.canCancel ? <button type="button" disabled={busy || onCancel === undefined} onClick={onCancel}>Stop</button> : null}
+            {selected.canCancel ? <button type="button" disabled={busy || onCancel === undefined} onClick={onCancel}>STOP TASK</button> : null}
             {onOpenTerminal === undefined ? null : <button type="button" disabled={busy || !terminalReady} onClick={() => onOpenTerminal(selected.request)}>OPEN TERMINAL</button>}
           </div>
         </>
       )}
-      <button type="button" disabled={busy || onClose === undefined} onClick={onClose}>CLOSE</button>
     </article>
   );
 }

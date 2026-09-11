@@ -64,6 +64,19 @@ export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}
     previousSelectedAgentID.current = selectedAgentID;
   }, [selectedAgentID]);
 
+  // A lone decision has no competing context. Open it once; a collapsed item
+  // remains collapsed until the factory asks a different question.
+  const openedHumanRequest = useRef<string | undefined>(undefined);
+  const loneHumanRequest = snapshot.state !== undefined && snapshot.state.humanRequests.size === 1 ? snapshot.state.humanRequests.values().next().value : undefined;
+  useEffect(() => {
+    const controller = owner.current;
+    const request = loneHumanRequest;
+    if (controller === undefined || snapshot.status !== "ready" || snapshot.selectedHumanRequest !== undefined || request === undefined || openedHumanRequest.current === request.id) return;
+    openedHumanRequest.current = request.id;
+    setDetail("needs-you");
+    void controller.selectHumanRequest(request);
+  }, [snapshot.status, snapshot.selectedHumanRequest, loneHumanRequest]);
+
   // The floor's rooms are regenerable, so they are fetched when the floor is
   // shown, whenever a fresh session becomes ready, and whenever the set of
   // projects changes under them.

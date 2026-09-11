@@ -14,8 +14,8 @@ export const fixtureState = {
   head: 42n,
   factory: { dispatch_enabled: true, capacity: 8, active_runs: 2, revision: 42n },
   projects: new Map([
-    [projectID, { id: projectID, name: "North Workshop", revision: 4n }],
-    [secondProjectID, { id: secondProjectID, name: "South Workshop", revision: 5n }],
+    [projectID, { id: projectID, name: "North Workshop", run_budget_limit: 12n, runs_used: 5n, max_run_seconds: 900, revision: 4n }],
+    [secondProjectID, { id: secondProjectID, name: "South Workshop", run_budget_limit: 0n, runs_used: 3n, max_run_seconds: 0, revision: 5n }],
   ]),
   agents: new Map([
     [agentID, { id: agentID, project_id: projectID, name: "Builder One", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision: 10n, account_id: accountID, idle_policy: "wait", idle_after_seconds: 0, idle_instruction: "", idle_run_budget: 0, idle_runs_used: 0 }],

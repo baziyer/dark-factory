@@ -250,6 +250,10 @@ func TestBrowserAdapterPairsAuthenticatesSnapshotsAndReloadsRevocation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	project, err = fixture.store.SetProjectLimits(ctx, project.ID, project.Revision, 7, 900, adapterTime(t, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
 	agent, err := fixture.store.CreateAgent(ctx, kernel.NewAgent{ID: agentID, ProjectID: project.ID, Name: "public agent", Role: kernel.RoleOrchestrator, Provider: kernel.ProviderCodex, Model: "SERVED_MODEL_FACT", ToolBudgetLimit: 4}, adapterTime(t, 11))
 	if err != nil {
 		t.Fatal(err)
@@ -268,6 +272,9 @@ func TestBrowserAdapterPairsAuthenticatesSnapshotsAndReloadsRevocation(t *testin
 	snapshot := frame.Body.(browserprotocol.StateSnapshot)
 	if len(snapshot.Projects) != 1 || len(snapshot.Agents) != 1 || len(snapshot.Tasks) != 1 {
 		t.Fatalf("one snapshot did not carry the whole Factory: %+v", snapshot)
+	}
+	if project := snapshot.Projects[0]; project.RunBudgetLimit != 7 || project.RunsUsed != 0 || project.MaxRunSeconds != 900 {
+		t.Fatalf("snapshot project limits = %+v", project)
 	}
 	for _, sentinel := range []string{"PRIVATE_ROOT_SENTINEL", "PRIVATE_BODY_SENTINEL"} {
 		if bytes.Contains(payload, []byte(sentinel)) {

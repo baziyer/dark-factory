@@ -25,7 +25,7 @@ func projectSnapshot(snapshot kernel.DashboardSnapshot) api.DashboardSnapshot {
 	}
 	for _, project := range snapshot.Projects {
 		result.Projects = append(result.Projects, api.ProjectSummary{
-			ID: project.ID.String(), Name: project.Name, Revision: uint64(project.Revision.Int64()),
+			ID: project.ID.String(), Name: project.Name, RunBudgetLimit: project.RunBudgetLimit, RunsUsed: project.RunsUsed, MaxRunSeconds: project.MaxRunSeconds, Revision: uint64(project.Revision.Int64()),
 		})
 	}
 	for _, agent := range snapshot.Agents {

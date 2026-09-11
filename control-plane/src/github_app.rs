@@ -26,6 +26,8 @@ const MAX_COMMIT_FILES: usize = 50;
 const MAX_COMMIT_FILE_BYTES: usize = 1_000_000;
 const MAX_ISSUE_COMMENT_PAGES: usize = 10;
 const MAX_ISSUE_COMMENTS_PER_PAGE: usize = 100;
+const MAX_ISSUE_LABELS: usize = 100;
+const MAX_ISSUE_LABEL_BYTES: usize = 50;
 const MAX_WORKFLOW_RUNS: usize = 20;
 const MAX_WORKFLOW_JOBS: usize = 100;
 const MAX_WORKFLOW_STEPS: usize = 100;
@@ -248,6 +250,19 @@ pub(crate) struct CreatePullRequest {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) draft: bool,
+    #[serde(
+        default = "default_close_on_merge",
+        skip_serializing_if = "close_on_merge_is_default"
+    )]
+    pub(crate) close_on_merge: bool,
+}
+
+const fn default_close_on_merge() -> bool {
+    true
+}
+
+fn close_on_merge_is_default(value: &bool) -> bool {
+    *value
 }
 
 /// Replace an open pull request's body. The App adds its own operation marker
@@ -476,6 +491,10 @@ pub(crate) struct ObserveIssue {
 pub(crate) struct IssueObservationResult {
     pub(crate) number: i64,
     pub(crate) url: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) labels: Vec<String>,
+    pub(crate) updated_at: String,
     pub(crate) state: String,
     pub(crate) state_reason: Option<String>,
 }
@@ -2877,7 +2896,11 @@ impl CreatePullRequest {
     }
 
     fn marked_body(&self) -> Result<String, OperationError> {
-        let closes = format!("Closes #{}", self.issue_number);
+        let closes = if self.close_on_merge {
+            format!("Closes #{}", self.issue_number)
+        } else {
+            format!("Refs #{}", self.issue_number)
+        };
         if self.body.is_empty() {
             Ok(format!("{}\n\n{}", closes, self.marker()?))
         } else {
@@ -3584,6 +3607,30 @@ fn valid_text(
             !character.is_control() || (allow_newline && matches!(character, '\n' | '\r' | '\t'))
         });
     valid.then_some(()).ok_or(OperationError::InvalidInput)
+}
+
+fn valid_github_timestamp(value: &str) -> Result<(), OperationError> {
+    let bytes = value.as_bytes();
+    let punctuation = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'Z'),
+    ];
+    (bytes.len() == 20
+        && punctuation
+            .iter()
+            .all(|(index, expected)| bytes[*index] == *expected)
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            punctuation
+                .iter()
+                .any(|(punctuation_index, _)| index == *punctuation_index)
+                || byte.is_ascii_digit()
+        }))
+    .then_some(())
+    .ok_or(OperationError::InvalidInput)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5720,7 +5767,7 @@ impl RepositoryMetadata {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 #[derive(Deserialize)]
 struct Issue {
     number: i64,
@@ -5732,10 +5779,20 @@ struct Issue {
     #[serde(default)]
     state_reason: Option<String>,
     #[serde(default)]
+    labels: Vec<IssueLabel>,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
     pull_request: Option<serde_json::Value>,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Deserialize)]
+struct IssueLabel {
+    name: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 impl Issue {
     fn matches_create(&self, request: &CreateIssue) -> bool {
         self.is_real_issue()
@@ -5768,9 +5825,25 @@ impl Issue {
         if !self.is_real_issue() || !matches!(self.state.as_str(), "open" | "closed") {
             return Err(OperationError::Conflict);
         }
+        valid_text(&self.title, 1, 256, false)?;
+        let body = self.body.unwrap_or_default();
+        valid_text(&body, 0, 30_000, true)?;
+        if self.labels.len() > MAX_ISSUE_LABELS {
+            return Err(OperationError::InvalidInput);
+        }
+        let mut labels = Vec::with_capacity(self.labels.len());
+        for label in self.labels {
+            valid_text(&label.name, 1, MAX_ISSUE_LABEL_BYTES, false)?;
+            labels.push(label.name);
+        }
+        valid_github_timestamp(&self.updated_at)?;
         Ok(IssueObservationResult {
             number: self.number,
             url: self.html_url,
+            title: self.title,
+            body,
+            labels,
+            updated_at: self.updated_at,
             state: self.state,
             state_reason: self.state_reason,
         })
@@ -9135,6 +9208,69 @@ mod tests {
     }
 
     #[test]
+    fn observed_issue_carries_bounded_current_source_facts() {
+        let issue = |title: String, body: String, labels: Vec<String>, updated_at: &str| {
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "number": 349,
+                "html_url": "https://github.com/dark-factory-build/dark-factory/issues/349",
+                "title": title,
+                "body": body,
+                "state": "open",
+                "labels": labels.into_iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
+                "updated_at": updated_at
+            }))
+            .unwrap()
+        };
+        let observed = issue(
+            "Current issue".into(),
+            "Current body".into(),
+            vec!["factory".into(), "priority:high".into()],
+            "2026-09-11T08:53:14Z",
+        )
+        .into_observation()
+        .unwrap();
+        assert_eq!(observed.title, "Current issue");
+        assert_eq!(observed.body, "Current body");
+        assert_eq!(observed.labels, ["factory", "priority:high"]);
+        assert_eq!(observed.updated_at, "2026-09-11T08:53:14Z");
+        assert!(
+            issue(
+                "x".repeat(257),
+                "body".into(),
+                Vec::new(),
+                "2026-09-11T08:53:14Z"
+            )
+            .into_observation()
+            .is_err()
+        );
+        assert!(
+            issue(
+                "title".into(),
+                "x".repeat(30_001),
+                Vec::new(),
+                "2026-09-11T08:53:14Z"
+            )
+            .into_observation()
+            .is_err()
+        );
+        assert!(
+            issue(
+                "title".into(),
+                "body".into(),
+                vec!["x".repeat(51)],
+                "2026-09-11T08:53:14Z"
+            )
+            .into_observation()
+            .is_err()
+        );
+        assert!(
+            issue("title".into(), "body".into(), Vec::new(), "yesterday")
+                .into_observation()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn typed_operation_inputs_are_exact_head_bound_and_bounded() {
         let mut issue = CreateIssue {
             repository: "dark-factory-build/dark-factory".into(),
@@ -9282,9 +9418,35 @@ mod tests {
             title: "Add maintainer operations".into(),
             body: "Exact-head change.".into(),
             draft: false,
+            close_on_merge: true,
         };
         assert!(create.validate().is_ok());
         assert!(create.marked_body().unwrap().contains("Closes #390"));
+        let mut references = create.clone();
+        references.close_on_merge = false;
+        assert!(references.marked_body().unwrap().contains("Refs #390"));
+        assert_ne!(
+            request_digest(&create).unwrap(),
+            request_digest(&references).unwrap()
+        );
+        assert_eq!(
+            request_digest(&create).unwrap(),
+            "9d780d819ca647446eb71292e554d0a5f941414c2c20ff854b6e1dd5458d67e7"
+        );
+        let old_request = serde_json::to_value(&create).unwrap();
+        assert!(old_request.get("close_on_merge").is_none());
+        let replay = serde_json::from_value::<CreatePullRequest>(old_request).unwrap();
+        assert!(replay.close_on_merge);
+        assert_eq!(
+            request_digest(&create).unwrap(),
+            request_digest(&replay).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&references)
+                .unwrap()
+                .get("close_on_merge"),
+            Some(&serde_json::Value::Bool(false))
+        );
         assert!(
             create
                 .marked_body()

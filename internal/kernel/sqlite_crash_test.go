@@ -228,7 +228,9 @@ func TestConcreteStoreCrashBeforeAndAfterAdmissionCommit(t *testing.T) {
 		mode         string
 		wantRevision int64
 		wantHead     int64
-	}{{"before", "admit-before", 1, 3}, {"after", "admit-after", 2, 6}} {
+		// A committed admission also publishes the project's incremented lifetime
+		// run count, so its project invalidation advances the durable head once.
+	}{{"before", "admit-before", 1, 3}, {"after", "admit-after", 2, 7}} {
 		t.Run(test.name, func(t *testing.T) {
 			store, path, project, agent := newAdmissionStore(t, RoleOrchestrator, 2)
 			task, err := store.EnqueueTask(context.Background(), NewTask{ID: taskID(t, 228), ProjectID: project.ID, AssignedAgentID: agent.ID, IncarnationID: incarnationID(t, 229), Title: "crash"}, mustTime(t, 5))

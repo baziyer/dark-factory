@@ -51,14 +51,14 @@ func projectByID(ctx context.Context, connection *sql.Conn, id ProjectID) (Proje
 	if id.zero() {
 		return Project{}, false, fmt.Errorf("%w: zero project identifier", ErrInvalidValue)
 	}
-	return scanProject(connection.QueryRowContext(ctx, `SELECT id, name, root, verification_policy, revision, created_at_ms, updated_at_ms FROM projects WHERE id = ?`, id.Bytes()))
+	return scanProject(connection.QueryRowContext(ctx, `SELECT id, name, root, verification_policy, run_budget_limit, runs_used, max_run_seconds, revision, created_at_ms, updated_at_ms FROM projects WHERE id = ?`, id.Bytes()))
 }
 
 func scanProject(scanner rowScanner) (Project, bool, error) {
 	var rawID []byte
 	var name, root, policyValue string
-	var revision, createdAt, updatedAt int64
-	if err := scanner.Scan(&rawID, &name, &root, &policyValue, &revision, &createdAt, &updatedAt); err != nil {
+	var revision, createdAt, updatedAt, runBudget, runsUsed, maxRunSeconds int64
+	if err := scanner.Scan(&rawID, &name, &root, &policyValue, &runBudget, &runsUsed, &maxRunSeconds, &revision, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Project{}, false, nil
 		}
@@ -66,7 +66,7 @@ func scanProject(scanner rowScanner) (Project, bool, error) {
 	}
 	id, err := ProjectIDFromBytes(rawID)
 	policy, policyErr := parseVerificationPolicy(policyValue)
-	if err != nil || policyErr != nil || byteLen(name) < 1 || byteLen(name) > 128 || !validAbsolutePath(root) || updatedAt < createdAt {
+	if err != nil || policyErr != nil || byteLen(name) < 1 || byteLen(name) > 128 || !validAbsolutePath(root) || runBudget < 0 || runsUsed < 0 || (runBudget != 0 && runsUsed > runBudget) || maxRunSeconds < 0 || maxRunSeconds > 86400 || updatedAt < createdAt {
 		return Project{}, false, fmt.Errorf("%w: invalid project row", ErrCorruptState)
 	}
 	rev, err := NewRevision(revision)
@@ -81,7 +81,7 @@ func scanProject(scanner rowScanner) (Project, bool, error) {
 	if err != nil {
 		return Project{}, false, fmt.Errorf("%w: invalid project update time", ErrCorruptState)
 	}
-	return Project{ID: id, Name: name, Root: root, VerificationPolicy: policy, Revision: rev, CreatedAt: created, UpdatedAt: updated}, true, nil
+	return Project{ID: id, Name: name, Root: root, VerificationPolicy: policy, RunBudgetLimit: uint64(runBudget), RunsUsed: uint64(runsUsed), MaxRunSeconds: uint32(maxRunSeconds), Revision: rev, CreatedAt: created, UpdatedAt: updated}, true, nil
 }
 
 func agentByID(ctx context.Context, connection *sql.Conn, id AgentID) (Agent, bool, error) {

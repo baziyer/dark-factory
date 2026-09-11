@@ -25,7 +25,9 @@ const (
 func factoryItem() FactoryItem {
 	return FactoryItem{DispatchEnabled: true, Capacity: 8, ActiveRuns: 2, Revision: 1}
 }
-func projectItem() ProjectItem { return ProjectItem{ID: projectID, Name: "Factory", Revision: 1} }
+func projectItem() ProjectItem {
+	return ProjectItem{ID: projectID, Name: "Factory", RunBudgetLimit: 12, RunsUsed: 5, MaxRunSeconds: 900, Revision: 1}
+}
 func agentItem() AgentItem {
 	return AgentItem{ID: agentID, ProjectID: projectID, Name: "Worker", Role: "worker", Provider: "claude_code", Revision: 1}
 }

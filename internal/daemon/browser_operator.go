@@ -30,11 +30,23 @@ func (daemon *Daemon) webRuntime() (*BrowserRuntime, bool) {
 	}
 	daemon.browserMu.Lock()
 	defer daemon.browserMu.Unlock()
-	if daemon.browserClosing || len(daemon.browsers) != 1 {
+	if daemon.browserClosing {
 		return nil, false
 	}
-	for runtime := range daemon.browsers {
-		return runtime, runtime != nil && !runtime.closing && runtime.server != nil && runtime.backend != nil
+	if len(daemon.browsers) == 1 {
+		for runtime := range daemon.browsers {
+			return runtime, runtime != nil && !runtime.closing && runtime.server != nil && runtime.backend != nil
+		}
+	}
+	// With several listeners, select the one the relay actually uses.
+	// Extra transport listeners must not make the public surface report stopped.
+	if daemon.relay != nil {
+		for runtime := range daemon.browsers {
+			if runtime != nil && runtime.Addr() == daemon.relay.browserAddress {
+				return runtime, !runtime.closing && runtime.server != nil && runtime.backend != nil
+			}
+		}
+		return nil, false
 	}
 	return nil, false
 }

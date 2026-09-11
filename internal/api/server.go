@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dark-factory-build/dark-factory/internal/install"
+	"github.com/dark-factory-build/dark-factory/internal/kernel"
 )
 
 // CallKind is the closed set of requests accepted by the local API.
@@ -22,6 +23,7 @@ const (
 	CallHealth CallKind = iota + 1
 	CallSnapshot
 	CallCreateProject
+	CallProjectLimits
 	CallCreateAgent
 	CallEnqueueTask
 	CallSetDispatch
@@ -68,6 +70,7 @@ type Call struct {
 	kind              CallKind
 	digest            AttemptDigest
 	project           CreateProjectInput
+	projectLimits     ProjectLimitsInput
 	agent             CreateAgentInput
 	task              EnqueueTaskInput
 	humanQuestion     HumanQuestionInput
@@ -146,6 +149,10 @@ func (call Call) OverseerHumanReplyInput() (OverseerHumanReplyInput, bool) {
 
 func (call Call) CreateProjectInput() (CreateProjectInput, bool) {
 	return call.project, call.kind == CallCreateProject
+}
+
+func (call Call) ProjectLimitsInput() (ProjectLimitsInput, bool) {
+	return call.projectLimits, call.kind == CallProjectLimits
 }
 
 func (call Call) CreateAgentInput() (CreateAgentInput, bool) {
@@ -559,6 +566,10 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		if err := decodeExact(request.Params, &call.project); err != nil || !validID(call.project.ID) || !validText(call.project.Name, 1, 128) || !validText(call.project.Root, 1, 4096) {
 			return Call{}, RemoteInvalidRequest
 		}
+	case CallProjectLimits:
+		if err := decodeExact(request.Params, &call.projectLimits); err != nil || !validID(call.projectLimits.ProjectID) || call.projectLimits.ExpectedRevision == 0 || call.projectLimits.RunBudget > uint64(^uint64(0)>>1) || call.projectLimits.MaxRunSeconds > 86400 {
+			return Call{}, RemoteInvalidRequest
+		}
 	case CallCreateAgent:
 		if err := decodeExact(request.Params, &call.agent); err != nil || !validCreateAgentInput(call.agent) {
 			return Call{}, RemoteInvalidRequest
@@ -597,7 +608,7 @@ func decodeCall(domain byte, bearer credential, encoded []byte) (Call, RemoteErr
 		}
 		call.text = detail
 	case CallRequestHuman:
-		if err := decodeExact(request.Params, &call.humanQuestion); err != nil || !validID(call.humanQuestion.IdempotencyKey) || !validText(call.humanQuestion.Question, 1, 8192) {
+		if err := decodeExact(request.Params, &call.humanQuestion); err != nil || !validID(call.humanQuestion.IdempotencyKey) || !validText(call.humanQuestion.Question, 1, 8192) || kernel.ValidateHumanOptions(call.humanQuestion.Options) != nil {
 			return Call{}, RemoteInvalidRequest
 		}
 	case CallPeerStatus:
@@ -681,6 +692,8 @@ func methodKind(method string) (CallKind, byte) {
 		return CallSnapshot, operatorDomain
 	case "create_project":
 		return CallCreateProject, operatorDomain
+	case "project_limits":
+		return CallProjectLimits, operatorDomain
 	case "create_agent":
 		return CallCreateAgent, operatorDomain
 	case "enqueue_task":
@@ -803,7 +816,7 @@ func replyMatches(kind CallKind, reply replyKind) bool {
 		return reply == replyPeerStatus
 	case CallOverseerSnapshot:
 		return reply == replyOverseerSnapshot
-	case CallCreateProject, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallPeerAsk, CallPeerAnswer, CallSendBack, CallSendBackTask, CallOverseerEnqueueTask, CallOverseerUpdateTask, CallOverseerUpdateAgent, CallOverseerStopRun, CallOverseerReplaceRun, CallOverseerMessageWorker, CallOverseerInterruptWorker, CallOverseerReplyHuman:
+	case CallCreateProject, CallProjectLimits, CallCreateAgent, CallEnqueueTask, CallSetDispatch, CallSucceed, CallBlock, CallFail, CallRequestHuman, CallPeerAsk, CallPeerAnswer, CallSendBack, CallSendBackTask, CallOverseerEnqueueTask, CallOverseerUpdateTask, CallOverseerUpdateAgent, CallOverseerStopRun, CallOverseerReplaceRun, CallOverseerMessageWorker, CallOverseerInterruptWorker, CallOverseerReplyHuman:
 		return reply == replyMutation
 	case CallWebStatus:
 		return reply == replyWebStatus

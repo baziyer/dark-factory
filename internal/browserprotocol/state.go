@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -107,9 +108,12 @@ type FactoryItem struct {
 }
 
 type ProjectItem struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	Revision Decimal `json:"revision"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	RunBudgetLimit Decimal `json:"run_budget_limit"`
+	RunsUsed       Decimal `json:"runs_used"`
+	MaxRunSeconds  uint32  `json:"max_run_seconds"`
+	Revision       Decimal `json:"revision"`
 }
 
 type AgentItem struct {
@@ -221,6 +225,7 @@ type HumanRequestDetail struct {
 	RequestID      string                           `json:"request_id"`
 	Revision       Decimal                          `json:"revision"`
 	Question       string                           `json:"question"`
+	Options        []string                         `json:"options,omitempty"`
 	CanReply       Bool                             `json:"can_reply"`
 	ReplyMaxBytes  uint16                           `json:"reply_max_bytes"`
 	TerminalTarget *TerminalTargetDescriptor        `json:"terminal_target"`
@@ -256,7 +261,7 @@ func validateFactoryItem(value FactoryItem) error {
 }
 
 func validateProjectItem(value ProjectItem) error {
-	if validateDynamicID(value.ID) != nil || validateBoundedText(value.Name, 1, MaxProjectNameBytes) != nil || value.Revision == 0 {
+	if validateDynamicID(value.ID) != nil || validateBoundedText(value.Name, 1, MaxProjectNameBytes) != nil || value.RunBudgetLimit != 0 && value.RunsUsed > value.RunBudgetLimit || value.MaxRunSeconds > 86400 || value.Revision == 0 {
 		return fmt.Errorf("%w: project item", ErrMalformed)
 	}
 	return nil
@@ -401,6 +406,16 @@ func validateHumanRequestDetailGet(value HumanRequestDetailGet) error {
 }
 
 func validateHumanRequestDetail(value HumanRequestDetail) error {
+	if len(value.Options) > 4 {
+		return ErrMalformed
+	}
+	seen := map[string]bool{}
+	for _, option := range value.Options {
+		if validateBoundedText(option, 1, 160) != nil || strings.TrimSpace(option) == "" || strings.ContainsAny(option, "\x00\r\n") || seen[option] {
+			return ErrMalformed
+		}
+		seen[option] = true
+	}
 	if validateDynamicID(value.RequestID) != nil || value.Revision == 0 || validateBoundedText(value.Question, 1, MaxHumanQuestionBytes) != nil || value.ReplyMaxBytes != MaxHumanReplyBytes {
 		return fmt.Errorf("%w: human request detail", ErrMalformed)
 	}

@@ -173,6 +173,13 @@ func (client *OperatorClient) CreateProject(ctx context.Context, input CreatePro
 	return client.client.mutate(ctx, "create_project", input)
 }
 
+func (client *OperatorClient) SetProjectLimits(ctx context.Context, input ProjectLimitsInput) (MutationResult, error) {
+	if !validID(input.ProjectID) || input.ExpectedRevision == 0 || input.RunBudget > uint64(^uint64(0)>>1) || input.MaxRunSeconds > 86400 {
+		return MutationResult{}, ErrInvalidInput
+	}
+	return client.client.mutate(ctx, "project_limits", input)
+}
+
 func (client *OperatorClient) CreateAgent(ctx context.Context, input CreateAgentInput) (MutationResult, error) {
 	if !validCreateAgentInput(input) {
 		return MutationResult{}, ErrInvalidInput
@@ -241,7 +248,7 @@ func (client *AttemptClient) Fail(ctx context.Context, detail string) (MutationR
 }
 
 func (client *AttemptClient) RequestHuman(ctx context.Context, input HumanQuestionInput) (MutationResult, error) {
-	if !validID(input.IdempotencyKey) || !validText(input.Question, 1, 8192) {
+	if !validID(input.IdempotencyKey) || !validText(input.Question, 1, 8192) || kernel.ValidateHumanOptions(input.Options) != nil {
 		return MutationResult{}, ErrInvalidInput
 	}
 	return client.client.mutate(ctx, "request_human", input)
@@ -819,7 +826,7 @@ func validSnapshot(snapshot DashboardSnapshot) bool {
 		return false
 	}
 	for _, project := range snapshot.Projects {
-		if !validID(project.ID) || !validText(project.Name, 1, 128) || project.Revision == 0 {
+		if !validID(project.ID) || !validText(project.Name, 1, 128) || project.RunBudgetLimit != 0 && project.RunsUsed > project.RunBudgetLimit || project.MaxRunSeconds > 86400 || project.Revision == 0 {
 			return false
 		}
 	}

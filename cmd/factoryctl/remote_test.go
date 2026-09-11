@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/dark-factory-build/dark-factory/internal/api"
@@ -25,7 +26,7 @@ func TestParseExactRemoteCommands(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			command, help, ok := parse(test.args)
-			if !ok || help != test.help || command != test.command {
+			if !ok || help != test.help || !reflect.DeepEqual(command, test.command) {
 				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 			}
 		})

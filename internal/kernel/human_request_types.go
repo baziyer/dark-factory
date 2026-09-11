@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -102,6 +103,7 @@ type HumanRequest struct {
 	Kind              HumanRequestKind
 	Status            HumanRequestStatus
 	QuestionText      string                  `json:"-"`
+	Options           []string                `json:"-"`
 	DeliveryID        *HumanRequestDeliveryID `json:"-"`
 	DeliveryStartedAt *UnixMillis             `json:"-"`
 	Resolution        *HumanRequestResolution `json:"-"`
@@ -132,6 +134,7 @@ type HumanRequestDetail struct {
 	ID             HumanRequestID
 	Revision       Revision
 	QuestionText   string
+	Options        []string
 	CanReply       bool
 	ReplyMaxBytes  uint32
 	TerminalTarget *TerminalTarget
@@ -157,6 +160,7 @@ func (cancelRun HumanRequestCancelRun) ExpectedRunRevision() Revision {
 type NewHumanQuestion struct {
 	IdempotencyKey [IDBytes]byte
 	QuestionText   string
+	Options        []string
 }
 
 type HumanDelivery struct {
@@ -172,7 +176,7 @@ func (input NewHumanQuestion) valid() error {
 	if input.IdempotencyKey == [IDBytes]byte{} {
 		return fmt.Errorf("%w: zero human request idempotency key", ErrInvalidValue)
 	}
-	if !utf8TextWithin(input.QuestionText, 1, MaxHumanRequestQuestionBytes) {
+	if !utf8TextWithin(input.QuestionText, 1, MaxHumanRequestQuestionBytes) || ValidateHumanOptions(input.Options) != nil {
 		return fmt.Errorf("%w: invalid human request question", ErrInvalidValue)
 	}
 	return nil
@@ -181,4 +185,19 @@ func (input NewHumanQuestion) valid() error {
 func utf8TextWithin(value string, minimum, maximum int) bool {
 	bytes := len([]byte(value))
 	return utf8.ValidString(value) && bytes >= minimum && bytes <= maximum
+}
+
+// ValidateHumanOptions bounds optional suggested answers; no suggestion is submitted automatically.
+func ValidateHumanOptions(options []string) error {
+	if len(options) > 4 {
+		return ErrInvalidValue
+	}
+	seen := map[string]bool{}
+	for _, option := range options {
+		if !utf8TextWithin(option, 1, 160) || strings.TrimSpace(option) == "" || strings.ContainsAny(option, "\x00\r\n") || seen[option] {
+			return ErrInvalidValue
+		}
+		seen[option] = true
+	}
+	return nil
 }

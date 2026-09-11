@@ -76,6 +76,24 @@ func TestWebOperatorOpenStatusListAndRevoke(t *testing.T) {
 	}
 }
 
+func TestWebStatusKeepsTheRelayBoundLoopbackListener(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve)
+	other, err := fixture.daemon.ListenBrowser("127.0.0.1:0", []string{adapterOrigin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	dialRelayFixture(t, fixture)
+
+	status, err := fixture.daemon.WebStatus(context.Background())
+	if err != nil || !status.Ready || status.Address != fixture.server.Addr() {
+		t.Fatalf("relay-bound web status = %+v, %v", status, err)
+	}
+	if _, err := fixture.daemon.OpenBrowser(context.Background()); err != nil {
+		t.Fatalf("relay-bound browser opening = %v", err)
+	}
+}
+
 // TestPairPageMintsTheSameChallengeAsTheOwnerMint drives the production listener
 // the way a browser does: the page's own same-origin form post answers with a
 // redirect carrying a fresh challenge, and the daemon counts it exactly once.

@@ -330,6 +330,10 @@ for local_child in \
     /bin/ln -s stub "$local_fixture/scripts/$local_child"
 done
 
+for local_python in intake notify release autonomy delivery review-intake source-refresh; do
+    printf 'pass\n' >"$local_fixture/scripts/test-factory-$local_python.py"
+done
+
 run_local_fault() {
     local_mode=$1
     set +e

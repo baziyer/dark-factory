@@ -83,6 +83,13 @@ func TestV6MigrationPreservesSendBackAndSupervision(t *testing.T) {
 	if err := rebuildTable(ctx, connection, expectedSchemaOf(v6SchemaStatements()), "invalidations", testInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 		t.Fatal(err)
 	}
+	target := expectedSchemaOf(v6SchemaStatements())
+	if err := rebuildTable(ctx, connection, target, "projects", "id, name, root, verification_policy, revision, created_at_ms, updated_at_ms", "projects_root_unique", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := rebuildTable(ctx, connection, target, "human_requests", "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms", "human_requests_one_unresolved_per_run", "", ""); err != nil {
+		t.Fatal(err)
+	}
 	for _, statement := range []string{"DROP TABLE peer_questions", "PRAGMA user_version = 6", "COMMIT"} {
 		if _, err := connection.ExecContext(ctx, statement); err != nil {
 			t.Fatal(err)

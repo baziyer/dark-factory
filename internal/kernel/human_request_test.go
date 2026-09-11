@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -44,7 +45,7 @@ func TestHumanQuestionCreationProjectionDetailAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := humanQuestionClient(t, store, 201, BrowserCapabilityObserve|BrowserCapabilityPrivateHumanRequestDetail|BrowserCapabilityHumanActions)
-	input := NewHumanQuestion{IdempotencyKey: humanKey(1), QuestionText: "QUESTION_PRIVATE_SENTINEL"}
+	input := NewHumanQuestion{IdempotencyKey: humanKey(1), QuestionText: "QUESTION_PRIVATE_SENTINEL", Options: []string{"Continue with the narrow fix", "Stop this task"}}
 	request, err := store.CreateHumanQuestionForAttempt(ctx, run.CredentialDigest, input, mustTime(t, 400))
 	if err != nil {
 		t.Fatal(err)
@@ -57,6 +58,11 @@ func TestHumanQuestionCreationProjectionDetailAndIdempotency(t *testing.T) {
 	changed.QuestionText = "different"
 	if _, err := store.CreateHumanQuestionForAttempt(ctx, run.CredentialDigest, changed, mustTime(t, 401)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("changed idempotency key content = %v", err)
+	}
+	changed = input
+	changed.Options = []string{"Different"}
+	if _, err := store.CreateHumanQuestionForAttempt(ctx, run.CredentialDigest, changed, mustTime(t, 401)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed options replay: %v", err)
 	}
 	projection, found, err := store.HumanRequest(ctx, request.ID)
 	if err != nil || !found {
@@ -79,16 +85,16 @@ func TestHumanQuestionCreationProjectionDetailAndIdempotency(t *testing.T) {
 		t.Fatalf("unsafe projection = %+v", projection)
 	}
 	encoded, err := json.Marshal(projection)
-	if err != nil || bytes.Contains(encoded, []byte(input.QuestionText)) {
+	if err != nil || (bytes.Contains(encoded, []byte(input.QuestionText)) || bytes.Contains(encoded, []byte(input.Options[0]))) {
 		t.Fatalf("public projection leaked question: %s, %v", encoded, err)
 	}
 	detail, err := store.HumanRequestDetail(ctx, client.ID, request.ID, request.Revision)
-	if err != nil || detail.QuestionText != input.QuestionText || detail.Revision != request.Revision {
+	if err != nil || detail.QuestionText != input.QuestionText || !slices.Equal(detail.Options, input.Options) || detail.Revision != request.Revision {
 		t.Fatalf("detail = %+v, %v", detail, err)
 	}
 	if snapshot, err := store.Snapshot(ctx); err != nil || len(snapshot.HumanRequests) != 1 {
 		t.Fatalf("snapshot = %+v, %v", snapshot, err)
-	} else if encoded, marshalErr := json.Marshal(snapshot); marshalErr != nil || bytes.Contains(encoded, []byte(input.QuestionText)) {
+	} else if encoded, marshalErr := json.Marshal(snapshot); marshalErr != nil || (bytes.Contains(encoded, []byte(input.QuestionText)) || bytes.Contains(encoded, []byte(input.Options[0]))) {
 		t.Fatalf("snapshot leaked question: %s, %v", encoded, marshalErr)
 	}
 	if _, err := store.HumanRequestDetail(ctx, humanQuestionClient(t, store, 202, BrowserCapabilityObserve).ID, request.ID, request.Revision); !errors.Is(err, ErrUnauthorized) {

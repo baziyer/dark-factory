@@ -198,7 +198,6 @@ export function FactoryConsole({
                   onReplyChange={onHumanReplyChange}
                   onReply={onReplyHumanRequest}
                   onCancel={onCancelHumanRequest}
-                  onClose={onCloseHumanRequest}
                   onOpenTerminal={onOpenTerminalForHumanRequest}
                   terminalReady={ready}
                 />}

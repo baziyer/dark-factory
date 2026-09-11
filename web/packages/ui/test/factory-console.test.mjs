@@ -38,6 +38,7 @@ const selectedRequest = (overrides = {}) => ({
   request: fixtureState.humanRequests.get(ids.request),
   phase: "ready",
   question: "Proceed with the migration?",
+  options: [],
   canReply: true,
   canCancel: true,
   replyMaxBytes: 8192,
@@ -79,10 +80,28 @@ test("one screen keeps Factory and the operator panels together", () => {
   assert.match(markup, /Builder One asks/);
   assert.match(markup, /Review the state projection/);
   assert.match(markup, /North Workshop · Review the state projection/);
+  assert.equal(markup.includes("DECISION NEEDED"), false, "an unopened request stays brief");
   assert.match(render({ detail: "queue" }), /aria-label="Queue"/);
   // No screen union survives: there is no navigation away from this screen.
   assert.equal(markup.includes("dfFactoryConsole__homeLink"), false);
   assert.equal(markup.includes("BUILDING STATE UNAVAILABLE"), false);
+});
+
+test("a selected decision names the action and keeps one collapse control", () => {
+  const markup = render({ selectedHumanRequest: selectedRequest(), onCloseHumanRequest: () => {}, onReplyHumanRequest: () => {}, onCancelHumanRequest: () => {} });
+  assert.match(markup, /<h3>DECISION NEEDED<\/h3>/);
+  assert.match(markup, />STOP TASK<\/button>/);
+  assert.equal(markup.includes(">CLOSE</button>"), false);
+});
+
+test("suggested answers fill the reply without sending it", () => {
+  const calls = [];
+  const elements = expand(FactoryConsole({ status: "ready", state: baseState(), selectedHumanRequest: selectedRequest({ options: ["Continue", "Stop"] }), onHumanReplyChange: (value) => calls.push(value) }));
+  elements.find((element) => element.type === "button" && Array.isArray(element.props.children) && element.props.children[0] === "Continue").props.onClick();
+  assert.deepEqual(calls, ["Continue"]);
+  const markup = render({ selectedHumanRequest: selectedRequest({ options: ["Continue", "Stop"] }) });
+  assert.match(markup, />Continue · RECOMMENDED<\/button>/);
+  assert.match(markup, />Stop<\/button>/);
 });
 
 test("the roster stays visible while the optional floor opens and closes", () => {
@@ -918,6 +937,8 @@ test("the settings modal carries the factory readout and a pairing mount point",
   assert.match(markup, /<dialog class="dfConsoleDialog" aria-label="Settings">/);
   assert.match(markup, /aria-label="BUILDING"/);
   assert.match(markup, /<dt>DISPATCH<\/dt><dd>ENABLED<\/dd>/);
+  assert.match(markup, /<dt>RUN ALLOWANCE<\/dt><dd>North Workshop: 7 LEFT \(5 USED\) · South Workshop: NOT LIMITED \(3 USED\)<\/dd>/);
+  assert.match(markup, /<dt>PER-RUN LIMIT<\/dt><dd>North Workshop: 900 SECONDS · South Workshop: NOT LIMITED<\/dd>/);
   assert.match(markup, /<dt>REVISION<\/dt><dd>42<\/dd>/);
   assert.match(markup, /127\.0\.0\.1:43123/);
   assert.match(markup, /aria-label="PAIRING"/);
@@ -1005,11 +1026,11 @@ test("selected hostile private detail is escaped and actions remain semantic", (
   assert.equal(markup.includes("<script>"), false);
   assert.match(markup, /<textarea[^>]*>&lt;reply&gt;<\/textarea>/);
   assert.match(markup, />ANSWER</);
-  assert.match(markup, />Stop</);
+  assert.match(markup, />STOP TASK</);
   assert.equal(markup.includes("expectedRunRevision"), false);
 });
 
-test("request, reply, cancel, and close controls forward only presentation intent", () => {
+test("request, reply, cancel, and summary collapse forward only presentation intent", () => {
   const request = fixtureState.humanRequests.get(ids.request);
   const calls = [];
   const baseProps = {
@@ -1036,8 +1057,8 @@ test("request, reply, cancel, and close controls forward only presentation inten
   selectedElements.find((element) => element.type === "textarea").props.onChange({ currentTarget: { value: "Proceed." } });
   let prevented = false;
   selectedElements.find((element) => element.type === "form").props.onSubmit({ preventDefault: () => { prevented = true; } });
-  selectedElements.find((element) => element.type === "button" && element.props.children === "Stop").props.onClick();
-  selectedElements.find((element) => element.type === "button" && element.props.children === "CLOSE").props.onClick();
+  selectedElements.find((element) => element.type === "button" && element.props.children === "STOP TASK").props.onClick();
+  selectedElements.find((element) => element.type === "summary" && element.props.className === "dfConsoleItem__summary").props.onClick({ preventDefault() {} });
   assert.equal(prevented, true);
   assert.deepEqual(calls.slice(1), [["change", "Proceed."], ["reply"], ["cancel"], ["close"]]);
 });

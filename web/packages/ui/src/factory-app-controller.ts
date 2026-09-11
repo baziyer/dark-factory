@@ -51,6 +51,7 @@ export type FactoryHumanRequestView = Readonly<{
   request: HumanRequestItem;
   phase: "loading" | "ready" | "replying" | "cancelling";
   question?: string;
+  options: readonly string[];
   canReply: boolean;
   canCancel: boolean;
   replyMaxBytes: number;
@@ -1434,6 +1435,7 @@ export class FactoryAppController {
         request: selection.request,
         phase: selection.phase,
         question: selection.detail?.question,
+        options: selection.detail?.options ?? [],
         canReply: selection.detail?.canReply ?? false,
         canCancel: selection.detail?.cancelRun !== null && selection.detail?.cancelRun !== undefined,
         replyMaxBytes: selection.detail?.replyMaxBytes ?? 0,

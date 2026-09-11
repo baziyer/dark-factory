@@ -156,6 +156,8 @@ func (daemon *Daemon) dispatch(ctx context.Context, call api.Call) api.Reply {
 		return daemon.snapshot(ctx)
 	case api.CallCreateProject:
 		return daemon.createProject(ctx, call)
+	case api.CallProjectLimits:
+		return daemon.setProjectLimits(ctx, call)
 	case api.CallCreateAgent:
 		return daemon.createAgent(ctx, call)
 	case api.CallEnqueueTask:
@@ -509,6 +511,30 @@ func (daemon *Daemon) createProject(ctx context.Context, call api.Call) api.Repl
 	return daemon.mutation(ctx, project.Revision)
 }
 
+func (daemon *Daemon) setProjectLimits(ctx context.Context, call api.Call) api.Reply {
+	input, ok := call.ProjectLimitsInput()
+	if !ok {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	id, err := parseProjectID(input.ProjectID)
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	expected, err := kernel.NewRevision(int64(input.ExpectedRevision))
+	if err != nil {
+		return newErrorReply(api.RemoteInvalidRequest)
+	}
+	at, err := daemon.timestamp()
+	if err != nil {
+		return newErrorReply(api.RemoteInternal)
+	}
+	project, err := daemon.store.SetProjectLimits(ctx, id, expected, input.RunBudget, input.MaxRunSeconds, at)
+	if err != nil {
+		return newErrorReply(remoteErrorCode(err))
+	}
+	return daemon.mutation(ctx, project.Revision)
+}
+
 func (daemon *Daemon) createAgent(ctx context.Context, call api.Call) api.Reply {
 	input, ok := call.CreateAgentInput()
 	if !ok {
@@ -778,6 +804,7 @@ func (daemon *Daemon) requestHuman(ctx context.Context, call api.Call) api.Reply
 	request, err := daemon.store.CreateHumanQuestionForAttempt(ctx, kDigest, kernel.NewHumanQuestion{
 		IdempotencyKey: key,
 		QuestionText:   input.Question,
+		Options:        input.Options,
 	}, at)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
