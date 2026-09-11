@@ -18,7 +18,7 @@ class ReviewIntakeTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.config = {'repository': 'o/r', 'project_id': '1' * 32, 'overseer_agent_id': '3' * 32,
-                       'label': 'factory:ready', 'allowed_authors': ['maintainer'], 'factory_home': str(root),
+                       'label': 'factory:ready', 'allowed_authors': ['maintainer'], 'factory_home': str(root / 'home'),
                        'journal': str(root / 'intake.json'), 'review_mirror_root': str(root / 'mirrors')}
         review.intake.atomic_json(Path(self.config['journal']), {'version': 2, 'updated_at': 0, 'config_fingerprint': review.intake.config_fingerprint(self.config),
             'issues': {'o/r#7': {'number': 7, 'managed': True}}})

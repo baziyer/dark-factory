@@ -73,7 +73,7 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 	if !ok || stderr.Mode().Type() != 0 || stderr.Mode().Perm() != 0o600 || stat.Uid != uint32(os.Geteuid()) {
 		t.Fatalf("service stderr metadata = mode %v uid %v", stderr.Mode(), stat)
 	}
-	client := fixture.waitClient(t)
+	client := fixture.waitClient(t, serviceStartupOutput(filepath.Join(install.ServiceDirectoryPath(fixture.home), "factoryd.stderr.log")))
 	web, err := client.WebStatus(context.Background())
 	if err != nil || !web.Ready || web.Address == "127.0.0.1:43123" {
 		t.Fatalf("disposable browser status = %+v, %v", web, err)
@@ -118,7 +118,7 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 	if state.State != "running" && state.State != "installed" {
 		t.Fatalf("start state = %+v", state)
 	}
-	client = fixture.waitClient(t)
+	client = fixture.waitClient(t, serviceStartupOutput(filepath.Join(install.ServiceDirectoryPath(fixture.home), "factoryd.stderr.log")))
 	second := fixture.operatorID(t, fixture.runFactoryctl(t, 0, "task", "add", "--project", project, "--agent", agent, "--title", "Managed restart run", "--body", happyPathBody))
 	fixture.awaitTaskStatus(t, client, second, "succeeded", 60*time.Second)
 
@@ -148,6 +148,16 @@ func TestBlackBoxServiceLifecycle(t *testing.T) {
 		t.Fatalf("final status = %+v", state)
 	}
 	awaitNoHomeProcesses(t, fixture.home, 20*time.Second)
+}
+
+func serviceStartupOutput(path string) func() string {
+	return func() string {
+		output, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		return string(output)
+	}
 }
 
 type serviceStateOutput struct {

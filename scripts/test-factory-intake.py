@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,9 @@ class IntakeTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
-        self.config = {"repository": "o/r", "project_id": "1" * 32, "overseer_agent_id": "3" * 32, "label": "factory:ready", "allowed_authors": ["maintainer"], "factory_home": str(root), "journal": str(root / "journal.json"), "max_issues": 25, "poll_seconds": 5}
+        home = root / "home"
+        home.mkdir()
+        self.config = {"repository": "o/r", "project_id": "1" * 32, "overseer_agent_id": "3" * 32, "label": "factory:ready", "allowed_authors": ["maintainer"], "factory_home": str(home), "journal": str(root / "journal.json"), "max_issues": 25, "poll_seconds": 5}
         self.source, self.calls, self.states = issue(), [], {}
         self.real_command, self.real_state = INTAKE.command, INTAKE.task_state
         INTAKE.command, INTAKE.task_state = self.command, lambda _config, operation: self.states.get(operation["task_id"])
@@ -140,6 +143,16 @@ class IntakeTest(unittest.TestCase):
         changed = dict(self.config, project_id='2' * 32)
         with self.assertRaisesRegex(INTAKE.IntakeError, 'different repository'):
             INTAKE.run_once(changed)
+
+    def test_journal_inside_runtime_home_is_rejected_before_journal_writes(self):
+        bad = dict(self.config, journal=str(Path(self.config['factory_home']) / 'journal.json'))
+        with self.assertRaisesRegex(INTAKE.IntakeError, 'outside factory_home'):
+            INTAKE.validate_config(bad)
+        self.assertFalse(Path(bad['journal']).exists())
+        linked = Path(self.temp.name) / 'linked-home'
+        os.symlink(self.config['factory_home'], linked)
+        with self.assertRaisesRegex(INTAKE.IntakeError, 'outside factory_home'):
+            INTAKE.validate_config(dict(self.config, journal=str(linked / 'journal.json')))
 
 
 if __name__ == "__main__":

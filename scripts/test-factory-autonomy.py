@@ -24,14 +24,45 @@ class AutonomyTest(unittest.TestCase):
     def test_controller_excludes_another_job_for_the_same_factory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = root / 'config.json'
-            config.write_text(json.dumps({'factory_home': str(root), 'journal': str(root / 'journal')}))
-            with (root / 'autonomy.lock').open('a+') as lock:
+            home = root / 'home'
+            home.mkdir()
+            other = root / 'other-config.json'
+            other.write_text(json.dumps({'factory_home': str(home), 'journal': str(root / 'other-journal')}))
+            with Path(str(home.resolve()) + '.autonomy.lock').open('a+') as lock:
                 autonomy.fcntl.flock(lock, autonomy.fcntl.LOCK_EX | autonomy.fcntl.LOCK_NB)
-                with patch.object(autonomy.sys, 'argv', ['factory-autonomy', str(config), '--once']), patch.object(autonomy, 'tick') as tick:
+                with patch.object(autonomy.sys, 'argv', ['factory-autonomy', str(other), '--once']), patch.object(autonomy, 'tick') as tick:
                     with self.assertRaisesRegex(ValueError, 'another controller'):
                         autonomy.main()
                     tick.assert_not_called()
+
+    def test_external_controller_state_leaves_runtime_home_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, home = Path(directory), Path(directory) / 'home'
+            home.mkdir()
+            config = root / 'config.json'
+            journal = root / 'state' / 'journal.json'
+            config.write_text(json.dumps({'factory_home': str(home), 'journal': str(journal)}))
+            with patch.object(autonomy.sys, 'argv', ['factory-autonomy', str(config), '--once']), patch.object(autonomy, 'tick', return_value=[]):
+                self.assertEqual(0, autonomy.main())
+            self.assertEqual([], list(home.iterdir()))
+            self.assertTrue(Path(str(home.resolve()) + '.autonomy.lock').is_file())
+            self.assertTrue(Path(str(journal) + '.autonomy.json').is_file())
+
+    def test_runtime_home_journal_and_release_journal_are_refused_before_controller_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, home = Path(directory), Path(directory) / 'home'
+            home.mkdir()
+            release = root / 'release.json'
+            release.write_text(json.dumps({'journal': str(home / 'release-journal.json')}))
+            for config_value in ({'factory_home': str(home), 'journal': str(home / 'journal.json')}, {'factory_home': str(home), 'journal': str(root / 'journal.json'), 'release_configs': [str(release)]}):
+                config = root / ('config-' + str(len(list(root.glob('config-*')))) + '.json')
+                config.write_text(json.dumps(config_value))
+                with patch.object(autonomy.sys, 'argv', ['factory-autonomy', str(config), '--once']), patch.object(autonomy, 'tick') as tick:
+                    with self.assertRaisesRegex(ValueError, 'outside factory_home'):
+                        autonomy.main()
+                    tick.assert_not_called()
+            self.assertEqual([], list(home.iterdir()))
+            self.assertFalse(Path(str(home.resolve()) + '.autonomy.lock').exists())
 
     def test_notification_runs_even_if_intake_fails(self):
         config = {'factory_home': '/private/tmp/factory', 'journal': '/private/tmp/journal'}
