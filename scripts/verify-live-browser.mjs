@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(join(process.env.DARK_FACTORY_SITE || join(homedir(), 'dark-factory-site'), 'package.json'));
 const { chromium, expect } = require('@playwright/test');
-const profile = join(homedir(), '.dark-factory', 'verification-browser');
+const profile = join(homedir(), '.dark-factory-verification-browser');
 await mkdir(profile, { recursive: true, mode: 0o700 });
 let context;
 try {
