@@ -134,7 +134,6 @@ export function FactoryConsole({
   const counters = factoryCounters(state);
   const agent = selectedAgent === undefined ? undefined : state?.agents.get(selectedAgent.id);
   const selectedDetail = detail ?? (selectedAgent === undefined ? "needs-you" : "agent");
-  const editError = editErrorCopy(edit);
   const appearanceAgent = appearanceAgentId === undefined ? undefined : state?.agents.get(appearanceAgentId);
   const editError = edit !== undefined && state?.projects.has(edit.target) ? undefined : editErrorCopy(edit);
 
