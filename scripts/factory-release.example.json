@@ -1,0 +1,9 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "base": "main",
+  "journal": "/ABSOLUTE/PRIVATE/PATH/releases.json",
+  "command_timeout": 1200,
+  "deploy_argv": ["/ABSOLUTE/PATH/python3", "/ABSOLUTE/RUNTIME/scripts/deploy-runtime.py"],
+  "verify_argv": ["/ABSOLUTE/PATH/python3", "/ABSOLUTE/RUNTIME/scripts/verify-live-runtime.py"],
+  "review_verifier": ["/bin/sh", "/ABSOLUTE/RUNTIME/scripts/verify-adversarial-review.sh"]
+}

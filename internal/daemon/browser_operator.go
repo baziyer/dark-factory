@@ -30,7 +30,22 @@ func (daemon *Daemon) webRuntime() (*BrowserRuntime, bool) {
 	}
 	daemon.browserMu.Lock()
 	defer daemon.browserMu.Unlock()
-	if daemon.browserClosing || len(daemon.browsers) != 1 {
+	if daemon.browserClosing {
+		return nil, false
+	}
+	// A relay is a client of one exact loopback listener. Once present, its
+	// configured address is the durable selection rule; other test or recovery
+	// listeners must not make the public operator surface report that listener
+	// as stopped or redirect pairing authority to it.
+	if daemon.relay != nil {
+		for runtime := range daemon.browsers {
+			if runtime != nil && runtime.Addr() == daemon.relay.browserAddress {
+				return runtime, !runtime.closing && runtime.server != nil && runtime.backend != nil
+			}
+		}
+		return nil, false
+	}
+	if len(daemon.browsers) != 1 {
 		return nil, false
 	}
 	for runtime := range daemon.browsers {

@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 const humanRequestColumns = `id, run_id, idempotency_key, kind, reason_code,
-    question_text, status, delivery_id, delivery_started_at_ms,
+    question_text, options_json, status, delivery_id, delivery_started_at_ms,
     resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms`
 
 func scanHumanRequest(scanner rowScanner) (HumanRequest, bool, error) {
@@ -18,16 +20,20 @@ func scanHumanRequest(scanner rowScanner) (HumanRequest, bool, error) {
 	var rawDelivery nullableBlob
 	var rawKind, rawStatus string
 	var rawReason, rawResolution sql.NullString
-	var question string
+	var question, optionsJSON string
+	var options []string
 	var deliveryAt, closedAt sql.NullInt64
 	var revision, createdAt, updatedAt int64
 	if err := scanner.Scan(&rawID, &rawRunID, &rawKey, &rawKind, &rawReason,
-		&question, &rawStatus, &rawDelivery, &deliveryAt, &rawResolution,
+		&question, &optionsJSON, &rawStatus, &rawDelivery, &deliveryAt, &rawResolution,
 		&closedAt, &revision, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return HumanRequest{}, false, nil
 		}
 		return HumanRequest{}, false, fmt.Errorf("scan human request: %w", err)
+	}
+	if json.Unmarshal([]byte(optionsJSON), &options) != nil || options == nil || ValidateHumanOptions(options) != nil {
+		return HumanRequest{}, false, ErrCorruptState
 	}
 	id, idErr := HumanRequestIDFromBytes(rawID)
 	runID, runErr := RunIDFromBytes(rawRunID)
@@ -41,7 +47,7 @@ func scanHumanRequest(scanner rowScanner) (HumanRequest, bool, error) {
 	}
 	var key [IDBytes]byte
 	copy(key[:], rawKey)
-	result := HumanRequest{ID: id, RunID: runID, IdempotencyKey: key, Kind: kind, Status: status, QuestionText: question, Revision: rev, CreatedAt: created, UpdatedAt: updated}
+	result := HumanRequest{ID: id, RunID: runID, IdempotencyKey: key, Kind: kind, Status: status, QuestionText: question, Options: options, Revision: rev, CreatedAt: created, UpdatedAt: updated}
 	if rawDelivery.valid {
 		delivery, err := HumanRequestDeliveryIDFromBytes(rawDelivery.bytes)
 		if err != nil {
@@ -155,7 +161,7 @@ func (store *Store) createHumanQuestionForAttempt(ctx context.Context, digest At
 		return HumanRequest{}, tx.Rollback(err)
 	}
 	if existingFound {
-		if existing.QuestionText != input.QuestionText {
+		if existing.QuestionText != input.QuestionText || !slices.Equal(existing.Options, input.Options) {
 			return HumanRequest{}, tx.Rollback(ErrConflict)
 		}
 		if err := tx.Rollback(nil); err != nil {
@@ -177,7 +183,15 @@ func (store *Store) createHumanQuestionForAttempt(ctx context.Context, digest At
 		}
 		return HumanRequest{}, tx.Rollback(err)
 	}
-	inserted, err := tx.connection.ExecContext(ctx, `INSERT INTO human_requests(id, run_id, idempotency_key, kind, reason_code, question_text, status, revision, created_at_ms, updated_at_ms) VALUES(?, ?, ?, 'question', 'provider_question', ?, 'open', 1, ?, ?)`, rawID[:], run.ID.Bytes(), input.IdempotencyKey[:], input.QuestionText, at.Int64(), at.Int64())
+	options := input.Options
+	if options == nil {
+		options = []string{}
+	}
+	optionsJSON, err := json.Marshal(options)
+	if err != nil {
+		return HumanRequest{}, tx.Rollback(err)
+	}
+	inserted, err := tx.connection.ExecContext(ctx, `INSERT INTO human_requests(id, run_id, idempotency_key, kind, reason_code, question_text, options_json, status, revision, created_at_ms, updated_at_ms) VALUES(?, ?, ?, 'question', 'provider_question', ?, ?, 'open', 1, ?, ?)`, rawID[:], run.ID.Bytes(), input.IdempotencyKey[:], input.QuestionText, string(optionsJSON), at.Int64(), at.Int64())
 	if err := requireOneRow(inserted, err); err != nil {
 		return HumanRequest{}, tx.Rollback(err)
 	}
@@ -381,7 +395,7 @@ func humanRequestDetail(ctx context.Context, connection *sql.Conn, clientID Brow
 	if request.Revision != expected {
 		return HumanRequestDetail{}, ErrRevisionConflict
 	}
-	detail := HumanRequestDetail{ID: request.ID, Revision: request.Revision, QuestionText: request.QuestionText, ReplyMaxBytes: MaxHumanRequestReplyBytes}
+	detail := HumanRequestDetail{ID: request.ID, Revision: request.Revision, QuestionText: request.QuestionText, Options: request.Options, ReplyMaxBytes: MaxHumanRequestReplyBytes}
 	if request.Status != HumanRequestOpen {
 		return detail, nil
 	}

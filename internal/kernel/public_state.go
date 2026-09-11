@@ -137,7 +137,7 @@ func readPublicAccounts(ctx context.Context, connection *sql.Conn) ([]AccountSum
 // loaded at all, so it cannot reach a projection by accident.
 
 func readPublicProjects(ctx context.Context, connection *sql.Conn) ([]ProjectSummary, error) {
-	rows, err := connection.QueryContext(ctx, `SELECT id, name, revision FROM projects ORDER BY id`)
+	rows, err := connection.QueryContext(ctx, `SELECT id, name, run_budget_limit, runs_used, max_run_seconds, revision FROM projects ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("read public projects: %w", err)
 	}
@@ -146,16 +146,16 @@ func readPublicProjects(ctx context.Context, connection *sql.Conn) ([]ProjectSum
 	for rows.Next() {
 		var rawID []byte
 		var name string
-		var rawRevision int64
-		if err := rows.Scan(&rawID, &name, &rawRevision); err != nil {
+		var runBudget, runsUsed, maxRunSeconds, rawRevision int64
+		if err := rows.Scan(&rawID, &name, &runBudget, &runsUsed, &maxRunSeconds, &rawRevision); err != nil {
 			return nil, fmt.Errorf("scan public project: %w", err)
 		}
 		id, idErr := ProjectIDFromBytes(rawID)
 		revision, revisionErr := NewRevision(rawRevision)
-		if idErr != nil || revisionErr != nil || byteLen(name) < 1 || byteLen(name) > 128 {
+		if idErr != nil || revisionErr != nil || byteLen(name) < 1 || byteLen(name) > 128 || runBudget < 0 || runsUsed < 0 || maxRunSeconds < 0 || maxRunSeconds > maxProjectRunSeconds || runBudget != 0 && runsUsed > runBudget {
 			return nil, fmt.Errorf("%w: invalid public project", ErrCorruptState)
 		}
-		result = append(result, ProjectSummary{ID: id, Name: name, Revision: revision})
+		result = append(result, ProjectSummary{ID: id, Name: name, RunBudgetLimit: uint64(runBudget), RunsUsed: uint64(runsUsed), MaxRunSeconds: uint32(maxRunSeconds), Revision: revision})
 	}
 	return result, rows.Err()
 }

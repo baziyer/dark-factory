@@ -121,6 +121,26 @@ class IntakeTest(unittest.TestCase):
         with self.assertRaisesRegex(INTAKE.IntakeError, "exceeds"):
             INTAKE.issue_from_json(issue(body="x" * 5001))
 
+    def test_stale_human_decision_waits_for_a_material_source_edit(self):
+        INTAKE.run_once(self.config)
+        first = next(iter(self.states))
+        self.states[first].update({'status': 'failed', 'needs_operator_recovery': True})
+        self.calls.clear()
+        self.assertEqual(['needs operator recovery o/r#7'], INTAKE.run_once(self.config))
+        self.assertEqual([], self.factory_calls())
+        record = json.loads(Path(self.config['journal']).read_text())['issues']['o/r#7']
+        self.assertEqual(first, record['needs_operator_recovery']['task_id'])
+        self.assertEqual([], INTAKE.run_once(self.config))
+        self.source = issue(body='operator clarified scope')
+        self.assertEqual(['queued o/r#7'], INTAKE.run_once(self.config))
+        self.assertNotEqual(first, self.factory_calls()[-1][self.factory_calls()[-1].index('--task-id') + 1])
+
+    def test_identity_change_cannot_reuse_a_managed_journal(self):
+        INTAKE.run_once(self.config)
+        changed = dict(self.config, project_id='2' * 32)
+        with self.assertRaisesRegex(INTAKE.IntakeError, 'different repository'):
+            INTAKE.run_once(changed)
+
 
 if __name__ == "__main__":
     unittest.main()

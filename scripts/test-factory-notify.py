@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -72,6 +73,24 @@ class NotifyTest(unittest.TestCase):
         self.assertIn("on run argv", argv[2])
         self.assertEqual(argv[4], '$(touch /tmp/no) " quoted')
         self.assertNotIn('$(touch /tmp/no) " quoted', argv[2])
+
+    def test_recovery_notifies_once_without_source_text(self):
+        journal = Path(self.temp.name) / 'intake.json'
+        receipt = Path(str(journal) + '.notifications')
+        journal.write_text('{"issues":{"o/r#7":{"needs_operator_recovery":{"task_id":"' + 'ab' * 16 + '"}}}}')
+        calls = []
+        with patch.object(NOTIFY, 'notify', calls.append):
+            self.assertTrue(NOTIFY.run_once(self.home, receipt)['notified'])
+            self.assertFalse(NOTIFY.run_once(self.home, receipt)['notified'])
+        self.assertEqual(calls, ['A source task needs operator recovery.'])
+
+    def test_v1_receipt_migrates_without_renotifying(self):
+        self.request("22")
+        self.receipt.write_text('{"version":1,"notified_request_ids":["' + '22' * 16 + '"],"run_limit_notified":false}')
+        with patch.object(NOTIFY, 'notify') as notify:
+            self.assertFalse(NOTIFY.run_once(self.home, self.receipt)['notified'])
+        notify.assert_not_called()
+        self.assertEqual(2, json.loads(self.receipt.read_text())['version'])
 
 
 if __name__ == "__main__":

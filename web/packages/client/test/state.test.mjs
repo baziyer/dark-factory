@@ -42,7 +42,7 @@ const ids = {
   request: "04040404040404040404040404040404",
 };
 const factoryItem = (revision = 1n) => ({ dispatch_enabled: true, capacity: 8, active_runs: 2, revision });
-const projectItem = (revision = 1n) => ({ id: ids.project, name: "Factory", revision });
+const projectItem = (revision = 1n) => ({ id: ids.project, name: "Factory", run_budget_limit: 12n, runs_used: 5n, max_run_seconds: 900, revision });
 const agentItem = (revision = 1n) => ({ id: ids.agent, project_id: ids.project, name: "Worker", role: "worker", provider: "claude_code", paused: false, model: "claude-opus-5", reasoning_effort: "high", effective_model: "claude-opus-5", effective_reasoning_effort: "high", model_source: "agent", revision });
 const taskItem = (revision = 1n, title = "Ship") => ({ id: ids.task, project_id: ids.project, assigned_agent_id: ids.agent, title, status: "queued", priority: 1, revision });
 const requestItem = (revision = 1n) => ({ id: ids.request, project_id: ids.project, agent_id: ids.agent, task_id: ids.task, created_at: 10n, updated_at: 11n, revision, kind: "question", status: "open", reply_max_bytes: 8192, can_reply: true });
@@ -88,6 +88,7 @@ test("the Go-produced snapshot fixture becomes one complete TypeScript state vie
   assert.equal(account.provider, agent.provider);
   assert.equal(account.home, "/Users/operator/.codex");
   assert.equal(view.projects.get(project.id), project);
+  assert.deepEqual([project.run_budget_limit, project.runs_used, project.max_run_seconds], [12n, 5n, 900]);
   assert.equal(agent.project_id, project.id);
   assert.equal(task.assigned_agent_id, agent.id);
   assert.equal(request.task_id, task.id);
@@ -95,6 +96,13 @@ test("the Go-produced snapshot fixture becomes one complete TypeScript state vie
   // The view is immutable: readers cannot mutate one another's snapshot.
   assert.throws(() => { task.title = "mutated"; }, TypeError);
   assert.throws(() => { view.head = 0n; }, TypeError);
+});
+
+test("project limits default to disabled for an older daemon and reject inconsistent ceilings", () => {
+  const legacy = decodeServerControl(encodeStateSnapshot("limits", snapshotBody({ projects: [{ id: ids.project, name: "Factory", revision: 1n }] }))).body.projects[0];
+  assert.deepEqual([legacy.run_budget_limit, legacy.runs_used, legacy.max_run_seconds], [0n, 0n, 0]);
+  expectMalformed(() => encodeStateSnapshot("limits", snapshotBody({ projects: [{ ...projectItem(), run_budget_limit: 2n, runs_used: 3n }] })));
+  expectMalformed(() => encodeStateSnapshot("limits", snapshotBody({ projects: [{ ...projectItem(), max_run_seconds: 86401 }] })));
 });
 
 test("task recency is optional for legacy snapshots and exact when served", () => {
@@ -290,7 +298,7 @@ test("public state cannot carry private fields and detail is separately bounded"
   expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, question: "" } }));
   expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, question: "x".repeat(MAX_HUMAN_QUESTION_BYTES + 1) } }));
   assert.match(encodeServerControl({ ...detail, body: { ...detail.body, options: ["Continue", "Stop"] } }), /"options":\["Continue","Stop"\]/);
-  for (const options of [null, [""], ["x".repeat(161)], ["same", "same"], ["1", "2", "3", "4", "5"]]) expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, options } }));
+  for (const options of [null, [""], [" "], ["line\nbreak"], ["zero\0byte"], ["x".repeat(161)], ["same", "same"], ["1", "2", "3", "4", "5"]]) expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, options } }));
 });
 
 test("state parsing rejects case-folded/duplicate/unknown/trailing/depth/member/array/UTF-8 violations", () => {

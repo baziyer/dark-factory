@@ -365,10 +365,14 @@ fn tools() -> Value {
             "properties": {
                 "number": {"type": "integer"},
                 "url": {"type": "string"},
+                "title": {"type": "string", "minLength": 1, "maxLength": 256},
+                "body": {"type": "string", "maxLength": 30000},
+                "labels": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 50}},
+                "updated_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
                 "state": {"type": "string", "enum": ["open", "closed"]},
                 "state_reason": {"type": ["string", "null"]}
             },
-            "required": ["number", "url", "state", "state_reason"],
+            "required": ["number", "url", "title", "body", "labels", "updated_at", "state", "state_reason"],
             "additionalProperties": false
         },
         "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": true}
@@ -480,7 +484,8 @@ fn tools() -> Value {
                 "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
                 "title": {"type": "string", "minLength": 1, "maxLength": 256},
                 "body": {"type": "string", "maxLength": 30000},
-                "draft": {"type": "boolean"}
+                "draft": {"type": "boolean"},
+                "close_on_merge": {"type": "boolean", "default": true}
             },
             "required": ["repository", "operation_id", "issue_number", "head", "head_sha", "base", "base_sha", "title", "body", "draft"],
             "additionalProperties": false

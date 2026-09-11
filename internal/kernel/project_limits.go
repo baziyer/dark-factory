@@ -65,7 +65,7 @@ func (store *Store) OverdueRuns(ctx context.Context, at UnixMillis) ([]Run, erro
 		return nil, err
 	}
 	defer tx.Close()
-	rows, err := tx.connection.QueryContext(ctx, `SELECT `+runColumns+` FROM runs AS r JOIN projects AS p ON p.id = r.project_id WHERE r.phase IN ('admitted', 'running') AND p.max_run_seconds > 0 AND r.admitted_at_ms + p.max_run_seconds * 1000 <= ? ORDER BY r.admitted_at_ms, r.id`, at.Int64())
+	rows, err := tx.connection.QueryContext(ctx, `SELECT `+runColumns+` FROM runs AS r WHERE r.phase IN ('admitted', 'running') AND r.admitted_at_ms + (SELECT p.max_run_seconds FROM projects AS p WHERE p.id = r.project_id) * 1000 <= ? AND (SELECT p.max_run_seconds FROM projects AS p WHERE p.id = r.project_id) > 0 ORDER BY r.admitted_at_ms, r.id`, at.Int64())
 	if err != nil {
 		return nil, err
 	}

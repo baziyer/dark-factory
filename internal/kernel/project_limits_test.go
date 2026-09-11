@@ -29,6 +29,14 @@ func TestProjectRunAllowanceCountsAdmissionsOnce(t *testing.T) {
 	if err != nil || !found || project.RunsUsed != 1 {
 		t.Fatalf("used runs = %+v, found=%v, err=%v", project, found, err)
 	}
+	project, err = store.SetProjectLimits(ctx, project.ID, project.Revision, 0, 1, mustTime(t, 6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	due, err := store.OverdueRuns(ctx, mustTime(t, 1005))
+	if err != nil || len(due) != 1 || due[0].ID != first.Run.ID {
+		t.Fatalf("overdue runs = %+v, %v", due, err)
+	}
 }
 
 func TestProjectLimitsUseAdditionalAllowanceAndDefaultToDisabled(t *testing.T) {

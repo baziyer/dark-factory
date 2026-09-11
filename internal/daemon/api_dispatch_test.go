@@ -141,6 +141,7 @@ func TestDaemonDispatchesOperatorCallsAndBoundsProjection(t *testing.T) {
 	}
 	waitDispatch(t, done)
 	assertNoSchedulerWake(t, fixture.daemon)
+
 	if initialSnapshot.Head != 0 || initialSnapshot.Projects == nil || initialSnapshot.Agents == nil || initialSnapshot.Tasks == nil || len(initialSnapshot.Projects) != 0 || len(initialSnapshot.Agents) != 0 || len(initialSnapshot.Tasks) != 0 {
 		t.Fatalf("fresh snapshot = %+v", initialSnapshot)
 	}
@@ -170,11 +171,25 @@ func TestDaemonDispatchesOperatorCallsAndBoundsProjection(t *testing.T) {
 	assertNoSchedulerWake(t, fixture.daemon)
 
 	done = fixture.serve(t)
+	limits, err := client.SetProjectLimits(ctx, api.ProjectLimitsInput{ProjectID: projectInput.ID, ExpectedRevision: projectResult.Revision, RunBudget: 3, MaxRunSeconds: 60})
+	if err != nil || limits.Revision != projectResult.Revision+1 {
+		t.Fatalf("set project limits = %+v, %v", limits, err)
+	}
+	waitDispatch(t, done)
+	assertNoSchedulerWake(t, fixture.daemon)
+
+	done = fixture.serve(t)
+	if _, err := client.SetProjectLimits(ctx, api.ProjectLimitsInput{ProjectID: projectInput.ID, ExpectedRevision: projectResult.Revision, RunBudget: 3, MaxRunSeconds: 60}); err == nil {
+		t.Fatal("stale project limits accepted")
+	}
+	waitDispatch(t, done)
+
+	done = fixture.serve(t)
 	agentResult, err := client.CreateAgent(ctx, api.CreateAgentInput{
 		ID: testID(2), ProjectID: projectInput.ID, Name: "agent", Role: "orchestrator",
 		Provider: "codex", Model: "gpt-5.6-luna", ReasoningEffort: "medium", ToolBudgetLimit: 50,
 	})
-	if err != nil || agentResult.Revision != 1 || agentResult.Head != 2 {
+	if err != nil || agentResult.Revision != 1 || agentResult.Head != 3 {
 		t.Fatalf("create agent = %+v, %v", agentResult, err)
 	}
 	waitDispatch(t, done)
@@ -185,7 +200,7 @@ func TestDaemonDispatchesOperatorCallsAndBoundsProjection(t *testing.T) {
 		ID: testID(3), ProjectID: projectInput.ID, AssignedAgentID: testID(2), IncarnationID: testID(4),
 		Title: "public title", Body: "private task body sentinel", Priority: 7,
 	})
-	if err != nil || taskResult.Revision != 1 || taskResult.Head != 3 {
+	if err != nil || taskResult.Revision != 1 || taskResult.Head != 4 {
 		t.Fatalf("enqueue task = %+v, %v", taskResult, err)
 	}
 	waitDispatch(t, done)
@@ -193,7 +208,7 @@ func TestDaemonDispatchesOperatorCallsAndBoundsProjection(t *testing.T) {
 
 	done = fixture.serve(t)
 	dispatchResult, err := client.SetDispatch(ctx, 1, true)
-	if err != nil || dispatchResult.Revision != 2 || dispatchResult.Head != 4 {
+	if err != nil || dispatchResult.Revision != 2 || dispatchResult.Head != 5 {
 		t.Fatalf("set dispatch = %+v, %v", dispatchResult, err)
 	}
 	waitDispatch(t, done)
@@ -205,7 +220,7 @@ func TestDaemonDispatchesOperatorCallsAndBoundsProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitDispatch(t, done)
-	if snapshot.Head != 4 || len(snapshot.Projects) != 1 || len(snapshot.Agents) != 1 || len(snapshot.Tasks) != 1 {
+	if snapshot.Head != 5 || len(snapshot.Projects) != 1 || len(snapshot.Agents) != 1 || len(snapshot.Tasks) != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 	if snapshot.Projects[0].ID != projectInput.ID || snapshot.Projects[0].Name != projectInput.Name || snapshot.Agents[0].Role != "orchestrator" || snapshot.Tasks[0].Title != "public title" {
@@ -799,14 +814,14 @@ func TestProjectionHasNoPrivateFieldsAndKeepsEmptySlices(t *testing.T) {
 	projected := projectSnapshot(kernel.DashboardSnapshot{
 		Head:     head,
 		Factory:  kernel.FactorySummary{Capacity: 2, Revision: revision},
-		Projects: []kernel.ProjectSummary{{ID: projectID, Name: "project", Revision: revision}},
+		Projects: []kernel.ProjectSummary{{ID: projectID, Name: "project", RunBudgetLimit: 8, RunsUsed: 3, MaxRunSeconds: 900, Revision: revision}},
 		Agents:   []kernel.AgentSummary{{ID: agentID, ProjectID: projectID, Name: "agent", Role: "worker", Provider: "codex", Revision: revision}},
 		Tasks:    []kernel.TaskSummary{{ID: taskID, ProjectID: projectID, AssignedAgentID: agentID, Title: "title", Status: "queued", Priority: 3, Revision: revision}},
 	})
 	if projected.Head != 0 || projected.Projects == nil || projected.Agents == nil || projected.Tasks == nil {
 		t.Fatalf("projection emptiness/head = %+v", projected)
 	}
-	if projected.Projects[0].Name != "project" || projected.Agents[0].Provider != "codex" || projected.Tasks[0].Title != "title" {
+	if projected.Projects[0].Name != "project" || projected.Projects[0].RunBudgetLimit != 8 || projected.Projects[0].RunsUsed != 3 || projected.Projects[0].MaxRunSeconds != 900 || projected.Agents[0].Provider != "codex" || projected.Tasks[0].Title != "title" {
 		t.Fatalf("projection fields = %+v", projected)
 	}
 }

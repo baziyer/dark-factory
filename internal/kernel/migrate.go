@@ -31,6 +31,33 @@ const (
 	v5UserVersion       = 5
 	v6UserVersion       = 6
 	v7UserVersion       = 7
+	v8UserVersion       = 8
+	v8HumanRequests     = `CREATE TABLE human_requests (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16 AND id <> zeroblob(16)),
+    run_id BLOB NOT NULL CHECK (length(run_id) = 16) REFERENCES runs(id),
+    idempotency_key BLOB NOT NULL CHECK (length(idempotency_key) = 16 AND idempotency_key <> zeroblob(16)),
+    kind TEXT NOT NULL CHECK (kind = 'question'),
+    reason_code TEXT NOT NULL CHECK (reason_code = 'provider_question'),
+    question_text TEXT NOT NULL CHECK (length(CAST(question_text AS BLOB)) BETWEEN 1 AND 8192),
+    status TEXT NOT NULL CHECK (status IN ('open', 'delivering', 'delivery_unknown', 'resolved', 'stale')),
+    delivery_id BLOB CHECK (delivery_id IS NULL OR (length(delivery_id) = 16 AND delivery_id <> zeroblob(16))),
+    delivery_started_at_ms INTEGER CHECK (delivery_started_at_ms IS NULL OR delivery_started_at_ms >= 0),
+    resolution_kind TEXT CHECK (resolution_kind IS NULL OR resolution_kind IN ('reply', 'stale', 'cancel_run')),
+    closed_at_ms INTEGER CHECK (closed_at_ms IS NULL OR closed_at_ms >= 0),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    UNIQUE(run_id, idempotency_key),
+    UNIQUE(delivery_id),
+    CHECK ((delivery_id IS NULL) = (delivery_started_at_ms IS NULL)),
+    CHECK (delivery_started_at_ms IS NULL OR (delivery_started_at_ms >= created_at_ms AND delivery_started_at_ms <= updated_at_ms)),
+    CHECK (closed_at_ms IS NULL OR (closed_at_ms >= created_at_ms AND closed_at_ms <= updated_at_ms)),
+    CHECK (status = 'open' AND delivery_id IS NULL OR status IN ('delivering', 'delivery_unknown') AND delivery_id IS NOT NULL OR status = 'resolved' AND (resolution_kind = 'reply' AND delivery_id IS NOT NULL OR resolution_kind = 'cancel_run' AND delivery_id IS NULL) OR status = 'stale'),
+    CHECK ((status IN ('resolved', 'stale')) = (closed_at_ms IS NOT NULL)),
+    CHECK (status = 'resolved' AND resolution_kind IN ('reply', 'cancel_run') OR status = 'stale' AND resolution_kind = 'stale' OR status IN ('open', 'delivering', 'delivery_unknown') AND resolution_kind IS NULL),
+    CHECK (status IN ('open', 'delivering', 'delivery_unknown') AND closed_at_ms IS NULL OR status IN ('resolved', 'stale')),
+    CHECK (status NOT IN ('resolved', 'stale') OR closed_at_ms = updated_at_ms)
+) STRICT, WITHOUT ROWID`
 
 	v7Projects = `CREATE TABLE projects (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -187,7 +214,7 @@ func v5SchemaStatements() []string {
 // v6SchemaStatements is the exact schema before task-linked peer questions.
 func v6SchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
-	for _, statement := range schemaStatements {
+	for _, statement := range v7SchemaStatements() {
 		_, name := schemaObjectIdentity(statement)
 		switch name {
 		case "peer_questions", "peer_questions_source_key_unique", "peer_questions_recipient_delivery_unique", "peer_questions_answer_delivery_unique", "peer_questions_task_history":
@@ -203,11 +230,22 @@ func v6SchemaStatements() []string {
 // v7SchemaStatements is the exact schema before project run limits.
 func v7SchemaStatements() []string {
 	statements := make([]string, 0, len(schemaStatements))
-	for _, statement := range schemaStatements {
+	for _, statement := range v8SchemaStatements() {
 		if _, name := schemaObjectIdentity(statement); name == "projects" {
 			statement = v7Projects
 		}
 		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// v8SchemaStatements predates private suggested answers.
+func v8SchemaStatements() []string {
+	statements := append([]string(nil), schemaStatements...)
+	for i, statement := range statements {
+		if _, name := schemaObjectIdentity(statement); name == "human_requests" {
+			statements[i] = v8HumanRequests
+		}
 	}
 	return statements
 }
@@ -300,6 +338,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return v6SchemaStatements(), true
 	case v7UserVersion:
 		return v7SchemaStatements(), true
+	case v8UserVersion:
+		return v8SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -325,7 +365,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction, migrateV7Transaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction, migrateV7Transaction, migrateV8Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -342,6 +382,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[5:]
 	case v7UserVersion:
 		steps = all[6:]
+	case v8UserVersion:
+		steps = all[7:]
 	default:
 		return connection.Close()
 	}
@@ -525,12 +567,29 @@ func migrateV7Transaction(ctx context.Context, connection *sql.Conn) error {
 	if err := validateSchemaVersion(ctx, connection, v7UserVersion, v7SchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
+	target := expectedSchemaOf(v8SchemaStatements())
 	if err := rebuildTable(ctx, connection, target, "projects", "id, name, root, verification_policy, revision, created_at_ms, updated_at_ms", "projects_root_unique", "", ""); err != nil {
 		return err
 	}
-	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
+	if _, err := connection.ExecContext(ctx, `UPDATE projects SET runs_used = (SELECT COUNT(*) FROM runs WHERE runs.project_id = projects.id)`); err != nil {
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v8UserVersion)); err != nil {
 		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, v8UserVersion, v8SchemaStatements())
+}
+
+func migrateV8Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v8UserVersion, v8SchemaStatements()); err != nil {
+		return err
+	}
+	columns := "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms"
+	if err := rebuildTable(ctx, connection, expectedSchemaOf(schemaStatements), "human_requests", columns, "human_requests_one_unresolved_per_run", "", ""); err != nil {
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
+		return err
 	}
 	return validateExactSchema(ctx, connection)
 }

@@ -42,7 +42,7 @@ no commit, push, pull-request, or repository-publication operation.
   events and explicit interventions trigger bounded standing instructions,
   including events received while the overseer was busy. Factory capacity
   counts workers; one overseer can run alongside them.
-- There is no external HTTP/GitHub intake and no in-runtime updater.
+- Optional [operator-owned GitHub intake and release scheduling](docs/development/UNATTENDED.md) runs on the host. There is no public HTTP intake or in-runtime updater.
 
 Each project has agents and durable tasks. An admitted attempt gets a fresh
 provider process and a daemon-owned `.git`-free Change. The browser and CLI

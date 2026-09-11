@@ -51,13 +51,15 @@ def receipt_lock(receipt: Path):
 
 def load_receipt(path: Path) -> dict:
     if not path.exists():
-        return {"version": 1, "notified_request_ids": [], "run_limit_notified": False}
+        return {"version": 2, "notified_request_ids": [], "recovery_task_ids": [], "run_limit_notified": False}
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise NotifyError("notification receipt is unreadable") from exc
-    ids = receipt.get("notified_request_ids")
-    if receipt.get("version") != 1 or not isinstance(ids, list) or not all(isinstance(item, str) and len(item) == 32 for item in ids) or len(set(ids)) != len(ids) or not isinstance(receipt.get("run_limit_notified"), bool):
+    if receipt.get("version") == 1 and isinstance(receipt.get("notified_request_ids"), list) and isinstance(receipt.get("run_limit_notified"), bool):
+        receipt = {"version": 2, "notified_request_ids": receipt["notified_request_ids"], "recovery_task_ids": [], "run_limit_notified": receipt["run_limit_notified"], "_migrated": True}
+    ids, recoveries = receipt.get("notified_request_ids"), receipt.get("recovery_task_ids")
+    if receipt.get("version") != 2 or not isinstance(ids, list) or not isinstance(recoveries, list) or not all(isinstance(item, str) and len(item) == 32 for item in ids + recoveries) or len(set(ids)) != len(ids) or len(set(recoveries)) != len(recoveries) or not isinstance(receipt.get("run_limit_notified"), bool):
         raise NotifyError("notification receipt is invalid")
     return receipt
 
@@ -77,6 +79,26 @@ def observe(home: Path) -> tuple[tuple[str, ...], int]:
     return requests, blocked[0]
 
 
+def recoveries(receipt_path: Path) -> tuple[str, ...]:
+    journal = receipt_path.with_suffix("")
+    if not journal.exists():
+        return ()
+    try:
+        records = json.loads(journal.read_text(encoding="utf-8")).get("issues", {})
+    except (OSError, json.JSONDecodeError) as exc:
+        raise NotifyError("intake journal is unreadable") from exc
+    if not isinstance(records, dict):
+        raise NotifyError("intake journal is invalid")
+    values = []
+    for record in records.values():
+        recovery = record.get("needs_operator_recovery") if isinstance(record, dict) else None
+        task_id = recovery.get("task_id") if isinstance(recovery, dict) else None
+        if not isinstance(task_id, str) or len(task_id) != 32:
+            raise NotifyError("intake recovery record is invalid")
+        values.append(task_id)
+    return tuple(sorted(set(values)))
+
+
 def notify(message: str) -> None:
     program = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run"
     try:
@@ -88,18 +110,22 @@ def notify(message: str) -> None:
 def run_once(home: Path, receipt_path: Path) -> dict:
     with receipt_lock(receipt_path):
         requests, blocked = observe(home)
+        recovery_ids = recoveries(receipt_path)
         receipt = load_receipt(receipt_path)
         known = set(receipt["notified_request_ids"])
         new_requests = [request for request in requests if request not in known]
+        new_recoveries = [task_id for task_id in recovery_ids if task_id not in set(receipt["recovery_task_ids"])]
         limit_started = blocked > 0 and not receipt["run_limit_notified"]
         messages = []
         if new_requests:
             messages.append("A decision needs your answer." if len(new_requests) == 1 else f"{len(new_requests)} decisions need your answers.")
+        if new_recoveries:
+            messages.append("A source task needs operator recovery." if len(new_recoveries) == 1 else f"{len(new_recoveries)} source tasks need operator recovery.")
         if limit_started:
             messages.append("A project run limit is blocking queued work." if blocked == 1 else f"Project run limits are blocking {blocked} queued tasks.")
         if messages:
             notify(" ".join(messages))
-        next_receipt = {"version": 1, "notified_request_ids": list(requests), "run_limit_notified": blocked > 0}
+        next_receipt = {"version": 2, "notified_request_ids": list(requests), "recovery_task_ids": list(recovery_ids), "run_limit_notified": blocked > 0}
         if next_receipt != receipt:
             atomic_json(receipt_path, next_receipt)
         return {"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "notified": bool(messages)}
@@ -118,7 +144,7 @@ def main(argv=None) -> int:
         if args.status:
             requests, blocked = observe(args.home)
             receipt = load_receipt(args.receipt)
-            print(json.dumps({"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "notified_request_ids": len(receipt["notified_request_ids"]), "run_limit_notified": receipt["run_limit_notified"]}, sort_keys=True))
+            print(json.dumps({"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "operator_recoveries": len(recoveries(args.receipt)), "notified_request_ids": len(receipt["notified_request_ids"]), "run_limit_notified": receipt["run_limit_notified"]}, sort_keys=True))
         else:
             print(json.dumps(run_once(args.home, args.receipt), sort_keys=True))
         return 0

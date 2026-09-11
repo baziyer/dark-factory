@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ import (
 func TestParseServiceStatusIsOneExplicitCommand(t *testing.T) {
 	home := "/private/tmp/factory"
 	command, help, ok := parse([]string{"service", "status", "--home", home})
-	if !ok || help || command != (attemptCommand{kind: commandServiceStatus, home: home}) {
+	if !ok || help || !reflect.DeepEqual(command, attemptCommand{kind: commandServiceStatus, home: home}) {
 		t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 	}
 	for verb, kind := range map[string]commandKind{
@@ -27,7 +28,7 @@ func TestParseServiceStatusIsOneExplicitCommand(t *testing.T) {
 	} {
 		command, help, ok := parse([]string{"service", verb, "--home", home, "--label", "com.dark-factory.e2e.x", "--plist-dir", "/private/tmp/plists"})
 		want := attemptCommand{kind: kind, home: home, label: "com.dark-factory.e2e.x", plistDir: "/private/tmp/plists"}
-		if !ok || help || command != want {
+		if !ok || help || !reflect.DeepEqual(command, want) {
 			t.Fatalf("parse service %s = %+v, help=%t, ok=%t", verb, command, help, ok)
 		}
 	}
@@ -60,7 +61,7 @@ func TestParseServiceInstallConfigurationIsInstallOnlyAndExact(t *testing.T) {
 	const origin = "wss://relay&.example"
 	const address = "127.0.0.1:0"
 	command, help, ok := parse([]string{"service", "install", "--home", home, "--relay-origin", origin, "--development-browser-address", address})
-	if !ok || help || command != (attemptCommand{kind: commandServiceInstall, home: home, relayOrigin: origin, browserAddress: address}) {
+	if !ok || help || !reflect.DeepEqual(command, attemptCommand{kind: commandServiceInstall, home: home, relayOrigin: origin, browserAddress: address}) {
 		t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 	}
 	if config := serviceConfigFor(command); config.RelayOrigin != origin || config.DevelopmentBrowserAddress != address {

@@ -937,6 +937,8 @@ test("the settings modal carries the factory readout and a pairing mount point",
   assert.match(markup, /<dialog class="dfConsoleDialog" aria-label="Settings">/);
   assert.match(markup, /aria-label="BUILDING"/);
   assert.match(markup, /<dt>DISPATCH<\/dt><dd>ENABLED<\/dd>/);
+  assert.match(markup, /<dt>RUN ALLOWANCE<\/dt><dd>North Workshop: 7 LEFT \(5 USED\) · South Workshop: NOT LIMITED \(3 USED\)<\/dd>/);
+  assert.match(markup, /<dt>PER-RUN LIMIT<\/dt><dd>North Workshop: 900 SECONDS · South Workshop: NOT LIMITED<\/dd>/);
   assert.match(markup, /<dt>REVISION<\/dt><dd>42<\/dd>/);
   assert.match(markup, /127\.0\.0\.1:43123/);
   assert.match(markup, /aria-label="PAIRING"/);

@@ -205,7 +205,7 @@ func (backend *browserBackend) HumanRequestDetail(ctx context.Context, rawClient
 		return browserprotocol.HumanRequestDetail{}, mapBrowserError(err)
 	}
 	result := browserprotocol.HumanRequestDetail{
-		RequestID: detail.ID.String(), Revision: decimalRevision(detail.Revision), Question: detail.QuestionText,
+		RequestID: detail.ID.String(), Revision: decimalRevision(detail.Revision), Question: detail.QuestionText, Options: detail.Options,
 		CanReply: browserprotocol.Bool(detail.CanReply), ReplyMaxBytes: uint16(detail.ReplyMaxBytes),
 	}
 	if detail.TerminalTarget != nil {
@@ -832,7 +832,7 @@ func projectFactory(item kernel.FactorySummary) browserprotocol.FactoryItem {
 }
 
 func projectProject(item kernel.ProjectSummary) browserprotocol.ProjectItem {
-	return browserprotocol.ProjectItem{ID: item.ID.String(), Name: item.Name, Revision: decimalRevision(item.Revision)}
+	return browserprotocol.ProjectItem{ID: item.ID.String(), Name: item.Name, RunBudgetLimit: browserprotocol.Decimal(item.RunBudgetLimit), RunsUsed: browserprotocol.Decimal(item.RunsUsed), MaxRunSeconds: item.MaxRunSeconds, Revision: decimalRevision(item.Revision)}
 }
 
 // projectAgent resolves what the agent will actually run with. An agent that

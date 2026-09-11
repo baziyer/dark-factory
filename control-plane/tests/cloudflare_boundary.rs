@@ -287,6 +287,19 @@ fn declared_output_schemas_name_the_fields_the_results_carry() {
             &["branch", "head_sha"][..],
         ),
         (
+            "observe_issue",
+            "IssueObservationResult",
+            &[
+                "number",
+                "url",
+                "title",
+                "body",
+                "labels",
+                "updated_at",
+                "state",
+            ][..],
+        ),
+        (
             // Written with its closing brace on the value's own line, which is
             // how six other tools in `mcp.rs` are written. Including one here
             // keeps the key reader honest about where a value ends.

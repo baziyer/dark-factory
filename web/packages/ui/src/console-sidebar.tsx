@@ -535,6 +535,9 @@ export function SettingsDialog({
   load.current = onLoadAccounts;
   useEffect(() => { load.current?.(); }, []);
   const close = () => dialog.current?.close();
+  const projects = state === undefined ? [] : [...state.projects.values()];
+  const allowance = projects.length === 0 ? "NOT LIMITED" : projects.map((project) => project.run_budget_limit === 0n ? `${project.name}: NOT LIMITED (${project.runs_used} USED)` : `${project.name}: ${project.run_budget_limit > project.runs_used ? project.run_budget_limit - project.runs_used : 0n} LEFT (${project.runs_used} USED)`).join(" · ");
+  const duration = projects.length === 0 ? "NOT LIMITED" : projects.map((project) => project.max_run_seconds === 0 ? `${project.name}: NOT LIMITED` : `${project.name}: ${project.max_run_seconds} SECONDS`).join(" · ");
   return (
     <dialog
       className="dfConsoleDialog"
@@ -555,6 +558,8 @@ export function SettingsDialog({
               <div><dt>DISPATCH</dt><dd>{state.factory.dispatch_enabled ? "ENABLED" : "PAUSED"}</dd></div>
               <div><dt>WORKER SLOTS</dt><dd>{String(state.factory.capacity)}</dd></div>
               <div><dt>ACTIVE RUNS</dt><dd>{`${state.factory.active_runs} TOTAL`}</dd></div>
+              <div><dt>RUN ALLOWANCE</dt><dd>{allowance}</dd></div>
+              <div><dt>PER-RUN LIMIT</dt><dd>{duration}</dd></div>
               <div><dt>REVISION</dt><dd>{state.factory.revision.toString()}</dd></div>
             </dl>
           )}

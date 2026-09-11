@@ -463,6 +463,10 @@ func TestRelayCarriesTwoConcurrentControllersToTheirOwnDaemonSessions(t *testing
 			t.Fatalf("relayed snapshot projects = %+v", snapshot.Projects)
 		}
 	}
+	status, err := fixture.daemon.WebStatus(context.Background())
+	if err != nil || !status.Ready || status.Address != fixture.server.Addr() {
+		t.Fatalf("web status during relayed sessions = %+v, %v", status, err)
+	}
 	first.quiet(t)
 	second.quiet(t)
 }

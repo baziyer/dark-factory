@@ -1160,6 +1160,8 @@ func parseUnicodeEscape(value []byte) (uint16, bool) {
 func rejectNullMembers(kind MessageType, body []byte) error {
 	var fields []string
 	switch kind {
+	case TypeHumanRequestDetail:
+		fields = []string{"options"}
 	case TypeTerminalLeaseResult:
 		fields = []string{"expires_at_ms"}
 	case TypeTerminalExit:

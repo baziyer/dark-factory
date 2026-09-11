@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -200,7 +201,7 @@ func TestParseExactAttemptCommands(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			command, help, ok := parse(test.args)
-			if !ok || help != test.help || command != test.command {
+			if !ok || help != test.help || !reflect.DeepEqual(command, test.command) {
 				t.Fatalf("parse = %+v, help=%t ok=%t", command, help, ok)
 			}
 		})
@@ -451,7 +452,7 @@ func TestAttemptCommandsUseExactTypedCalls(t *testing.T) {
 				}
 			case api.CallRequestHuman:
 				input, ok := result.call.HumanQuestionInput()
-				if !ok || input != (api.HumanQuestionInput{IdempotencyKey: test.key, Question: test.text}) {
+				if !ok || !reflect.DeepEqual(input, api.HumanQuestionInput{IdempotencyKey: test.key, Question: test.text}) {
 					t.Fatalf("human question = %+v, %t", input, ok)
 				}
 			case api.CallSendBack:

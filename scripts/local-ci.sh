@@ -15,6 +15,12 @@ echo "local-ci: repository contract fixtures"
 ./scripts/test-reinstall-service.sh
 ./scripts/test-deploy-site.sh
 ./scripts/test-cold-review.sh
+python3 ./scripts/test-factory-intake.py
+python3 ./scripts/test-factory-notify.py
+python3 ./scripts/test-factory-release.py
+python3 ./scripts/test-factory-autonomy.py
+python3 ./scripts/test-factory-delivery.py
+python3 ./scripts/test-factory-review-intake.py
 ./scripts/test-github-step-summary.sh
 ./scripts/test-verify-adversarial-review.sh
 ./scripts/test-cloudflare-env.sh

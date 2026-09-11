@@ -17,7 +17,7 @@ import (
 )
 
 func TestLegacyHomeMigratesAndKeepsEveryRow(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion, v7UserVersion, v8UserVersion} {
 		for _, persistWAL := range []bool{false, true} {
 			t.Run(fmt.Sprintf("v%d/wal=%v", version, persistWAL), func(t *testing.T) {
 				testLegacyHomeMigratesAndKeepsEveryRow(t, version, persistWAL)
@@ -326,8 +326,19 @@ func newLegacyDatabase(t *testing.T, persistWAL bool, version int, extra ...stri
 			t.Fatal(err)
 		}
 	}
+	if version <= v8UserVersion {
+		columns := "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms"
+		if err := rebuildTable(ctx, connection, legacy, "human_requests", columns, "human_requests_one_unresolved_per_run", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if version <= v7UserVersion {
+		if err := rebuildTable(ctx, connection, legacy, "projects", "id, name, root, verification_policy, revision, created_at_ms, updated_at_ms", "projects_root_unique", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 	downgrade := []string{fmt.Sprintf("PRAGMA user_version = %d", version), "COMMIT"}
-	if version < userVersion {
+	if version < v7UserVersion {
 		downgrade = append([]string{"DROP TABLE peer_questions"}, downgrade...)
 	}
 	if version < v6UserVersion {
@@ -444,6 +455,12 @@ func snapshotSchemaRows(t *testing.T, ctx context.Context, connection *sql.Conn,
 		if !legacyColumns {
 			columns = "*"
 		}
+		if name == "projects" {
+			columns = "id, name, root, verification_policy, revision, created_at_ms, updated_at_ms"
+		}
+		if name == "human_requests" {
+			columns = "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms"
+		}
 		rows, err := connection.QueryContext(ctx, "SELECT "+columns+" FROM "+name+" ORDER BY 1")
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -506,7 +523,8 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 		statements []string
 		digest     string
 	}{
-		{"current", schemaStatements, "c6793e1552a878dfff3fb4efc4179ba6343a26f122337580b6ac558e8a6bfedf"},
+		{"current", schemaStatements, "049dc8ff317e31a86157fd5366579954581a4468caaca63c5dd95ee2958ab4cb"},
+		{"v7", v7SchemaStatements(), "c6793e1552a878dfff3fb4efc4179ba6343a26f122337580b6ac558e8a6bfedf"},
 		{"v6", v6SchemaStatements(), "4063acf5233e3aaf29fe932259283622df543733b56a7e78a359bd73ce85da8c"},
 		{"v4", v4SchemaStatements(), "6eb8be2af2f3efc8ed7d40ecf9bd1ec316675e39ad11fb8b0827a228e9232cf1"},
 		{"v3", priorSchemaStatements(), "2d5319a0afce6206d963631465833bc5f25d0f2261537f4f33c92a8e38a36009"},
@@ -524,7 +542,7 @@ func TestSchemaDigestsArePinned(t *testing.T) {
 // that reaches inside the migration transaction: the two above are rejected by
 // the preflight, on its disposable copy, before any pool exists.
 func TestLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t *testing.T) {
-	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion} {
+	for _, version := range []int{legacyUserVersion, previousUserVersion, priorUserVersion, v4UserVersion, v5UserVersion, v6UserVersion, v7UserVersion, v8UserVersion} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			testLegacyHomeWithBrokenDurableStateRollsBackAndRefuses(t, version)
 		})

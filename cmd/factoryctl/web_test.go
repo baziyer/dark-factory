@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestParseExactWebCommands(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			command, help, ok := parse(test.args)
-			if !ok || help != test.help || command != test.command {
+			if !ok || help != test.help || !reflect.DeepEqual(command, test.command) {
 				t.Fatalf("parse = %+v, help=%t, ok=%t", command, help, ok)
 			}
 		})

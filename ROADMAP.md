@@ -11,8 +11,8 @@ durable daemon-owned work queue, and supervised provider attempts.
   boundaries.
 - Complete release-grade install, service replacement, rollback, and recovery
   proof for the managed macOS service.
-- Revisit external intake and repository publication only as separately
-  reviewed, provider-neutral capabilities.
+- Prove each configured unattended project end to end with its selected
+  GitHub backlog, worker limits, review policy, and deployment target.
 
 ## Boundaries
 

@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -132,7 +133,7 @@ func TestHumanRequestDetailRejectsCorruptActiveRunRelationships(t *testing.T) {
 			}
 			corruptSQL(t, store, test.mutate, test.args(run)...)
 			detail, err := store.HumanRequestDetail(context.Background(), client.ID, request.ID, request.Revision)
-			if !errors.Is(err, ErrCorruptState) || detail != (HumanRequestDetail{}) {
+			if !errors.Is(err, ErrCorruptState) || !reflect.DeepEqual(detail, HumanRequestDetail{}) {
 				t.Fatalf("corrupt active detail = %+v, err=%v", detail, err)
 			}
 		})

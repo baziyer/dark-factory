@@ -599,9 +599,12 @@ type Task struct {
 }
 
 type ProjectSummary struct {
-	ID       ProjectID
-	Name     string
-	Revision Revision
+	ID             ProjectID
+	Name           string
+	RunBudgetLimit uint64
+	RunsUsed       uint64
+	MaxRunSeconds  uint32
+	Revision       Revision
 }
 
 type AgentSummary struct {

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,10 @@ import time
 from pathlib import Path
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
+SOURCE_FOOTER = re.compile(r"(?mi)^(Refs|Closes) #([1-9][0-9]*)\s*$")
+APP_MARKER_TRAILER = re.compile(r"(?mi)^<!-- dark-factory-operation:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}:[0-9a-f]{64} -->\s*\Z")
+MAX_RANGE_COMMITS = 100
+MAX_RANGE_PULLS = 100
 
 
 class ReleaseError(Exception):
@@ -48,12 +53,27 @@ def atomic_json(path, value):
 
 def run(argv, timeout=60, env=None):
     try:
-        return subprocess.run(argv, check=True, text=True, capture_output=True, timeout=timeout, env=env).stdout
+        process = subprocess.Popen(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, start_new_session=True)
+        stdout, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        # The fixed operator hook owns this fresh process group. Killing the
+        # group prevents a timed-out wrapper from leaving its installer alive.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        except ProcessLookupError:
+            pass
         raise ReleaseError(f"command timed out: {argv[0]}") from exc
-    except (OSError, subprocess.CalledProcessError) as exc:
-        detail = getattr(exc, "stderr", "") or str(exc)
-        raise ReleaseError(f"command failed: {argv[0]}: {detail.strip()[:512]}") from exc
+    except OSError as exc:
+        # Hooks may write credentials or private task text to stderr.  Receipts
+        # are durable and launcher output is public to the local operator.
+        raise ReleaseError(f"command failed: {argv[0]}") from exc
+    if process.returncode:
+        raise ReleaseError(f"command failed: {argv[0]}")
+    return stdout
 
 
 def valid_argv(value, name):
@@ -82,9 +102,11 @@ def validate_config(config):
         timeout = int(config.get("command_timeout", 60))
     except (TypeError, ValueError) as exc:
         raise ReleaseError("command_timeout must be an integer") from exc
-    if timeout < 5 or timeout > 600:
-        raise ReleaseError("command_timeout must be between 5 and 600")
+    if timeout < 5 or timeout > 1200:
+        raise ReleaseError("command_timeout must be between 5 and 1200")
     valid_argv(config["review_verifier"], "review_verifier")
+    if "allow_nonancestor_baseline" in config and type(config["allow_nonancestor_baseline"]) is not bool:
+        raise ReleaseError("allow_nonancestor_baseline must be a boolean")
 
 
 def load(path):
@@ -96,11 +118,16 @@ def load(path):
         raise ReleaseError("release journal is unreadable") from exc
     if value.get("version") != 1 or not isinstance(value.get("releases"), dict):
         raise ReleaseError("release journal has an invalid version")
+    tip = value.get("live_tip")
+    if tip is not None and (not isinstance(tip, dict) or not SHA.fullmatch(str(tip.get("sha", ""))) or type(tip.get("healthy")) is not bool):
+        raise ReleaseError("release journal has an invalid live tip")
     return value
 
 
 def config_fingerprint(config):
     relevant = {key: config.get(key) for key in ("repository", "base", "deploy_argv", "verify_argv", "review_verifier", "command_timeout")}
+    if "allow_nonancestor_baseline" in config:
+        relevant["allow_nonancestor_baseline"] = config["allow_nonancestor_baseline"]
     return hashlib.sha256(json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -183,7 +210,13 @@ def verify(config, expected):
 
 
 def probe(config, expected):
-    return verify_output(run(config["verify_argv"] + [expected], int(config.get("command_timeout", 60))), expected)
+    try:
+        value = json.loads(run(config["verify_argv"] + [expected], int(config.get("command_timeout", 60))))
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("live probe did not emit JSON") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("sha"), str) or not SHA.fullmatch(value["sha"]) or not isinstance(value.get("healthy"), bool):
+        raise ReleaseError("live probe did not identify the installed revision")
+    return value
 
 
 def gh_snapshot(config, number):
@@ -208,6 +241,73 @@ def latest_pr(config):
     return None
 
 
+def range_sources(config, previous, target):
+    """Return every factory PR and explicit source issue between two live tips."""
+    repo = config["repository"]
+    compare = json.loads(run(["gh", "api", f"repos/{repo}/compare/{previous}...{target}"]))
+    if not isinstance(compare, dict) or compare.get("status") != "ahead":
+        if config.get("allow_nonancestor_baseline") is True:
+            return [], "nonancestor_baseline"
+        raise ReleaseError("installed revision is not an ancestor of the deployment target")
+    count = compare.get("total_commits")
+    commits = compare.get("commits")
+    if type(count) is not int or count < 1 or count > MAX_RANGE_COMMITS or not isinstance(commits, list) or len(commits) != count:
+        raise ReleaseError("deployment range is incomplete or exceeds the commit bound")
+    shas = []
+    for commit in commits:
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not SHA.fullmatch(sha) or sha in shas:
+            raise ReleaseError("deployment range contains invalid commits")
+        shas.append(sha)
+    by_number = {}
+    for sha in shas:
+        pages = json.loads(run(["gh", "api", f"repos/{repo}/commits/{sha}/pulls?per_page={MAX_RANGE_PULLS}", "--paginate", "--slurp"]))
+        if not isinstance(pages, list) or len(pages) > 1 or any(not isinstance(page, list) or len(page) > MAX_RANGE_PULLS for page in pages):
+            raise ReleaseError("deployment pull-request lookup is incomplete or exceeds the bound")
+        for pull in (pages[0] if pages else []):
+            if not isinstance(pull, dict):
+                raise ReleaseError("deployment pull-request lookup is malformed")
+            number = pull.get("number")
+            merge = pull.get("merge_commit_sha")
+            base = pull.get("base")
+            if not isinstance(base, dict):
+                raise ReleaseError("deployment pull-request lookup is malformed")
+            if base.get("ref") != config["base"] or not pull.get("merged_at"):
+                continue
+            if type(number) is not int or number < 1 or not isinstance(merge, str) or merge not in shas:
+                raise ReleaseError("deployment pull request is malformed")
+            prior = by_number.get(number)
+            if prior is not None and prior != merge:
+                raise ReleaseError("deployment pull request has ambiguous merge commits")
+            by_number[number] = merge
+    sources = []
+    for sha in shas:
+        for number, merge in sorted(by_number.items()):
+            if merge != sha:
+                continue
+            detail = json.loads(run(["gh", "pr", "view", str(number), "--repo", repo, "--json", "state,baseRefName,mergeCommit,body"]))
+            actual = (detail.get("mergeCommit") or {}).get("oid") if isinstance(detail, dict) else None
+            if not isinstance(detail, dict) or detail.get("state") != "MERGED" or detail.get("baseRefName") != config["base"] or actual != merge or not isinstance(detail.get("body"), str):
+                raise ReleaseError("deployment pull request changed or is malformed")
+            footer = SOURCE_FOOTER.findall(detail["body"])
+            terminal_footer = re.search(r"(?mi)^(Refs|Closes) #([1-9][0-9]*)[ \t]*(?:\n\s*)?\Z", detail["body"])
+            if terminal_footer is None:
+                marker = APP_MARKER_TRAILER.search(detail["body"])
+                before_marker = detail["body"][:marker.start()] if marker else ""
+                terminal_footer = re.search(r"(?mi)^(Refs|Closes) #([1-9][0-9]*)[ \t]*\s*\Z", before_marker)
+            if len(footer) != 1 or terminal_footer is None:
+                raise ReleaseError(f"merged PR #{number} must contain exactly one Refs #N or Closes #N footer")
+            kind, issue = footer[0]
+            sources.append({"pr": number, "merge_sha": merge, "issue": int(issue), "reference": kind.lower()})
+    if len(sources) != len(by_number):
+        raise ReleaseError("deployment pull-request lookup did not cover every merged PR")
+    return sources, "range"
+
+
+def record_live_tip(journal, value):
+    journal["live_tip"] = {"sha": value["sha"], "healthy": value["healthy"], "observed_at": int(time.time())}
+
+
 def once(config, number, retry=False):
     journal_path = Path(config["journal"])
     lock_path = Path(str(journal_path) + ".lock")
@@ -227,9 +327,10 @@ def once(config, number, retry=False):
         if entry and entry.get("state") == "running":
             try:
                 value = probe(config, entry["sha"])
-                if value["healthy"] is not True:
+                if value["healthy"] is not True or value["sha"] != entry["sha"]:
                     raise ReleaseError("deployment outcome is ambiguous; live probe reports another state")
                 entry.update({"state": "verified", "verification": value, "verified_at": int(time.time())})
+                record_live_tip(journal, value)
                 atomic_json(journal_path, journal)
                 return entry
             except ReleaseError:
@@ -249,15 +350,39 @@ def once(config, number, retry=False):
         atomic_json(journal_path, journal)
         try:
             value = probe(config, sha)
-            if value["healthy"] is True:
-                entry.update({"state": "verified", "verification": value, "verified_at": int(time.time())})
-                atomic_json(journal_path, journal)
-                return entry
         except ReleaseError:
             entry["state"] = "blocked"
             entry["error"] = "live probe unavailable or malformed before deployment"
             atomic_json(journal_path, journal)
             raise ReleaseError(entry["error"])
+        prior_tip = journal.get("live_tip")
+        if prior_tip is not None and prior_tip["sha"] != value["sha"]:
+            entry["state"] = "blocked"
+            entry["error"] = "live revision changed outside the release journal"
+            atomic_json(journal_path, journal)
+            raise ReleaseError(entry["error"])
+        previous = value["sha"]
+        if prior_tip is None:
+            record_live_tip(journal, value)
+        if previous == sha:
+            sources, delivery_mode = [], "baseline_current" if prior_tip is None else "unchanged"
+        else:
+            try:
+                sources, delivery_mode = range_sources(config, previous, sha)
+            except ReleaseError as exc:
+                entry["state"] = "blocked"
+                entry["error"] = str(exc)
+                atomic_json(journal_path, journal)
+                raise
+        entry.update({"delivery_from_sha": previous, "delivery_sources": sources, "delivery_mode": delivery_mode})
+        # Persist the observed installed SHA and complete source mapping before
+        # deployment; a crash cannot turn an unrecorded range into a delivery.
+        atomic_json(journal_path, journal)
+        if value["healthy"] is True and value["sha"] == sha:
+            entry.update({"state": "verified", "verification": value, "verified_at": int(time.time())})
+            record_live_tip(journal, value)
+            atomic_json(journal_path, journal)
+            return entry
         fresh_default = json.loads(run(["gh", "api", f"repos/{config['repository']}/git/ref/heads/{config['base']}"]))["object"]["sha"]
         if fresh_default != sha:
             entry["state"] = "blocked"
@@ -275,6 +400,7 @@ def once(config, number, retry=False):
             atomic_json(journal_path, journal)
             raise
         entry.update({"state": "verified", "verification": value, "verified_at": int(time.time())})
+        record_live_tip(journal, value)
         atomic_json(journal_path, journal)
         return entry
 

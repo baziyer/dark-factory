@@ -194,9 +194,12 @@ type FactorySummary struct {
 }
 
 type ProjectSummary struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Revision uint64 `json:"revision"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	RunBudgetLimit uint64 `json:"run_budget_limit"`
+	RunsUsed       uint64 `json:"runs_used"`
+	MaxRunSeconds  uint32 `json:"max_run_seconds"`
+	Revision       uint64 `json:"revision"`
 }
 
 type AgentSummary struct {
@@ -388,6 +391,13 @@ type CreateProjectInput struct {
 	Root string `json:"root"`
 }
 
+type ProjectLimitsInput struct {
+	ProjectID        string `json:"project_id"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+	RunBudget        uint64 `json:"run_budget"`
+	MaxRunSeconds    uint32 `json:"max_run_seconds"`
+}
+
 type CreateAgentInput struct {
 	ID              string `json:"id"`
 	ProjectID       string `json:"project_id"`
@@ -428,8 +438,9 @@ type EnqueueTaskInput struct {
 // HumanRequest. The daemon derives the run and all public projection fields
 // from the authenticated attempt; callers cannot supply those identities.
 type HumanQuestionInput struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	Question       string `json:"question"`
+	IdempotencyKey string   `json:"idempotency_key"`
+	Question       string   `json:"question"`
+	Options        []string `json:"options,omitempty"`
 }
 
 type PeerQuestionInput struct {
