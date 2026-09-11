@@ -33,10 +33,13 @@ func (daemon *Daemon) webRuntime() (*BrowserRuntime, bool) {
 	if daemon.browserClosing {
 		return nil, false
 	}
-	// A relay is a client of one exact loopback listener. Once present, its
-	// configured address is the durable selection rule; other test or recovery
-	// listeners must not make the public operator surface report that listener
-	// as stopped or redirect pairing authority to it.
+	if len(daemon.browsers) == 1 {
+		for runtime := range daemon.browsers {
+			return runtime, runtime != nil && !runtime.closing && runtime.server != nil && runtime.backend != nil
+		}
+	}
+	// With several listeners, select the one the relay actually uses.
+	// Extra transport listeners must not make the public surface report stopped.
 	if daemon.relay != nil {
 		for runtime := range daemon.browsers {
 			if runtime != nil && runtime.Addr() == daemon.relay.browserAddress {
@@ -44,12 +47,6 @@ func (daemon *Daemon) webRuntime() (*BrowserRuntime, bool) {
 			}
 		}
 		return nil, false
-	}
-	if len(daemon.browsers) != 1 {
-		return nil, false
-	}
-	for runtime := range daemon.browsers {
-		return runtime, runtime != nil && !runtime.closing && runtime.server != nil && runtime.backend != nil
 	}
 	return nil, false
 }

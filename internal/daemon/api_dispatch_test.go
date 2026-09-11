@@ -268,7 +268,7 @@ func TestDaemonDispatchesAttemptOutcomeAfterCommit(t *testing.T) {
 	ctx := context.Background()
 	done := fixture.serve(t)
 	result, err := active.client.Succeed(ctx, "private result sentinel")
-	if err != nil || result.Revision != uint64(active.run.Revision.Int64()+1) || result.Head != 11 {
+	if err != nil || result.Revision != uint64(active.run.Revision.Int64()+1) || result.Head != 12 {
 		t.Fatalf("attempt succeed = %+v, %v", result, err)
 	}
 	waitDispatch(t, done)
@@ -688,7 +688,7 @@ func TestDaemonDispatchesBlockAndFailCalls(t *testing.T) {
 			active := prepareActiveAttempt(t, fixture, byte(21+len(test.name)))
 			done := fixture.serve(t)
 			result, err := test.call(context.Background(), active.client)
-			if err != nil || result.Revision != uint64(active.run.Revision.Int64()+1) || result.Head != 11 {
+			if err != nil || result.Revision != uint64(active.run.Revision.Int64()+1) || result.Head != 12 {
 				t.Fatalf("outcome = %+v, %v", result, err)
 			}
 			waitDispatch(t, done)
