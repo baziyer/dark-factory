@@ -51,15 +51,17 @@ def receipt_lock(receipt: Path):
 
 def load_receipt(path: Path) -> dict:
     if not path.exists():
-        return {"version": 2, "notified_request_ids": [], "recovery_task_ids": [], "run_limit_notified": False}
+        return {"version": 3, "notified_request_ids": [], "recovery_task_ids": [], "run_limit_notified": False, "automation_failure_codes": []}
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise NotifyError("notification receipt is unreadable") from exc
     if receipt.get("version") == 1 and isinstance(receipt.get("notified_request_ids"), list) and isinstance(receipt.get("run_limit_notified"), bool):
         receipt = {"version": 2, "notified_request_ids": receipt["notified_request_ids"], "recovery_task_ids": [], "run_limit_notified": receipt["run_limit_notified"], "_migrated": True}
-    ids, recoveries = receipt.get("notified_request_ids"), receipt.get("recovery_task_ids")
-    if receipt.get("version") != 2 or not isinstance(ids, list) or not isinstance(recoveries, list) or not all(isinstance(item, str) and len(item) == 32 for item in ids + recoveries) or len(set(ids)) != len(ids) or len(set(recoveries)) != len(recoveries) or not isinstance(receipt.get("run_limit_notified"), bool):
+    if receipt.get("version") == 2:
+        receipt = {"version": 3, "notified_request_ids": receipt.get("notified_request_ids"), "recovery_task_ids": receipt.get("recovery_task_ids"), "run_limit_notified": receipt.get("run_limit_notified"), "automation_failure_codes": [], "_migrated": True}
+    ids, recoveries, failures = receipt.get("notified_request_ids"), receipt.get("recovery_task_ids"), receipt.get("automation_failure_codes")
+    if receipt.get("version") != 3 or not isinstance(ids, list) or not isinstance(recoveries, list) or not isinstance(failures, list) or not all(isinstance(item, str) and len(item) == 32 for item in ids + recoveries) or not all(isinstance(item, str) and item and len(item) <= 128 for item in failures) or len(set(ids)) != len(ids) or len(set(recoveries)) != len(recoveries) or len(set(failures)) != len(failures) or not isinstance(receipt.get("run_limit_notified"), bool):
         raise NotifyError("notification receipt is invalid")
     return receipt
 
@@ -91,12 +93,40 @@ def recoveries(receipt_path: Path) -> tuple[str, ...]:
         raise NotifyError("intake journal is invalid")
     values = []
     for record in records.values():
-        recovery = record.get("needs_operator_recovery") if isinstance(record, dict) else None
+        if not isinstance(record, dict):
+            raise NotifyError("intake recovery record is invalid")
+        if "needs_operator_recovery" not in record:
+            continue
+        recovery = record["needs_operator_recovery"]
         task_id = recovery.get("task_id") if isinstance(recovery, dict) else None
         if not isinstance(task_id, str) or len(task_id) != 32:
             raise NotifyError("intake recovery record is invalid")
         values.append(task_id)
     return tuple(sorted(set(values)))
+
+
+def automation_failures(receipt_path: Path) -> tuple[str, ...]:
+    journal = receipt_path.with_suffix("")
+    health = Path(str(journal) + ".autonomy.json")
+    if not health.exists():
+        return ()
+    try:
+        value = json.loads(health.read_text(encoding="utf-8"))
+        components = value["components"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return ("health_receipt_invalid",)
+    failures = []
+    if not isinstance(components, list):
+        return ("health_receipt_invalid",)
+    for component in components:
+        if not isinstance(component, dict) or not isinstance(component.get("component"), str) or not component["component"] or not isinstance(component.get("ok"), bool):
+            return ("health_receipt_invalid",)
+        if not component["ok"]:
+            code = component.get("error")
+            if not isinstance(code, str) or not code or len(code) > 64:
+                return ("health_receipt_invalid",)
+            failures.append(component["component"] + ":" + code)
+    return tuple(sorted(set(failures)))
 
 
 def notify(message: str) -> None:
@@ -111,11 +141,13 @@ def run_once(home: Path, receipt_path: Path) -> dict:
     with receipt_lock(receipt_path):
         requests, blocked = observe(home)
         recovery_ids = recoveries(receipt_path)
+        failure_codes = automation_failures(receipt_path)
         receipt = load_receipt(receipt_path)
         known = set(receipt["notified_request_ids"])
         new_requests = [request for request in requests if request not in known]
         new_recoveries = [task_id for task_id in recovery_ids if task_id not in set(receipt["recovery_task_ids"])]
         limit_started = blocked > 0 and not receipt["run_limit_notified"]
+        automation_started = [code for code in failure_codes if code not in set(receipt["automation_failure_codes"])]
         messages = []
         if new_requests:
             messages.append("A decision needs your answer." if len(new_requests) == 1 else f"{len(new_requests)} decisions need your answers.")
@@ -123,9 +155,11 @@ def run_once(home: Path, receipt_path: Path) -> dict:
             messages.append("A source task needs operator recovery." if len(new_recoveries) == 1 else f"{len(new_recoveries)} source tasks need operator recovery.")
         if limit_started:
             messages.append("A project run limit is blocking queued work." if blocked == 1 else f"Project run limits are blocking {blocked} queued tasks.")
+        if automation_started:
+            messages.append("Factory automation needs attention.")
         if messages:
             notify(" ".join(messages))
-        next_receipt = {"version": 2, "notified_request_ids": list(requests), "recovery_task_ids": list(recovery_ids), "run_limit_notified": blocked > 0}
+        next_receipt = {"version": 3, "notified_request_ids": list(requests), "recovery_task_ids": list(recovery_ids), "run_limit_notified": blocked > 0, "automation_failure_codes": list(failure_codes)}
         if next_receipt != receipt:
             atomic_json(receipt_path, next_receipt)
         return {"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "notified": bool(messages)}
@@ -144,7 +178,7 @@ def main(argv=None) -> int:
         if args.status:
             requests, blocked = observe(args.home)
             receipt = load_receipt(args.receipt)
-            print(json.dumps({"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "operator_recoveries": len(recoveries(args.receipt)), "notified_request_ids": len(receipt["notified_request_ids"]), "run_limit_notified": receipt["run_limit_notified"]}, sort_keys=True))
+            print(json.dumps({"pending_human_requests": len(requests), "queued_at_run_limit": blocked, "operator_recoveries": len(recoveries(args.receipt)), "automation_failures": len(automation_failures(args.receipt)), "notified_request_ids": len(receipt["notified_request_ids"]), "run_limit_notified": receipt["run_limit_notified"]}, sort_keys=True))
         else:
             print(json.dumps(run_once(args.home, args.receipt), sort_keys=True))
         return 0

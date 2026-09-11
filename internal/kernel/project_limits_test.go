@@ -59,3 +59,35 @@ func TestProjectLimitsUseAdditionalAllowanceAndDefaultToDisabled(t *testing.T) {
 		t.Fatalf("additional limits = %+v, %v", project, err)
 	}
 }
+
+func TestAdmissionSkipsExhaustedProjectBeforePriority(t *testing.T) {
+	for _, role := range []AgentRole{RoleWorker, RoleOrchestrator} {
+		t.Run(role.String(), func(t *testing.T) {
+			store, _, exhausted, exhaustedAgent := newAdmissionStore(t, role, 4)
+			defer store.Close()
+			ctx := context.Background()
+			if _, err := store.writer.Exec(`UPDATE projects SET run_budget_limit = 1, runs_used = 1 WHERE id = ?`, exhausted.ID.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			funded, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 210), Name: "funded", Root: "/funded"}, mustTime(t, 4))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fundedAgent, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 211), ProjectID: funded.ID, Name: "funded", Role: role, Provider: ProviderCodex, ToolBudgetLimit: 5}, mustTime(t, 5))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 212), ProjectID: exhausted.ID, AssignedAgentID: exhaustedAgent.ID, IncarnationID: incarnationID(t, 213), Title: "exhausted", Priority: 9}, mustTime(t, 6)); err != nil {
+				t.Fatal(err)
+			}
+			fundedTask, err := store.EnqueueTask(ctx, NewTask{ID: taskID(t, 214), ProjectID: funded.ID, AssignedAgentID: fundedAgent.ID, IncarnationID: incarnationID(t, 215), Title: "funded", Priority: 1}, mustTime(t, 7))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.AdmitNext(ctx, admissionKeys(t, 216, nil), mustTime(t, 8))
+			if err != nil || !result.Admitted() || result.Run.TaskID != fundedTask.ID {
+				t.Fatalf("admission = %+v, %v", result, err)
+			}
+		})
+	}
+}

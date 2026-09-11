@@ -77,12 +77,32 @@ class NotifyTest(unittest.TestCase):
     def test_recovery_notifies_once_without_source_text(self):
         journal = Path(self.temp.name) / 'intake.json'
         receipt = Path(str(journal) + '.notifications')
-        journal.write_text('{"issues":{"o/r#7":{"needs_operator_recovery":{"task_id":"' + 'ab' * 16 + '"}}}}')
+        journal.write_text('{"issues":{"o/r#6":{"number":6},"o/r#7":{"needs_operator_recovery":{"task_id":"' + 'ab' * 16 + '"}}}}')
         calls = []
         with patch.object(NOTIFY, 'notify', calls.append):
             self.assertTrue(NOTIFY.run_once(self.home, receipt)['notified'])
             self.assertFalse(NOTIFY.run_once(self.home, receipt)['notified'])
         self.assertEqual(calls, ['A source task needs operator recovery.'])
+
+    def test_automation_failure_notifies_once_per_active_code_without_details(self):
+        journal = Path(self.temp.name) / 'intake.json'
+        receipt = Path(str(journal) + '.notifications')
+        health = Path(str(journal) + '.autonomy.json')
+        health.write_text('{"at":1,"components":[{"component":"factory-intake","ok":false,"error":"exit_1"}]}')
+        calls = []
+        with patch.object(NOTIFY, 'notify', calls.append):
+            self.assertTrue(NOTIFY.run_once(self.home, receipt)['notified'])
+            self.assertFalse(NOTIFY.run_once(self.home, receipt)['notified'])
+            health.write_text('{"at":2,"components":[{"component":"factory-release","ok":false,"error":"timeout"}]}')
+            self.assertTrue(NOTIFY.run_once(self.home, receipt)['notified'])
+        self.assertEqual(calls, ['Factory automation needs attention.', 'Factory automation needs attention.'])
+
+    def test_invalid_present_recovery_is_refused(self):
+        journal = Path(self.temp.name) / 'intake.json'
+        receipt = Path(str(journal) + '.notifications')
+        journal.write_text('{"issues":{"o/r#7":{"needs_operator_recovery":{}}}}')
+        with self.assertRaisesRegex(NOTIFY.NotifyError, 'recovery record'):
+            NOTIFY.run_once(self.home, receipt)
 
     def test_v1_receipt_migrates_without_renotifying(self):
         self.request("22")
@@ -90,7 +110,7 @@ class NotifyTest(unittest.TestCase):
         with patch.object(NOTIFY, 'notify') as notify:
             self.assertFalse(NOTIFY.run_once(self.home, self.receipt)['notified'])
         notify.assert_not_called()
-        self.assertEqual(2, json.loads(self.receipt.read_text())['version'])
+        self.assertEqual(3, json.loads(self.receipt.read_text())['version'])
 
 
 if __name__ == "__main__":

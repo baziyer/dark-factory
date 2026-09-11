@@ -16,13 +16,12 @@ import time
 def tick(config_path, config):
     scripts = Path(__file__).resolve().parent
     # Notifications remain useful when GitHub or intake is unavailable.
-    calls = [
-        [sys.executable, str(scripts / 'factory-intake.py'), str(config_path), '--once'],
-    ]
+    calls = [[sys.executable, str(scripts / 'factory-source-refresh.py'), str(config_path), '--once']]
     if 'review_mirror_root' in config:
         if not isinstance(config['review_mirror_root'], str) or not Path(config['review_mirror_root']).is_absolute():
             raise ValueError('review_mirror_root must be an absolute path')
         calls.append([sys.executable, str(scripts / 'factory-review-intake.py'), str(config_path), '--once'])
+    calls.append([sys.executable, str(scripts / 'factory-intake.py'), str(config_path), '--once'])
     calls.append([sys.executable, str(scripts / 'factory-notify.py'), '--once', '--home', config['factory_home'], '--receipt', config['journal'] + '.notifications'])
     releases = config.get('release_configs', [])
     if not isinstance(releases, list) or any(not isinstance(item, str) or not Path(item).is_absolute() for item in releases):
@@ -30,13 +29,19 @@ def tick(config_path, config):
     for release_config in releases:
         calls.append([sys.executable, str(scripts / 'factory-release.py'), release_config, '--latest', '--once'])
     results = []
+    refreshed = None
     for argv in calls:
+        if Path(argv[1]).name == 'factory-intake.py' and refreshed is False:
+            results.append({'component': 'factory-intake', 'ok': False, 'error': 'source_refresh_failed'})
+            continue
         try:
             completed = subprocess.run(argv, capture_output=True, text=True, timeout=1300)
             result = {'component': Path(argv[1]).stem, 'ok': completed.returncode == 0}
             if completed.returncode:
                 result['error'] = 'exit_' + str(completed.returncode)
             results.append(result)
+            if Path(argv[1]).name == 'factory-source-refresh.py':
+                refreshed = result['ok']
             if completed.returncode == 0 and Path(argv[1]).name == 'factory-release.py':
                 receipt = json.loads(completed.stdout)
                 if receipt.get('state') == 'verified':
@@ -48,8 +53,12 @@ def tick(config_path, config):
 
         except subprocess.TimeoutExpired:
             results.append({'component': Path(argv[1]).stem, 'ok': False, 'error': 'timeout'})
+            if Path(argv[1]).name == 'factory-source-refresh.py':
+                refreshed = False
         except Exception:
             results.append({'component': Path(argv[1]).stem, 'ok': False, 'error': 'exception'})
+            if Path(argv[1]).name == 'factory-source-refresh.py':
+                refreshed = False
     return results
 
 

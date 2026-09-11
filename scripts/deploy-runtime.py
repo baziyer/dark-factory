@@ -44,9 +44,11 @@ def deploy(sha):
     home = Path.home() / '.dark-factory'
     control = Path(str(home) + '.service') / 'bin' / 'current' / 'factoryctl'
     env = dict(os.environ, DARK_FACTORY_SOCKET=str(home / 'runtimes' / 'factory.sock'), DARK_FACTORY_OPERATOR_TOKEN_FILE=str(home / 'operator.token'))
-    enabled, _, _ = state(home)
-    subprocess.run([str(control), 'dispatch', 'off'], env=env, check=True, timeout=15)
+    enabled, original_revision, _ = state(home)
+    subprocess.run([str(control), 'dispatch', 'off', '--revision', str(original_revision)], env=env, check=True, timeout=15)
     _, paused_revision, _ = state(home)
+    if paused_revision != original_revision + int(bool(enabled)):
+        raise ValueError('operator changed dispatch during deployment pause')
     try:
         deadline = time.monotonic() + 300
         while state(home)[2]:
@@ -68,7 +70,7 @@ def deploy(sha):
     current_enabled, revision, _ = state(home)
     # A subsequent explicit operator dispatch change wins over our restoration.
     if enabled and not current_enabled and revision == paused_revision:
-        subprocess.run([str(control), 'dispatch', 'on'], env=env, check=True, timeout=15)
+        subprocess.run([str(control), 'dispatch', 'on', '--revision', str(paused_revision)], env=env, check=True, timeout=15)
     print(json.dumps({'sha': sha, 'healthy': True, 'dispatch_enabled': bool(state(home)[0])}))
 
 

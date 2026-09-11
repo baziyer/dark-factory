@@ -21,6 +21,7 @@ python3 ./scripts/test-factory-release.py
 python3 ./scripts/test-factory-autonomy.py
 python3 ./scripts/test-factory-delivery.py
 python3 ./scripts/test-factory-review-intake.py
+python3 ./scripts/test-factory-source-refresh.py
 ./scripts/test-github-step-summary.sh
 ./scripts/test-verify-adversarial-review.sh
 ./scripts/test-cloudflare-env.sh

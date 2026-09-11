@@ -86,7 +86,9 @@ answer. Ordinary terminal prose is not a human request.
 `scripts/factory-notify.py --once --home HOME --receipt RECEIPT` sends a
 content-free local macOS notification for new decisions and exhausted project
 allowances. macOS notification settings control presentation. The browser is
-the answer surface. This does not send email, chat, or GitHub messages.
+the answer surface. A new automation failure also produces a content-free
+notification on the next scheduled observation; its private health receipt
+names the affected component. This does not send email, chat, or GitHub messages.
 
 ## Recovery and completion
 
@@ -101,6 +103,13 @@ outcomes remain visible. Stop intake to stop importing work; disable dispatch
 to stop future admissions. Existing runs require Stop or their duration limit.
 Intake never fast-forwards the project root. Every delegated worker uses a
 private clean worktree and fetches the current base before making changes.
+Before each intake pass, the host pauses dispatch at its exact factory
+revision, waits for every active run to finish, then fast-forwards the clean
+configured project root from its configured HTTPS origin. It preserves
+untracked files and refuses tracked edits, a non-fast-forward, an origin or
+branch mismatch, and a five-minute drain timeout. It restores only its own
+pause through the same revision guard; an operator change wins. A failed
+refresh delays new source intake until the next successful pass.
 If a source supervisor reaches its duration limit while a human decision is
 unanswered, intake records `needs_operator_recovery` and sends one local alert.
 It does not repeat that task. Edit the source issue materially to create a new

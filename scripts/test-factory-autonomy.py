@@ -23,18 +23,19 @@ deploy = module('deploy-runtime')
 class AutonomyTest(unittest.TestCase):
     def test_notification_runs_even_if_intake_fails(self):
         config = {'factory_home': '/private/tmp/factory', 'journal': '/private/tmp/journal'}
-        with patch.object(autonomy.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 1, '', 'GitHub unavailable'), subprocess.CompletedProcess([], 0, '{}', '')]) as run:
+        with patch.object(autonomy.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0, '{}', ''), subprocess.CompletedProcess([], 1, '', 'GitHub unavailable'), subprocess.CompletedProcess([], 0, '{}', '')]) as run:
             result = autonomy.tick(Path('/private/tmp/config'), config)
-        self.assertFalse(result[0]['ok'])
-        self.assertTrue(result[1]['ok'])
-        self.assertIn('factory-intake.py', run.call_args_list[0].args[0][1])
+        self.assertFalse(result[1]['ok'])
+        self.assertTrue(result[2]['ok'])
+        self.assertIn('factory-source-refresh.py', run.call_args_list[0].args[0][1])
 
     def test_launchd_results_do_not_retain_child_output(self):
         config = {'factory_home': '/private/tmp/factory', 'journal': '/private/tmp/journal'}
         secret = 'token=should-not-appear'
         with patch.object(autonomy.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 1, secret, secret), subprocess.CompletedProcess([], 1, secret, secret)]):
             result = autonomy.tick(Path('/private/tmp/config'), config)
-        self.assertEqual([{'component': 'factory-intake', 'ok': False, 'error': 'exit_1'},
+        self.assertEqual([{'component': 'factory-source-refresh', 'ok': False, 'error': 'exit_1'},
+                          {'component': 'factory-intake', 'ok': False, 'error': 'source_refresh_failed'},
                           {'component': 'factory-notify', 'ok': False, 'error': 'exit_1'}], result)
 
     def test_health_receipt_is_private_and_finite(self):
@@ -70,6 +71,15 @@ class AutonomyTest(unittest.TestCase):
             deploy.deploy('a' * 40)
         install = next(call for call in run.call_args_list if Path(call.args[0][1]).name == 'reinstall-service.sh')
         self.assertEqual(600, install.kwargs['timeout'])
+        self.assertIn([str(Path.home() / '.dark-factory.service/bin/current/factoryctl'), 'dispatch', 'off', '--revision', '4'], [call.args[0] for call in run.call_args_list])
+        self.assertIn([str(Path.home() / '.dark-factory.service/bin/current/factoryctl'), 'dispatch', 'on', '--revision', '5'], [call.args[0] for call in run.call_args_list])
+
+    def test_runtime_operator_change_after_pause_never_installs(self):
+        states = iter([(True, 4, 0), (False, 6, 0)])
+        with patch.object(deploy, 'state', side_effect=lambda _home: next(states)), patch.object(deploy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            with self.assertRaisesRegex(ValueError, 'operator changed'):
+                deploy.deploy('a' * 40)
+        self.assertFalse(any(Path(call.args[0][1]).name == 'reinstall-service.sh' for call in run.call_args_list))
 
     def test_runtime_failure_records_a_safe_receipt(self):
         def timeout_install(argv, **_kwargs):

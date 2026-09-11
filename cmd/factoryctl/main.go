@@ -63,7 +63,7 @@ const (
   factoryctl task add --project ID --agent ID --title TEXT [--body TEXT] [--priority N] [--task-id ID --incarnation-id ID]
   factoryctl status
   factoryctl task send-back --task ID --note TEXT
-  factoryctl dispatch on|off
+  factoryctl dispatch on|off [--revision REVISION]
   factoryctl web status
   factoryctl web list-clients [--after CLIENT_ID]
   factoryctl web revoke CLIENT_ID --revision REVISION
@@ -724,6 +724,12 @@ func parseOperator(args []string) (attemptCommand, bool, bool) {
 		if len(args) == 2 && (args[1] == "on" || args[1] == "off") {
 			return attemptCommand{kind: commandDispatch, enabled: args[1] == "on"}, false, true
 		}
+		if len(args) == 4 && (args[1] == "on" || args[1] == "off") && args[2] == "--revision" {
+			revision, ok := parseRevision(args[3])
+			if ok {
+				return attemptCommand{kind: commandDispatch, enabled: args[1] == "on", expectedRevision: revision}, false, true
+			}
+		}
 		return attemptCommand{}, false, false
 	}
 	if len(args) < 2 {
@@ -1260,11 +1266,15 @@ func runOperator(ctx context.Context, command attemptCommand, getenv func(string
 			Revision uint64 `json:"revision"`
 		}{ID: command.id, Head: result.Head, Revision: result.Revision})
 	case commandDispatch:
-		snapshot, callErr := client.Snapshot(callContext)
-		if callErr != nil {
-			return writeWebFailure(stderr, "dispatch", callErr)
+		revision := command.expectedRevision
+		if revision == 0 {
+			snapshot, callErr := client.Snapshot(callContext)
+			if callErr != nil {
+				return writeWebFailure(stderr, "dispatch", callErr)
+			}
+			revision = snapshot.Factory.Revision
 		}
-		result, callErr := client.SetDispatch(callContext, snapshot.Factory.Revision, command.enabled)
+		result, callErr := client.SetDispatch(callContext, revision, command.enabled)
 		if callErr != nil {
 			return writeWebFailure(stderr, "dispatch", callErr)
 		}

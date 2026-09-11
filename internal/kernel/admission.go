@@ -52,6 +52,7 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 			WHERE t.status = 'queued'
 			  AND a.paused = 0
 			  AND a.tool_calls_used < a.tool_budget_limit
+			  AND EXISTS (SELECT 1 FROM projects AS p WHERE p.id = t.project_id AND (p.run_budget_limit = 0 OR p.runs_used < p.run_budget_limit))
 			  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
 			  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') < ?)
 			    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') < 1))
@@ -83,6 +84,7 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 			SELECT 1 FROM tasks AS t
 			JOIN agents AS a ON a.id = t.assigned_agent_id AND a.project_id = t.project_id
 			WHERE t.status = 'queued' AND a.paused = 0 AND a.tool_calls_used < a.tool_budget_limit
+			  AND EXISTS (SELECT 1 FROM projects AS p WHERE p.id = t.project_id AND (p.run_budget_limit = 0 OR p.runs_used < p.run_budget_limit))
 			  AND NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.agent_id = a.id AND r.phase <> 'terminal')
 			  AND ((a.role = 'worker' AND (SELECT COUNT(*) FROM runs WHERE role = 'worker' AND phase <> 'terminal') >= ?)
 			    OR (a.role = 'orchestrator' AND (SELECT COUNT(*) FROM runs WHERE role = 'orchestrator' AND phase <> 'terminal') >= 1))
