@@ -329,6 +329,7 @@ for local_child in \
     test-prepare-release-source.sh test-publish-release.sh test-package-release.sh; do
     /bin/ln -s stub "$local_fixture/scripts/$local_child"
 done
+printf 'process.exit(0);\n' >"$local_fixture/scripts/test-verification-profile.mjs"
 
 for local_python in intake notify release autonomy delivery review-intake source-refresh; do
     printf 'pass\n' >"$local_fixture/scripts/test-factory-$local_python.py"

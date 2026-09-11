@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 // Operator-owned browser profile: no user browser session or stored login is touched.
-import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { verificationProfile } from './verification-profile.mjs';
 
 const require = createRequire(join(process.env.DARK_FACTORY_SITE || join(homedir(), 'dark-factory-site'), 'package.json'));
 const { chromium, expect } = require('@playwright/test');
-const profile = join(homedir(), '.dark-factory-verification-browser');
-await mkdir(profile, { recursive: true, mode: 0o700 });
 let context;
 try {
+  const profile = await verificationProfile();
   context = await chromium.launchPersistentContext(profile, { headless: true, viewport: { width: 1440, height: 900 } });
   await context.grantPermissions(['local-network-access'], { origin: 'https://app.darkfactory.build' });
   const page = await context.newPage();
