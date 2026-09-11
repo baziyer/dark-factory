@@ -372,21 +372,21 @@ func (store *Store) Snapshot(ctx context.Context) (DashboardSnapshot, error) {
 		Factory: FactorySummary{DispatchEnabled: state.DispatchEnabled, Capacity: state.Capacity, ActiveRuns: activeRuns, Revision: state.Revision},
 	}
 	count := 0
-	projectRows, err := tx.connection.QueryContext(ctx, `SELECT id, name, revision FROM projects ORDER BY id LIMIT ?`, SnapshotEntityLimit+1)
+	projectRows, err := tx.connection.QueryContext(ctx, `SELECT id, name, run_budget_limit, runs_used, max_run_seconds, revision FROM projects ORDER BY id LIMIT ?`, SnapshotEntityLimit+1)
 	if err != nil {
 		return DashboardSnapshot{}, fmt.Errorf("read project summaries: %w", err)
 	}
 	for projectRows.Next() {
 		var rawID []byte
 		var name string
-		var rawRevision int64
-		if err := projectRows.Scan(&rawID, &name, &rawRevision); err != nil {
+		var runBudget, runsUsed, maxRunSeconds, rawRevision int64
+		if err := projectRows.Scan(&rawID, &name, &runBudget, &runsUsed, &maxRunSeconds, &rawRevision); err != nil {
 			projectRows.Close()
 			return DashboardSnapshot{}, fmt.Errorf("scan project summary: %w", err)
 		}
 		id, idErr := ProjectIDFromBytes(rawID)
 		revision, revisionErr := NewRevision(rawRevision)
-		if idErr != nil || revisionErr != nil || byteLen(name) < 1 || byteLen(name) > 128 {
+		if idErr != nil || revisionErr != nil || byteLen(name) < 1 || byteLen(name) > 128 || runBudget < 0 || runsUsed < 0 || runBudget != 0 && runsUsed > runBudget || maxRunSeconds < 0 || maxRunSeconds > 86400 {
 			projectRows.Close()
 			return DashboardSnapshot{}, fmt.Errorf("%w: invalid project summary", ErrCorruptState)
 		}
@@ -395,7 +395,7 @@ func (store *Store) Snapshot(ctx context.Context) (DashboardSnapshot, error) {
 			projectRows.Close()
 			return DashboardSnapshot{}, ErrSnapshotTooLarge
 		}
-		snapshot.Projects = append(snapshot.Projects, ProjectSummary{ID: id, Name: name, Revision: revision})
+		snapshot.Projects = append(snapshot.Projects, ProjectSummary{ID: id, Name: name, RunBudgetLimit: uint64(runBudget), RunsUsed: uint64(runsUsed), MaxRunSeconds: uint32(maxRunSeconds), Revision: revision})
 	}
 	if err := projectRows.Close(); err != nil {
 		return DashboardSnapshot{}, err

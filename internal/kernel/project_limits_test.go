@@ -58,6 +58,13 @@ func TestProjectLimitsUseAdditionalAllowanceAndDefaultToDisabled(t *testing.T) {
 	if err != nil || project.RunBudgetLimit != 10 || project.RunsUsed != 7 || project.MaxRunSeconds != 120 {
 		t.Fatalf("additional limits = %+v, %v", project, err)
 	}
+	snapshot, err := store.Snapshot(ctx)
+	if err != nil || len(snapshot.Projects) != 1 {
+		t.Fatalf("dashboard snapshot = %+v, %v", snapshot, err)
+	}
+	if got := snapshot.Projects[0]; got.RunBudgetLimit != 10 || got.RunsUsed != 7 || got.MaxRunSeconds != 120 {
+		t.Fatalf("dashboard project limits = %+v", got)
+	}
 }
 
 func TestAdmissionSkipsExhaustedProjectBeforePriority(t *testing.T) {
