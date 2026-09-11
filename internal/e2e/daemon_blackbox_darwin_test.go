@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 )
 
 const blackBoxGit = "/Library/Developer/CommandLineTools/usr/bin/git"
+const maxStartupDiagnosticBytes = 4096
 
 // happyPathBody is the shell provider task: it must declare its own outcome,
 // exactly as a real provider session does.
@@ -49,6 +51,25 @@ func (buffer *syncBuffer) String() string {
 	return buffer.value.String()
 }
 
+func startupDiagnostic(output func() string) string {
+	if output == nil {
+		return "no factoryd startup diagnostic"
+	}
+	diagnostic := ""
+	for _, line := range strings.Split(output(), "\n") {
+		if strings.HasPrefix(line, "factoryd:") {
+			diagnostic = line
+		}
+	}
+	if diagnostic == "" {
+		return "no factoryd startup diagnostic"
+	}
+	if len(diagnostic) > maxStartupDiagnosticBytes {
+		diagnostic = diagnostic[:maxStartupDiagnosticBytes] + " [truncated]"
+	}
+	return strconv.Quote(diagnostic)
+}
+
 type blackBoxFixture struct {
 	root       string
 	home       string
@@ -70,7 +91,7 @@ func TestBlackBoxDaemonLifecycle(t *testing.T) {
 	// Boot A: create the operator surface with dispatch off, then SIGKILL
 	// with the first task enqueued and never admitted (crash cut a).
 	daemonA, outputA := fixture.startFactoryd(t)
-	client := fixture.waitClient(t)
+	client := fixture.waitClient(t, outputA.String)
 	projectID := fixture.operatorID(t, fixture.runFactoryctl(t, 0, "project", "create", "--name", "black-box", "--root", fixture.repo))
 	agentID := fixture.operatorID(t, fixture.runFactoryctl(t, 0, "agent", "create", "--project", projectID, "--name", "builder", "--provider", "shell", "--tool-budget", "4"))
 	firstTask := fixture.operatorID(t, fixture.runFactoryctl(t, 0, "task", "add", "--project", projectID, "--agent", agentID, "--title", "prove the happy path", "--body", happyPathBody))
@@ -83,7 +104,7 @@ func TestBlackBoxDaemonLifecycle(t *testing.T) {
 	// Boot B: the queued task survived the kill; dispatch drives it through
 	// a real attempt to the succeeded terminal record.
 	daemonB, outputB := fixture.startFactoryd(t)
-	client = fixture.waitClient(t)
+	client = fixture.waitClient(t, outputB.String)
 	if sweep := outputB.String(); strings.Contains(sweep, "recovered run") {
 		t.Fatalf("boot after pre-admission kill recovered a run: %q", sweep)
 	}
@@ -106,7 +127,7 @@ func TestBlackBoxDaemonLifecycle(t *testing.T) {
 	// opens and settles the run — retained published change, terminal failed
 	// task — rather than leaving it wedged or reporting it unsettled.
 	daemonC, outputC := fixture.startFactoryd(t)
-	client = fixture.waitClient(t)
+	client = fixture.waitClient(t, outputC.String)
 	fixture.awaitTaskStatus(t, client, secondTask, "failed", 30*time.Second)
 	sweep := outputC.String()
 	if !strings.Contains(sweep, "result-consumed") || strings.Contains(sweep, "result-consumed-unsettled") {
@@ -273,7 +294,7 @@ func (fixture *blackBoxFixture) startFactoryd(t *testing.T) (*exec.Cmd, *syncBuf
 	return command, output
 }
 
-func (fixture *blackBoxFixture) waitClient(t *testing.T) *api.OperatorClient {
+func (fixture *blackBoxFixture) waitClient(t *testing.T, output func() string) *api.OperatorClient {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	socket := install.LocalAPISocketPath(fixture.home)
@@ -290,8 +311,21 @@ func (fixture *blackBoxFixture) waitClient(t *testing.T) *api.OperatorClient {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatal("factoryd local API did not become ready")
+	t.Fatalf("factoryd local API did not become ready: %s", startupDiagnostic(output))
 	return nil
+}
+
+func TestStartupDiagnosticShowsOnlyBoundedFactorydStartupOutput(t *testing.T) {
+	output := &syncBuffer{}
+	_, _ = output.Write([]byte("provider: secret\nfactoryd: browser: listen tcp4 127.0.0.1:43123: bind: address already in use\n"))
+	if got, want := startupDiagnostic(output.String), `"factoryd: browser: listen tcp4 127.0.0.1:43123: bind: address already in use"`; got != want {
+		t.Fatalf("startup diagnostic = %s, want %s", got, want)
+	}
+	long := &syncBuffer{}
+	_, _ = long.Write([]byte("factoryd: " + strings.Repeat("x", maxStartupDiagnosticBytes+1)))
+	if !strings.HasSuffix(startupDiagnostic(long.String), " [truncated]\"") {
+		t.Fatalf("long startup diagnostic was not bounded: %s", startupDiagnostic(long.String))
+	}
 }
 
 func (fixture *blackBoxFixture) runFactoryctl(t *testing.T, wantExit int, arguments ...string) string {
