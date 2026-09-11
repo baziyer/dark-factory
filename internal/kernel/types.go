@@ -523,9 +523,15 @@ type Project struct {
 	Name               string
 	Root               string
 	VerificationPolicy VerificationPolicy
-	Revision           Revision
-	CreatedAt          UnixMillis
-	UpdatedAt          UnixMillis
+	// RunBudgetLimit is an absolute lifetime ceiling. Zero disables it; setting
+	// an allowance records RunsUsed + allowance so past runs never surprise a
+	// later operator configuration.
+	RunBudgetLimit uint64
+	RunsUsed       uint64
+	MaxRunSeconds  uint32
+	Revision       Revision
+	CreatedAt      UnixMillis
+	UpdatedAt      UnixMillis
 }
 
 // IdlePolicy is what an agent does with no run: wait for work, or enqueue a

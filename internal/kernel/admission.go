@@ -114,6 +114,9 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		}
 		return AdmissionResult{}, tx.Rollback(err)
 	}
+	if project.RunBudgetLimit != 0 && project.RunsUsed >= project.RunBudgetLimit {
+		return rollbackNoAdmission(tx, NoAdmissionNoEligibleWork)
+	}
 	if err := validateAdmissionLocatorOwnership(ctx, tx.connection, keys); err != nil {
 		return AdmissionResult{}, tx.Rollback(err)
 	}
@@ -159,6 +162,13 @@ func (store *Store) AdmitNext(ctx context.Context, keys AdmissionKeys, at UnixMi
 		keys.AttemptDigest.Bytes(), keys.ResultProofDigest.bytes(), at.Int64(), at.Int64())
 	if err != nil {
 		return AdmissionResult{}, tx.Rollback(classifyAdmissionConflict(ctx, tx.connection, keys, err))
+	}
+	updated, updateErr := tx.connection.ExecContext(ctx, `UPDATE projects SET runs_used = runs_used + 1, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ? AND (run_budget_limit = 0 OR runs_used < run_budget_limit)`, at.Int64(), project.ID.Bytes(), project.Revision.Int64())
+	if err := requireOneRow(updated, updateErr); err != nil {
+		return AdmissionResult{}, tx.Rollback(err)
+	}
+	if err := appendInvalidations(ctx, tx.connection, at, []pendingInvalidation{{kind: EntityProject, id: project.ID.Bytes(), revision: project.Revision.Int64() + 1}}); err != nil {
+		return AdmissionResult{}, tx.Rollback(err)
 	}
 	inserted, err := tx.connection.ExecContext(ctx, `INSERT INTO terminal_sessions(id, run_id, state, unresolved_reason, revision, declared_at_ms, activated_at_ms, closed_at_ms, updated_at_ms) VALUES(?, ?, 'declared', NULL, 1, ?, NULL, NULL, ?)`, keys.TerminalSessionID.Bytes(), keys.RunID.Bytes(), at.Int64(), at.Int64())
 	if err := requireOneRow(inserted, err); err != nil {

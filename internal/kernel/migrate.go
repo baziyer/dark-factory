@@ -30,6 +30,17 @@ const (
 	v4UserVersion       = 4
 	v5UserVersion       = 5
 	v6UserVersion       = 6
+	v7UserVersion       = 7
+
+	v7Projects = `CREATE TABLE projects (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+	    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
+	    root TEXT NOT NULL CHECK (length(CAST(root AS BLOB)) BETWEEN 1 AND 4096 AND substr(root, 1, 1) = '/'),
+	    verification_policy TEXT NOT NULL CHECK (verification_policy IN ('none', 'rust_workspace_test', 'go_workspace_test')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
+) STRICT, WITHOUT ROWID`
 
 	legacyAgents = `CREATE TABLE agents (
     id BLOB PRIMARY KEY CHECK (length(id) = 16),
@@ -189,6 +200,18 @@ func v6SchemaStatements() []string {
 	return statements
 }
 
+// v7SchemaStatements is the exact schema before project run limits.
+func v7SchemaStatements() []string {
+	statements := make([]string, 0, len(schemaStatements))
+	for _, statement := range schemaStatements {
+		if _, name := schemaObjectIdentity(statement); name == "projects" {
+			statement = v7Projects
+		}
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
 // priorSchemaStatements is the exact v3 schema: v4 with the frozen agents
 // definition substituted. Every other statement is read live from
 // schemaStatements, so editing any of them silently changes what this claims
@@ -275,6 +298,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return v5SchemaStatements(), true
 	case v6UserVersion:
 		return v6SchemaStatements(), true
+	case v7UserVersion:
+		return v7SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -300,7 +325,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction, migrateV7Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -315,6 +340,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[4:]
 	case v6UserVersion:
 		steps = all[5:]
+	case v7UserVersion:
+		steps = all[6:]
 	default:
 		return connection.Close()
 	}
@@ -479,7 +506,7 @@ func migrateV6Transaction(ctx context.Context, connection *sql.Conn) error {
 	if err := validateSchemaVersion(ctx, connection, v6UserVersion, v6SchemaStatements()); err != nil {
 		return err
 	}
-	target := expectedSchemaOf(schemaStatements)
+	target := expectedSchemaOf(v7SchemaStatements())
 	if err := rebuildTable(ctx, connection, target, "invalidations", legacyInvalidationColumns, "invalidations_entity_revision_unique", "", ""); err != nil {
 		return err
 	}
@@ -487,6 +514,20 @@ func migrateV6Transaction(ctx context.Context, connection *sql.Conn) error {
 		if _, err := connection.ExecContext(ctx, target[name].sql); err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v7UserVersion)); err != nil {
+		return fmt.Errorf("set sqlite user version: %w", err)
+	}
+	return validateSchemaVersion(ctx, connection, v7UserVersion, v7SchemaStatements())
+}
+
+func migrateV7Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v7UserVersion, v7SchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	if err := rebuildTable(ctx, connection, target, "projects", "id, name, root, verification_policy, revision, created_at_ms, updated_at_ms", "projects_root_unique", "", ""); err != nil {
+		return err
 	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
 		return fmt.Errorf("set sqlite user version: %w", err)
