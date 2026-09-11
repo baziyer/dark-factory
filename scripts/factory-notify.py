@@ -18,6 +18,12 @@ class NotifyError(Exception):
     pass
 
 
+def validate_receipt_path(home: Path, receipt: Path) -> None:
+    resolved_home, resolved_receipt = home.resolve(), receipt.resolve()
+    if resolved_receipt == resolved_home or resolved_home in resolved_receipt.parents:
+        raise NotifyError("receipt must be outside factory home")
+
+
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -138,6 +144,7 @@ def notify(message: str) -> None:
 
 
 def run_once(home: Path, receipt_path: Path) -> dict:
+    validate_receipt_path(home, receipt_path)
     with receipt_lock(receipt_path):
         requests, blocked = observe(home)
         recovery_ids = recoveries(receipt_path)
@@ -175,6 +182,7 @@ def main(argv=None) -> int:
     if not args.home.is_absolute() or not args.receipt.is_absolute():
         parser.error("--home and --receipt must be absolute paths")
     try:
+        validate_receipt_path(args.home, args.receipt)
         if args.status:
             requests, blocked = observe(args.home)
             receipt = load_receipt(args.receipt)

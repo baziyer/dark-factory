@@ -88,6 +88,9 @@ def validate_config(config: object) -> dict:
         raise IntakeError("allowed_authors must contain names")
     if any(not isinstance(config[key], str) or not os.path.isabs(config[key]) for key in ("factory_home", "journal")):
         raise IntakeError("factory_home and journal must be absolute paths")
+    home, journal = Path(config["factory_home"]).resolve(), Path(config["journal"]).resolve()
+    if journal == home or home in journal.parents:
+        raise IntakeError("journal must be outside factory_home")
     try:
         for key, low, high, default in (("max_issues", 1, 200, 25), ("poll_seconds", 5, 86400, 60), ("command_timeout", 5, 120, 30)):
             if not low <= int(config.get(key, default)) <= high:

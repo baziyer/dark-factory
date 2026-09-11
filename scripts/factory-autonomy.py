@@ -14,6 +14,25 @@ import tempfile
 import time
 
 
+def validate_controller_config(config):
+    home, journal = config.get('factory_home'), config.get('journal')
+    if not isinstance(home, str) or not isinstance(journal, str) or not Path(home).is_absolute() or not Path(journal).is_absolute():
+        raise ValueError('factory_home and journal must be absolute paths')
+    resolved_home, resolved_journal = Path(home).resolve(), Path(journal).resolve()
+    if resolved_journal == resolved_home or resolved_home in resolved_journal.parents:
+        raise ValueError('journal must be outside factory_home')
+    releases = config.get('release_configs', [])
+    if not isinstance(releases, list) or any(not isinstance(item, str) or not Path(item).is_absolute() for item in releases):
+        raise ValueError('release_configs must be absolute config paths')
+    for path in releases:
+        release_journal = json.loads(Path(path).read_text()).get('journal')
+        if not isinstance(release_journal, str) or not Path(release_journal).is_absolute():
+            raise ValueError('release journal must be absolute')
+        resolved_release = Path(release_journal).resolve()
+        if resolved_release == resolved_home or resolved_home in resolved_release.parents:
+            raise ValueError('release journal must be outside factory_home')
+
+
 def tick(config_path, config):
     scripts = Path(__file__).resolve().parent
     # Notifications remain useful when GitHub or intake is unavailable.
@@ -25,8 +44,6 @@ def tick(config_path, config):
     calls.append([sys.executable, str(scripts / 'factory-intake.py'), str(config_path), '--once'])
     calls.append([sys.executable, str(scripts / 'factory-notify.py'), '--once', '--home', config['factory_home'], '--receipt', config['journal'] + '.notifications'])
     releases = config.get('release_configs', [])
-    if not isinstance(releases, list) or any(not isinstance(item, str) or not Path(item).is_absolute() for item in releases):
-        raise ValueError('release_configs must be absolute config paths')
     for release_config in releases:
         calls.append([sys.executable, str(scripts / 'factory-release.py'), release_config, '--latest', '--once'])
     results = []
@@ -90,6 +107,7 @@ def main():
     args = parser.parse_args()
     config_path = args.config.resolve(strict=True)
     config = json.loads(config_path.read_text())
+    validate_controller_config(config)
     interval = config.get('poll_seconds', 120)
     if type(interval) is not int or not 5 <= interval <= 86400:
         raise ValueError('poll_seconds must be 5..86400')
@@ -104,7 +122,7 @@ def main():
         return 0
     # ponytail: one host controller at a time; split maintenance leases only
     # when independent factories need concurrent host deployment hooks.
-    descriptor = os.open(Path(config['factory_home']) / 'autonomy.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(Path(str(Path(config['factory_home']).resolve()) + '.autonomy.lock'), os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(descriptor, 'a+') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

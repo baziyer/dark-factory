@@ -28,11 +28,11 @@ class SourceRefreshTest(unittest.TestCase):
         self.home.cleanup()
 
     def test_concurrent_refresh_is_refused_before_source_access(self):
-        with (Path(self.home.name) / 'source-refresh.lock').open('a+') as lock:
+        with Path(str(Path(self.home.name).resolve()) + '.source-refresh.lock').open('a+') as lock:
             refresh.fcntl.flock(lock, refresh.fcntl.LOCK_EX | refresh.fcntl.LOCK_NB)
             with patch.object(refresh, 'root') as root:
                 with self.assertRaisesRegex(refresh.RefreshError, 'source_refresh_busy'):
-                    refresh.refresh(self.config)
+                    refresh.refresh(dict(self.config, journal='/private/tmp/other-journal'))
                 root.assert_not_called()
 
     def test_pause_drain_refresh_restore_uses_exact_revisions(self):

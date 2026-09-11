@@ -112,6 +112,13 @@ class NotifyTest(unittest.TestCase):
         notify.assert_not_called()
         self.assertEqual(3, json.loads(self.receipt.read_text())['version'])
 
+    def test_receipt_inside_runtime_home_is_refused_before_lock_write(self):
+        receipt = self.home / 'notifications.json'
+        with self.assertRaisesRegex(NOTIFY.NotifyError, 'outside factory home'):
+            NOTIFY.run_once(self.home, receipt)
+        self.assertFalse(receipt.exists())
+        self.assertFalse(Path(str(receipt) + '.lock').exists())
+
 
 if __name__ == "__main__":
     unittest.main()

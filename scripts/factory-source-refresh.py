@@ -76,7 +76,7 @@ def fetch_target(path, base, env):
 
 def refresh(config):
     config = intake.validate_config(config)
-    descriptor = os.open(Path(config["factory_home"]) / "source-refresh.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(Path(str(Path(config["factory_home"]).resolve()) + ".source-refresh.lock"), os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(descriptor, "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
