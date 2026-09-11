@@ -1042,12 +1042,14 @@ test("a refused appearance edit keeps the editor and its draft", async () => {
     let renderer;
     await act(async () => { renderer = create(createElement(FactoryConsole, {
       status: "ready", state: baseState(), appearanceAgentId: ids.agent,
+      edit: { target: ids.agent, pending: false, error: { code: "stale" } },
       onSaveAgentAppearance: () => Promise.resolve(false), onCloseAppearance: () => {},
     }), { createNodeMock: () => node }); });
     const dialog = renderer.root.findByProps({ "aria-label": "Edit appearance for Builder One" });
     await act(async () => { dialog.findAllByType("select")[0].props.onChange({ target: { value: "3" } }); });
     await act(async () => { await dialog.findByType("form").props.onSubmit({ preventDefault() {} }); });
     assert.equal(closes, 0);
+    assert.equal(dialog.findByProps({ role: "alert" }).children.join(""), "SOMEONE ELSE CHANGED THIS — REOPEN IT AND TRY AGAIN");
     assert.equal(dialog.findAllByType("select")[0].props.value, 3);
     await act(async () => { renderer.unmount(); });
   } finally { globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct; }

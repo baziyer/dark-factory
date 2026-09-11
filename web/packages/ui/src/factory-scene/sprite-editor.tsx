@@ -7,9 +7,10 @@ const groups = ["skin", "hair", "hair_colour", "face", "outfit", "clothes_colour
 const labels = { skin: "SKIN TONE", hair: "HAIR STYLE", hair_colour: "HAIR COLOUR", face: "FACE DETAIL", outfit: "CLOTHING STYLE", clothes_colour: "CLOTHING COLOUR", shoes: "SHOES", tool: "TOOL", headwear: "HEADWEAR" } as const;
 const activities = ["waiting", "busy", "needs-you", "idle"] as const;
 
-export function SpriteEditor({ agent, pending, onSave, onClose }: {
+export function SpriteEditor({ agent, pending, error, onSave, onClose }: {
   agent: AgentItem;
   pending: boolean;
+  error?: string;
   onSave: (appearance: SpriteAppearance) => Promise<boolean>;
   onClose: () => void;
 }) {
@@ -23,6 +24,7 @@ export function SpriteEditor({ agent, pending, onSave, onClose }: {
   return <dialog ref={dialog} className="dfConsoleDialog dfSpriteEditor" aria-label={`Edit appearance for ${agent.name}`} onClose={onClose} onClick={(event) => { if (event.target === dialog.current) close(); }}>
     <form className="dfConsoleSidebar__panel" onSubmit={submit}>
       <div className="dfConsoleSidebar__heading"><h2>EDIT APPEARANCE · {agent.name}</h2><button type="button" onClick={close}>CLOSE</button></div>
+      {error === undefined ? null : <p role="alert">{error}</p>}
       <div className="dfSpriteEditor__preview">
         <AgentSprite agent={{ ...agent, appearance: draft }} activity={activity} />
         <div className="dfConsoleViewToggle" role="group" aria-label="Preview activity">
