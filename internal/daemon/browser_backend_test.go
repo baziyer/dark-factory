@@ -304,6 +304,34 @@ func TestBrowserAdapterPairsAuthenticatesSnapshotsAndReloadsRevocation(t *testin
 	}
 }
 
+func TestBrowserProjectLimitsPreserveUsedAndRejectStaleEdits(t *testing.T) {
+	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions|kernel.BrowserCapabilityAdministration)
+	ctx := context.Background()
+	projectID, _ := kernel.ProjectIDFromBytes(adapterID(t, 21))
+	project, err := fixture.store.CreateProject(ctx, kernel.NewProject{ID: projectID, Name: "limits", Root: "/limits"}, adapterTime(t, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := fixture.pair(t)
+	_ = connection.Close(websocket.StatusNormalClosure, "")
+	updated, err := fixture.backend.SetProjectLimits(ctx, rawBrowserClient(fixture.client.ID), browserprotocol.ProjectLimits{ProjectID: project.ID.String(), ExpectedRevision: decimalRevision(project.Revision), RunBudget: 3, MaxRunSeconds: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, found, err := fixture.store.Project(ctx, project.ID)
+	if err != nil || !found || current.RunBudgetLimit != 3 || current.RunsUsed != 0 || current.MaxRunSeconds != 60 || updated.Revision != decimalRevision(current.Revision) {
+		t.Fatalf("updated project = %+v, result=%+v, found=%v, err=%v", current, updated, found, err)
+	}
+	if _, err := fixture.backend.SetProjectLimits(ctx, rawBrowserClient(fixture.client.ID), browserprotocol.ProjectLimits{ProjectID: project.ID.String(), ExpectedRevision: decimalRevision(project.Revision), RunBudget: 1, MaxRunSeconds: 60}); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("stale browser edit = %v", err)
+	}
+	result, err := fixture.backend.SetProjectLimits(ctx, rawBrowserClient(fixture.client.ID), browserprotocol.ProjectLimits{ProjectID: project.ID.String(), ExpectedRevision: decimalRevision(current.Revision), RunBudget: 0, MaxRunSeconds: 0})
+	current, found, err = fixture.store.Project(ctx, project.ID)
+	if err != nil || !found || current.RunBudgetLimit != 0 || current.RunsUsed != 0 || result.Revision != decimalRevision(current.Revision) {
+		t.Fatalf("unlimited renewal = %+v, result=%+v, found=%v, err=%v", current, result, found, err)
+	}
+}
+
 func TestBrowserAdapterBadPairProofDoesNotConsumeChallenge(t *testing.T) {
 	fixture := newAdapterFixture(t, kernel.BrowserCapabilityObserve)
 	connection := adapterDial(t, fixture.server)

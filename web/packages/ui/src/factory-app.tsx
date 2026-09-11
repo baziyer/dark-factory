@@ -122,6 +122,7 @@ export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}
       appearanceAgentId={appearanceAgentId}
       onEditAppearance={(agent) => setAppearanceAgentId(agent.id)}
       onCloseAppearance={() => setAppearanceAgentId(undefined)}
+      onSaveProjectLimits={(project, limits) => { void owner.current?.updateProjectLimits(project, limits); }}
       onEditTask={(task, change) => owner.current?.editTask(task, change) ?? Promise.resolve(false)}
       onLoadTaskDetail={(task, peerOffset, expectedHead) => owner.current?.taskDetail(task, peerOffset, expectedHead) ?? Promise.reject(new Error("closed"))}
       onLoadTaskHistory={(task) => owner.current?.taskHistory(task) ?? Promise.reject(new Error("closed"))}

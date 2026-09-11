@@ -508,6 +508,21 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeAgentUpdateResult(frame.ID, result)
+	case browserprotocol.ProjectLimits:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.SetProjectLimits(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.ProjectID != body.ProjectID || result.Revision <= body.ExpectedRevision {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeProjectLimitsResult(frame.ID, result)
 	case browserprotocol.TaskUpdate:
 		if current.server.consoleBackend == nil {
 			err = ErrUnauthorized

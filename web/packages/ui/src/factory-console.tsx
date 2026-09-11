@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { AccountItem, AgentItem, SpriteAppearance, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
+import type { AccountItem, AgentItem, ProjectItem, SpriteAppearance, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
 import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
@@ -26,6 +26,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   appearanceAgentId?: string;
   onEditAppearance?: (agent: AgentItem) => void;
   onCloseAppearance?: () => void;
+  onSaveProjectLimits?: (project: Pick<ProjectItem, "id" | "revision">, limits: { runBudget: bigint; maxRunSeconds: number }) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
@@ -103,6 +104,7 @@ export function FactoryConsole({
   appearanceAgentId,
   onEditAppearance,
   onCloseAppearance,
+  onSaveProjectLimits,
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
@@ -134,6 +136,7 @@ export function FactoryConsole({
   const selectedDetail = detail ?? (selectedAgent === undefined ? "needs-you" : "agent");
   const editError = editErrorCopy(edit);
   const appearanceAgent = appearanceAgentId === undefined ? undefined : state?.agents.get(appearanceAgentId);
+  const editError = edit !== undefined && state?.projects.has(edit.target) ? undefined : editErrorCopy(edit);
 
   return (
     <div className="dfConsoleShell">
@@ -246,6 +249,7 @@ export function FactoryConsole({
       {settingsOpen !== true ? null : (
         <SettingsDialog
           state={state}
+          ready={ready}
           address={address}
           accounts={accounts}
           accountsPending={accountsPending}
@@ -253,6 +257,8 @@ export function FactoryConsole({
           onLoadAccounts={onLoadAccounts}
           onLinkAccount={onLinkAccount}
           onUpdateAccount={onUpdateAccount}
+          edit={edit}
+          onSaveProjectLimits={onSaveProjectLimits}
           pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
             <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
           ))}

@@ -63,6 +63,8 @@ const (
 	TypeTaskEnqueueResult           MessageType = "TASK_ENQUEUE_RESULT"
 	TypeAgentUpdate                 MessageType = "AGENT_UPDATE"
 	TypeAgentUpdateResult           MessageType = "AGENT_UPDATE_RESULT"
+	TypeProjectLimits               MessageType = "PROJECT_LIMITS"
+	TypeProjectLimitsResult         MessageType = "PROJECT_LIMITS_RESULT"
 	TypeTaskUpdate                  MessageType = "TASK_UPDATE"
 	TypeTaskUpdateResult            MessageType = "TASK_UPDATE_RESULT"
 	TypeTopologyGet                 MessageType = "TOPOLOGY_GET"
@@ -392,6 +394,10 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		body = new(AgentUpdate)
 	case TypeAgentUpdateResult:
 		body = new(AgentUpdateResult)
+	case TypeProjectLimits:
+		body = new(ProjectLimits)
+	case TypeProjectLimitsResult:
+		body = new(ProjectLimitsResult)
 	case TypeTaskUpdate:
 		body = new(TaskUpdate)
 	case TypeTaskUpdateResult:
@@ -517,7 +523,7 @@ func idRequired(kind MessageType) bool {
 		TypeHumanRequestDetailGet, TypeHumanRequestDetail,
 		TypeHumanRequestReply, TypeHumanRequestReplyResult, TypeHumanRequestCancelRun, TypeHumanRequestCancelRunResult,
 		TypeTaskEnqueue, TypeTaskEnqueueResult, TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskListGet, TypeTaskList, TypeTaskDetailGet, TypeTaskDetail,
-		TypeAgentUpdate, TypeAgentUpdateResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
+		TypeAgentUpdate, TypeAgentUpdateResult, TypeProjectLimits, TypeProjectLimitsResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
 		TypeRunPathsGet, TypeRunPaths,
 		TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult,
 		TypeTerminalTargetGet, TypeTerminalTarget,
@@ -538,12 +544,12 @@ func typeAllowed(role senderRole, kind MessageType) bool {
 	if role == clientRole {
 		return kind == TypePairProve || kind == TypeAuthProve || kind == TypeStateGet ||
 			kind == TypeStateWatch || kind == TypeHumanRequestDetailGet || kind == TypeHumanRequestReply || kind == TypeHumanRequestCancelRun || kind == TypeTerminalTargetGet || kind == TypeTerminalAttach || kind == TypeTerminalAck || kind == TypeTerminalLeaseAcquire || kind == TypeTerminalLeaseRenew || kind == TypeTerminalLeaseRelease || kind == TypeTerminalResize || kind == TypeTerminalDetach || kind == TypeTaskEnqueue || kind == TypeRemoteInvite ||
-			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeTaskListGet || kind == TypeAgentUpdate || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
+			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeTaskListGet || kind == TypeAgentUpdate || kind == TypeProjectLimits || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
 			kind == TypeAccountsDiscover || kind == TypeAccountLink || kind == TypeAccountUpdate
 	}
 	return role == serverRole && (kind == TypeHello || kind == TypePairResult || kind == TypeAuthResult ||
 		kind == TypeStateSnapshot || kind == TypeStateChanged || kind == TypeHumanRequestDetail || kind == TypeHumanRequestReplyResult || kind == TypeHumanRequestCancelRunResult || kind == TypeTaskEnqueueResult || kind == TypeTerminalTarget || kind == TypeTerminalAttached || kind == TypeTerminalLeaseResult || kind == TypeTerminalResized || kind == TypeTerminalDetached || kind == TypeTerminalInputResult || kind == TypeTerminalEOF || kind == TypeTerminalExit || kind == TypeTerminalReset || kind == TypeRemoteInviteResult ||
-		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeTaskList || kind == TypeAgentUpdateResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
+		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeTaskList || kind == TypeAgentUpdateResult || kind == TypeProjectLimitsResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
 		kind == TypeAccounts || kind == TypeAccountLinkResult || kind == TypeAccountUpdateResult)
 }
 
@@ -602,6 +608,10 @@ func dereferenceBody(body any) any {
 	case *AgentUpdate:
 		return *value
 	case *AgentUpdateResult:
+		return *value
+	case *ProjectLimits:
+		return *value
+	case *ProjectLimitsResult:
 		return *value
 	case *TaskUpdate:
 		return *value
@@ -938,7 +948,7 @@ func validateBody(kind MessageType, body any) error {
 		return validAgentControl(kind, body)
 	case TypeTaskEnqueue, TypeTaskEnqueueResult:
 		return validTaskControl(kind, body)
-	case TypeAgentUpdate, TypeAgentUpdateResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
+	case TypeAgentUpdate, TypeAgentUpdateResult, TypeProjectLimits, TypeProjectLimitsResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
 		TypeRunPathsGet, TypeRunPaths, TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult:
 		return validConsoleControl(kind, body)
 	case TypeTerminalTargetGet, TypeTerminalTarget:

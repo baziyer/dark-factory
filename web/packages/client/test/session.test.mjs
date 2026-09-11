@@ -358,6 +358,13 @@ test("console edits and topology carry exact bodies and correlate their results"
   socket.reply(encodeServerControl({ type: "AGENT_UPDATE_RESULT", id: agentFrame.id, body: { agent_id: agentId, revision: 8n } }));
   assert.deepEqual(await agentPending, { agentId, revision: 8n });
 
+  const limitsPending = session.setProjectLimits({ projectId, expectedRevision: 4n, runBudget: 7n, maxRunSeconds: 900 });
+  const limitsFrame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(limitsFrame.type, "PROJECT_LIMITS");
+  assert.deepEqual(limitsFrame.body, { project_id: projectId, expected_revision: 4n, run_budget: 7n, max_run_seconds: 900 });
+  socket.reply(encodeServerControl({ type: "PROJECT_LIMITS_RESULT", id: limitsFrame.id, body: { project_id: projectId, revision: 5n } }));
+  assert.deepEqual(await limitsPending, { projectId, revision: 5n });
+
   const taskPending = session.updateTask({ taskId, expectedRevision: 3n, priority: 5, cancel: true });
   const taskFrame = decodeClientControl(socket.sent.at(-1));
   assert.equal(taskFrame.type, "TASK_UPDATE");
@@ -1825,7 +1832,7 @@ test("without administration the account verbs are refused before anything is se
   assert.equal(session.status, "ready");
   const sent = socket.sent.length;
   const agentId = "7c".repeat(16);
-  for (const refused of [session.discoverAccounts(), session.linkAccount({ provider: "codex", home: "/x", label: "x" }), session.updateAgent({ agentId, expectedRevision: 3n, accountId: "" })]) {
+  for (const refused of [session.discoverAccounts(), session.linkAccount({ provider: "codex", home: "/x", label: "x" }), session.updateAgent({ agentId, expectedRevision: 3n, accountId: "" }), session.setProjectLimits({ projectId: "7d".repeat(16), expectedRevision: 3n, runBudget: 1n, maxRunSeconds: 0 })]) {
     await assert.rejects(refused, (error) => error instanceof SessionError && error.code === "unauthorized");
   }
   assert.equal(socket.sent.length, sent);

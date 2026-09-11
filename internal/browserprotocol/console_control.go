@@ -30,6 +30,20 @@ type AgentUpdateResult struct {
 	Revision Decimal `json:"revision"`
 }
 
+// ProjectLimits replaces the future run allowance and per-run ceiling. A zero
+// allowance or duration explicitly means unlimited.
+type ProjectLimits struct {
+	ProjectID        string  `json:"project_id"`
+	ExpectedRevision Decimal `json:"expected_revision"`
+	RunBudget        Decimal `json:"run_budget"`
+	MaxRunSeconds    uint32  `json:"max_run_seconds"`
+}
+
+type ProjectLimitsResult struct {
+	ProjectID string  `json:"project_id"`
+	Revision  Decimal `json:"revision"`
+}
+
 // TaskUpdate edits one still-queued task. Status is the only member that is
 // not free: it may say "cancelled" and nothing else.
 type TaskUpdate struct {
@@ -140,6 +154,10 @@ func EncodeAgentUpdateResult(id string, value AgentUpdateResult) ([]byte, error)
 	return encodeControl(TypeAgentUpdateResult, id, value)
 }
 
+func EncodeProjectLimitsResult(id string, value ProjectLimitsResult) ([]byte, error) {
+	return encodeControl(TypeProjectLimitsResult, id, value)
+}
+
 func EncodeTaskUpdateResult(id string, value TaskUpdateResult) ([]byte, error) {
 	return encodeControl(TypeTaskUpdateResult, id, value)
 }
@@ -180,6 +198,10 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case *AgentUpdateResult:
 		return validConsoleControl(kind, *value)
+	case *ProjectLimits:
+		return validConsoleControl(kind, *value)
+	case *ProjectLimitsResult:
+		return validConsoleControl(kind, *value)
 	case *TaskUpdate:
 		return validConsoleControl(kind, *value)
 	case *TaskUpdateResult:
@@ -218,6 +240,14 @@ func validConsoleControl(kind MessageType, body any) error {
 		}
 	case AgentUpdateResult:
 		if validateDynamicID(value.AgentID) != nil || value.Revision == 0 {
+			return bad()
+		}
+	case ProjectLimits:
+		if validateDynamicID(value.ProjectID) != nil || value.ExpectedRevision == 0 || uint64(value.RunBudget) > MaxSQLiteInteger || value.MaxRunSeconds > 86400 {
+			return bad()
+		}
+	case ProjectLimitsResult:
+		if validateDynamicID(value.ProjectID) != nil || value.Revision == 0 {
 			return bad()
 		}
 	case TaskUpdate:

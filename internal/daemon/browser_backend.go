@@ -366,6 +366,34 @@ func (backend *browserBackend) UpdateAgent(ctx context.Context, rawClient [brows
 	return browserprotocol.AgentUpdateResult{AgentID: agent.ID.String(), Revision: decimalRevision(agent.Revision)}, nil
 }
 
+func (backend *browserBackend) SetProjectLimits(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.ProjectLimits) (browserprotocol.ProjectLimitsResult, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, err
+	}
+	defer release()
+	projectID, err := browserID(request.ProjectID, kernel.ProjectIDFromBytes)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, browser.ErrStale
+	}
+	expected, err := browserDecimal(request.ExpectedRevision)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, browser.ErrStale
+	}
+	at, err := backend.timestamp()
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, mapBrowserError(err)
+	}
+	project, err := backend.store.SetProjectLimits(ctx, projectID, expected, uint64(request.RunBudget), request.MaxRunSeconds, at)
+	if err != nil {
+		return browserprotocol.ProjectLimitsResult{}, consoleUpdateError(err)
+	}
+	if backend.owner != nil {
+		backend.owner.notifyScheduler()
+	}
+	return browserprotocol.ProjectLimitsResult{ProjectID: project.ID.String(), Revision: decimalRevision(project.Revision)}, nil
+}
+
 func (backend *browserBackend) UpdateTask(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.TaskUpdate) (browserprotocol.TaskUpdateResult, error) {
 	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityHumanActions)
 	if err != nil {

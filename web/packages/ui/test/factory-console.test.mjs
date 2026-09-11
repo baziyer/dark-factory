@@ -966,6 +966,32 @@ test("the settings modal carries the factory readout and a pairing mount point",
   assert.match(both, /aria-label="Agent Builder One"/);
 });
 
+test("settings edits project limits as future runs with an explicit unlimited choice", () => {
+  const markup = render({ settingsOpen: true, onToggleSettings: () => {}, onSaveProjectLimits: () => {} });
+  assert.match(markup, /aria-label="PROJECT LIMITS"/);
+  assert.match(markup, /value="7"/);
+  assert.match(markup, /REMAINING RUN ALLOWANCE/);
+  assert.match(markup, /UNLIMITED RUNS/);
+  assert.match(markup, /value="0"/);
+  assert.match(markup, /MAX SECONDS PER RUN \(0 = UNLIMITED\)/);
+  assert.match(markup, /UNATTENDED ISSUE INTAKE REQUIRES BOTH LIMITS/);
+});
+
+test("settings rejects a blank per-run duration before saving", async () => {
+  const calls = [];
+  let renderer;
+  await act(async () => {
+    renderer = create(createElement(FactoryConsole, { status: "ready", state: baseState(), settingsOpen: true, onToggleSettings: () => {}, onSaveProjectLimits: (...args) => calls.push(args) }));
+  });
+  const form = renderer.root.findByProps({ "aria-label": `Limits for ${fixtureState.projects.get(ids.project).name}` });
+  const inputs = form.findAllByType("input");
+  await act(async () => { inputs[2].props.onChange({ currentTarget: { value: "" } }); });
+  await act(async () => { form.props.onSubmit({ preventDefault: () => {} }); });
+  assert.equal(calls.length, 0);
+  assert.match(JSON.stringify(renderer.toJSON()), /DURATION MUST BE 0–86400 SECONDS/);
+  await act(async () => { renderer.unmount(); });
+});
+
 test("SETTINGS opens and closes as a native modal, over whatever sidebar is open", async () => {
   const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;

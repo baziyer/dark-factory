@@ -695,7 +695,8 @@
   min-height: 2.25rem;
 }
 
-.dfConsoleSidebar :where(input[type="text"], input:not([type]), select) {
+.dfConsoleSidebar :where(input[type="text"], input:not([type]), select),
+.dfConsoleDialog :where(input[type="text"], input:not([type]), select) {
   width: 100%;
   padding: 0.6rem;
   color: var(--df-console-text);
