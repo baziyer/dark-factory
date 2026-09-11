@@ -73,6 +73,8 @@ const (
 	TypeAccounts                    MessageType = "ACCOUNTS"
 	TypeAccountLink                 MessageType = "ACCOUNT_LINK"
 	TypeAccountLinkResult           MessageType = "ACCOUNT_LINK_RESULT"
+	TypeAccountUpdate               MessageType = "ACCOUNT_UPDATE"
+	TypeAccountUpdateResult         MessageType = "ACCOUNT_UPDATE_RESULT"
 	TypeTerminalTargetGet           MessageType = "TERMINAL_TARGET_GET"
 	TypeTerminalTarget              MessageType = "TERMINAL_TARGET"
 	TypeTerminalAttach              MessageType = "TERMINAL_ATTACH"
@@ -410,6 +412,10 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		body = new(AccountLink)
 	case TypeAccountLinkResult:
 		body = new(AccountLinkResult)
+	case TypeAccountUpdate:
+		body = new(AccountUpdate)
+	case TypeAccountUpdateResult:
+		body = new(AccountUpdateResult)
 	case TypeTerminalTargetGet:
 		body = new(TerminalTargetGet)
 	case TypeTerminalTarget:
@@ -513,7 +519,7 @@ func idRequired(kind MessageType) bool {
 		TypeTaskEnqueue, TypeTaskEnqueueResult, TypeAgentControl, TypeAgentControlResult, TypeTaskHistoryGet, TypeTaskHistory, TypeTaskListGet, TypeTaskList, TypeTaskDetailGet, TypeTaskDetail,
 		TypeAgentUpdate, TypeAgentUpdateResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
 		TypeRunPathsGet, TypeRunPaths,
-		TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult,
+		TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult,
 		TypeTerminalTargetGet, TypeTerminalTarget,
 		TypeTerminalAttach, TypeTerminalAttached, TypeTerminalLeaseAcquire, TypeTerminalLeaseRenew, TypeTerminalLeaseRelease,
 		TypeTerminalLeaseResult, TypeTerminalResize, TypeTerminalResized, TypeTerminalDetach, TypeTerminalDetached,
@@ -533,12 +539,12 @@ func typeAllowed(role senderRole, kind MessageType) bool {
 		return kind == TypePairProve || kind == TypeAuthProve || kind == TypeStateGet ||
 			kind == TypeStateWatch || kind == TypeHumanRequestDetailGet || kind == TypeHumanRequestReply || kind == TypeHumanRequestCancelRun || kind == TypeTerminalTargetGet || kind == TypeTerminalAttach || kind == TypeTerminalAck || kind == TypeTerminalLeaseAcquire || kind == TypeTerminalLeaseRenew || kind == TypeTerminalLeaseRelease || kind == TypeTerminalResize || kind == TypeTerminalDetach || kind == TypeTaskEnqueue || kind == TypeRemoteInvite ||
 			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeTaskListGet || kind == TypeAgentUpdate || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
-			kind == TypeAccountsDiscover || kind == TypeAccountLink
+			kind == TypeAccountsDiscover || kind == TypeAccountLink || kind == TypeAccountUpdate
 	}
 	return role == serverRole && (kind == TypeHello || kind == TypePairResult || kind == TypeAuthResult ||
 		kind == TypeStateSnapshot || kind == TypeStateChanged || kind == TypeHumanRequestDetail || kind == TypeHumanRequestReplyResult || kind == TypeHumanRequestCancelRunResult || kind == TypeTaskEnqueueResult || kind == TypeTerminalTarget || kind == TypeTerminalAttached || kind == TypeTerminalLeaseResult || kind == TypeTerminalResized || kind == TypeTerminalDetached || kind == TypeTerminalInputResult || kind == TypeTerminalEOF || kind == TypeTerminalExit || kind == TypeTerminalReset || kind == TypeRemoteInviteResult ||
 		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeTaskList || kind == TypeAgentUpdateResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
-		kind == TypeAccounts || kind == TypeAccountLinkResult)
+		kind == TypeAccounts || kind == TypeAccountLinkResult || kind == TypeAccountUpdateResult)
 }
 
 func dereferenceBody(body any) any {
@@ -616,6 +622,10 @@ func dereferenceBody(body any) any {
 	case *AccountLink:
 		return *value
 	case *AccountLinkResult:
+		return *value
+	case *AccountUpdate:
+		return *value
+	case *AccountUpdateResult:
 		return *value
 	case *TerminalTargetGet:
 		return *value
@@ -929,7 +939,7 @@ func validateBody(kind MessageType, body any) error {
 	case TypeTaskEnqueue, TypeTaskEnqueueResult:
 		return validTaskControl(kind, body)
 	case TypeAgentUpdate, TypeAgentUpdateResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
-		TypeRunPathsGet, TypeRunPaths, TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult:
+		TypeRunPathsGet, TypeRunPaths, TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult:
 		return validConsoleControl(kind, body)
 	case TypeTerminalTargetGet, TypeTerminalTarget:
 		return validTerminalControl(kind, body)

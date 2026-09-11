@@ -112,6 +112,19 @@ type AccountLinkResult struct {
 	Revision  Decimal `json:"revision"`
 }
 
+// AccountUpdate edits one linked login or removes it when no agent or run uses it.
+type AccountUpdate struct {
+	AccountID        string  `json:"account_id"`
+	ExpectedRevision Decimal `json:"expected_revision"`
+	Label            *string `json:"label,omitempty"`
+	Remove           *Bool   `json:"remove,omitempty"`
+}
+
+type AccountUpdateResult struct {
+	AccountID string  `json:"account_id"`
+	Revision  Decimal `json:"revision"`
+}
+
 type TopologyNode struct {
 	ID         string `json:"id"`
 	ParentID   string `json:"parent_id"`
@@ -155,6 +168,10 @@ func EncodeAccountLinkResult(id string, value AccountLinkResult) ([]byte, error)
 	return encodeControl(TypeAccountLinkResult, id, value)
 }
 
+func EncodeAccountUpdateResult(id string, value AccountUpdateResult) ([]byte, error) {
+	return encodeControl(TypeAccountUpdateResult, id, value)
+}
+
 func validConsoleControl(kind MessageType, body any) error {
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	switch value := body.(type) {
@@ -181,6 +198,10 @@ func validConsoleControl(kind MessageType, body any) error {
 	case *AccountLink:
 		return validConsoleControl(kind, *value)
 	case *AccountLinkResult:
+		return validConsoleControl(kind, *value)
+	case *AccountUpdate:
+		return validConsoleControl(kind, *value)
+	case *AccountUpdateResult:
 		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
@@ -257,6 +278,17 @@ func validConsoleControl(kind MessageType, body any) error {
 			return bad()
 		}
 	case AccountLinkResult:
+		if validateDynamicID(value.AccountID) != nil || value.Revision == 0 {
+			return bad()
+		}
+	case AccountUpdate:
+		if validateDynamicID(value.AccountID) != nil || value.ExpectedRevision == 0 ||
+			(value.Label == nil) == (value.Remove == nil) ||
+			value.Label != nil && validateBoundedText(*value.Label, 1, MaxAgentNameBytes) != nil ||
+			value.Remove != nil && !bool(*value.Remove) {
+			return bad()
+		}
+	case AccountUpdateResult:
 		if validateDynamicID(value.AccountID) != nil || value.Revision == 0 {
 			return bad()
 		}

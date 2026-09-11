@@ -144,8 +144,8 @@ export type RunPathSample = Readonly<{
  * block of rooms taken from its own served topology, or the one room that
  * stands for a project whose structure the daemon has not served yet, and every
  * worker stands in the room of code its matching live run is changing. A
- * retained sample only annotates a resting worker; no sample ever invents a
- * root location. The floor is a grid because served nodes carry no edges: it
+ * retained sample only annotates a resting worker; an active overseer without
+ * an observed path uses its assigned project control room. The floor is a grid because served nodes carry no edges: it
  * shows what the code is, not what depends on what.
  */
 export function floorScene(
@@ -189,8 +189,9 @@ export function floorScene(
     const live = task === undefined || sample?.taskId !== task.id || sample.taskRevision !== task.revision || sample.projectId !== agent.project_id || sample.runId === "" ? undefined : roomOfRunPaths(block, sample.paths);
     const previous = lastRunPaths?.get(agent.id);
     const last = previous?.projectId === agent.project_id && previous.paths.length > 0 ? roomOfRunPaths(block, previous.paths) : undefined;
-    const location: "working" | "last-observed" | "unobserved" | "resting" = task === undefined ? last === undefined ? "resting" : "last-observed" : live === undefined ? "unobserved" : "working";
-    const room = location === "working" ? allRooms.get(live!) : location === "last-observed" ? allRooms.get(last!) : undefined;
+    const controlRoom = agent.role === "orchestrator" && task !== undefined && live === undefined ? block[0] : undefined;
+    const location: "working" | "control-room" | "last-observed" | "unobserved" | "resting" = task === undefined ? last === undefined ? "resting" : "last-observed" : live !== undefined ? "working" : controlRoom === undefined ? "unobserved" : "control-room";
+    const room = location === "working" ? allRooms.get(live!) : location === "control-room" ? controlRoom : location === "last-observed" ? allRooms.get(last!) : undefined;
     return {
       id: agent.id,
       name: agent.name,
@@ -200,7 +201,7 @@ export function floorScene(
       paused: agent.paused,
       location,
       ...(room === undefined ? {} : { locationLabel: room.label }),
-      ...(location === "working" && live !== undefined && kept.has(live) ? { nodeId: live } : {}),
+      ...((location === "working" && live !== undefined && kept.has(live)) || (location === "control-room" && room !== undefined && kept.has(room.id)) ? { nodeId: location === "working" ? live! : room!.id } : {}),
     };
   });
   const digest = projects.map((project) => topologies?.get(project.id)?.digest).filter((value) => value !== undefined).join(" ");

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { AgentItem, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
+import type { AccountItem, AgentItem, TaskHistoryView, TaskItem, TaskListView } from "@dark-factory/client";
 import { BROWSER_HOST, type FactoryAgentSelection, type FactoryAppSnapshot, type FactoryHumanRequestView } from "./factory-app-controller.js";
 import { AgentList, FactoryFloor } from "./console-screens.js";
 import { AgentPanel, HumanRequestPanel, QueuePanel, SettingsDialog, editErrorCopy, type AgentConfigEdit, type AgentPanelView, type DiscoveredAccount, type TaskEdit, type TaskBrief } from "./console-sidebar.js";
@@ -35,6 +35,7 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onDismissRemoteInvite?: () => void;
   onLoadAccounts?: () => void;
   onLinkAccount?: (login: DiscoveredAccount, label: string) => void;
+  onUpdateAccount?: (account: AccountItem, change: { label?: string; remove?: boolean }) => void;
   /** The loopback address this console is served from. */
   address?: string;
   /** Overrides the pairing surface the settings modal mounts by default. */
@@ -113,6 +114,7 @@ export function FactoryConsole({
   accountsError,
   onLoadAccounts,
   onLinkAccount,
+  onUpdateAccount,
   address = BROWSER_HOST,
   pairing,
   terminalContent,
@@ -132,9 +134,7 @@ export function FactoryConsole({
             <h1>DARK FACTORY</h1>
           </div>
           <dl className="dfConsoleBar__counters" aria-label="Factory counters">
-            <Counter label="ACTIVE RUNS" value={state === undefined ? "—" : `${state.factory.active_runs} / ${state.factory.capacity} WORKERS + 1 OVERSEER`} />
-            <Counter label="QUEUED" value={`${counters.queued ?? "—"}`} />
-            <Counter label="NEEDS YOU" value={`${counters.needsYou ?? "—"}`} alert={(counters.needsYou ?? 0) > 0} />
+            <Counter label="ACTIVE RUNS" value={state === undefined ? "—" : String(state.factory.active_runs)} />
           </dl>
           <div className="dfConsoleBar__actions">
             <button type="button" aria-pressed={settingsOpen === true} disabled={onToggleSettings === undefined} onClick={onToggleSettings}>SETTINGS</button>
@@ -175,14 +175,14 @@ export function FactoryConsole({
               </div>
             </div>
             {view === "floor"
-              ? <FactoryFloor state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
+              ? <FactoryFloor selectedAgentId={selectedDetail === "agent" ? selectedAgent?.id : undefined} state={state} topologies={topologies} runPaths={runPaths} lastRunPaths={lastRunPaths} onSelectAgent={ready ? onSelectAgent : undefined} />
               : <AgentList state={state} selectedAgentId={selectedAgent?.id} ready={ready} onSelectAgent={ready ? onSelectAgent : undefined} />}
           </section>
 
           <aside className="dfConsoleSidebar" aria-label="Selected detail">
             <div className="dfConsoleViewToggle" role="group" aria-label="Right panel">
-              <button type="button" aria-pressed={selectedDetail === "needs-you"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("needs-you")}>NEEDS YOU</button>
-              <button type="button" aria-pressed={selectedDetail === "queue"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("queue")}>QUEUE</button>
+              <button type="button" aria-pressed={selectedDetail === "needs-you"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("needs-you")}>NEEDS YOU <span>{counters.needsYou ?? "—"}</span></button>
+              <button type="button" aria-pressed={selectedDetail === "queue"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("queue")}>QUEUE <span>{counters.queued ?? "—"}</span></button>
               <button type="button" aria-pressed={selectedDetail === "agent"} disabled={!ready || onDetail === undefined} onClick={() => onDetail?.("agent")}>AGENT</button>
             </div>
             {editError === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{editError}</p>}
@@ -242,6 +242,7 @@ export function FactoryConsole({
           accountsError={accountsError}
           onLoadAccounts={onLoadAccounts}
           onLinkAccount={onLinkAccount}
+          onUpdateAccount={onUpdateAccount}
           pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
             <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
           ))}

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
+import { AgentSprite, FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
 import { PADDING, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
@@ -285,6 +285,25 @@ test("worker identity is stable while operational state changes", () => {
   ];
   for (const worker of variants) assert.equal(frameIdentity(workerFrame(worker)), stableIdentity);
   assert.equal(workerFrame({ ...base, id: "worker-😀" }), "worker.codex.3.busy.0");
+});
+
+test("the standalone agent sprite crops one existing stable frame", () => {
+  const agent = { id: "worker-b", name: "Builder", role: "worker", provider: "codex" };
+  const frame = workerFrame({ ...agent, activity: "busy" });
+  const cell = spriteAtlas.frames[frame];
+  const markup = renderToStaticMarkup(createElement(AgentSprite, { agent, activity: "busy" }));
+  assert.match(markup, /class="dfAgentSprite"/);
+  assert.match(markup, /aria-label="Builder, worker, busy"/);
+  assert.match(markup, new RegExp(`x="${cell.x === 0 ? 0 : -cell.x}" y="${cell.y === 0 ? 0 : -cell.y}"`));
+  assert.equal(markup.includes("df-frame-"), false, "standalone sprite creates no document symbol id");
+});
+
+test("the selected scene worker has a ring without changing its sprite", () => {
+  const markup = render({ selectedWorkerId: "worker-b" });
+  const selected = markup.slice(markup.indexOf('data-worker-id="worker-b"'));
+  assert.match(selected.slice(0, selected.indexOf("</g>")), /dfFactoryScene__worker--selected/);
+  assert.match(selected.slice(0, selected.indexOf("</g>")), /class="dfFactoryScene__selection"/);
+  assert.match(selected.slice(0, selected.indexOf("</g>")), new RegExp(`href="#df-frame-${frameName(workers[0])}"`));
 });
 
 test("every identity and operational frame is reachable, including fallbacks", () => {

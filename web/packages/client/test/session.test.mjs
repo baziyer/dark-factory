@@ -1887,3 +1887,37 @@ test("account discovery and linking correlate by request id and gate on capabili
   closed.close();
   session.close();
 });
+
+test("account update emits one revisioned rename or unlink request", async () => {
+  const { session, socket } = await openControlledStateSession();
+  const accountId = "5a".repeat(16);
+  const rename = session.updateAccount({ accountId, expectedRevision: 3n, label: "dogfood" });
+  const renameFrame = lastFrame(socket, "ACCOUNT_UPDATE");
+  assert.deepEqual(renameFrame.body, { account_id: accountId, expected_revision: 3n, label: "dogfood" });
+  socket.reply(encodeServerControl({ type: "ACCOUNT_UPDATE_RESULT", id: renameFrame.id, body: { account_id: accountId, revision: 4n } }));
+  assert.deepEqual(await rename, { accountId, revision: 4n });
+
+  const remove = session.updateAccount({ accountId, expectedRevision: 4n, remove: true });
+  const removeFrame = lastFrame(socket, "ACCOUNT_UPDATE");
+  assert.deepEqual(removeFrame.body, { account_id: accountId, expected_revision: 4n, remove: true });
+  socket.reply(encodeServerControl({ type: "ACCOUNT_UPDATE_RESULT", id: removeFrame.id, body: { account_id: accountId, revision: 5n } }));
+  assert.deepEqual(await remove, { accountId, revision: 5n });
+
+  await assert.rejects(session.updateAccount({ accountId, expectedRevision: 5n }), (error) => error.code === "invalid_request");
+  await assert.rejects(session.updateAccount({ accountId, expectedRevision: 5n, label: "x", remove: true }), (error) => error.code === "invalid_request");
+});
+
+test("account update rejects a reply for the wrong account or revision", async () => {
+  for (const body of [
+    { account_id: "6b".repeat(16), revision: 4n },
+    { account_id: "5a".repeat(16), revision: 5n },
+  ]) {
+    const { session, socket } = await openControlledStateSession();
+    const pending = session.updateAccount({ accountId: "5a".repeat(16), expectedRevision: 3n, label: "dogfood" });
+    const frame = lastFrame(socket, "ACCOUNT_UPDATE");
+    const rejection = assert.rejects(pending, (error) => error instanceof ProtocolError && error.code === "malformed");
+    socket.reply(encodeServerControl({ type: "ACCOUNT_UPDATE_RESULT", id: frame.id, body }));
+    await rejection;
+    assert.equal(session.status, "closed");
+  }
+});

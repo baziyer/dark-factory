@@ -71,9 +71,11 @@ test("one screen keeps Factory and the operator panels together", () => {
     assert.match(markup, new RegExp(`aria-label="${label}"`));
   }
   // Counters read the served factory, not a second count of it.
-  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2 \/ 8 WORKERS \+ 1 OVERSEER<\/dd>/);
-  assert.match(markup, /<dt>QUEUED<\/dt><dd>1<\/dd>/);
-  assert.match(markup, /<dt>NEEDS YOU<\/dt><dd>1<\/dd>/);
+  assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>2<\/dd>/);
+  assert.equal(markup.includes("<dt>QUEUED</dt>"), false);
+  assert.equal(markup.includes("<dt>NEEDS YOU</dt>"), false);
+  assert.match(markup, /NEEDS YOU <span>1<\/span>/);
+  assert.match(markup, /QUEUE <span>1<\/span>/);
   assert.match(markup, /Builder One asks/);
   assert.match(markup, /Review the state projection/);
   assert.match(markup, /North Workshop · Review the state projection/);
@@ -219,6 +221,22 @@ const soloState = (projectId) => ({
   agents: new Map(),
   tasks: new Map(),
   humanRequests: new Map(),
+});
+
+test("an active overseer without a path uses its assigned project control room", () => {
+  const overseer = { ...fixtureState.agents.get(ids.orchestrator), project_id: ids.project };
+  const agents = new Map(fixtureState.agents);
+  agents.set(overseer.id, overseer);
+  const task = { ...fixtureState.tasks.get(ids.task), id: "35".repeat(16), project_id: ids.project, assigned_agent_id: overseer.id, title: "Supervise", status: "running" };
+  const state = baseState({ agents, tasks: new Map([[task.id, task]]) });
+  const worker = floorScene(state, fixtureTopologies).workers.find((item) => item.id === ids.orchestrator);
+  const root = floorScene(state, fixtureTopologies).topology.nodes.find((node) => node.project.id === ids.project && node.path === ".");
+  assert.deepEqual([worker.location, worker.nodeId, worker.locationLabel], ["control-room", root.id, "North Workshop"]);
+  const observed = floorScene(state, fixtureTopologies, new Map([[ids.orchestrator, {
+    taskId: task.id, taskRevision: task.revision, runId: "71".repeat(16), projectId: ids.project, paths: ["."],
+  }]]))
+    .workers.find((item) => item.id === ids.orchestrator);
+  assert.equal(observed.location, "working", "an observed overseer keeps the observed room");
 });
 
 test("the floor is whatever the daemon served, with no shape or name known to the code", () => {
@@ -478,7 +496,7 @@ test("an unavailable snapshot is explicit and does not invent runtime state", ()
   assert.match(markup, /WAITING FOR SNAPSHOT/);
   assert.match(markup, /WAITING FOR SNAPSHOT/);
   assert.match(markup, /<dt>ACTIVE RUNS<\/dt><dd>—<\/dd>/);
-  assert.match(markup, /<dt>QUEUED<\/dt><dd>—<\/dd>/);
+  assert.match(markup, /QUEUE <span>—<\/span>/);
   assert.equal(markup.includes("THE QUEUE IS EMPTY"), false);
   assert.equal(markup.includes("all quiet"), false);
   assert.match(render({ state: undefined, status: "syncing", view: "agents" }), /waiting for the factory/);
@@ -566,7 +584,7 @@ test("opening a selected question restores that agent's terminal panel", async (
     let renderer;
     await act(async () => { renderer = create(createElement(ConsoleHarness)); });
     await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "CONFIG").props.onClick(); });
-    await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "NEEDS YOU").props.onClick(); });
+    await act(async () => { renderer.root.findAllByType("button").find((button) => Array.isArray(button.props.children) && button.props.children[0] === "NEEDS YOU ").props.onClick(); });
     await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "OPEN TERMINAL").props.onClick(); });
     const terminal = renderer.root.findByProps({ "aria-label": "Terminal" });
     const config = renderer.root.findByProps({ "aria-label": "Agent configuration" });
@@ -805,27 +823,32 @@ test("recent work remains collapsed, bounded, and private until opened", async (
   let renderer;
   await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
   const recent = renderer.root.findByProps({ className: "dfConsoleRecentWork dfConsoleSidebar__section" });
-  assert.equal(recent.props.open, undefined, "recent work starts collapsed");
-  assert.deepEqual(detailCalls, [], "the collapsed list requests no private detail");
-  assert.deepEqual(listCalls, [], "the collapsed list requests no private completion list");
-  assert.deepEqual(historyCalls, [], "the collapsed list requests no intervention history");
-  await act(async () => { recent.props.onToggle({ currentTarget: { open: true } }); });
-  assert.equal(detailCalls.length, 10, "opening fetches the bounded first page only");
-  assert.equal(listCalls.length, 1, "opening fetches one private completion page");
-  assert.deepEqual(historyCalls, [], "row history remains lazy");
-  const items = () => recent.findByProps({ className: "dfConsoleItems" }).findAllByType("li").filter((item) => item.props.className === "dfConsoleItem");
+  assert.equal(renderer.root.findAllByType("dialog").length, 0);
+  assert.deepEqual(detailCalls, []);
+  assert.deepEqual(listCalls, []);
+  assert.deepEqual(historyCalls, []);
+  await act(async () => { recent.findByType("button").props.onClick(); });
+  assert.equal(detailCalls.length, 1, "only the selected task loads private detail");
+  assert.equal(listCalls.length, 1);
+  assert.deepEqual(historyCalls, [detailCalls[0][0]]);
+  const items = () => renderer.root.findAllByProps({ className: "dfRecentWorkRow" });
   assert.equal(items().length, 10);
-  assert.ok(items()[0].findAllByType("small").some((item) => String(item.children).includes("00000000000000000000000000000012")), "newest updated task is first");
-  const firstDetails = items()[0].findByType("details");
-  await act(async () => { firstDetails.props.onToggle({ currentTarget: { open: true } }); });
-  assert.deepEqual(historyCalls, [detailCalls[0][0]], "intervention receipts load only for the expanded row");
-  assert.ok(renderer.root.findAllByType("pre").some((item) => item.props.children === `Outcome ${detailCalls[0][0]}`));
-  const links = items()[0].findAllByType("a");
-  assert.deepEqual(links.map((link) => link.props.href), ["https://github.com/example-owner/example-repo/pull/42"], "only an exact GitHub pull URL becomes a link");
+  assert.equal(items()[0].props["aria-pressed"], true);
+  assert.equal(detailCalls[0][0], "00000000000000000000000000000012");
+  assert.equal(JSON.stringify(items()[0].children.map((child) => typeof child === "string" ? child : child.props.children)).includes("Instruction"), false, "list titles do not repeat full private instructions");
+  const detail = renderer.root.findByProps({ "aria-label": "Work details" });
+  assert.ok(detail.findAllByType("p").some((item) => item.props.children === `Outcome ${detailCalls[0][0]}`));
+  assert.deepEqual(detail.findAllByType("a").map((link) => link.props.href), ["https://github.com/example-owner/example-repo/pull/42"]);
   await act(async () => { renderer.root.findAllByType("button").find((button) => button.props.children === "SHOW MORE").props.onClick(); });
-  assert.equal(detailCalls.length, 12, "show more loads exactly the next bounded page");
+  assert.equal(detailCalls.length, 1, "pagination does not fetch private details for unselected work");
   assert.deepEqual(listCalls[1], { beforeUpdatedAtMs: 1_700_000_000_002n, beforeTaskId: "00000000000000000000000000000003" });
   assert.equal(items().length, 12);
+  await act(async () => { items()[11].props.onClick(); });
+  assert.equal(detailCalls.length, 2);
+  assert.equal(historyCalls.length, 2);
+  assert.equal(items()[11].props["aria-pressed"], true);
+  await act(async () => { renderer.root.findByType("dialog").props.onClose(); });
+  assert.equal(renderer.root.findAllByType("dialog").length, 0);
   await act(async () => { renderer.unmount(); });
 });
 
@@ -844,7 +867,7 @@ test("late recent-work detail never crosses an agent remount", async () => {
   await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
   const openRecent = async () => {
     const recent = renderer.root.findByProps({ className: "dfConsoleRecentWork dfConsoleSidebar__section" });
-    await act(async () => { recent.props.onToggle({ currentTarget: { open: true } }); });
+    await act(async () => { recent.findByType("button").props.onClick(); });
   };
   await openRecent();
   assert.equal(pending.has(firstTask.id), true);
@@ -1212,6 +1235,7 @@ test("settings asks the daemon for logins on open and links the one the operator
     };
     const asked = [];
     const linkings = [];
+    const updates = [];
     const props = {
       status: "ready",
       state: baseState(),
@@ -1219,6 +1243,7 @@ test("settings asks the daemon for logins on open and links the one the operator
       onToggleSettings: () => {},
       onLoadAccounts: () => asked.push("asked"),
       onLinkAccount: (candidate, label) => linkings.push([candidate.home, label]),
+      onUpdateAccount: (account, change) => updates.push([account.id, account.revision, change]),
       accounts: [login],
     };
     let renderer;
@@ -1232,6 +1257,20 @@ test("settings asks the daemon for logins on open and links the one the operator
     const link = renderer.root.findAllByType("button").find((button) => button.props.children === "LINK");
     await act(async () => { link.props.onClick(); });
     assert.deepEqual(linkings, [[login.home, "dogfood"]]);
+    const account = [...props.state.accounts.values()][0];
+    const linkedLabel = renderer.root.findAllByType("input").find((input) => input.props.id === `df-linked-account-${account.id}`);
+    await act(async () => { linkedLabel.props.onChange({ currentTarget: { value: "personal" } }); });
+    const button = (name) => renderer.root.findAllByType("button").find((item) => item.props.children === name);
+    await act(async () => { button("SAVE LABEL").props.onClick(); });
+    assert.deepEqual(updates, [[account.id, account.revision, { label: "personal" }]]);
+    assert.equal(button("UNLINK").props.disabled, true, "an agent still references this account");
+    await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, state: { ...props.state, agents: new Map() } })); });
+    assert.equal(button("UNLINK").props.disabled, false);
+    await act(async () => { button("UNLINK").props.onClick(); });
+    assert.deepEqual(updates.at(-1), [account.id, account.revision, { remove: true }]);
+    await act(async () => { button("REFRESH ACCOUNTS").props.onClick(); });
+    assert.equal(asked.length, 2);
+
 
     // The daemon's refusal is shown plainly rather than retried.
     await act(async () => { renderer.update(createElement(FactoryConsole, { ...props, accountsError: "not_found" })); });

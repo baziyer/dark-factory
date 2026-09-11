@@ -469,6 +469,59 @@ func (store *Store) ListAccounts(ctx context.Context) ([]Account, error) {
 	return readAccounts(ctx, connection)
 }
 
+// UpdateAccount renames or removes one linked provider login at an exact
+// revision. Removal only removes the registry entry: it never detaches agents,
+// changes provider defaults, or touches the provider's home or auth data.
+func (store *Store) UpdateAccount(ctx context.Context, id AccountID, expected Revision, label *string, remove bool, at UnixMillis) (Account, error) {
+	if id.zero() || expected.Int64() < 1 || (label == nil) != remove {
+		return Account{}, fmt.Errorf("%w: invalid account update", ErrInvalidValue)
+	}
+	tx, err := store.beginValidatedWrite(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	defer tx.Close()
+	account, found, err := accountByID(ctx, tx.connection, id)
+	if err != nil {
+		return Account{}, tx.Rollback(err)
+	}
+	if !found {
+		return Account{}, tx.Rollback(ErrNotFound)
+	}
+	if account.Revision != expected || at.Int64() < account.UpdatedAt.Int64() {
+		return Account{}, tx.Rollback(ErrRevisionConflict)
+	}
+	if remove {
+		var referenced bool
+		if err := tx.connection.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE account_id = ?)`, id.Bytes()).Scan(&referenced); err != nil {
+			return Account{}, tx.Rollback(err)
+		}
+		if referenced {
+			return Account{}, tx.Rollback(ErrConflict)
+		}
+		if _, err := tx.connection.ExecContext(ctx, `DELETE FROM accounts WHERE id = ? AND revision = ?`, id.Bytes(), expected.Int64()); err != nil {
+			return Account{}, tx.Rollback(err)
+		}
+	} else {
+		if len(*label) == 0 || len(*label) > 128 || !utf8.ValidString(*label) || strings.ContainsRune(*label, 0) {
+			return Account{}, tx.Rollback(fmt.Errorf("%w: invalid account label", ErrInvalidValue))
+		}
+		account.Label = *label
+		if _, err := tx.connection.ExecContext(ctx, `UPDATE accounts SET label = ?, revision = revision + 1, updated_at_ms = ? WHERE id = ? AND revision = ?`, account.Label, at.Int64(), id.Bytes(), expected.Int64()); err != nil {
+			return Account{}, tx.Rollback(err)
+		}
+	}
+	if err := appendInvalidations(ctx, tx.connection, at, []pendingInvalidation{{kind: EntityAccount, id: id.Bytes(), revision: expected.Int64() + 1}}); err != nil {
+		return Account{}, tx.Rollback(err)
+	}
+	account.Revision, _ = NewRevision(expected.Int64() + 1)
+	account.UpdatedAt = at
+	if err := tx.Commit(ctx); err != nil {
+		return Account{}, err
+	}
+	return account, nil
+}
+
 func readAccounts(ctx context.Context, connection *sql.Conn) ([]Account, error) {
 	rows, err := connection.QueryContext(ctx, `SELECT `+accountColumns+` FROM accounts ORDER BY id`)
 	if err != nil {

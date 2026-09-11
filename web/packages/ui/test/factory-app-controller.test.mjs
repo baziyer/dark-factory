@@ -55,6 +55,7 @@ function harness(overrides = {}) {
     getTopology: overrides.getTopology ?? (async () => { throw new SessionError("not_found"); }),
     getRunPaths: overrides.getRunPaths ?? (async () => { throw new SessionError("not_found"); }),
     discoverAccounts: overrides.discoverAccounts ?? (async () => []),
+    updateAccount: overrides.updateAccount ?? (async () => ({ accountId: "00".repeat(16), revision: 2n })),
     linkAccount: overrides.linkAccount ?? (async () => ({ accountId: "00".repeat(16), revision: 1n })),
     inviteRemote: overrides.inviteRemote ?? (async () => remoteInvite),
     capabilities: overrides.capabilities ?? 15,
@@ -839,9 +840,11 @@ test("a late path answer from an earlier revision only becomes a retained observ
 test("account discovery links once then refreshes its provider view", async () => {
   const discovered = [];
   const linked = [];
+  const updated = [];
   const account = { provider: "codex", home: "/private/account", label: "work", email: "", organization: "", default_model: "", default_reasoning_effort: "", linked_id: "" };
   const context = harness({
     discoverAccounts: async () => { discovered.push(true); return [account]; },
+    updateAccount: async (request) => { updated.push(request); return { accountId: request.accountId, revision: request.expectedRevision + 1n }; },
     linkAccount: async (request) => { linked.push(request); return { accountId: "00".repeat(16), revision: 1n }; },
   });
   context.controller.start();
@@ -851,6 +854,10 @@ test("account discovery links once then refreshes its provider view", async () =
   await context.controller.linkAccount({ provider: "codex", home: account.home, label: account.label });
   assert.deepEqual(linked, [{ provider: "codex", home: account.home, label: account.label }]);
   assert.equal(discovered.length, 2, "link refreshes the discovered provider view");
+  const request = { accountId: "00".repeat(16), expectedRevision: 1n, label: "personal" };
+  await context.controller.updateAccount(request);
+  assert.deepEqual(updated, [request]);
+  assert.equal(discovered.length, 3, "update refreshes the discovered provider view");
   assert.equal(context.latest().accountsPending, false);
 });
 

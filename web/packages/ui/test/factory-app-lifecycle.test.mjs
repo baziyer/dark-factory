@@ -85,8 +85,8 @@ test("StrictMode selected-agent composition owns one real terminal surface", asy
   const result = await runStrictCompositionProbe();
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /"opens":2/);
-  assert.match(result.stdout, /"attaches":2/);
-  assert.match(result.stdout, /"acquires":2/);
-  assert.match(result.stdout, /"detaches":1/);
+  assert.match(result.stdout, /"opens":1/);
+  assert.match(result.stdout, /"attaches":1/);
+  assert.match(result.stdout, /"acquires":1/);
+  assert.match(result.stdout, /"detaches":0/);
 });

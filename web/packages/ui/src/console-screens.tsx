@@ -2,6 +2,7 @@ import type { AgentItem, StateView, TopologyView } from "@dark-factory/client";
 import {
   STAGE_SEQUENCE,
   agentStatus,
+  agentActivity,
   agentCurrentTask,
   agentGlyph,
   factoryCounters,
@@ -11,7 +12,7 @@ import {
   type RunPathSample,
   type TaskStage,
 } from "./console-view.js";
-import { FactoryScene } from "./factory-scene/factory-scene.js";
+import { FactoryScene, AgentSprite } from "./factory-scene/factory-scene.js";
 
 function shortID(value: string): string {
   return value.slice(0, 8);
@@ -126,17 +127,20 @@ export function FactoryFloor({
   topologies,
   runPaths,
   lastRunPaths,
+  selectedAgentId,
   onSelectAgent,
 }: {
   state: StateView | undefined;
   topologies: ReadonlyMap<string, TopologyView> | undefined;
   runPaths?: ReadonlyMap<string, RunPathSample>;
   lastRunPaths?: ReadonlyMap<string, RunPathSample>;
+  selectedAgentId?: string;
   onSelectAgent?: (agent: AgentItem) => void;
 }) {
   const scene = floorScene(state, topologies, runPaths, lastRunPaths);
   return <div className="dfFactoryFloor">
     <FactoryScene
+      selectedWorkerId={selectedAgentId}
       topology={scene.topology}
       workers={scene.workers}
       omittedLocations={scene.omittedLocations}
@@ -219,7 +223,7 @@ function AgentRow({
   const label = `${agent.name}: ${activity}`;
   const cells = (
     <>
-      <span className="dfConsoleRow__glyph" aria-hidden="true">{agentGlyph(agent)}</span>
+      <AgentSprite agent={agent} activity={agentActivity(agent, state)} />
       <span className="dfConsoleRow__title">{agent.name}</span>
       <span className="dfAgentList__provider">{agent.effective_model === "" ? agent.provider : `${agent.provider} · ${agent.effective_model}`}</span>
       <span className="dfAgentList__activity">{activity === "needs-you" ? "! needs you" : activity}</span>

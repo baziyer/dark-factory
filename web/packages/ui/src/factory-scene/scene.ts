@@ -24,7 +24,7 @@ export type SceneWorker = Readonly<{
   activity: "busy" | "waiting" | "needs-you" | "idle";
   paused?: boolean;
   /** Live work is placed in a room; retained samples annotate the resting area. */
-  location?: "working" | "last-observed" | "unobserved" | "resting";
+  location?: "working" | "control-room" | "last-observed" | "unobserved" | "resting";
   locationLabel?: string;
   nodeId?: string;
 }>;
@@ -120,7 +120,7 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
   const roomCounts = new Map<string, number>();
   const outsideColumns = Math.max(1, Math.floor((layout.width - PADDING * 2 - 16) / WORKER_GAP) + 1);
   const sorted = [...workers].sort((left, right) => compareText(left.id, right.id));
-  const resting = sorted.filter((worker) => worker.location !== "working" && worker.location !== "unobserved");
+  const resting = sorted.filter((worker) => worker.location !== "working" && worker.location !== "control-room" && worker.location !== "unobserved");
   const staging = sorted.filter((worker) => worker.location === "unobserved");
   const restRows = Math.ceil(resting.length / outsideColumns);
   const stagingRows = Math.ceil(staging.length / outsideColumns);
@@ -131,9 +131,9 @@ export function placeWorkers(layout: SceneLayout, workers: readonly SceneWorker[
     y: top + Math.floor(slot / outsideColumns) * WORKER_GAP,
   }));
   const placed: SceneWorkerPlacement[] = [];
-  const overflow: SceneWorker[] = sorted.filter((worker) => worker.location === "working" && worker.nodeId === undefined);
+  const overflow: SceneWorker[] = sorted.filter((worker) => (worker.location === "working" || worker.location === "control-room") && worker.nodeId === undefined);
   for (const worker of sorted) {
-    if (worker.location !== "working" || worker.nodeId === undefined) continue;
+    if ((worker.location !== "working" && worker.location !== "control-room") || worker.nodeId === undefined) continue;
     const room = rooms.get(worker.nodeId);
     const roomSlot = room === undefined ? -1 : roomCounts.get(room.id) ?? 0;
     const roomColumns = room === undefined ? 0 : Math.max(1, Math.floor((room.width - 16) / WORKER_GAP));

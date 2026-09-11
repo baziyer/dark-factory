@@ -657,6 +657,31 @@ func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [brows
 	return browserprotocol.AccountLinkResult{AccountID: account.ID.String(), Revision: decimalRevision(account.Revision)}, nil
 }
 
+func (backend *browserBackend) UpdateAccount(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.AccountUpdate) (browserprotocol.AccountUpdateResult, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
+	if err != nil {
+		return browserprotocol.AccountUpdateResult{}, err
+	}
+	defer release()
+	id, err := browserID(request.AccountID, kernel.AccountIDFromBytes)
+	if err != nil {
+		return browserprotocol.AccountUpdateResult{}, browser.ErrStale
+	}
+	expected, err := kernel.NewRevision(int64(request.ExpectedRevision))
+	if err != nil {
+		return browserprotocol.AccountUpdateResult{}, browser.ErrStale
+	}
+	at, err := backend.timestamp()
+	if err != nil {
+		return browserprotocol.AccountUpdateResult{}, mapBrowserError(err)
+	}
+	account, err := backend.store.UpdateAccount(ctx, id, expected, request.Label, request.Remove != nil && bool(*request.Remove), at)
+	if err != nil {
+		return browserprotocol.AccountUpdateResult{}, consoleUpdateError(err)
+	}
+	return browserprotocol.AccountUpdateResult{AccountID: account.ID.String(), Revision: decimalRevision(account.Revision)}, nil
+}
+
 func (backend *browserBackend) authorize(ctx context.Context, rawID [browserprotocol.ClientIDSize]byte, capability kernel.BrowserCapabilityMask) (kernel.BrowserClientID, func(), kernel.BrowserClient, error) {
 	clientID, err := kernel.BrowserClientIDFromBytes(rawID[:])
 	if err != nil {

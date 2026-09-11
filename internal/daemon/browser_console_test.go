@@ -398,6 +398,10 @@ func TestBrowserAccountsNeedAdministration(t *testing.T) {
 	if _, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: filepath.Join(home, ".codex"), Label: "dogfood"}); !errors.Is(err, browser.ErrUnauthorized) {
 		t.Fatalf("link without administration = %v", err)
 	}
+	renameLabel := "renamed"
+	if _, err := fixture.backend.UpdateAccount(ctx, client, browserprotocol.AccountUpdate{AccountID: strings.Repeat("01", 16), ExpectedRevision: 1, Label: &renameLabel}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("account update without administration = %v", err)
+	}
 	if accounts, err := fixture.store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
 		t.Fatalf("refused link left %d accounts, err=%v", len(accounts), err)
 	}
@@ -468,11 +472,19 @@ func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
 	if err != nil || result.Revision != 1 {
 		t.Fatalf("link = %+v, %v", result, err)
 	}
+	renameLabel := "renamed"
+	renamed, err := fixture.backend.UpdateAccount(ctx, client, browserprotocol.AccountUpdate{AccountID: result.AccountID, ExpectedRevision: result.Revision, Label: &renameLabel})
+	if err != nil || renamed.Revision != 2 {
+		t.Fatalf("rename = %+v, %v", renamed, err)
+	}
+	if _, err := fixture.backend.UpdateAccount(ctx, client, browserprotocol.AccountUpdate{AccountID: result.AccountID, ExpectedRevision: result.Revision, Label: &renameLabel}); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("stale rename = %v, want stale", err)
+	}
 	again, err := fixture.backend.DiscoverAccounts(ctx, client)
 	if err != nil || len(again.Accounts) != 1 {
 		t.Fatalf("second discovery = %+v, %v", again.Accounts, err)
 	}
-	if again.Accounts[0].LinkedID != result.AccountID || again.Accounts[0].Label != "dogfood" {
+	if again.Accounts[0].LinkedID != result.AccountID || again.Accounts[0].Label != "renamed" {
 		t.Fatalf("linked login = %+v, want id %q", again.Accounts[0], result.AccountID)
 	}
 
@@ -484,5 +496,29 @@ func TestBrowserAccountsLinkOnlyWhatDiscoveryFound(t *testing.T) {
 	accounts, err := fixture.store.ListAccounts(ctx)
 	if err != nil || len(accounts) != 1 {
 		t.Fatalf("accounts after relink = %d, err=%v", len(accounts), err)
+	}
+}
+
+func TestBrowserAccountsUnlinkUnused(t *testing.T) {
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions|kernel.BrowserCapabilityAdministration, consoleRoot(t))
+	home := accountHomeFixture(t, fixture)
+	ctx := context.Background()
+	client := rawBrowserClient(fixture.client.ID)
+	discovered, err := fixture.backend.DiscoverAccounts(ctx, client)
+	if err != nil || len(discovered.Accounts) != 1 {
+		t.Fatalf("discovery = %+v, %v", discovered.Accounts, err)
+	}
+	linked, err := fixture.backend.LinkAccount(ctx, client, browserprotocol.AccountLink{Provider: "codex", Home: filepath.Join(home, ".codex"), Label: "dogfood"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remove := browserprotocol.Bool(true)
+	removed, err := fixture.backend.UpdateAccount(ctx, client, browserprotocol.AccountUpdate{AccountID: linked.AccountID, ExpectedRevision: linked.Revision, Remove: &remove})
+	if err != nil || removed.AccountID != linked.AccountID || removed.Revision != linked.Revision+1 {
+		t.Fatalf("unlink = %+v, %v", removed, err)
+	}
+	accounts, err := fixture.store.ListAccounts(ctx)
+	if err != nil || len(accounts) != 0 {
+		t.Fatalf("accounts after unlink = %d, err=%v", len(accounts), err)
 	}
 }

@@ -23,10 +23,10 @@ function terminalView(overrides = {}) {
   };
 }
 
-function panel(terminal = terminalView(), onClose = () => {}) {
+function panel(terminal = terminalView()) {
   return createElement(
     TerminalPanel,
-    { terminal, onClose },
+    { terminal },
     createElement("div", { className: "terminal-surface" }, "live terminal surface"),
   );
 }
@@ -34,13 +34,13 @@ function panel(terminal = terminalView(), onClose = () => {}) {
 test("the terminal is a quiet sidebar", () => {
   const markup = renderToStaticMarkup(panel(terminalView({ taskTitle: "Repair finalization" })));
   assert.match(markup, /dfFactoryConsole__terminalPanel/);
-  assert.match(markup, /Builder One · Repair finalization/);
+  assert.match(markup, />Repair finalization<\/p>/);
   assert.match(markup, /live terminal surface/);
-  assert.match(markup, />CLOSE<\/button>/);
+  assert.equal(markup.includes("CLOSE"), false);
   for (const noise of ["CURRENT RUN TERMINAL", "READY", "you have control", "watching", "take control", "hand back", "Steer"]) {
     assert.equal(markup.includes(noise), false, noise);
   }
-  assert.equal((markup.match(/<button/g) ?? []).length, 1, "close is the only terminal control");
+  assert.equal((markup.match(/<button/g) ?? []).length, 0, "the terminal has no duplicate controls");
 });
 
 test("finalizing work shows no blank terminal or idle input", () => {
@@ -154,29 +154,6 @@ test("crypto-unavailable preflight is definitively not sent", () => {
   }));
   assert.match(markup, />NOT SENT</);
   assert.equal(markup.includes("SEND NOT CONFIRMED"), false);
-});
-
-test("close remains available through setup and invokes the owner once", async () => {
-  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
-  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-  try {
-    for (const phase of ["idle", "resolving", "attaching", "acquiring", "ready", "closing", "closed"]) {
-      let closes = 0;
-      let renderer;
-      await act(async () => {
-        renderer = create(panel(terminalView({ phase }), () => { closes += 1; }));
-      });
-      const button = renderer.root.findByType("button");
-      assert.equal(button.props.disabled, phase === "closing" || phase === "closed", phase);
-      if (!button.props.disabled) {
-        await act(async () => { button.props.onClick(); });
-        assert.equal(closes, 1, phase);
-      }
-      await act(async () => { renderer.unmount(); });
-    }
-  } finally {
-    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
-  }
 });
 
 test("exceptional input ownership and replay loss are concise", () => {

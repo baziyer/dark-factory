@@ -12,7 +12,7 @@ export type FactoryRemoteInvite = Readonly<{
   expiresAtMs: bigint;
 }>;
 
-type SettingsSession = Pick<BrowserSession, "discoverAccounts" | "linkAccount" | "inviteRemote" | "capabilities">;
+type SettingsSession = Pick<BrowserSession, "discoverAccounts" | "linkAccount" | "updateAccount" | "inviteRemote" | "capabilities">;
 
 type SettingsOwner = Readonly<{
   session(): SettingsSession | undefined;
@@ -70,14 +70,23 @@ export class FactorySettingsCoordinator {
     this.#owner.publish();
   }
 
-  async linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<void> {
+  linkAccount(request: Parameters<BrowserSession["linkAccount"]>[0]): Promise<void> {
+    return this.#changeAccount(request);
+  }
+
+  updateAccount(request: Parameters<BrowserSession["updateAccount"]>[0]): Promise<void> {
+    return this.#changeAccount(request);
+  }
+
+  async #changeAccount(request: Parameters<BrowserSession["linkAccount"]>[0] | Parameters<BrowserSession["updateAccount"]>[0]): Promise<void> {
     const session = this.#owner.session();
     if (!this.#owner.ready() || session === undefined || this.#accountsPending) return;
     const generation = this.#owner.generation();
     this.#accountsPending = true;
     this.#owner.publish();
     try {
-      await session.linkAccount(request);
+      if ("accountId" in request) await session.updateAccount(request);
+      else await session.linkAccount(request);
       if (!this.#owner.current(generation)) return;
       this.#accountsError = undefined;
     } catch (error) {

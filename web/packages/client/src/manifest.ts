@@ -92,6 +92,8 @@ export const CONTROL_MANIFEST = [
   { type: "ACCOUNTS", direction: "server", id: "required", fixture: "accounts.json" },
   { type: "ACCOUNT_LINK", direction: "client", id: "required", fixture: "account_link.json" },
   { type: "ACCOUNT_LINK_RESULT", direction: "server", id: "required", fixture: "account_link_result.json" },
+  { type: "ACCOUNT_UPDATE", direction: "client", id: "required", fixture: "account_update.json" },
+  { type: "ACCOUNT_UPDATE_RESULT", direction: "server", id: "required", fixture: "account_update_result.json" },
   { type: "REMOTE_INVITE", direction: "client", id: "required", fixture: "remote_invite.json" },
   { type: "REMOTE_INVITE_RESULT", direction: "server", id: "required", fixture: "remote_invite_result.json" },
   { type: "ERROR", direction: "both", id: "optional", fixture: "error.json" },

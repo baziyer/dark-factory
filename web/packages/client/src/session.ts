@@ -15,6 +15,7 @@ import {
   encodeTaskHistoryGet,
   encodeTerminalTargetGet,
   type AccountLinkResultBody,
+  type AccountUpdateResultBody,
   type AccountsBody,
   type AgentUpdateBody,
   type AgentControlAction,
@@ -40,7 +41,7 @@ import {
   type TopologyBody,
 } from "./control.js";
 import { ProtocolError, type ProtocolErrorCode } from "./errors.js";
-import { CAPABILITIES, MAX_AGENT_MODEL_BYTES,
+import { CAPABILITIES, MAX_AGENT_MODEL_BYTES, MAX_AGENT_NAME_BYTES,
   MAX_IDLE_AFTER_SECONDS,
   MAX_IDLE_RUN_BUDGET, MAX_ARRAY_ITEMS, MAX_HUMAN_REPLY_BYTES, MAX_SQLITE_INTEGER, MAX_TASK_INSTRUCTION_BYTES, MAX_TASK_PRIORITY, MAX_TASK_TITLE_BYTES, type CapabilityMask, type ErrorCode } from "./manifest.js";
 import { snapshotView, type StateView } from "./state.js";
@@ -178,11 +179,12 @@ export type TopologyView = Readonly<{ projectId: string; digest: string; sourceR
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
 export type TaskListView = Readonly<{ agentId: string; head: bigint; total: bigint; tasks: readonly TaskItem[]; hasMore: boolean }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
-type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT"; resolve: (value: never) => void; reject: (error: unknown) => void };
+type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT"; accountId?: string; expectedRevision?: bigint; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 /** One provider login found on the daemon's machine, linked or not. */
 export type DiscoveredAccountView = AccountsBody["accounts"][number];
 export type AccountLinkResult = Readonly<{ accountId: string; revision: bigint }>;
+export type AccountUpdateResult = Readonly<{ accountId: string; revision: bigint }>;
 
 /** One minted remote pairing invitation and the code that carries it. */
 export type RemoteInvite = Readonly<{ link: string; expiresAtMs: bigint; svg: string }>;
@@ -427,6 +429,16 @@ export class BrowserSession {
   /** Registers one already-existing login so agents can be pointed at it. */
   linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<AccountLinkResult> {
     return this.#accountRequest("ACCOUNT_LINK_RESULT", CAPABILITIES.administration, "account-link", (id) => encodeClientControl({ type: "ACCOUNT_LINK", id, body: { provider: request.provider, home: request.home, label: request.label } }));
+  }
+
+  /** Renames or removes a linked login; removal is refused while referenced. */
+  updateAccount(request: { accountId: string; expectedRevision: bigint; label?: string; remove?: boolean }): Promise<AccountUpdateResult> {
+    const hasLabel = request.label !== undefined;
+    const hasRemove = request.remove === true;
+    if (hasLabel === hasRemove || request.label !== undefined && bounded(request.label, MAX_AGENT_NAME_BYTES)) return Promise.reject(new SessionError("invalid_request"));
+    if (request.accountId === "" || !validDynamicID(request.accountId) || request.expectedRevision < 1n || request.expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
+    if ((this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
+    return this.#accountRequest("ACCOUNT_UPDATE_RESULT", CAPABILITIES.administration, "account-update", (id) => encodeClientControl({ type: "ACCOUNT_UPDATE", id, body: { account_id: request.accountId, expected_revision: request.expectedRevision, ...(request.label === undefined ? { remove: true } : { label: request.label }) } }), { accountId: request.accountId, expectedRevision: request.expectedRevision });
   }
 
   /** Mints one remote pairing invitation. The mint is never retried: a failed
@@ -752,7 +764,7 @@ export class BrowserSession {
       this.#inviteResult(frame.body, frame.id);
       return;
     }
-    if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT") {
+    if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT" || frame.type === "ACCOUNT_UPDATE_RESULT") {
       this.#accountResult(frame);
       return;
     }
@@ -1140,9 +1152,8 @@ export class BrowserSession {
     this.#accountPending.clear();
   }
 
-  /** One shape for the two account request/result pairs. Neither names an
-   * entity, so the request id alone correlates the answer. */
-  #accountRequest<T>(kind: AccountPending["kind"], capability: number, prefix: string, encode: (id: string) => string): Promise<T> {
+  /** One shape for account requests; updates also correlate the returned revision. */
+  #accountRequest<T>(kind: AccountPending["kind"], capability: number, prefix: string, encode: (id: string) => string, correlation?: Pick<AccountPending, "accountId" | "expectedRevision">): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
     if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
     if ((this.#capabilities & capability) === 0) return Promise.reject(new SessionError("unauthorized"));
@@ -1150,16 +1161,17 @@ export class BrowserSession {
     const id = this.#nextID(prefix);
     let payload: string;
     try { payload = encode(id); } catch (error) { return Promise.reject(error); }
-    const result = new Promise<T>((resolve, reject) => this.#accountPending.set(id, { kind, resolve: resolve as (value: never) => void, reject }));
+    const result = new Promise<T>((resolve, reject) => this.#accountPending.set(id, { kind, ...correlation, resolve: resolve as (value: never) => void, reject }));
     try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
     return result;
   }
 
-  #accountResult(frame: Extract<ServerControlFrame, { type: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" }>): void {
+  #accountResult(frame: Extract<ServerControlFrame, { type: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT" }>): void {
     const pending = this.#accountPending.get(frame.id);
     if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
+    if (frame.type === "ACCOUNTS") { this.#accountPending.delete(frame.id); pending.resolve(Object.freeze(frame.body.accounts.map((account) => Object.freeze({ ...account }))) as never); return; }
+    if (frame.type === "ACCOUNT_UPDATE_RESULT" && (pending.accountId !== frame.body.account_id || pending.expectedRevision === undefined || frame.body.revision !== pending.expectedRevision + 1n)) throw new ProtocolError("malformed");
     this.#accountPending.delete(frame.id);
-    if (frame.type === "ACCOUNTS") { pending.resolve(Object.freeze(frame.body.accounts.map((account) => Object.freeze({ ...account }))) as never); return; }
     pending.resolve(Object.freeze({ accountId: frame.body.account_id, revision: frame.body.revision }) as never);
   }
 
