@@ -48,6 +48,7 @@ function detailFor(request, overrides = {}) {
     requestId: request.id,
     revision: request.revision,
     question: "Proceed with the migration?",
+    options: [],
     canReply: true,
     replyMaxBytes: 8192,
     terminalTarget: {},
@@ -302,6 +303,36 @@ test("REPLY sends the bounded answer once and a second press during it does noth
     await act(async () => { release({ request_id: northRequest.id }); await pending; });
     await settle();
     assert.equal(session.calls.detail.length, 2, "the detail is read again, and only once");
+  });
+});
+
+test("a suggested answer fills the draft and waits for explicit reply", async () => {
+  const detail = detailFor(northRequest, { options: ["Continue", "Stop"] });
+  const session = fakeSession({ detail: () => detail });
+  const manager = fakeManager([northFactory()], new Map([[NORTH, session]]));
+  await withApp(props(manager), async (renderer) => {
+    await act(async () => { buttons(renderer, "dfRemote__answer")[0].props.onClick(); });
+    const suggested = allButtons(renderer).find((control) => flat(control.props.children) === "Continue · RECOMMENDED");
+    assert.ok(suggested !== undefined);
+    await act(async () => { suggested.props.onClick(); });
+    assert.equal(renderer.root.findByProps({ className: "dfRemote__replyText" }).props.value, "Continue");
+    assert.equal(session.calls.reply.length, 0);
+    await act(async () => { button(renderer, "dfRemote__replyAction").props.onClick(); });
+    assert.deepEqual(session.calls.reply.map((call) => call.reply), ["Continue"]);
+  });
+});
+
+test("read-only questions keep their suggested answers disabled", async () => {
+  const detail = detailFor(northRequest, { canReply: false, options: ["Continue", "Stop"] });
+  const session = fakeSession({ detail: () => detail });
+  const manager = fakeManager([northFactory()], new Map([[NORTH, session]]));
+  await withApp(props(manager), async (renderer) => {
+    await act(async () => { buttons(renderer, "dfRemote__answer")[0].props.onClick(); });
+    const suggested = allButtons(renderer).find((control) => flat(control.props.children) === "Continue · RECOMMENDED");
+    assert.ok(suggested !== undefined);
+    assert.equal(suggested.props.disabled, true);
+    assert.equal(renderer.root.findAllByProps({ className: "dfRemote__replyText" }).length, 0);
+    assert.match(sectionText(renderer, "dfRemote__detail"), /THIS OPEN DECISION IS READ-ONLY IN THIS VIEW\./);
   });
 });
 

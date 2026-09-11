@@ -251,6 +251,14 @@ export function RemoteApp(props: RemoteAppProps = {}) {
     })();
   };
 
+  const changeReply = (value: string) => {
+    const current = selection.current;
+    const currentDetail = current?.detail;
+    if (current === undefined || current.phase !== "ready" || currentDetail === undefined || !currentDetail.canReply || !actionable(current.nodeId)) return;
+    if (new TextEncoder().encode(value).length > currentDetail.replyMaxBytes) return;
+    putDetail({ ...current, reply: value });
+  };
+
   const cancelRun = () => {
     const current = selection.current;
     const descriptor = current?.detail?.cancelRun;
@@ -449,6 +457,9 @@ export function RemoteApp(props: RemoteAppProps = {}) {
             {detail.detail === undefined ? null : (
               <>
                 <p className="dfRemote__questionText">{detail.detail.question}</p>
+                {detail.detail.options.length === 0 ? null : <div className="dfFactoryConsole__answerOptions" role="group" aria-label="Suggested answers">
+                  {detail.detail.options.map((option, index) => <button type="button" key={option} disabled={busy(detail) || !detail.detail?.canReply || !actionable(detail.nodeId)} onClick={() => changeReply(option)}>{option}{index === 0 ? " · RECOMMENDED" : ""}</button>)}
+                </div>}
                 {detail.detail.canReply ? (
                   <div className="dfRemote__reply">
                     <label htmlFor="dfRemoteReply">YOUR ANSWER</label>
@@ -458,14 +469,7 @@ export function RemoteApp(props: RemoteAppProps = {}) {
                       value={detail.reply}
                       maxLength={detail.detail.replyMaxBytes}
                       disabled={busy(detail) || !actionable(detail.nodeId)}
-                      onChange={(event) => {
-                        const value = event.currentTarget.value;
-                        const current = selection.current;
-                        const bound = current?.detail?.replyMaxBytes;
-                        if (current === undefined || bound === undefined || current.phase !== "ready") return;
-                        if (new TextEncoder().encode(value).length > bound) return;
-                        putDetail({ ...current, reply: value });
-                      }}
+                      onChange={(event) => changeReply(event.currentTarget.value)}
                     />
                     <button
                       type="button"
@@ -476,7 +480,7 @@ export function RemoteApp(props: RemoteAppProps = {}) {
                       {detail.phase === "replying" ? "REPLYING…" : "REPLY"}
                     </button>
                   </div>
-                ) : null}
+                ) : <p className="dfFactoryConsole__empty">{detail.request.status === "open" ? "THIS OPEN DECISION IS READ-ONLY IN THIS VIEW." : `THIS DECISION IS ${detail.request.status.replaceAll("_", " ").toUpperCase()}.`}</p>}
                 {detail.detail.cancelRun === null ? null : cancelPhrase === undefined ? (
                   <button
                     type="button"
