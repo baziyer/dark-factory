@@ -1,0 +1,19 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "project_id": "32-hex-project-id",
+  "worker_agent_id": "32-hex-worker-id",
+  "overseer_agent_id": "32-hex-overseer-id",
+  "label": "factory:ready",
+  "allowed_authors": ["trusted-maintainer"],
+  "priority_default": 0,
+  "priority_by_label": {
+    "priority:high": 50,
+    "priority:low": -25
+  },
+  "priority_min": -100,
+  "priority_max": 100,
+  "max_issues": 25,
+  "poll_seconds": 120,
+  "factory_home": "/Users/you/.dark-factory",
+  "journal": "/Users/you/.dark-factory/github-intake.json"
+}
