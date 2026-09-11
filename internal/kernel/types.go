@@ -571,6 +571,7 @@ type Agent struct {
 	ReasoningEffort string
 	AccountID       AccountID
 	Paused          bool
+	Appearance      AgentAppearance
 	Idle            IdleRule
 	ToolBudgetLimit uint64
 	ToolCallsUsed   uint64
@@ -619,8 +620,9 @@ type AgentSummary struct {
 	// bumping the agent revision, so a served copy would go stale on the
 	// wire; clients derive them from task and human-request state, which
 	// invalidates correctly.
-	Provider string
-	Paused   bool
+	Provider   string
+	Paused     bool
+	Appearance AgentAppearance
 	// Model and ReasoningEffort are public launch controls by owner decision
 	// on 5 September 2026: the console displays and edits them.
 	Model           string

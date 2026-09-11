@@ -798,6 +798,12 @@ summary.dfConsoleItem__summary { cursor: pointer; }
 .dfFactoryScene__room--empty > use { opacity: 0.45; }
 .dfFactoryFloor { overflow-x: auto; }
 .dfFactoryScene__worker { transition: transform 180ms ease-out; }
+.dfFactoryScene__edit { opacity: 0; pointer-events: none; cursor: pointer; }
+.dfFactoryScene__edit rect { fill: #101f2b; stroke: var(--df-console-accent); stroke-width: 0.75; }
+.dfFactoryScene__edit path { fill: var(--df-console-accent); stroke: var(--df-console-accent); stroke-width: 0.6; }
+.dfFactoryScene__worker:hover .dfFactoryScene__edit,
+.dfFactoryScene__worker--selected .dfFactoryScene__edit,
+.dfFactoryScene__edit:focus { opacity: 1; pointer-events: auto; }
 
 @media (prefers-reduced-motion: reduce) {
   .dfFactoryScene__worker { transition: none; }
@@ -821,11 +827,24 @@ summary.dfConsoleItem__summary { cursor: pointer; }
 }
 
 .dfAgentSprite { flex: 0 0 auto; width: 2rem; height: 2rem; image-rendering: pixelated; }
-.dfConsoleSidebar__heading > .dfAgentSprite { width: 4rem; height: 4rem; }
-.dfConsoleSidebar__heading:has(> .dfAgentSprite) { justify-content: flex-start; align-items: center; }
+.dfAgentSpriteEdit { position: relative; flex: 0 0 auto; padding: 0; border: 0; background: transparent; }
+.dfAgentSpriteEdit > .dfAgentSprite { display: block; width: 4rem; height: 4rem; }
+.dfAgentSpriteEdit > .dfAgentSpriteEdit__icon { position: absolute; top: -0.25rem; right: -0.5rem; width: 1.25rem; height: 1.25rem; padding: 0.15rem; color: var(--df-console-accent); fill: currentColor; background: #101f2b; border: 1px solid currentColor; border-radius: 0.2rem; opacity: 0; }
+.dfAgentSpriteEdit:hover > .dfAgentSpriteEdit__icon, .dfAgentSpriteEdit:focus-visible > .dfAgentSpriteEdit__icon { opacity: 1; }
+.dfConsoleSidebar__heading:has(> .dfAgentSpriteEdit) { justify-content: flex-start; align-items: center; }
 .dfConsoleViewToggle button > span { margin-left: 0.4rem; font-size: 0.85em; }
 
 .dfFactoryScene__selection { fill: none; stroke: var(--df-console-accent); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
+
+.dfSpriteEditor { width: min(48rem, calc(100% - 2rem)); }
+.dfConsoleDialog.dfSpriteEditor .dfConsoleSidebar__panel { max-height: calc(100svh - 2rem); gap: 1rem; }
+.dfSpriteEditor__preview { display: grid; justify-items: center; gap: 0.75rem; padding: 1rem; background: #08131d; border: 1px solid var(--df-console-rule); }
+.dfSpriteEditor__preview > .dfAgentSprite { width: 12rem; height: 12rem; }
+.dfSpriteEditor__groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.dfSpriteEditor__groups label { display: grid; gap: 0.35rem; color: var(--df-console-muted); font-size: 0.7rem; letter-spacing: 0.08em; }
+.dfSpriteEditor__groups select { width: 100%; padding: 0.65rem; color: var(--df-console-text); background: var(--df-console-background); border: 1px solid var(--df-console-rule); font: inherit; }
+.dfSpriteEditor__actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+@media (max-width: 640px) { .dfSpriteEditor__groups { grid-template-columns: minmax(0, 1fr); } }
 
 /* remote ------------------------------------------------------------------
    The phone console. One column by default because the smallest screen is the

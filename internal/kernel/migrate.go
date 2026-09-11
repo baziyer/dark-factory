@@ -32,6 +32,7 @@ const (
 	v6UserVersion       = 6
 	v7UserVersion       = 7
 	v8UserVersion       = 8
+	v9UserVersion       = 9
 	v8HumanRequests     = `CREATE TABLE human_requests (
     id BLOB PRIMARY KEY CHECK (length(id) = 16 AND id <> zeroblob(16)),
     run_id BLOB NOT NULL CHECK (length(run_id) = 16) REFERENCES runs(id),
@@ -57,6 +58,30 @@ const (
     CHECK (status = 'resolved' AND resolution_kind IN ('reply', 'cancel_run') OR status = 'stale' AND resolution_kind = 'stale' OR status IN ('open', 'delivering', 'delivery_unknown') AND resolution_kind IS NULL),
     CHECK (status IN ('open', 'delivering', 'delivery_unknown') AND closed_at_ms IS NULL OR status IN ('resolved', 'stale')),
     CHECK (status NOT IN ('resolved', 'stale') OR closed_at_ms = updated_at_ms)
+) STRICT, WITHOUT ROWID`
+
+	v7Agents = `CREATE TABLE agents (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    project_id BLOB NOT NULL CHECK (length(project_id) = 16) REFERENCES projects(id),
+    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
+    role TEXT NOT NULL CHECK (role IN ('orchestrator', 'worker')),
+    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex', 'shell')),
+    model TEXT CHECK (model IS NULL OR length(CAST(model AS BLOB)) BETWEEN 1 AND 128),
+    reasoning_effort TEXT CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')),
+    account_id BLOB CHECK (account_id IS NULL OR length(account_id) = 16) REFERENCES accounts(id),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    idle_policy TEXT NOT NULL CHECK (idle_policy IN ('wait', 'standing_instruction')),
+    idle_after_seconds INTEGER NOT NULL CHECK (idle_after_seconds BETWEEN 0 AND 604800),
+    idle_instruction TEXT NOT NULL CHECK (length(CAST(idle_instruction AS BLOB)) <= 32768),
+    idle_run_budget INTEGER NOT NULL CHECK (idle_run_budget BETWEEN 0 AND 1000000),
+    idle_runs_used INTEGER NOT NULL CHECK (idle_runs_used >= 0 AND idle_runs_used <= idle_run_budget),
+    tool_budget_limit INTEGER NOT NULL CHECK (tool_budget_limit BETWEEN 1 AND 1000000000),
+    tool_calls_used INTEGER NOT NULL CHECK (tool_calls_used >= 0 AND tool_calls_used <= tool_budget_limit),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    CHECK (provider <> 'shell' OR (model IS NULL AND reasoning_effort IS NULL AND account_id IS NULL)),
+    CHECK (idle_policy <> 'standing_instruction' OR (idle_after_seconds >= 1 AND idle_instruction <> '' AND idle_run_budget >= 1))
 ) STRICT, WITHOUT ROWID`
 
 	v7Projects = `CREATE TABLE projects (
@@ -103,6 +128,8 @@ const (
     revision INTEGER NOT NULL CHECK (revision >= 1),
     deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))
 ) STRICT`
+
+	v7AgentColumns = `id, project_id, name, role, provider, model, reasoning_effort, account_id, paused, idle_policy, idle_after_seconds, idle_instruction, idle_run_budget, idle_runs_used, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 
 	legacyAgentColumns        = `id, project_id, name, role, provider, model, reasoning_effort, paused, tool_budget_limit, tool_calls_used, revision, created_at_ms, updated_at_ms`
 	legacyInvalidationColumns = `sequence, occurred_at_ms, entity_kind, entity_id, revision, deleted`
@@ -241,10 +268,21 @@ func v7SchemaStatements() []string {
 
 // v8SchemaStatements predates private suggested answers.
 func v8SchemaStatements() []string {
-	statements := append([]string(nil), schemaStatements...)
+	statements := v9SchemaStatements()
 	for i, statement := range statements {
 		if _, name := schemaObjectIdentity(statement); name == "human_requests" {
 			statements[i] = v8HumanRequests
+		}
+	}
+	return statements
+}
+
+// v9SchemaStatements predates durable sprite appearance.
+func v9SchemaStatements() []string {
+	statements := append([]string(nil), schemaStatements...)
+	for i, statement := range statements {
+		if _, name := schemaObjectIdentity(statement); name == "agents" {
+			statements[i] = v7Agents
 		}
 	}
 	return statements
@@ -340,6 +378,8 @@ func migratableSchema(version int) ([]string, bool) {
 		return v7SchemaStatements(), true
 	case v8UserVersion:
 		return v8SchemaStatements(), true
+	case v9UserVersion:
+		return v9SchemaStatements(), true
 	}
 	return nil, false
 }
@@ -365,7 +405,7 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		releaseUncertainConnection(connection)
 		return err
 	}
-	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction, migrateV7Transaction, migrateV8Transaction}
+	all := []func(context.Context, *sql.Conn) error{migrateLegacyTransaction, migratePreviousTransaction, migratePriorTransaction, migrateV4Transaction, migrateV5Transaction, migrateV6Transaction, migrateV7Transaction, migrateV8Transaction, migrateV9Transaction}
 	var steps []func(context.Context, *sql.Conn) error
 	switch version {
 	case legacyUserVersion:
@@ -384,6 +424,8 @@ func (store *Store) migrateLegacy(ctx context.Context) error {
 		steps = all[6:]
 	case v8UserVersion:
 		steps = all[7:]
+	case v9UserVersion:
+		steps = all[8:]
 	default:
 		return connection.Close()
 	}
@@ -585,7 +627,23 @@ func migrateV8Transaction(ctx context.Context, connection *sql.Conn) error {
 		return err
 	}
 	columns := "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms"
-	if err := rebuildTable(ctx, connection, expectedSchemaOf(schemaStatements), "human_requests", columns, "human_requests_one_unresolved_per_run", "", ""); err != nil {
+	if err := rebuildTable(ctx, connection, expectedSchemaOf(v9SchemaStatements()), "human_requests", columns, "human_requests_one_unresolved_per_run", "", ""); err != nil {
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v9UserVersion)); err != nil {
+		return err
+	}
+	return validateSchemaVersion(ctx, connection, v9UserVersion, v9SchemaStatements())
+}
+
+// migrateV9Transaction adds optional durable sprite appearance; existing
+// agents keep their deterministic id-derived look.
+func migrateV9Transaction(ctx context.Context, connection *sql.Conn) error {
+	if err := validateSchemaVersion(ctx, connection, v9UserVersion, v9SchemaStatements()); err != nil {
+		return err
+	}
+	target := expectedSchemaOf(schemaStatements)
+	if err := rebuildTable(ctx, connection, target, "agents", v7AgentColumns, "agents_id_project_unique", "appearance", "''"); err != nil {
 		return err
 	}
 	if _, err := connection.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {

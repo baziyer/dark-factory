@@ -116,6 +116,19 @@ type ProjectItem struct {
 	Revision       Decimal `json:"revision"`
 }
 
+type SpriteAppearance struct {
+	Automatic     Bool  `json:"automatic"`
+	Skin          uint8 `json:"skin"`
+	Hair          uint8 `json:"hair"`
+	HairColour    uint8 `json:"hair_colour"`
+	Face          uint8 `json:"face"`
+	Outfit        uint8 `json:"outfit"`
+	ClothesColour uint8 `json:"clothes_colour"`
+	Shoes         uint8 `json:"shoes"`
+	Tool          uint8 `json:"tool"`
+	Headwear      uint8 `json:"headwear"`
+}
+
 type AgentItem struct {
 	ID        string `json:"id"`
 	ProjectID string `json:"project_id"`
@@ -124,8 +137,9 @@ type AgentItem struct {
 	// Provider is a public fact used for display. Live activity facts are
 	// deliberately not item fields; clients derive them from task and
 	// human-request state in the same coherent snapshot.
-	Provider string `json:"provider"`
-	Paused   Bool   `json:"paused"`
+	Provider   string           `json:"provider"`
+	Appearance SpriteAppearance `json:"appearance"`
+	Paused     Bool             `json:"paused"`
 	// Model and ReasoningEffort are the operator-editable launch controls the
 	// console displays and AGENT_UPDATE edits. Empty means unset.
 	Model           string `json:"model"`

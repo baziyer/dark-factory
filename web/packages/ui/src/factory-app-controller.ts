@@ -9,6 +9,7 @@ import {
   type BrowserSession,
   type BrowserSessionOptions,
   type AgentItem,
+  type SpriteAppearance,
   type AgentControlAction,
   type TaskHistoryView,
   type TaskDetailView,
@@ -498,6 +499,28 @@ export class FactoryAppController {
       this.#edit = { target: selected.agent.id, pending: false, error: finiteError(error) };
     }
     this.#publish();
+  }
+
+  async updateAgentAppearance(agentId: string, appearance: SpriteAppearance): Promise<boolean> {
+    const session = this.#client?.session;
+    const agent = this.#state?.agents.get(agentId);
+    if (this.#closed || this.#status !== "ready" || session === undefined || agent === undefined || this.#edit?.pending === true) return false;
+    const generation = this.#generation;
+    const edit: FactoryEditView = { target: agent.id, pending: true };
+    this.#edit = edit;
+    this.#publish();
+    try {
+      await session.updateAgent({ agentId: agent.id, expectedRevision: agent.revision, appearance });
+      if (!this.#current(generation) || this.#edit !== edit) return false;
+      this.#edit = undefined;
+      this.#publish();
+      return true;
+    } catch (error) {
+      if (!this.#current(generation) || this.#edit !== edit) return false;
+      this.#edit = { target: agent.id, pending: false, error: finiteError(error) };
+    }
+    this.#publish();
+    return false;
   }
 
   /** Keep operator-authored task text outside a transient sidebar component. */

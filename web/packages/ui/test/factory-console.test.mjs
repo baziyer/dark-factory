@@ -1002,6 +1002,57 @@ test("SETTINGS opens and closes as a native modal, over whatever sidebar is open
   }
 });
 
+test("one sprite editor previews categories and saves one atomic appearance", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    const saved = [];
+    const node = { showModal: () => {}, close: () => {} };
+    let renderer;
+    await act(async () => {
+      renderer = create(createElement(FactoryConsole, {
+        status: "ready",
+        state: baseState(),
+        appearanceAgentId: ids.agent,
+        onSaveAgentAppearance: (agentId, appearance) => { saved.push([agentId, appearance]); return Promise.resolve(true); },
+        onCloseAppearance: () => {},
+      }), { createNodeMock: () => node });
+    });
+    const dialog = renderer.root.findByProps({ "aria-label": "Edit appearance for Builder One" });
+    assert.deepEqual(dialog.findAllByType("label").map((label) => label.findByType("span").children.join("")), ["SKIN TONE", "HAIR STYLE", "HAIR COLOUR", "FACE DETAIL", "CLOTHING STYLE", "CLOTHING COLOUR", "SHOES", "TOOL", "HEADWEAR"]);
+    assert.equal(dialog.findAllByProps({ className: "dfAgentSprite" }).length, 1);
+    await act(async () => { dialog.findAllByType("select")[0].props.onChange({ target: { value: "3" } }); });
+    await act(async () => { dialog.findByType("form").props.onSubmit({ preventDefault() {} }); });
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0][0], ids.agent);
+    assert.equal(saved[0][1].automatic, false);
+    assert.equal(saved[0][1].skin, 3);
+    await act(async () => { renderer.unmount(); });
+  } finally {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct;
+  }
+});
+
+test("a refused appearance edit keeps the editor and its draft", async () => {
+  const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  try {
+    let closes = 0;
+    const node = { showModal: () => {}, close: () => { closes += 1; } };
+    let renderer;
+    await act(async () => { renderer = create(createElement(FactoryConsole, {
+      status: "ready", state: baseState(), appearanceAgentId: ids.agent,
+      onSaveAgentAppearance: () => Promise.resolve(false), onCloseAppearance: () => {},
+    }), { createNodeMock: () => node }); });
+    const dialog = renderer.root.findByProps({ "aria-label": "Edit appearance for Builder One" });
+    await act(async () => { dialog.findAllByType("select")[0].props.onChange({ target: { value: "3" } }); });
+    await act(async () => { await dialog.findByType("form").props.onSubmit({ preventDefault() {} }); });
+    assert.equal(closes, 0);
+    assert.equal(dialog.findAllByType("select")[0].props.value, 3);
+    await act(async () => { renderer.unmount(); });
+  } finally { globalThis.IS_REACT_ACT_ENVIRONMENT = previousAct; }
+});
+
 test("Factory and Agents are explicit left-side alternatives", () => {
   const floor = render();
   assert.match(floor, /aria-label="Left view"/);

@@ -51,6 +51,7 @@ export function AgentPanel({
   edit,
   ready,
   onSaveConfig,
+  onEditAppearance,
   onEditTask,
   onLoadTaskDetail,
   onLoadTaskHistory,
@@ -64,6 +65,7 @@ export function AgentPanel({
   edit?: FactoryEditView;
   ready: boolean;
   onSaveConfig?: (config: AgentConfigEdit) => void;
+  onEditAppearance?: (agent: AgentItem) => void;
   onEditTask?: (task: TaskItem, change: TaskEdit) => Promise<boolean>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
@@ -96,7 +98,10 @@ export function AgentPanel({
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
       <div className="dfConsoleSidebar__heading">
-        <AgentSprite agent={agent} activity={state === undefined ? "waiting" : agentActivity(agent, state)} />
+        <button type="button" className="dfAgentSpriteEdit" aria-label={`Edit appearance for ${agent.name}`} onClick={() => onEditAppearance?.(agent)} disabled={onEditAppearance === undefined}>
+          <AgentSprite agent={agent} activity={state === undefined ? "waiting" : agentActivity(agent, state)} />
+          <svg className="dfAgentSpriteEdit__icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 11.5 10.5 4 12 5.5 4.5 13 2 14Zm7-8L11.5 2 14 4.5 12.5 6Z" /></svg>
+        </button>
         <div>
           <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
           <h2>{agent.name}</h2>

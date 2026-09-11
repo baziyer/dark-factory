@@ -402,7 +402,7 @@ test("linked accounts and agent account selections decode under the closed rules
   const valid = fixture("state_snapshot.json");
   for (const wire of [
     // A shell agent can never carry an account.
-    valid.replace('"provider":"codex","paused"', '"provider":"shell","paused"'),
+    valid.replace('"provider":"codex","appearance"', '"provider":"shell","appearance"'),
     valid.replace('"account_id":"05050505050505050505050505050505","idle_policy"', '"account_id":"05","idle_policy"'),
     valid.replace('"provider":"codex","home"', '"provider":"shell","home"'),
     valid.replace('"home":"/Users/operator/.codex"', '"home":"Users/operator/.codex"'),

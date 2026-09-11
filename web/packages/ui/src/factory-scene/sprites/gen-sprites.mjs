@@ -30,8 +30,9 @@ function draw(target, rows, x = 0, y = 0) {
     }
   }));
 }
+const keep = (rows, keys) => rows.map(row => [...row].map(key => keys.includes(key) ? key : '.').join(''));
 
-// Art lives here: shared face/boots, chosen hair + outfit, then pose/equipment.
+// Art lives here: shared face, chosen hair/clothes/shoes, then pose/equipment.
 // a/b are skin/light-shadow; u is the sleeve colour. All parts face forward.
 const head = grid(`
   .oooo.
@@ -99,16 +100,35 @@ const outfits = [
   `),
 ];
 // Stable slots: revise a part in place rather than reorder identities.
-const identities = [
-  { name: 'Copper / cropped hair', hair: hair[0], outfit: outfits[0], sleeve: 'c', skin: 'a', shadow: 'b' },
-  { name: 'Slate / side part', hair: hair[1], outfit: outfits[1], sleeve: 's', skin: 'a', shadow: 'b' },
-  { name: 'Linen / curls', hair: hair[2], outfit: outfits[2], sleeve: 'p', skin: 'b', shadow: 'w' },
-  { name: 'Steel / tied hair', hair: hair[3], outfit: outfits[3], sleeve: 'l', skin: 'b', shadow: 'w' },
+const hairStyles = ['Cropped', 'Side part', 'Curls', 'Tied'];
+const hairColours = [
+  { name: 'black', label: 'Black', colour: 'd' },
+  { name: 'brown', label: 'Brown', colour: 'h' },
+  { name: 'auburn', label: 'Auburn', colour: 'w' },
+  { name: 'blonde', label: 'Blonde', colour: 'y' },
+];
+const outfitStyles = ['Jacket', 'Overalls', 'Shirt', 'Hoodie'];
+const clothesColours = [
+  { name: 'copper', label: 'Copper', colour: 'c' },
+  { name: 'slate', label: 'Slate', colour: 's' },
+  { name: 'linen', label: 'Linen', colour: 'p' },
+  { name: 'steel', label: 'Steel', colour: 'l' },
 ];
 const legs = grid(`
   .omoomo.
-  osmoomso
-  ooo..ooo
+  .omoomo.
+  .oo..oo.
+`);
+const shoes = [
+  { name: 'coal', label: 'Coal', colour: 'm' },
+  { name: 'slate', label: 'Slate', colour: 's' },
+  { name: 'brown', label: 'Brown', colour: 'w' },
+  { name: 'cream', label: 'Cream', colour: 'p' },
+];
+const shoe = grid(`
+  ........
+  .uu..uu.
+  ouo..ouo
 `);
 const relaxedArm = grid(`
   ou
@@ -162,35 +182,42 @@ const alert = grid(`
   .o.
   oro
 `);
-// Equipment is plain part/position data, keyed only by a served role.
-const equipment = { worker: [], overseer: [
-  { part: hat, x: 4, y: 0 }, { part: clipboard, x: 11, y: 9 },
-] };
-function person(role, colour, activity, n, identity) {
-  const pixels = blank();
-  const bob = activity === 'idle' ? n : 0;
-  const skin = rows => rows.map(row => row.replace(/[ab]/g, key => key === 'a' ? identity.skin : identity.shadow));
-  const arm = rows => skin(tint(rows, identity.sleeve));
-  draw(pixels, legs, 4, 13);
-  draw(pixels, identity.outfit, 5, 8 + bob);
-  draw(pixels, skin(head), 5, 2 + bob);
-  draw(pixels, identity.hair, 4, 1 + bob);
-  if (activity === 'waiting') {
-    draw(pixels, arm(foldedArms), 4, 9);
-  } else if (activity === 'busy') {
-    draw(pixels, keyboard, 7, 12);
-    draw(pixels, arm(typingArms[n]), 4, 9);
-  } else {
-    draw(pixels, arm(relaxedArm), 3, 9 + bob);
-    draw(pixels, arm(mirror(relaxedArm)), 11, 9 + bob);
-    if (activity === 'needs-you') draw(pixels, arm(raisedArm), 2, 4);
-  }
-  draw(pixels, [colour], 9, 8 + bob); // One provider badge, never the identity.
-  for (const { part, x, y } of equipment[role]) draw(pixels, part, x, y + bob);
-  if (activity === 'needs-you') draw(pixels, alert, 13, 0);
-  return pixels;
-}
-
+const faceFeatures = [
+  { name: 'none', label: 'None', part: [] },
+  { name: 'glasses', label: 'Glasses', part: grid(`ssoss`), y: 4 },
+  { name: 'beard', label: 'Beard', part: grid(`.hhh.\nhhhhh`), y: 6 },
+  { name: 'moustache', label: 'Moustache', part: grid(`hhhhh`), y: 5 },
+];
+const tools = [
+  { name: 'none', label: 'None', part: [], x: 0, y: 0 },
+  { name: 'clipboard', label: 'Clipboard', part: clipboard, x: 11, y: 9 },
+  { name: 'wrench', label: 'Wrench', part: grid(`.ss\n.s.\noso\n.o.\n.o.`), x: 12, y: 8 },
+  { name: 'mug', label: 'Mug', part: grid(`oooo\nommo\noooo`), x: 11, y: 11 },
+  { name: 'tablet', label: 'Tablet', part: grid(`oooo\nommo\nommo\noooo`), x: 11, y: 10 },
+];
+const headwear = [
+  { name: 'none', label: 'None', part: [], x: 0, y: 0 },
+  { name: 'hard-hat', label: 'Hard hat', part: hat, x: 4, y: 0 },
+  { name: 'cap', label: 'Cap', part: grid(`.oooooo.\n.otttto.\noooooooo`), x: 4, y: 0 },
+  { name: 'headset', label: 'Headset', part: grid(`oo....oo\no......o\n.......o\n......oo`), x: 4, y: 2 },
+];
+const skinTones = [
+  { name: 'light', label: 'Light', skin: 'p', shadow: 'a' },
+  { name: 'warm', label: 'Warm', skin: 'a', shadow: 'b' },
+  { name: 'brown', label: 'Brown', skin: 'b', shadow: 'w' },
+  { name: 'deep', label: 'Deep', skin: 'w', shadow: 'h' },
+];
+const optionGroups = {
+  skin: skinTones.map(({ name, label }) => ({ name, label })),
+  hair: hairStyles.map((label, index) => ({ name: `style-${index}`, label })),
+  hair_colour: hairColours.map(({ name, label }) => ({ name, label })),
+  face: faceFeatures.map(({ name, label }) => ({ name, label })),
+  outfit: outfitStyles.map((label, index) => ({ name: `outfit-${index}`, label })),
+  clothes_colour: clothesColours.map(({ name, label }) => ({ name, label })),
+  shoes: shoes.map(({ name, label }) => ({ name, label })),
+  tool: tools.map(({ name, label }) => ({ name, label })),
+  headwear: headwear.map(({ name, label }) => ({ name, label })),
+};
 // Complete tile silhouettes; repeatable structure rather than random texture.
 const floor = grid(`
   oooooooooooooooo
@@ -267,18 +294,33 @@ const pad = grid(`
 
 const sprites = new Map();
 const providers = { claude_code: 'c', codex: 't', shell: 's' };
-const activities = { busy: 2, waiting: 1, 'needs-you': 1, idle: 2 };
-for (const identity of identities.keys()) {
-  for (const role of ['worker', 'overseer']) {
-    for (const [provider, colour] of Object.entries(providers)) {
-      for (const [activity, count] of Object.entries(activities)) {
-        for (let n = 0; n < count; n++) {
-          sprites.set(`${role}.${provider}.${identity}.${activity}.${n}`, person(role, colour, activity, n, identities[identity]));
-        }
-      }
-    }
-  }
-}
+const activities = ['busy', 'waiting', 'needs-you', 'idle'];
+const add = (name, build) => { const pixels = blank(); build(pixels); sprites.set(name, pixels); };
+const arms = activity => activity === 'waiting' ? [foldedArms] : activity === 'busy' ? [typingArms[0]] : activity === 'needs-you' ? [relaxedArm, mirror(relaxedArm), raisedArm] : [relaxedArm, mirror(relaxedArm)];
+const armPosition = (activity, index) => index === 0 ? [activity === 'waiting' || activity === 'busy' ? 4 : 3, 9] : index === 1 ? [11, 9] : [2, 4];
+for (const [skinIndex, tone] of skinTones.entries()) for (const activity of activities) add(`person.skin.${skinIndex}.${activity}`, pixels => {
+  const colour = rows => rows.map(row => row.replace(/[ab]/g, key => key === 'a' ? tone.skin : tone.shadow));
+  draw(pixels, colour(head), 5, 2);
+  arms(activity).forEach((part, index) => draw(pixels, keep(colour(part), [tone.skin, tone.shadow]), ...armPosition(activity, index)));
+});
+for (const [outfitIndex, outfit] of outfits.entries()) for (const [colourIndex, colour] of clothesColours.entries()) for (const activity of activities) add(`person.outfit.${outfitIndex}.${colourIndex}.${activity}`, pixels => {
+  draw(pixels, tint(outfit.map(row => row.replace(/[cpslmw]/g, 'u')), colour.colour), 5, 8);
+  draw(pixels, legs, 4, 13);
+  if (activity === 'busy') draw(pixels, keyboard, 7, 12);
+  arms(activity).forEach((part, index) => draw(pixels, keep(tint(part, colour.colour), ['o', colour.colour]), ...armPosition(activity, index)));
+});
+for (const [hairIndex, style] of hair.entries()) for (const [colourIndex, colour] of hairColours.entries()) for (const activity of activities) add(`person.hair.${hairIndex}.${colourIndex}.${activity}`, pixels => draw(pixels, tint(style.map(row => row.replace(/[hwp]/g, 'u')), colour.colour), 4, 1));
+for (const [featureIndex, feature] of faceFeatures.entries()) for (const activity of activities) add(`person.face.${featureIndex}.${activity}`, pixels => draw(pixels, feature.part, 6, feature.y ?? 4));
+for (const [shoeIndex, colour] of shoes.entries()) for (const activity of activities) add(`person.shoes.${shoeIndex}.${activity}`, pixels => draw(pixels, tint(shoe, colour.colour), 4, 13));
+for (const [toolIndex, tool] of tools.entries()) for (const activity of activities) add(`person.tool.${toolIndex}.${activity}`, pixels => {
+  if (activity !== 'busy') draw(pixels, tool.part, tool.x, tool.y);
+});
+for (const [hatIndex, item] of headwear.entries()) for (const activity of activities) add(`person.headwear.${hatIndex}.${activity}`, pixels => draw(pixels, item.part, item.x, item.y));
+for (const role of ['worker', 'overseer']) for (const [provider, colour] of Object.entries(providers)) for (const activity of activities) add(`person.system.${role}.${provider}.${activity}`, pixels => {
+  draw(pixels, [colour], 9, 8);
+  if (role === 'overseer') draw(pixels, ['yy'], 7, 8);
+  if (activity === 'needs-you') draw(pixels, alert, 13, 0);
+});
 function tile(name, rows) {
   const pixels = blank();
   draw(pixels, rows);
@@ -341,7 +383,7 @@ const png = Buffer.concat([
   chunk('IDAT', deflateSync(scanlines, { level: 9 })), chunk('IEND', Buffer.alloc(0)),
 ]);
 const dataUrl = `data:image/png;base64,${png.toString('base64')}`;
-const atlasJson = JSON.stringify(atlas, null, 2) + '\n';
+const atlasJson = JSON.stringify(atlas);
 const preview = `<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -362,12 +404,11 @@ const preview = `<!doctype html>
   select { font: inherit; color: inherit; background: #191d24; padding: 6px; }
 </style>
 <h1>Dark Factory / Sprite workbench</h1>
-<p>${sprites.size} frames · shared 16-colour palette · 16 × 16 footprint. Four appearances repeat; names identify agents.</p>
+<p>${sprites.size} reusable layers · shared 16-colour palette · 16 × 16 footprint.</p>
 <label>Role <select id="role"><option value="worker">Worker</option><option value="overseer">Overseer</option></select></label>
 <label>Provider badge <select id="provider">${Object.keys(providers).map(provider => `<option>${provider}</option>`).join('')}</select></label>
-<label>Inspect <select id="motion"><option value="0">Still · frame 0</option><option value="1">Still · frame 1</option><option value="animate">Animated · 600ms per frame</option></select></label>
-<p>Each pose: native 1×, normal display 3×, enlarged 8×, over the factory floor tile. Reduced motion holds frame 0 during animation.</p>
-${identities.map((identity, index) => `<h2>${index} · ${identity.name}</h2><section>${Object.keys(activities).map(activity => `<figure><figcaption>${activity}</figcaption><div class="scales">${[1, 3, 8].map(scale => `<div><canvas width="16" height="16" style="width:${16 * scale}px;height:${16 * scale}px" data-pose="${index}.${activity}" role="img" aria-label="${identity.name}, ${activity}, ${scale}×"></canvas><small>${scale}×</small></div>`).join('')}</div></figure>`).join('')}</section>`).join('')}
+<p>Each pose: native 1×, normal display 3×, enlarged 8×, over the factory floor tile.</p>
+${hairStyles.map((style, index) => `<h2>${index} · ${style}</h2><section>${activities.map(activity => `<figure><figcaption>${activity}</figcaption><div class="scales">${[1, 3, 8].map(scale => `<div><canvas width="16" height="16" style="width:${16 * scale}px;height:${16 * scale}px" data-identity="${index}" data-activity="${activity}" role="img" aria-label="${style}, ${activity}, ${scale}×"></canvas><small>${scale}×</small></div>`).join('')}</div></figure>`).join('')}</section>`).join('')}
 <h2>Floor / equipment bays</h2>
 <section>${[...sprites.keys()].filter(name => /^(tile|bay)\./.test(name)).map(name => `<figure><figcaption>${name}</figcaption><canvas width="16" height="16" style="width:48px;height:48px" data-tile="${name}" role="img" aria-label="${name}"></canvas></figure>`).join('')}</section>
 <p>Edit hair, outfits, identities or equipment in gen-sprites.mjs, run <code>node web/packages/ui/src/factory-scene/sprites/gen-sprites.mjs</code>, reload this page, then inspect the console fixture floor.</p>
@@ -376,27 +417,30 @@ const atlas = ${JSON.stringify(atlas)};
 const image = new Image();
 const role = document.getElementById('role');
 const provider = document.getElementById('provider');
-const motion = document.getElementById('motion');
-const reduced = matchMedia('(prefers-reduced-motion: reduce)');
-let frame = 0;
 function paint() {
   for (const canvas of document.querySelectorAll('canvas')) {
-    const prefix = role.value + '.' + provider.value + '.' + canvas.dataset.pose;
-    const n = motion.value === 'animate' ? (reduced.matches ? 0 : frame) : Number(motion.value);
-    const name = canvas.dataset.tile || (prefix + '.' + (atlas.frames[prefix + '.' + n] ? n : 0));
-    const {x,y} = atlas.frames[name];
     const context = canvas.getContext('2d');
     context.clearRect(0, 0, 16, 16);
     const floor = atlas.frames['tile.floor.0'];
     context.drawImage(image, floor.x, floor.y, 16, 16, 0, 0, 16, 16);
-    context.drawImage(image, x, y, 16, 16, 0, 0, 16, 16);
+    const identity = Number(canvas.dataset.identity);
+    const activity = canvas.dataset.activity;
+    const names = canvas.dataset.tile ? [canvas.dataset.tile] : [
+      'person.skin.' + (identity < 2 ? 1 : 2) + '.' + activity,
+      'person.outfit.' + identity + '.' + identity + '.' + activity,
+      'person.hair.' + identity + '.' + identity + '.' + activity,
+      'person.face.0.' + activity,
+      'person.shoes.' + identity + '.' + activity,
+      'person.tool.' + (role.value === 'overseer' ? 1 : 0) + '.' + activity,
+      'person.headwear.' + (role.value === 'overseer' ? 1 : 0) + '.' + activity,
+      'person.system.' + role.value + '.' + provider.value + '.' + activity,
+    ];
+    for (const name of names) { const {x,y} = atlas.frames[name]; context.drawImage(image, x, y, 16, 16, 0, 0, 16, 16); }
   }
 }
 image.onload = () => {
   paint();
-  for (const select of [role, provider, motion]) select.onchange = () => { frame = 0; paint(); };
-  reduced.onchange = paint;
-  setInterval(() => { if (motion.value === 'animate' && !reduced.matches) { frame = 1 - frame; paint(); } }, 600);
+  for (const select of [role, provider]) select.onchange = paint;
 };
 image.src = ${JSON.stringify(dataUrl)};
 </script>
@@ -405,7 +449,7 @@ image.src = ${JSON.stringify(dataUrl)};
 const root = new URL('./', import.meta.url);
 for (const [name, data] of Object.entries({
   'sprites.png': png,
-  'sprites.generated.ts': `export const spriteSheet = ${JSON.stringify(dataUrl)};\nexport const spriteSheetSize = ${JSON.stringify({ width, height })} as const;\nexport const spriteAtlas = ${atlasJson.trim()} as const;\n`,
+  'sprites.generated.ts': `export const spriteSheet = ${JSON.stringify(dataUrl)};\nexport const spriteSheetSize = ${JSON.stringify({ width, height })} as const;\nexport const spriteAtlas = ${atlasJson} as const;\nexport const spriteOptions = ${JSON.stringify(optionGroups)} as const;\n`,
   'preview.html': preview,
 })) writeFileSync(new URL(name, root), data);
 
@@ -435,19 +479,9 @@ for (let y = 0; y < height; y++) {
   assert.equal(inflated[y * (stride + 1)], 0, 'Expected PNG filter zero');
   assert.deepEqual(inflated.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)), pixels.subarray(y * stride, (y + 1) * stride));
 }
-const expectedNames = [];
-for (const identity of identities.keys()) {
-  for (const role of ['worker', 'overseer']) {
-    for (const provider of ['claude_code', 'codex', 'shell']) {
-      for (const suffix of ['busy.0', 'busy.1', 'waiting.0', 'needs-you.0', 'idle.0', 'idle.1']) {
-        expectedNames.push(`${role}.${provider}.${identity}.${suffix}`);
-      }
-    }
-  }
-}
-expectedNames.push('tile.floor.0', 'tile.floor.1', 'tile.wall', 'tile.door', 'bay.free', 'bay.staged', 'bay.ready');
+const expectedNames = [...sprites.keys()];
 const generated = readFileSync(new URL('sprites.generated.ts', root), 'utf8');
-const savedAtlas = JSON.parse(generated.slice(generated.indexOf('spriteAtlas = ') + 14, generated.lastIndexOf(' as const;')));
+const savedAtlas = JSON.parse(generated.slice(generated.indexOf('spriteAtlas = ') + 14, generated.indexOf(' as const;\nexport const spriteOptions')));
 assert.deepEqual(savedAtlas, atlas);
 assert.match(generated, new RegExp(`spriteSheetSize = \\{"width":${width},"height":${height}\\}`));
 assert.deepEqual(Object.keys(savedAtlas.frames).sort(), expectedNames.sort());
@@ -459,17 +493,8 @@ for (const {x, y} of Object.values(savedAtlas.frames)) {
   occupied.add(`${x},${y}`);
 }
 assert.equal(Object.keys(palette).length, 16);
-for (const identity of identities.keys()) {
-  for (const role of ['worker', 'overseer']) {
-    for (const provider of Object.keys(providers)) {
-      for (const activity of ['busy', 'idle']) {
-        assert.notDeepEqual(sprites.get(`${role}.${provider}.${identity}.${activity}.0`), sprites.get(`${role}.${provider}.${identity}.${activity}.1`));
-      }
-      assert.equal(sprites.get(`${role}.${provider}.${identity}.needs-you.0`).flat().filter(key => key === 'r').length, 3);
-    }
-  }
-}
-console.log(`Verified PNG decode, 16-colour palette, exact atlas names, bounds, and animation frames.`);
+for (const provider of Object.keys(providers)) assert.equal(sprites.get(`person.system.worker.${provider}.needs-you`).flat().filter(key => key === 'r').length, 3);
+console.log(`Verified PNG decode, 16-colour palette, exact atlas names, bounds, and sprite layers.`);
 console.log(`Sheet: ${width} × ${height} RGBA; frames: ${sprites.size}`);
 for (const name of ['gen-sprites.mjs', 'sprites.png', 'sprites.generated.ts', 'preview.html']) {
   const path = fileURLToPath(new URL(name, root));

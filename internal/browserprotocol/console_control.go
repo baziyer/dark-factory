@@ -9,10 +9,11 @@ import (
 // ReasoningEffort and Paused are each optional: an absent member leaves the
 // durable value alone, so one console screen can edit one control at a time.
 type AgentUpdate struct {
-	AgentID          string  `json:"agent_id"`
-	ExpectedRevision Decimal `json:"expected_revision"`
-	Model            *string `json:"model,omitempty"`
-	ReasoningEffort  *string `json:"reasoning_effort,omitempty"`
+	AgentID          string            `json:"agent_id"`
+	ExpectedRevision Decimal           `json:"expected_revision"`
+	Appearance       *SpriteAppearance `json:"appearance,omitempty"`
+	Model            *string           `json:"model,omitempty"`
+	ReasoningEffort  *string           `json:"reasoning_effort,omitempty"`
 	// AccountID selects a linked provider login; an empty string clears the
 	// selection back to that provider's default configuration directory.
 	AccountID *string `json:"account_id,omitempty"`
@@ -205,6 +206,7 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
+			value.Appearance != nil && bool(value.Appearance.Automatic) && (value.Appearance.Skin != 0 || value.Appearance.Hair != 0 || value.Appearance.HairColour != 0 || value.Appearance.Face != 0 || value.Appearance.Outfit != 0 || value.Appearance.ClothesColour != 0 || value.Appearance.Shoes != 0 || value.Appearance.Tool != 0 || value.Appearance.Headwear != 0) ||
 			value.Model != nil && validateBoundedText(*value.Model, 0, MaxAgentModelBytes) != nil ||
 			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil ||
 			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil ||

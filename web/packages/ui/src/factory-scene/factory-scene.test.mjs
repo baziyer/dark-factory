@@ -8,7 +8,8 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AgentSprite, FactoryScene } from "../../dist/src/factory-scene/factory-scene.js";
-import { PADDING, layoutScene, placeWorkers, workerFrame } from "../../dist/src/factory-scene/scene.js";
+import { PADDING, layoutScene, placeWorkers } from "../../dist/src/factory-scene/scene.js";
+import { resolvedAppearance, spriteOptions, workerFrames } from "../../dist/src/factory-scene/appearance.js";
 import { spriteAtlas, spriteSheet, spriteSheetSize } from "../../dist/src/factory-scene/sprites/sprites.generated.js";
 
 const topology = {
@@ -49,17 +50,6 @@ function idForIdentity(identity) {
   return id;
 }
 
-function frameIdentity(frame) {
-  return Number(frame.split(".")[2]);
-}
-
-function frameName(worker) {
-  const role = worker.role === "orchestrator" ? "overseer" : "worker";
-  const provider = worker.provider === "claude_code" || worker.provider === "codex" ? worker.provider : "shell";
-  const activity = ["busy", "waiting", "needs-you", "idle"].includes(worker.activity) ? worker.activity : "idle";
-  return `${role}.${provider}.${identityFor(worker.id)}.${activity}.0`;
-}
-
 function render(props = {}) {
   return renderToStaticMarkup(createElement(FactoryScene, { topology, workers, ...props }));
 }
@@ -80,9 +70,9 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   const placements = placeWorkers(layout, workers);
   assert.deepEqual(placements, placeWorkers(layout, [...workers].reverse()));
-  assert.equal(workerFrame(workers[0]), frameName(workers[0]));
-  assert.equal(workerFrame(workers[1]), frameName(workers[1]));
-  assert.equal(workerFrame({ ...workers[0], provider: "made_up" }), frameName({ ...workers[0], provider: "made_up" }));
+  assert.equal(workerFrames(workers[0]).length, 8);
+  assert.match(workerFrames(workers[0]).at(-1), /person\.system\.worker\.codex\.busy/);
+  assert.match(workerFrames({ ...workers[0], provider: "made_up" }).at(-1), /person\.system\.worker\.shell\.busy/);
 
   const first = render();
   const reordered = render({
@@ -112,7 +102,7 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
     const rendered = first.slice(first.indexOf(`data-worker-id="${worker.id}"`));
     const frame = rendered.slice(0, rendered.indexOf("</g>")).match(/href="#df-frame-([^"]+)"/g)
       .map((match) => match.slice('href="#df-frame-'.length, -1));
-    assert.deepEqual(frame, [frameName(worker)]);
+    assert.deepEqual(frame, workerFrames(worker));
     for (const name of frame) assert.ok(name in spriteAtlas.frames, name);
   }
   assert.equal(first.includes("dfFactoryScene__alternate"), false);
@@ -134,9 +124,9 @@ test("the pure scene model feeds a deterministic SVG renderer", () => {
 
   // The sheet the renderer reads is every frame it can draw, on a 16px grid,
   // inside the size the generator wrote next to it.
-  assert.equal(Object.keys(spriteAtlas.frames).length, 151);
+  assert.equal(Object.keys(spriteAtlas.frames).length, 243);
   assert.equal(spriteAtlas.frame, 16);
-  assert.deepEqual(spriteSheetSize, { width: 128, height: 304 });
+  assert.deepEqual(spriteSheetSize, { width: 128, height: 496 });
   assert.match(first, new RegExp(`width="${spriteSheetSize.width}" height="${spriteSheetSize.height}"`));
   for (const [name, cell] of Object.entries(spriteAtlas.frames)) {
     assert.ok(cell.x % 16 === 0 && cell.y % 16 === 0, name);
@@ -283,18 +273,18 @@ test("worker identity is stable while operational state changes", () => {
     { ...base, role: "orchestrator" },
     { ...base, provider: "made_up", activity: "unknown" },
   ];
-  for (const worker of variants) assert.equal(frameIdentity(workerFrame(worker)), stableIdentity);
-  assert.equal(workerFrame({ ...base, id: "worker-😀" }), "worker.codex.3.busy.0");
+  for (const worker of variants) assert.equal(resolvedAppearance(worker).hair, stableIdentity);
+  assert.equal(resolvedAppearance({ ...base, id: "worker-😀" }).hair, 3);
 });
 
 test("the standalone agent sprite crops one existing stable frame", () => {
   const agent = { id: "worker-b", name: "Builder", role: "worker", provider: "codex" };
-  const frame = workerFrame({ ...agent, activity: "busy" });
-  const cell = spriteAtlas.frames[frame];
+  const frames = workerFrames({ ...agent, activity: "busy" });
   const markup = renderToStaticMarkup(createElement(AgentSprite, { agent, activity: "busy" }));
   assert.match(markup, /class="dfAgentSprite"/);
   assert.match(markup, /aria-label="Builder, worker, busy"/);
-  assert.match(markup, new RegExp(`x="${cell.x === 0 ? 0 : -cell.x}" y="${cell.y === 0 ? 0 : -cell.y}"`));
+  assert.equal((markup.match(/<image /g) ?? []).length, frames.length);
+  for (const frame of frames) { const cell = spriteAtlas.frames[frame]; assert.match(markup, new RegExp(`x="${cell.x === 0 ? 0 : -cell.x}" y="${cell.y === 0 ? 0 : -cell.y}"`)); }
   assert.equal(markup.includes("df-frame-"), false, "standalone sprite creates no document symbol id");
 });
 
@@ -303,26 +293,26 @@ test("the selected scene worker has a ring without changing its sprite", () => {
   const selected = markup.slice(markup.indexOf('data-worker-id="worker-b"'));
   assert.match(selected.slice(0, selected.indexOf("</g>")), /dfFactoryScene__worker--selected/);
   assert.match(selected.slice(0, selected.indexOf("</g>")), /class="dfFactoryScene__selection"/);
-  assert.match(selected.slice(0, selected.indexOf("</g>")), new RegExp(`href="#df-frame-${frameName(workers[0])}"`));
+  for (const frame of workerFrames(workers[0])) assert.match(selected.slice(0, selected.indexOf("</g>")), new RegExp(`href="#df-frame-${frame}"`));
 });
 
-test("every identity and operational frame is reachable, including fallbacks", () => {
+test("every generated person layer is reachable, including fallbacks", () => {
   const reached = new Set();
   for (const role of ["worker", "orchestrator"]) {
     for (const provider of ["claude_code", "codex", "shell"]) {
       for (const activity of ["busy", "waiting", "needs-you", "idle"]) {
-        for (let identity = 0; identity < 4; identity++) {
-          const worker = { id: idForIdentity(identity), name: "Agent", role, provider, activity };
-          const frame = workerFrame(worker);
-          reached.add(frame);
-        }
+        const base = { automatic: false, skin: 0, hair: 0, hair_colour: 0, face: 0, outfit: 0, clothes_colour: 0, shoes: 0, tool: 0, headwear: 0 };
+        const add = (appearance) => { for (const frame of workerFrames({ id: "agent", name: "Agent", role, provider, activity, appearance })) reached.add(frame); };
+        for (const field of ["skin", "face", "shoes", "tool", "headwear"]) for (let index = 0; index < spriteOptions[field].length; index++) add({ ...base, [field]: index });
+        for (let hair = 0; hair < spriteOptions.hair.length; hair++) for (let hair_colour = 0; hair_colour < spriteOptions.hair_colour.length; hair_colour++) add({ ...base, hair, hair_colour });
+        for (let outfit = 0; outfit < spriteOptions.outfit.length; outfit++) for (let clothes_colour = 0; clothes_colour < spriteOptions.clothes_colour.length; clothes_colour++) add({ ...base, outfit, clothes_colour });
       }
     }
   }
   const fallback = { id: idForIdentity(2), name: "Fallback", role: "worker", provider: "unknown", activity: "debugging" };
-  assert.equal(workerFrame(fallback), "worker.shell.2.idle.0");
-  reached.add(workerFrame(fallback));
-  const personFrames = Object.keys(spriteAtlas.frames).filter((name) => /^(worker|overseer)\./.test(name) && name.endsWith(".0"));
+  assert.match(workerFrames(fallback).at(-1), /person\.system\.worker\.shell\.idle/);
+  for (const frame of workerFrames(fallback)) reached.add(frame);
+  const personFrames = Object.keys(spriteAtlas.frames).filter((name) => name.startsWith("person."));
   assert.deepEqual([...reached].sort(), personFrames.sort());
 });
 
