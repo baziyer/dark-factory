@@ -23,6 +23,9 @@ func TestV8PendingQuestionSurvivesOptionsMigration(t *testing.T) {
 	if _, err := connection.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
+	if err := rebuildTable(ctx, connection, expectedSchemaOf(v8SchemaStatements()), "agents", v7AgentColumns, "agents_id_project_unique", "", ""); err != nil {
+		t.Fatal(err)
+	}
 	columns := "id, run_id, idempotency_key, kind, reason_code, question_text, status, delivery_id, delivery_started_at_ms, resolution_kind, closed_at_ms, revision, created_at_ms, updated_at_ms"
 	if err := rebuildTable(ctx, connection, expectedSchemaOf(v8SchemaStatements()), "human_requests", columns, "human_requests_one_unresolved_per_run", "", ""); err != nil {
 		t.Fatal(err)
