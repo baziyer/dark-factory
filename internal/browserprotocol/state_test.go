@@ -343,6 +343,13 @@ func TestStateExactFieldAndEnumBounds(t *testing.T) {
 	if _, err := EncodeStateSnapshot("x", value); err == nil {
 		t.Fatal("unknown agent role accepted")
 	}
+	badAgent = agentItem()
+	badAgent.Appearance.Automatic = true
+	badAgent.Appearance.Skin = 1
+	value.Agents = []AgentItem{badAgent}
+	if _, err := EncodeStateSnapshot("x", value); err == nil {
+		t.Fatal("automatic appearance with custom slots accepted")
+	}
 	for _, provider := range []string{"", "claude", "CODEX", "bash"} {
 		item := agentItem()
 		item.Provider = provider

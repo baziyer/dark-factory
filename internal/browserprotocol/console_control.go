@@ -228,7 +228,7 @@ func validConsoleControl(kind MessageType, body any) error {
 		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
-			value.Appearance != nil && bool(value.Appearance.Automatic) && (value.Appearance.Skin != 0 || value.Appearance.Hair != 0 || value.Appearance.HairColour != 0 || value.Appearance.Face != 0 || value.Appearance.Outfit != 0 || value.Appearance.ClothesColour != 0 || value.Appearance.Shoes != 0 || value.Appearance.Tool != 0 || value.Appearance.Headwear != 0) ||
+			value.Appearance != nil && validateSpriteAppearance(*value.Appearance) != nil ||
 			value.Model != nil && validateBoundedText(*value.Model, 0, MaxAgentModelBytes) != nil ||
 			value.ReasoningEffort != nil && validateBoundedText(*value.ReasoningEffort, 0, MaxAgentModelBytes) != nil ||
 			value.AccountID != nil && *value.AccountID != "" && validateDynamicID(*value.AccountID) != nil ||

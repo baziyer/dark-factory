@@ -129,6 +129,36 @@ type SpriteAppearance struct {
 	Headwear      uint8 `json:"headwear"`
 }
 
+func (value *SpriteAppearance) UnmarshalJSON(data []byte) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		return fmt.Errorf("%w: appearance object required", ErrMalformed)
+	}
+	for _, field := range []string{"skin", "hair", "hair_colour", "face", "outfit", "clothes_colour", "shoes", "tool", "headwear"} {
+		if raw, ok := object[field]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("%w: appearance field %s", ErrMalformed, field)
+		}
+	}
+	type plain SpriteAppearance
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("%w: appearance: %v", ErrMalformed, err)
+	}
+	result := SpriteAppearance(decoded)
+	if err := validateSpriteAppearance(result); err != nil {
+		return err
+	}
+	*value = result
+	return nil
+}
+
+func validateSpriteAppearance(value SpriteAppearance) error {
+	if bool(value.Automatic) && (value.Skin != 0 || value.Hair != 0 || value.HairColour != 0 || value.Face != 0 || value.Outfit != 0 || value.ClothesColour != 0 || value.Shoes != 0 || value.Tool != 0 || value.Headwear != 0) {
+		return fmt.Errorf("%w: automatic appearance has custom slots", ErrMalformed)
+	}
+	return nil
+}
+
 type AgentItem struct {
 	ID        string `json:"id"`
 	ProjectID string `json:"project_id"`
@@ -287,6 +317,9 @@ func validateAgentItem(value AgentItem) error {
 	}
 	if value.Provider != "claude_code" && value.Provider != "codex" && value.Provider != "shell" {
 		return fmt.Errorf("%w: agent provider", ErrMalformed)
+	}
+	if err := validateSpriteAppearance(value.Appearance); err != nil {
+		return err
 	}
 	if validateBoundedText(value.Model, 0, MaxAgentModelBytes) != nil || validateBoundedText(value.ReasoningEffort, 0, MaxAgentModelBytes) != nil {
 		return fmt.Errorf("%w: agent launch controls", ErrMalformed)

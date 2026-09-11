@@ -424,6 +424,8 @@ test("linked accounts and agent account selections decode under the closed rules
   assert.equal(decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":""')).body.account_id, "");
   expectMalformed(() => decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":"nope"')));
   expectMalformed(() => decodeClientControl(update.replace('"account_id":"05050505050505050505050505050505"', '"account_id":null')));
+  expectMalformed(() => decodeClientControl(update.replace('"skin":1', '"skin":null')));
+  expectMalformed(() => decodeClientControl(update.replace('"automatic":false', '"automatic":true')));
 
   // Discovery answers with logins and never a token.
   const accounts = decodeServerControl(fixture("accounts.json")).body.accounts;

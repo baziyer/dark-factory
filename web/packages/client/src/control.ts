@@ -483,7 +483,9 @@ function spriteAppearance(value: unknown, wire: boolean): SpriteAppearance {
   if (!isObject(value)) malformed();
   requireKeys(value, ["automatic", "skin", "hair", "hair_colour", "face", "outfit", "clothes_colour", "shoes", "tool", "headwear"], wire);
   if (typeof value.automatic !== "boolean") malformed();
-  return { automatic: value.automatic, skin: integer(value.skin, 0, 255), hair: integer(value.hair, 0, 255), hair_colour: integer(value.hair_colour, 0, 255), face: integer(value.face, 0, 255), outfit: integer(value.outfit, 0, 255), clothes_colour: integer(value.clothes_colour, 0, 255), shoes: integer(value.shoes, 0, 255), tool: integer(value.tool, 0, 255), headwear: integer(value.headwear, 0, 255) };
+  const result = { automatic: value.automatic, skin: integer(value.skin, 0, 255), hair: integer(value.hair, 0, 255), hair_colour: integer(value.hair_colour, 0, 255), face: integer(value.face, 0, 255), outfit: integer(value.outfit, 0, 255), clothes_colour: integer(value.clothes_colour, 0, 255), shoes: integer(value.shoes, 0, 255), tool: integer(value.tool, 0, 255), headwear: integer(value.headwear, 0, 255) };
+  if (result.automatic && [result.skin, result.hair, result.hair_colour, result.face, result.outfit, result.clothes_colour, result.shoes, result.tool, result.headwear].some((slot) => slot !== 0)) malformed();
+  return result;
 }
 function agentItem(value: unknown, wire: boolean): AgentItem {
   // An older daemon does not send the launch controls, the resolved model or

@@ -41,6 +41,8 @@ func TestConsoleControlBounds(t *testing.T) {
 		`{"type":"AGENT_UPDATE","id":"x","body":{"agent_id":"` + agent + `","expected_revision":"7","model":null}}`,
 		`{"type":"AGENT_UPDATE","id":"x","body":{"agent_id":"` + agent + `","expected_revision":"7","reasoning_effort":null}}`,
 		`{"type":"AGENT_UPDATE","id":"x","body":{"agent_id":"` + agent + `","expected_revision":"7","paused":null}}`,
+		`{"type":"AGENT_UPDATE","id":"x","body":{"agent_id":"` + agent + `","expected_revision":"7","appearance":{"automatic":false,"skin":null,"hair":0,"hair_colour":0,"face":0,"outfit":0,"clothes_colour":0,"shoes":0,"tool":0,"headwear":0}}}`,
+		`{"type":"AGENT_UPDATE","id":"x","body":{"agent_id":"` + agent + `","expected_revision":"7","appearance":{"automatic":true,"skin":1,"hair":0,"hair_colour":0,"face":0,"outfit":0,"clothes_colour":0,"shoes":0,"tool":0,"headwear":0}}}`,
 		`{"type":"TASK_UPDATE","id":"x","body":{"task_id":"` + task + `","expected_revision":"7","title":null}}`,
 		`{"type":"TASK_UPDATE","id":"x","body":{"task_id":"` + task + `","expected_revision":"7","priority":null}}`,
 		`{"type":"TASK_UPDATE","id":"x","body":{"task_id":"` + task + `","expected_revision":"7","assigned_agent_id":null}}`,
