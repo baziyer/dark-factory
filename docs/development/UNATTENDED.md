@@ -126,7 +126,10 @@ optional `release_configs` paths run exact-default-head releases and enqueue
 one idempotent verified-delivery follow-up for the same project's overseer.
 Use `--plist` to generate a launchd StartInterval job. The generated job uses
 absolute script/config paths and the host's tool PATH. Install it only after
-the one-shot preflight succeeds. Each config gets a separate launchd label.
+the one-shot preflight succeeds. Each config gets a separate launchd label. Controllers for the same factory
+serialize through a host lock, so their source-refresh and deployment hooks
+cannot overlap. Use the controller for scheduled work; direct maintenance
+hooks are operator tools.
 Each tick writes a mode-0600 `.autonomy.json` health receipt beside the intake
 journal, containing only component names and finite status codes.
 For private repositories, optionally set `review_mirror_root` to an existing

@@ -16,14 +16,24 @@ SPEC.loader.exec_module(refresh)
 
 class SourceRefreshTest(unittest.TestCase):
     def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
         self.config = {'repository': 'o/r', 'project_id': '1' * 32, 'overseer_agent_id': '3' * 32,
-                       'label': 'ready', 'allowed_authors': ['m'], 'factory_home': '/private/tmp/factory',
+                       'label': 'ready', 'allowed_authors': ['m'], 'factory_home': self.home.name,
                        'journal': '/private/tmp/journal'}
         self.fetch = patch.object(refresh, 'fetch_target', return_value='a' * 40)
         self.fetcher = self.fetch.start()
 
     def tearDown(self):
         self.fetch.stop()
+        self.home.cleanup()
+
+    def test_concurrent_refresh_is_refused_before_source_access(self):
+        with (Path(self.home.name) / 'source-refresh.lock').open('a+') as lock:
+            refresh.fcntl.flock(lock, refresh.fcntl.LOCK_EX | refresh.fcntl.LOCK_NB)
+            with patch.object(refresh, 'root') as root:
+                with self.assertRaisesRegex(refresh.RefreshError, 'source_refresh_busy'):
+                    refresh.refresh(self.config)
+                root.assert_not_called()
 
     def test_pause_drain_refresh_restore_uses_exact_revisions(self):
         calls = []

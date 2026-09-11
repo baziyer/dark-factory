@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Refresh a project root only while dispatch is durably paused and drained."""
 import argparse
+import fcntl
 import importlib.util
 import json
 import os
@@ -75,6 +76,16 @@ def fetch_target(path, base, env):
 
 def refresh(config):
     config = intake.validate_config(config)
+    descriptor = os.open(Path(config["factory_home"]) / "source-refresh.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RefreshError("source_refresh_busy") from exc
+        return refresh_locked(config)
+
+
+def refresh_locked(config):
     home, path = Path(config["factory_home"]), root(config)
     env = dict(os.environ, DARK_FACTORY_SOCKET=str(home / "runtimes" / "factory.sock"), DARK_FACTORY_OPERATOR_TOKEN_FILE=str(home / "operator.token"))
     base = validate_source(path, config, env)

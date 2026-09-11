@@ -21,6 +21,18 @@ deploy = module('deploy-runtime')
 
 
 class AutonomyTest(unittest.TestCase):
+    def test_controller_excludes_another_job_for_the_same_factory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config.json'
+            config.write_text(json.dumps({'factory_home': str(root), 'journal': str(root / 'journal')}))
+            with (root / 'autonomy.lock').open('a+') as lock:
+                autonomy.fcntl.flock(lock, autonomy.fcntl.LOCK_EX | autonomy.fcntl.LOCK_NB)
+                with patch.object(autonomy.sys, 'argv', ['factory-autonomy', str(config), '--once']), patch.object(autonomy, 'tick') as tick:
+                    with self.assertRaisesRegex(ValueError, 'another controller'):
+                        autonomy.main()
+                    tick.assert_not_called()
+
     def test_notification_runs_even_if_intake_fails(self):
         config = {'factory_home': '/private/tmp/factory', 'journal': '/private/tmp/journal'}
         with patch.object(autonomy.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0, '{}', ''), subprocess.CompletedProcess([], 1, '', 'GitHub unavailable'), subprocess.CompletedProcess([], 0, '{}', '')]) as run:

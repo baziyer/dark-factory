@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the operator-configured intake and local attention checks under launchd."""
 import argparse
+import fcntl
 import importlib.util
 import hashlib
 import json
@@ -101,8 +102,16 @@ def main():
                  'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')}}
         sys.stdout.buffer.write(plistlib.dumps(plist))
         return 0
-    results = tick(config_path, config)
-    write_health(config, results)
+    # ponytail: one host controller at a time; split maintenance leases only
+    # when independent factories need concurrent host deployment hooks.
+    descriptor = os.open(Path(config['factory_home']) / 'autonomy.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, 'a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('another controller owns this factory') from error
+        results = tick(config_path, config)
+        write_health(config, results)
     print(json.dumps({'at': int(time.time()), 'components': results}), flush=True)
     return 0 if all(result['ok'] for result in results) else 1
 
