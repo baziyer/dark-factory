@@ -254,12 +254,18 @@
 .dfFactoryConsole__empty { color: var(--df-console-muted); font-size: 0.75rem; }
 
 .dfFactoryConsole__humanRequest .dfFactoryConsole__question {
-  margin-top: 0;
+  margin-top: 0.5rem;
   color: var(--df-console-text);
   font-size: 1rem;
   line-height: 1.5;
   text-transform: none;
   overflow-wrap: anywhere;
+}
+
+.dfFactoryConsole__humanRequest h3 {
+  color: var(--df-console-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
 }
 
 .dfFactoryConsole__reply {
@@ -269,6 +275,14 @@
 }
 
 .dfFactoryConsole__reply label { color: var(--df-console-muted); }
+
+.dfFactoryConsole__answerOptions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.dfFactoryConsole__answerOptions button { margin: 0; }
 
 .dfFactoryConsole__reply textarea {
   min-height: 7rem;

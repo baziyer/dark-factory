@@ -667,13 +667,12 @@ function AccountsSection({
   );
 }
 
-/** Private question and controls inside the selected Needs You row. */
+/** Private decision and controls inside the selected Needs You row. */
 export function HumanRequestPanel({
   selected,
   onReplyChange,
   onReply,
   onCancel,
-  onClose,
   onOpenTerminal,
   terminalReady,
 }: {
@@ -681,7 +680,6 @@ export function HumanRequestPanel({
   onReplyChange?: (reply: string) => void;
   onReply?: () => void;
   onCancel?: () => void;
-  onClose?: () => void;
   onOpenTerminal?: (request: FactoryHumanRequestView["request"]) => void;
   terminalReady: boolean;
 }) {
@@ -691,9 +689,13 @@ export function HumanRequestPanel({
     <article className="dfFactoryConsole__humanRequest" aria-label="Selected question" aria-live="polite">
       {selected.phase === "loading" ? <p className="dfFactoryConsole__empty">LOADING THE QUESTION…</p> : (
         <>
+          <h3>DECISION NEEDED</h3>
           <p className="dfFactoryConsole__question">{selected.question}</p>
           {selected.canReply ? (
             <form className="dfFactoryConsole__reply" aria-label="Answer this question" onSubmit={submit}>
+              {selected.options.length === 0 ? null : <div className="dfFactoryConsole__answerOptions" role="group" aria-label="Suggested answers">
+                {selected.options.map((option, index) => <button type="button" key={option} disabled={busy || onReplyChange === undefined} onClick={() => onReplyChange?.(option)}>{option}{index === 0 ? " · RECOMMENDED" : ""}</button>)}
+              </div>}
               <label htmlFor="dfHumanRequestReply">YOUR ANSWER</label>
               <textarea
                 id="dfHumanRequestReply"
@@ -706,12 +708,11 @@ export function HumanRequestPanel({
             </form>
           ) : null}
           <div className="dfFactoryConsole__humanActions">
-            {selected.canCancel ? <button type="button" disabled={busy || onCancel === undefined} onClick={onCancel}>Stop</button> : null}
+            {selected.canCancel ? <button type="button" disabled={busy || onCancel === undefined} onClick={onCancel}>STOP TASK</button> : null}
             {onOpenTerminal === undefined ? null : <button type="button" disabled={busy || !terminalReady} onClick={() => onOpenTerminal(selected.request)}>OPEN TERMINAL</button>}
           </div>
         </>
       )}
-      <button type="button" disabled={busy || onClose === undefined} onClick={onClose}>CLOSE</button>
     </article>
   );
 }

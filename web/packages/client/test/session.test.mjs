@@ -213,12 +213,14 @@ test("authenticated HumanRequest methods emit exact frames and correlate results
   assert.equal(detailFrame.type, "HUMAN_REQUEST_DETAIL_GET");
   assert.deepEqual(detailFrame.body, { request_id: requestId, expected_revision: 1n });
   socket.reply(encodeHumanRequestDetail(detailFrame.id, {
-    request_id: requestId, revision: 1n, question: "Choose", can_reply: true, reply_max_bytes: 8192,
+    request_id: requestId, revision: 1n, question: "Choose", options: ["Continue", "Stop"], can_reply: true, reply_max_bytes: 8192,
     terminal_target: { run_id: runID, session_id: "99".repeat(16), run_revision: 1n, session_revision: 1n },
     cancel_run: { expected_request_revision: 1n, expected_run_revision: 1n },
   }));
   const detail = await detailPending;
   assert.equal(Object.isFrozen(detail), true);
+  assert.deepEqual(detail.options, ["Continue", "Stop"]);
+  assert.equal(Object.isFrozen(detail.options), true);
   assert.equal(Object.isFrozen(detail.terminalTarget), true);
   assert.equal(Object.isFrozen(detail.cancelRun), true);
   assert.equal(typeof session.openTerminal(detail.terminalTarget).attach, "function");

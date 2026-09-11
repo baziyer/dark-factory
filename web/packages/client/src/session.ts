@@ -199,6 +199,7 @@ export type HumanRequestDetail = Readonly<{
   requestId: string;
   revision: bigint;
   question: string;
+  options: readonly string[];
   canReply: boolean;
   replyMaxBytes: number;
   terminalTarget: TerminalTarget | null;
@@ -1043,6 +1044,7 @@ export class BrowserSession {
         requestId: frame.body.request_id,
         revision: frame.body.revision,
         question: frame.body.question,
+        options: Object.freeze([...(frame.body.options ?? [])]),
         canReply: frame.body.can_reply,
         replyMaxBytes: frame.body.reply_max_bytes,
         terminalTarget,

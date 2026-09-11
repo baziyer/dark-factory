@@ -76,7 +76,7 @@ export type StateWatchBody = { after_head: bigint };
 export type StateChangedBody = { head: bigint };
 export type HumanRequestDetailGetBody = { request_id: string; expected_revision: bigint };
 type HumanRequestCancelRunDetail = { expected_request_revision: bigint; expected_run_revision: bigint };
-export type HumanRequestDetailBody = { request_id: string; revision: bigint; question: string; can_reply: boolean; reply_max_bytes: number; terminal_target: TerminalTargetDescriptor | null; cancel_run: HumanRequestCancelRunDetail | null };
+export type HumanRequestDetailBody = { request_id: string; revision: bigint; question: string; options?: string[]; can_reply: boolean; reply_max_bytes: number; terminal_target: TerminalTargetDescriptor | null; cancel_run: HumanRequestCancelRunDetail | null };
 export type HumanRequestReplyBody = { request_id: string; expected_revision: bigint; reply: string };
 export type HumanRequestReplyResultBody = { request_id: string; revision: bigint; status: "resolved" | "delivery_unknown" };
 export type HumanRequestCancelRunBody = { request_id: string; expected_request_revision: bigint; expected_run_revision: bigint };
@@ -327,7 +327,7 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "STATE_CHANGED": requireKeys(body, ["head"], wire); return { head: decimal(body.head, wire, true) };
     case "HUMAN_REQUEST_DETAIL_GET": requireKeys(body, ["request_id", "expected_revision"], wire); return { request_id: dynamicID(body.request_id), expected_revision: decimal(body.expected_revision, wire, true) };
     case "HUMAN_REQUEST_DETAIL": {
-      requireKeys(body, ["request_id", "revision", "question", "can_reply", "reply_max_bytes", "terminal_target", "cancel_run"], wire);
+      requireKeys(body, ["request_id", "revision", "question", "can_reply", "reply_max_bytes", "terminal_target", "cancel_run"], wire, ["options"]);
       const request_id = dynamicID(body.request_id); const revision = decimal(body.revision, wire, true);
       if (typeof body.can_reply !== "boolean") malformed();
       const can_reply = body.can_reply; const reply_max_bytes = integer(body.reply_max_bytes, MAX_HUMAN_REPLY_BYTES, MAX_HUMAN_REPLY_BYTES);
@@ -340,7 +340,8 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
       }
       if (cancel_run !== null && (terminal_target === null || !can_reply || cancel_run.expected_request_revision !== revision || cancel_run.expected_run_revision !== terminal_target.run_revision)) malformed();
       if (can_reply && (terminal_target === null || cancel_run === null)) malformed();
-      return { request_id, revision, question: boundedText(body.question, 1, MAX_HUMAN_QUESTION_BYTES), can_reply, reply_max_bytes, terminal_target, cancel_run };
+      const options = present(body, "options") ? humanRequestOptions(body.options) : undefined;
+      return { request_id, revision, question: boundedText(body.question, 1, MAX_HUMAN_QUESTION_BYTES), ...(options === undefined ? {} : { options }), can_reply, reply_max_bytes, terminal_target, cancel_run };
     }
     case "HUMAN_REQUEST_REPLY": requireKeys(body, ["request_id", "expected_revision", "reply"], wire); return { request_id: dynamicID(body.request_id), expected_revision: decimal(body.expected_revision, wire, true), reply: boundedText(body.reply, 1, MAX_HUMAN_REPLY_BYTES) };
     case "HUMAN_REQUEST_REPLY_RESULT": requireKeys(body, ["request_id", "revision", "status"], wire); if (body.status !== "resolved" && body.status !== "delivery_unknown") malformed(); return { request_id: dynamicID(body.request_id), revision: decimal(body.revision, wire, true), status: body.status };
@@ -545,6 +546,13 @@ function taskPeerQuestion(value: unknown, wire: boolean): TaskPeerQuestion {
   const result: TaskPeerQuestion = { id: dynamicID(value.id), source_task_id: dynamicID(value.source_task_id), target_task_id: dynamicID(value.target_task_id), question: boundedText(value.question, 1, 2048), recipient_delivery_state: value.recipient_delivery_state, answer_delivery_state: value.answer_delivery_state, revision: decimal(value.revision, wire, true), created_at_ms, updated_at_ms };
   if (present(value, "answer")) result.answer = boundedText(value.answer, 0, 2048);
   return result;
+}
+
+function humanRequestOptions(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 4) malformed();
+  const options = value.map((option) => boundedText(option, 1, 160));
+  if (new Set(options).size !== options.length) malformed();
+  return options;
 }
 function humanRequestItem(value: unknown, wire: boolean): HumanRequestItem {
   if (!isObject(value)) malformed(); requireKeys(value, ["id", "project_id", "agent_id", "task_id", "created_at", "updated_at", "revision", "kind", "status", "reply_max_bytes", "can_reply"], wire);

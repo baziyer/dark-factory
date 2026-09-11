@@ -271,7 +271,7 @@ test("the resolved model is served beside the agent's own override", () => {
 
 test("public state cannot carry private fields and detail is separately bounded", () => {
   const wire = encodeStateSnapshot("state", snapshotBody());
-  for (const field of ["run_id", "question", "reply", "terminal_target", "cancel_run", "action", "project_name", "agent_name", "task_title", "summary", "why_human_needed", "root", "instruction"]) {
+  for (const field of ["run_id", "question", "options", "reply", "terminal_target", "cancel_run", "action", "project_name", "agent_name", "task_title", "summary", "why_human_needed", "root", "instruction"]) {
     assert.equal(wire.includes(`"${field}":`), false, field);
   }
   // The agent's launch controls are served, not private.
@@ -280,6 +280,7 @@ test("public state cannot carry private fields and detail is separately bounded"
   // where an inherited model came from. Nothing inside that file is served.
   for (const field of ["model", "reasoning_effort", "effective_model", "effective_reasoning_effort", "model_source"]) assert.equal(wire.includes(`"${field}":`), true, field);
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ human_requests: [{ ...requestItem(), question: "private" }] })));
+  expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ human_requests: [{ ...requestItem(), options: ["private"] }] })));
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ projects: [{ ...projectItem(), root: "/private" }] })));
   expectMalformed(() => encodeStateSnapshot("state", snapshotBody({ tasks: [{ ...taskItem(), body: "private" }] })));
   const detail = { type: "HUMAN_REQUEST_DETAIL", id: "detail", body: { request_id: ids.request, revision: 1n, question: "\0".repeat(MAX_HUMAN_QUESTION_BYTES), can_reply: false, reply_max_bytes: 8192, terminal_target: null, cancel_run: null } };
@@ -288,6 +289,8 @@ test("public state cannot carry private fields and detail is separately bounded"
   assert.ok(Buffer.byteLength(detailWire) > 49_000);
   expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, question: "" } }));
   expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, question: "x".repeat(MAX_HUMAN_QUESTION_BYTES + 1) } }));
+  assert.match(encodeServerControl({ ...detail, body: { ...detail.body, options: ["Continue", "Stop"] } }), /"options":\["Continue","Stop"\]/);
+  for (const options of [null, [""], ["x".repeat(161)], ["same", "same"], ["1", "2", "3", "4", "5"]]) expectMalformed(() => encodeServerControl({ ...detail, body: { ...detail.body, options } }));
 });
 
 test("state parsing rejects case-folded/duplicate/unknown/trailing/depth/member/array/UTF-8 violations", () => {
