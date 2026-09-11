@@ -1029,7 +1029,7 @@ func resourcesMatchRunPhase(phase RunPhase, resources []Resource) bool {
 }
 
 func validateProjects(ctx context.Context, connection *sql.Conn) error {
-	rows, err := connection.QueryContext(ctx, `SELECT id, name, root, verification_policy, revision, created_at_ms, updated_at_ms FROM projects`)
+	rows, err := connection.QueryContext(ctx, `SELECT id, name, root, verification_policy, run_budget_limit, runs_used, max_run_seconds, revision, created_at_ms, updated_at_ms FROM projects`)
 	if err != nil {
 		return err
 	}
