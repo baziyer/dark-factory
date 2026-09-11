@@ -25,6 +25,7 @@ fake_bin=$temporary/fake-bin
 fake_home=$temporary/home
 mkdir -p "$test_repository/scripts" "$fake_bin" "$fake_home/.dark-factory"
 cp "$repository_root/scripts/reinstall-service.sh" "$test_repository/scripts/reinstall-service.sh"
+cp "$repository_root/scripts/verification-profile.mjs" "$test_repository/scripts/verification-profile.mjs"
 
 git -C "$test_repository" init -q -b main
 git -C "$test_repository" config user.name fixture
@@ -114,6 +115,7 @@ stop() {
 }
 case "$1 $2" in
     "service uninstall")
+        [ ! -e "$HOME/.dark-factory/verification-browser" ] || exit 1
         case "${DARK_FACTORY_TEST_UNINSTALL_LEAVES-}" in
             stale) stop ;;
             listening) ;;
@@ -210,6 +212,36 @@ grep -q 'non-terminal run' "$temporary/stderr" || fail "run admitted during the 
 [ ! -e "$DARK_FACTORY_TEST_FACTORYCTL_LOG" ] || fail "run admitted during the build: service uninstalled"
 printf '0\n' >"$temporary/active-runs"
 rm -rf "$fake_home/.dark-factory-backups"
+
+# A legacy browser session must leave the strict runtime home before the
+# service lifecycle starts, without changing its contents.
+legacy_profile="$fake_home/.dark-factory/verification-browser"
+mkdir -p "$legacy_profile"
+printf 'paired session\n' >"$legacy_profile/session"
+DARK_FACTORY_TEST_INSTALL_DEAD=1 "$script" "$sha" >"$temporary/stdout" 2>"$temporary/stderr" \
+    && fail "legacy browser profile accepted a dead service"
+grep -q 'did not listen' "$temporary/stderr" || fail "legacy browser profile: reinstall did not reach service lifecycle"
+[ ! -e "$legacy_profile" ] || fail "legacy browser profile remained in runtime home"
+grep -qx 'paired session' "$fake_home/.dark-factory-verification-browser/session" \
+    || fail "legacy browser profile was not preserved"
+rm "$DARK_FACTORY_TEST_FACTORYCTL_LOG"
+rm -rf "$fake_home/.dark-factory-backups"
+
+# A symlinked runtime home must be refused before a service lifecycle action.
+unsafe_home="$temporary/unsafe-home"
+mkdir -p "$unsafe_home/real-home"
+printf 'live store\n' >"$unsafe_home/real-home/factory.sqlite3"
+mkdir -p "$unsafe_home/real-home/verification-browser" "$unsafe_home/.dark-factory-verification-browser"
+printf 'legacy session\n' >"$unsafe_home/real-home/verification-browser/session"
+printf 'current session\n' >"$unsafe_home/.dark-factory-verification-browser/session"
+ln -s real-home "$unsafe_home/.dark-factory"
+HOME="$unsafe_home" "$script" "$sha" >/dev/null 2>"$temporary/stderr" && fail "symlinked runtime home accepted"
+grep -q 'browser verification profile migration failed' "$temporary/stderr" || fail "symlinked runtime home: wrong refusal"
+grep -qx 'legacy session' "$unsafe_home/real-home/verification-browser/session" \
+    || fail "symlinked runtime home: legacy profile changed"
+grep -qx 'current session' "$unsafe_home/.dark-factory-verification-browser/session" \
+    || fail "symlinked runtime home: current profile changed"
+no_service_change "symlinked runtime home"
 
 "$script" "$sha" >"$temporary/stdout" || fail "clean reinstall exited non-zero"
 backup=$(find "$fake_home/.dark-factory-backups" -name factory.sqlite3)
