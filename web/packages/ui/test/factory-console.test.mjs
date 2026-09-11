@@ -104,6 +104,19 @@ test("suggested answers fill the reply without sending it", () => {
   assert.match(markup, />Stop<\/button>/);
 });
 
+test("read-only decisions retain disabled suggestions and explain their status", () => {
+  const open = render({ selectedHumanRequest: selectedRequest({ options: ["Keep accounts", "Include users"], canReply: false }) });
+  assert.match(open, /aria-label="Suggested answers"/);
+  assert.match(open, />Keep accounts · RECOMMENDED<\/button>/);
+  assert.match(open, />Include users<\/button>/);
+  assert.match(open, /<button type="button" disabled="">Keep accounts/);
+  assert.match(open, /THIS OPEN DECISION IS READ-ONLY IN THIS VIEW\./);
+  assert.equal(open.includes("YOUR ANSWER"), false);
+
+  const deliveryUnknown = render({ selectedHumanRequest: selectedRequest({ request: { ...fixtureState.humanRequests.get(ids.request), status: "delivery_unknown" }, canReply: false }) });
+  assert.match(deliveryUnknown, /THIS DECISION IS DELIVERY UNKNOWN\./);
+});
+
 test("the roster stays visible while the optional floor opens and closes", () => {
   const floor = render();
   assert.match(floor, /aria-label="Dark Factory codebase floor"/);
