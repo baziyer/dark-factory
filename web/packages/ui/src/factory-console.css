@@ -317,14 +317,6 @@
   min-height: 0;
 }
 
-.dfFactoryConsole__terminalHeading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 0.75rem;
-}
-
 .dfFactoryConsole__terminalAgent {
   color: var(--df-console-muted);
   font-size: 0.75rem;
@@ -439,8 +431,7 @@
 
 @media (max-width: 720px) {
   .dfFactoryConsole__header,
-  .dfFactoryConsole__sectionHeading,
-  .dfFactoryConsole__terminalHeading { align-items: flex-start; flex-direction: column; }
+  .dfFactoryConsole__sectionHeading { align-items: flex-start; flex-direction: column; }
   .dfFactoryConsole__connection { justify-items: start; }
   .dfFactoryConsole__metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dfFactoryConsole__columns { grid-template-columns: 1fr; gap: 0; }
@@ -457,7 +448,7 @@
   }
   .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal {
     flex: 0 0 auto;
-    height: min(22rem, 30svh);
+    height: min(34rem, 52svh);
     min-height: 0;
   }
 }
@@ -617,7 +608,8 @@
 
 .dfConsoleViewToggle { display: flex; flex: 0 0 auto; }
 .dfConsoleViewToggle button + button { margin-left: -1px; }
-.dfConsoleViewToggle button:is([aria-pressed="true"], :focus-visible) { position: relative; z-index: 1; }
+.dfConsoleViewToggle button:hover:not(:disabled) { z-index: 2; }
+.dfConsoleViewToggle button:is([aria-pressed="true"], :focus-visible, :hover) { position: relative; z-index: 1; }
 .dfConsoleShell .dfConsoleViewToggle button[aria-pressed="true"],
 .dfConsoleShell .dfConsoleBar__actions > button[aria-pressed="true"] {
   color: var(--df-console-accent);
@@ -707,21 +699,15 @@
   list-style: none;
 }
 
-.dfConsoleRecentWork > .dfConsoleItems {
-  max-height: 28rem;
-  overflow-y: auto;
-  margin-top: 0.75rem;
-}
-
 .dfConsoleItem {
   min-width: 0;
   border: 1px solid var(--df-console-rule);
 }
 
 .dfConsoleItem__summary { padding: 0.7rem; overflow-wrap: anywhere; }
-summary.dfConsoleItem__summary, .dfConsoleRecentWork > summary { cursor: pointer; }
+summary.dfConsoleItem__summary { cursor: pointer; }
 .dfConsoleItem__summary[aria-disabled="true"] { cursor: default; opacity: 0.6; }
-.dfConsoleItem__summary:focus-visible, .dfConsoleRecentWork > summary:focus-visible { outline: 2px solid var(--df-console-accent); outline-offset: -2px; }
+.dfConsoleItem__summary:focus-visible { outline: 2px solid var(--df-console-accent); outline-offset: -2px; }
 .dfConsoleItem__summary small, .dfConsoleItem__meta { display: block; margin-top: 0.3rem; color: var(--df-console-muted); font-size: 0.75rem; }
 .dfConsoleItem__detail { display: grid; gap: 0.5rem; min-width: 0; padding: 0.7rem; border-top: 1px solid var(--df-console-rule); overflow-wrap: anywhere; }
 .dfConsoleItem__detail h4, .dfConsoleItem__detail p { margin: 0; }
@@ -744,11 +730,13 @@ summary.dfConsoleItem__summary, .dfConsoleRecentWork > summary { cursor: pointer
   height: auto;
   min-height: 0;
   margin: 0;
+  padding: 0;
+  border: 0;
 }
 
 .dfConsoleSidebar .dfFactoryConsole__terminalPanel .dfFactoryConsole__terminal {
   flex: 0 0 auto;
-  height: min(22rem, 30svh);
+  height: min(34rem, 52svh);
   min-height: 0;
 }
 
@@ -800,6 +788,30 @@ summary.dfConsoleItem__summary, .dfConsoleRecentWork > summary { cursor: pointer
 @media (prefers-reduced-motion: reduce) {
   .dfFactoryScene__worker { transition: none; }
 }
+
+.dfRecentWorkDialog { width: min(70rem, calc(100% - 2rem)); }
+.dfRecentWorkLayout { font-family: system-ui, sans-serif; display: grid; grid-template-columns: minmax(14rem, 1fr) minmax(0, 2fr); gap: 1.5rem; margin-top: 1rem; }
+.dfRecentWorkLayout > nav, .dfRecentWorkDetail { min-width: 0; max-height: calc(100svh - 12rem); overflow-y: auto; }
+.dfRecentWorkDialog .dfRecentWorkRow { font: inherit; font-size: 0.95rem; letter-spacing: normal; display: grid; gap: 0.4rem; width: 100%; text-align: left; text-transform: none; }
+.dfRecentWorkRow[aria-pressed="true"] { border-color: var(--df-console-accent); }
+.dfRecentWorkRow :where(span, time), .dfRecentWorkDetail time { color: var(--df-console-muted); font-size: 0.85rem; }
+.dfRecentWorkDetail { display: grid; align-content: start; gap: 1rem; line-height: 1.55; overflow-wrap: anywhere; }
+.dfRecentWorkDetail h3, .dfRecentWorkDetail h4 { margin: 0; color: var(--df-console-text); font-size: 1rem; letter-spacing: normal; }
+.dfRecentWorkText { white-space: pre-wrap; }
+.dfRecentWorkDetail a { display: block; color: var(--df-console-accent); }
+.dfRecentWorkDetail summary { cursor: pointer; }
+@media (max-width: 640px) {
+  .dfRecentWorkLayout { grid-template-columns: minmax(0, 1fr); }
+  .dfRecentWorkLayout > nav { max-height: 28svh; }
+  .dfRecentWorkDetail { max-height: none; }
+}
+
+.dfAgentSprite { flex: 0 0 auto; width: 2rem; height: 2rem; image-rendering: pixelated; }
+.dfConsoleSidebar__heading > .dfAgentSprite { width: 4rem; height: 4rem; }
+.dfConsoleSidebar__heading:has(> .dfAgentSprite) { justify-content: flex-start; align-items: center; }
+.dfConsoleViewToggle button > span { margin-left: 0.4rem; font-size: 0.85em; }
+
+.dfFactoryScene__selection { fill: none; stroke: var(--df-console-accent); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
 
 /* remote ------------------------------------------------------------------
    The phone console. One column by default because the smallest screen is the

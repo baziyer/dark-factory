@@ -14,16 +14,17 @@ import (
 
 type consoleDispatchBackend struct {
 	*fakeBackend
-	mu       sync.Mutex
-	client   [browserprotocol.ClientIDSize]byte
-	agent    browserprotocol.AgentUpdateResult
-	task     browserprotocol.TaskUpdateResult
-	topology browserprotocol.Topology
-	account  browserprotocol.AccountLinkResult
-	err      error
-	calls    int
-	walking  chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
-	budgets  []time.Time   // each walk's context deadline, in the order the walks started
+	mu            sync.Mutex
+	client        [browserprotocol.ClientIDSize]byte
+	agent         browserprotocol.AgentUpdateResult
+	task          browserprotocol.TaskUpdateResult
+	topology      browserprotocol.Topology
+	account       browserprotocol.AccountLinkResult
+	accountUpdate browserprotocol.AccountUpdateResult
+	err           error
+	calls         int
+	walking       chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
+	budgets       []time.Time   // each walk's context deadline, in the order the walks started
 }
 
 func newConsoleDispatchBackend() *consoleDispatchBackend {
@@ -33,6 +34,7 @@ func newConsoleDispatchBackend() *consoleDispatchBackend {
 	backend.agent = browserprotocol.AgentUpdateResult{AgentID: consoleAgentID, Revision: 8}
 	backend.task = browserprotocol.TaskUpdateResult{TaskID: consoleTaskID, Revision: 4}
 	backend.account = browserprotocol.AccountLinkResult{AccountID: consoleAccountID, Revision: 1}
+	backend.accountUpdate = browserprotocol.AccountUpdateResult{AccountID: consoleAccountID, Revision: 2}
 	backend.topology = browserprotocol.Topology{
 		ProjectID: consoleProjectID, Digest: strings.Repeat("ab", 32),
 		Nodes: []browserprotocol.TopologyNode{{ID: strings.Repeat("a1", 32), Kind: "repository", Path: ".", Label: "repository", SizeBucket: "small"}},
@@ -129,6 +131,13 @@ func (backend *consoleDispatchBackend) LinkAccount(_ context.Context, client [br
 	return backend.account, nil
 }
 
+func (backend *consoleDispatchBackend) UpdateAccount(_ context.Context, client [browserprotocol.ClientIDSize]byte, _ browserprotocol.AccountUpdate) (browserprotocol.AccountUpdateResult, error) {
+	if err := backend.record(client); err != nil {
+		return browserprotocol.AccountUpdateResult{}, err
+	}
+	return backend.accountUpdate, nil
+}
+
 const (
 	consoleAgentID   = "606162636465666768696a6b6c6d6e6f"
 	consoleTaskID    = "404142434445464748494a4b4c4d4e4f"
@@ -154,6 +163,8 @@ var consoleRequests = []struct {
 		`{"type":"ACCOUNTS_DISCOVER","id":"console-accounts","body":{}}`},
 	{browserprotocol.TypeAccountLink, browserprotocol.TypeAccountLinkResult,
 		`{"type":"ACCOUNT_LINK","id":"console-account-link","body":{"provider":"codex","home":"/Users/operator/.codex","label":"codex"}}`},
+	{browserprotocol.TypeAccountUpdate, browserprotocol.TypeAccountUpdateResult,
+		`{"type":"ACCOUNT_UPDATE","id":"console-account-update","body":{"account_id":"` + consoleAccountID + `","expected_revision":"1","label":"renamed"}}`},
 }
 
 func TestConsoleControlDispatchesAndCorrelatesExactResults(t *testing.T) {
@@ -221,6 +232,9 @@ func TestConsoleControlFailsClosedWithoutBackendAndOnBackendRefusal(t *testing.T
 			{browserprotocol.TypeAgentUpdate, func(backend *consoleDispatchBackend) { backend.agent.AgentID = consoleTaskID }},
 			{browserprotocol.TypeTaskUpdate, func(backend *consoleDispatchBackend) { backend.task.Revision = 3 }},
 			{browserprotocol.TypeTaskUpdate, func(backend *consoleDispatchBackend) { backend.task.TaskID = consoleAgentID }},
+			{browserprotocol.TypeAccountUpdate, func(backend *consoleDispatchBackend) { backend.accountUpdate.Revision = 1 }},
+			{browserprotocol.TypeAccountUpdate, func(backend *consoleDispatchBackend) { backend.accountUpdate.Revision = 3 }},
+			{browserprotocol.TypeAccountUpdate, func(backend *consoleDispatchBackend) { backend.accountUpdate.AccountID = consoleTaskID }},
 			{browserprotocol.TypeTopologyGet, func(backend *consoleDispatchBackend) { backend.topology.ProjectID = consoleAgentID }},
 		} {
 			backend := newConsoleDispatchBackend()

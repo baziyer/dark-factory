@@ -115,3 +115,49 @@ func TestAccountLinkingAndAgentSelection(t *testing.T) {
 		t.Fatalf("served agent account selections = %d, want 1", selected)
 	}
 }
+
+func TestAccountUpdateRenamesAndUnlinksUnusedAccounts(t *testing.T) {
+	store, _ := newTestStore(t)
+	defer store.Close()
+	ctx := context.Background()
+	account, err := store.LinkAccount(ctx, NewAccount{ID: accountID(t, 21), Provider: ProviderCodex, Home: "/Users/operator/.codex-update", Label: "old"}, mustTime(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := store.UpdateAccount(ctx, account.ID, account.Revision, stringPtr("new"), false, mustTime(t, 2))
+	if err != nil || renamed.Label != "new" || renamed.Revision.Int64() != 2 {
+		t.Fatalf("rename = %+v, %v", renamed, err)
+	}
+	if _, err := store.UpdateAccount(ctx, account.ID, account.Revision, stringPtr("stale"), false, mustTime(t, 3)); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale rename = %v", err)
+	}
+	removed, err := store.UpdateAccount(ctx, account.ID, renamed.Revision, nil, true, mustTime(t, 4))
+	if err != nil || removed.ID != account.ID || removed.Revision.Int64() != 3 {
+		t.Fatalf("remove = %+v, %v", removed, err)
+	}
+	if accounts, err := store.ListAccounts(ctx); err != nil || len(accounts) != 0 {
+		t.Fatalf("accounts after remove = %+v, %v", accounts, err)
+	}
+}
+
+func TestAccountUpdateRefusesReferencedAccount(t *testing.T) {
+	store, _ := newTestStore(t)
+	defer store.Close()
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, NewProject{ID: projectID(t, 22), Name: "project", Root: filepath.Join(t.TempDir(), "root")}, mustTime(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := store.LinkAccount(ctx, NewAccount{ID: accountID(t, 23), Provider: ProviderCodex, Home: "/Users/operator/.codex-referenced", Label: "work"}, mustTime(t, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAgent(ctx, NewAgent{ID: agentID(t, 24), ProjectID: project.ID, Name: "worker", Role: RoleWorker, Provider: ProviderCodex, AccountID: account.ID, ToolBudgetLimit: 1}, mustTime(t, 3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateAccount(ctx, account.ID, account.Revision, nil, true, mustTime(t, 4)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("referenced remove = %v", err)
+	}
+}
+
+func stringPtr(value string) *string { return &value }

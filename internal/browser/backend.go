@@ -210,6 +210,7 @@ type ConsoleBackend interface {
 	RunPaths(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.RunPathsGet) (browserprotocol.RunPaths, error)
 	DiscoverAccounts(context.Context, [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error)
 	LinkAccount(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error)
+	UpdateAccount(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AccountUpdate) (browserprotocol.AccountUpdateResult, error)
 }
 
 // TerminalBackend is the optional effect half of browser v1. Keeping it

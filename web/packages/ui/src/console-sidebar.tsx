@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "rea
 import { MAX_TASK_PRIORITY, type AccountItem, type AgentItem, type StateView, type TaskHistoryView, type TaskItem, type TaskListView, type TaskPeerQuestion } from "@dark-factory/client";
 import type { FactoryEditView, FactoryHumanRequestView } from "./factory-app-controller.js";
 import { rankLabel } from "./console-screens.js";
-import { agentStatus, agentCurrentTask } from "./console-view.js";
+import { AgentSprite } from "./factory-scene/factory-scene.js";
+import { agentStatus, agentCurrentTask, agentActivity } from "./console-view.js";
 
 /** Only the controls the operator actually changed; the rest are left alone. */
 export type AgentConfigEdit = Readonly<{ model?: string; reasoningEffort?: string; accountId?: string; paused?: boolean; idlePolicy?: "wait" | "standing_instruction"; idleAfterSeconds?: number; idleInstruction?: string; idleRunBudget?: number }>;
@@ -95,6 +96,7 @@ export function AgentPanel({
   return (
     <section className="dfConsoleSidebar__panel" aria-label={`Agent ${agent.name}`}>
       <div className="dfConsoleSidebar__heading">
+        <AgentSprite agent={agent} activity={state === undefined ? "waiting" : agentActivity(agent, state)} />
         <div>
           <p className="dfFactoryConsole__eyebrow">{rankLabel(agent.role)} · {agent.provider}{agent.effective_model === "" ? "" : ` · ${agent.effective_model}`}</p>
           <h2>{agent.name}</h2>
@@ -133,10 +135,6 @@ function dateLabel(value: bigint | undefined): string {
   return Number.isNaN(date.valueOf()) ? "DATE UNAVAILABLE" : date.toISOString().replace("T", " ").replace(".000Z", " UTC");
 }
 
-function excerpt(value: string): string {
-  const compact = value.replace(/\s+/g, " ").trim();
-  return compact.length <= 180 ? compact : `${compact.slice(0, 177)}…`;
-}
 
 function pullRequests(value: string): readonly Readonly<{ href: string; label: string }>[] {
   const found = new Map<string, string>();
@@ -150,34 +148,32 @@ function pullRequests(value: string): readonly Readonly<{ href: string; label: s
 
 /** Private completed-task detail, kept bounded until the operator opens it. */
 function RecentWork({
-  agent,
-  completionRevision,
-  onLoadTaskList,
-  onLoadTaskDetail,
-  onLoadTaskHistory,
+  agent, completionRevision, onLoadTaskList, onLoadTaskDetail, onLoadTaskHistory,
 }: {
   agent: AgentItem;
   completionRevision: string;
-  onLoadTaskList?: (agentId: string, cursor?: { beforeUpdatedAtMs?: bigint; beforeTaskId?: string }) => Promise<TaskListView>;
+  onLoadTaskList?: (agentId: string, cursor?: { beforeUpdatedAtMs: bigint; beforeTaskId: string }) => Promise<TaskListView>;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
 }) {
   const [open, setOpen] = useState(false);
   const [page, setPage] = useState<readonly TaskItem[]>([]);
+  const [selectedId, setSelectedId] = useState<string>();
   const [total, setTotal] = useState<bigint>();
   const [hasMore, setHasMore] = useState(false);
   const [pending, setPending] = useState(false);
   const [failed, setFailed] = useState(false);
+  const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef(0);
   const load = (append: boolean) => {
     const loader = onLoadTaskList;
     if (loader === undefined || (append && (pending || !hasMore))) return;
     const cursor = append ? page.at(-1) : undefined;
-    if (append && (cursor?.updated_at_ms === undefined)) return;
+    if (append && cursor?.updated_at_ms === undefined) return;
     const token = ++request.current;
     setPending(true);
     setFailed(false);
-    void loader(agent.id, cursor === undefined ? undefined : { beforeUpdatedAtMs: cursor.updated_at_ms, beforeTaskId: cursor.id }).then((result) => {
+    void loader(agent.id, cursor === undefined ? undefined : { beforeUpdatedAtMs: cursor.updated_at_ms!, beforeTaskId: cursor.id }).then((result) => {
       if (request.current !== token) return;
       setPage((prior) => append ? [...prior, ...result.tasks] : result.tasks);
       setTotal(result.total);
@@ -186,27 +182,35 @@ function RecentWork({
   };
   useEffect(() => {
     if (!open) return;
+    if (!dialog.current?.open) dialog.current?.showModal();
     load(false);
     return () => { ++request.current; };
   }, [open, agent.id, completionRevision]);
-  const count = total === undefined ? "—" : total.toString();
-  return <details className="dfConsoleRecentWork dfConsoleSidebar__section" onToggle={(event) => setOpen(event.currentTarget.open)}>
-    <summary>RECENT WORK · {count}</summary>
-    {!open ? null : <>
-      {failed ? <p role="alert">RECENT WORK UNAVAILABLE <button type="button" onClick={() => load(false)}>RETRY</button></p>
-        : pending && page.length === 0 ? <p>LOADING RECENT WORK</p>
-          : page.length === 0 ? <p className="dfFactoryConsole__empty">NO COMPLETED OR BLOCKED TASKS</p>
-            : <ol className="dfConsoleItems">{page.map((task) => <RecentWorkItem key={`${task.id}:${task.revision}`} task={task} onLoadTaskDetail={onLoadTaskDetail} onLoadTaskHistory={onLoadTaskHistory} />)}</ol>}
-      {!hasMore ? null : <button type="button" disabled={pending} onClick={() => load(true)}>SHOW MORE</button>}
-    </>}
-  </details>;
+  const selected = page.find((task) => task.id === selectedId) ?? page[0];
+  return <div className="dfConsoleRecentWork dfConsoleSidebar__section">
+    <button type="button" onClick={() => setOpen(true)}>RECENT WORK{total === undefined ? "" : ` · ${total}`}</button>
+    {!open ? null : <dialog ref={dialog} className="dfConsoleDialog dfRecentWorkDialog" aria-label={`Recent work for ${agent.name}`} onClose={() => setOpen(false)} onClick={(event) => { if (event.target === dialog.current) dialog.current?.close(); }}>
+      <div className="dfConsoleSidebar__panel">
+        <div className="dfConsoleSidebar__heading"><h2>RECENT WORK · {agent.name}</h2><button type="button" onClick={() => dialog.current?.close()}>CLOSE</button></div>
+        {failed ? <p role="alert">RECENT WORK UNAVAILABLE <button type="button" onClick={() => load(false)}>RETRY</button></p> : null}
+        <div className="dfRecentWorkLayout">
+          <nav aria-label="Completed work">
+            <p>{total === undefined ? "Loading work…" : `${total} completed or blocked tasks`}</p>
+            <ol className="dfConsoleItems">{page.map((task) => <li key={task.id}>
+              <button type="button" className="dfRecentWorkRow" aria-pressed={selected?.id === task.id} onClick={() => setSelectedId(task.id)}>
+                <strong>{task.title}</strong><span>{task.status.replaceAll("_", " ")}</span><time>{dateLabel(task.updated_at_ms)}</time>
+              </button>
+            </li>)}</ol>
+            {!hasMore ? null : <button type="button" disabled={pending} onClick={() => load(true)}>{pending ? "LOADING" : "SHOW MORE"}</button>}
+          </nav>
+          {selected === undefined ? <p>{pending ? "Loading recent work…" : "No completed or blocked tasks."}</p> : <RecentWorkDetail key={`${selected.id}:${selected.revision}`} task={selected} onLoadTaskDetail={onLoadTaskDetail} onLoadTaskHistory={onLoadTaskHistory} />}
+        </div>
+      </div>
+    </dialog>}
+  </div>;
 }
 
-function RecentWorkItem({
-  task,
-  onLoadTaskDetail,
-  onLoadTaskHistory,
-}: {
+function RecentWorkDetail({ task, onLoadTaskDetail, onLoadTaskHistory }: {
   task: TaskItem;
   onLoadTaskDetail?: (task: TaskItem, peerOffset?: bigint, expectedHead?: bigint) => Promise<TaskBrief>;
   onLoadTaskHistory?: (task: TaskItem) => Promise<TaskHistoryView>;
@@ -219,43 +223,34 @@ function RecentWorkItem({
   const [detailError, setDetailError] = useState(false);
   const [history, setHistory] = useState<TaskHistoryView>();
   const [historyError, setHistoryError] = useState(false);
-  const [expanded, setExpanded] = useState(false);
   const [olderPending, setOlderPending] = useState(false);
   useEffect(() => {
-    const load = detailLoader.current;
-    if (load === undefined) return;
     let live = true;
-    void load(task).then((loaded) => {
-      if (!live) return;
-      setBrief(loaded);
-      setDetailError(false);
-    }).catch(() => { if (live) setDetailError(true); });
+    void detailLoader.current?.(task).then((loaded) => { if (live) setBrief(loaded); }).catch(() => { if (live) setDetailError(true); });
+    void historyLoader.current?.(task).then((loaded) => { if (live) setHistory(loaded); }).catch(() => { if (live) setHistoryError(true); });
     return () => { live = false; };
   }, [task.id, task.revision]);
-  useEffect(() => {
-    if (!expanded || history !== undefined || historyError || historyLoader.current === undefined) return;
-    let live = true;
-    void historyLoader.current(task).then((loaded) => { if (live) setHistory(loaded); }).catch(() => { if (live) setHistoryError(true); });
-    return () => { live = false; };
-  }, [expanded, task.id, task.revision, history, historyError]);
   const links = brief === undefined ? [] : pullRequests(`${brief.outcome ?? ""}\n${brief.feedback}`);
-  const instruction = brief?.instruction === "" || brief === undefined ? undefined : excerpt(brief.instruction);
-  const outcome = brief?.outcome === "" || brief?.outcome === undefined ? undefined : excerpt(brief.outcome);
-  const detailState = detailError || onLoadTaskDetail === undefined ? "DETAIL UNAVAILABLE" : brief === undefined ? "LOADING DETAILS" : undefined;
-  return <li className="dfConsoleItem"><details onToggle={(event) => setExpanded(event.currentTarget.open)}>
-    <summary className="dfConsoleItem__summary"><span>{instruction ?? task.title}</span><small className="dfConsoleItem__meta">{instruction === undefined || instruction === task.title ? "" : `${task.title} · `}{task.status.toUpperCase()} · {dateLabel(task.updated_at_ms)} · {task.id.slice(0, 8)}</small>{outcome === undefined ? null : <small>OUTCOME · {outcome}</small>}{detailState === undefined ? null : <small>{detailState}</small>}</summary>
-    {!expanded ? null : <div className="dfConsoleItem__detail">
-      {detailError || onLoadTaskDetail === undefined ? <p role="alert">DETAIL UNAVAILABLE</p> : brief === undefined ? <p>LOADING DETAILS</p> : <>
-        {brief.outcome === undefined || brief.outcome === "" ? <p>NO RECORDED OUTCOME</p> : <><h4>OUTCOME</h4><pre className="dfConsoleSidebar__feedback">{brief.outcome}</pre></>}
-        {brief.instruction === "" ? null : <><h4>ORIGINAL INSTRUCTION</h4><pre className="dfConsoleSidebar__feedback">{brief.instruction}</pre></>}
-        {brief.feedback === "" ? null : <><h4>RETAINED REVIEW FEEDBACK</h4><pre className="dfConsoleSidebar__feedback">{brief.feedback}</pre></>}
-        {links.length === 0 ? null : <p>{links.map((link) => <a key={link.href} href={link.href} target="_blank" rel="noreferrer">PR · {link.label}</a>)}</p>}
-        <TaskConversation brief={brief} pending={olderPending} onOlder={brief.nextPeerOffset === undefined ? undefined : () => { const load = detailLoader.current; if (load === undefined) return; setOlderPending(true); void load(task, brief.nextPeerOffset, brief.head).then((loaded) => { setBrief(loaded); setDetailError(false); }).catch(() => setDetailError(true)).finally(() => setOlderPending(false)); }} />
-      </>}
-      <h4>INTERVENTION HISTORY</h4>
-      {historyError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : onLoadTaskHistory === undefined ? <p>HISTORY UNAVAILABLE</p> : history === undefined ? <p>LOADING HISTORY</p> : history.entries.length === 0 ? <p>NO DURABLE CONTROLS</p> : <><ol>{history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind.toUpperCase()} · {entry.status.toUpperCase()}</strong><span>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</span><small>{dateLabel(entry.createdAtMs)}</small></li>)}</ol>{history.entries.length === 32 ? <p>SHOWING THE NEWEST 32 EVENTS.</p> : null}</>}
-    </div>}
-  </details></li>;
+  return <article className="dfRecentWorkDetail" aria-label="Work details">
+    <h3>{task.title}</h3>
+    <p>{task.status.replaceAll("_", " ")} · {dateLabel(task.updated_at_ms)}</p>
+    {detailError || onLoadTaskDetail === undefined ? <p role="alert">DETAIL UNAVAILABLE</p> : brief === undefined ? <p>LOADING DETAILS</p> : <>
+      <h4>OUTCOME</h4><p className="dfRecentWorkText">{brief.outcome || "No recorded outcome."}</p>
+      {links.length === 0 ? null : <p>{links.map((link) => <a key={link.href} href={link.href} target="_blank" rel="noreferrer">PR · {link.label}</a>)}</p>}
+      {brief.instruction === "" ? null : <details><summary>ORIGINAL INSTRUCTION</summary><p className="dfRecentWorkText">{brief.instruction}</p></details>}
+      {brief.feedback === "" ? null : <details><summary>REVIEW FEEDBACK</summary><p className="dfRecentWorkText">{brief.feedback}</p></details>}
+      {brief.peerQuestions.length === 0 && brief.nextPeerOffset === undefined ? null : <TaskConversation brief={brief} pending={olderPending} onOlder={brief.nextPeerOffset === undefined ? undefined : () => {
+        const load = detailLoader.current;
+        if (load === undefined) return;
+        setOlderPending(true);
+        void load(task, brief.nextPeerOffset, brief.head).then(setBrief).catch(() => setDetailError(true)).finally(() => setOlderPending(false));
+      }} />}
+    </>}
+    <details><summary>INTERVENTION HISTORY</summary>
+      {historyError ? <p role="alert">THE FACTORY REFUSED THIS HISTORY</p> : onLoadTaskHistory === undefined ? <p>HISTORY UNAVAILABLE</p> : history === undefined ? <p>LOADING HISTORY</p> : history.entries.length === 0 ? <p>No durable controls.</p> : <ol>{history.entries.map((entry) => <li key={entry.operationId}><strong>{entry.kind} · {entry.status}</strong><p>{entry.actor}{entry.body === "" ? "" : ` · ${entry.body}`}</p><time>{dateLabel(entry.createdAtMs)}</time></li>)}</ol>}
+      {history?.entries.length === 32 ? <p>Showing the newest 32 events.</p> : null}
+    </details>
+  </article>;
 }
 
 /** The single editable queue keeps the authoritative per-agent task order. */
@@ -515,6 +510,7 @@ export function SettingsDialog({
   accountsError,
   onLoadAccounts,
   onLinkAccount,
+  onUpdateAccount,
   pairing,
   onClose,
 }: {
@@ -526,6 +522,7 @@ export function SettingsDialog({
   accountsError?: string;
   onLoadAccounts?: () => void;
   onLinkAccount?: (login: DiscoveredAccount, label: string) => void;
+  onUpdateAccount?: (account: AccountItem, change: { label?: string; remove?: boolean }) => void;
   /** A self-contained "PAIR A PHONE" surface mounts here. */
   pairing?: ReactNode;
   onClose?: () => void;
@@ -572,6 +569,8 @@ export function SettingsDialog({
           pending={accountsPending === true}
           error={accountsError}
           onLink={onLinkAccount}
+          onUpdate={onUpdateAccount}
+          onRefresh={onLoadAccounts}
         />
         <div className="dfConsoleSidebar__section" aria-label="PAIRING">
           <h3>PAIRING</h3>
@@ -592,12 +591,16 @@ function AccountsSection({
   pending,
   error,
   onLink,
+  onUpdate,
+  onRefresh,
 }: {
   state: StateView | undefined;
   accounts?: readonly DiscoveredAccount[];
   pending: boolean;
   error?: string;
   onLink?: (login: DiscoveredAccount, label: string) => void;
+  onUpdate?: (account: AccountItem, change: { label?: string; remove?: boolean }) => void;
+  onRefresh?: () => void;
 }) {
   const [labels, setLabels] = useState<Record<string, string>>({});
   const linked = state === undefined ? [] : [...state.accounts.values()];
@@ -605,24 +608,36 @@ function AccountsSection({
   return (
     <div className="dfConsoleSidebar__section" aria-label="ACCOUNTS">
       <h3>ACCOUNTS</h3>
+      <p>The factory finds local logins in .codex* and .claude* folders in your home directory. Agent configuration chooses which linked login and model to use.</p>
+      <details><summary>ADD ACCOUNT</summary><p>Sign in with your provider CLI on this Mac. For another login, use a separate profile directory named .codex-name or .claude-name in your home folder. Then refresh and link it below.</p></details>
+      <button type="button" disabled={pending || onRefresh === undefined} onClick={onRefresh}>{pending ? "REFRESHING" : "REFRESH ACCOUNTS"}</button>
       {error === undefined ? null : <p className="dfFactoryConsole__terminalError" role="alert">{EDIT_ERRORS.get(error) ?? "THE FACTORY REFUSED THIS"}</p>}
       {linked.length === 0 ? <p className="dfFactoryConsole__empty">NO ACCOUNTS LINKED</p> : (
         <ul className="dfFactoryConsole__list">
           {linked.map((account) => {
             const login = (accounts ?? []).find((candidate) => candidate.linked_id === account.id);
-            const identity = [login?.email, login?.organization, login?.default_model].filter((part) => part !== undefined && part !== "").join(" · ");
+            const identity = [login?.email, login?.organization].filter((part) => part !== undefined && part !== "").join(" · ");
             return (
-              <li key={account.id} className="dfConsoleSidebar__account">
+              <li key={`${account.id}:${account.revision}`} className="dfConsoleSidebar__account">
                 <p className="dfConsoleRow__title">{account.label} · {account.provider}</p>
-                <p className="dfFactoryConsole__eyebrow">{identity === "" ? account.home : identity}</p>
+                <p>{identity === "" ? account.home : identity}</p>
+                {login?.default_model ? <p className="dfConsoleSidebar__inherit">CLI default: {login.default_model}</p> : null}
+                <div className="dfConsoleSidebar__taskActions">
+                  <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-linked-account-${account.id}`}>Label for {account.label}</label>
+                  <input id={`df-linked-account-${account.id}`} value={labels[`${account.id}:${account.revision}`] ?? account.label} disabled={pending || onUpdate === undefined} onChange={(event) => { const value = event.currentTarget.value; setLabels((current) => ({ ...current, [`${account.id}:${account.revision}`]: value })); }} />
+                  <button type="button" disabled={pending || onUpdate === undefined || !(labels[`${account.id}:${account.revision}`] ?? account.label).trim() || (labels[`${account.id}:${account.revision}`] ?? account.label) === account.label} onClick={() => onUpdate?.(account, { label: labels[`${account.id}:${account.revision}`] ?? account.label })}>SAVE LABEL</button>
+                  <button type="button" disabled={pending || onUpdate === undefined || [...(state?.agents.values() ?? [])].some((agent) => agent.account_id === account.id)} onClick={() => onUpdate?.(account, { remove: true })}>UNLINK</button>
+                </div>
+                {[...(state?.agents.values() ?? [])].some((agent) => agent.account_id === account.id) ? <p className="dfConsoleSidebar__inherit">In use by an agent. Choose another account in its configuration before unlinking.</p> : null}
               </li>
             );
           })}
         </ul>
       )}
-      <h3>DISCOVERED</h3>
+      <p className="dfConsoleSidebar__inherit">Unlinking removes the factory entry only; it keeps the provider login and credentials.</p>
+      <h3>AVAILABLE TO LINK</h3>
       {accounts === undefined ? <p className="dfFactoryConsole__empty">{pending ? "LOOKING" : "NOT LOOKED YET"}</p>
-        : unlinked.length === 0 ? <p className="dfFactoryConsole__empty">EVERY LOGIN IS LINKED</p> : (
+        : unlinked.length === 0 ? <p className="dfFactoryConsole__empty">NO UNLINKED LOGINS FOUND</p> : (
         <ul className="dfFactoryConsole__list">
           {unlinked.map((login) => (
             <li key={login.home} className="dfConsoleSidebar__account">

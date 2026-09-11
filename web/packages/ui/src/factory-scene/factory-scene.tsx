@@ -23,8 +23,15 @@ export type FactorySceneProps = Readonly<{
   workers: readonly SceneWorker[];
   /** Current changed locations omitted by the bounded room map. */
   omittedLocations?: number;
+  /** The selected agent is highlighted without changing its deterministic placement. */
+  selectedWorkerId?: string;
   /** Pointer convenience only; the AGENTS list is the keyboard path. */
   onSelectWorker?: (workerId: string) => void;
+}>;
+
+export type AgentSpriteProps = Readonly<{
+  agent: Pick<SceneWorker, "id" | "name" | "role" | "provider">;
+  activity: SceneWorker["activity"];
 }>;
 
 const FRAME = spriteAtlas.frame;
@@ -39,9 +46,18 @@ function Frame({ name, x, y, className }: { name: string; x: number; y: number; 
   return <use href={`#df-frame-${name}`} x={x} y={y} width={FRAME} height={FRAME} className={className} />;
 }
 
+/** A standalone crop of the shared sheet for lists and detail panels. */
+export function AgentSprite({ agent, activity }: AgentSpriteProps) {
+  const frame = workerFrame({ ...agent, activity });
+  const cell = spriteAtlas.frames[frame as keyof typeof spriteAtlas.frames];
+  return <svg viewBox={`0 0 ${FRAME} ${FRAME}`} role="img" aria-label={`${agent.name}, ${agent.role}, ${activity}`} className="dfAgentSprite">
+    <image href={spriteSheet} x={-cell.x} y={-cell.y} width={spriteSheetSize.width} height={spriteSheetSize.height} style={{ imageRendering: "pixelated" }} />
+  </svg>;
+}
+
 /** A disposable SVG projection of topology and current factory state. */
-export function FactoryScene({ topology, workers, omittedLocations = 0, onSelectWorker }: FactorySceneProps) {
-  const layout = layoutScene(topology, workers.filter((worker) => worker.location !== "working" && worker.location !== "unobserved").length);
+export function FactoryScene({ topology, workers, omittedLocations = 0, selectedWorkerId, onSelectWorker }: FactorySceneProps) {
+  const layout = layoutScene(topology, workers.filter((worker) => worker.location !== "working" && worker.location !== "control-room" && worker.location !== "unobserved").length);
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
@@ -128,6 +144,7 @@ export function FactoryScene({ topology, workers, omittedLocations = 0, onSelect
         const room = placement.roomId === undefined ? undefined : nodes.get(placement.roomId);
         const location = worker.location === "working"
           ? placement.area === "room" ? `working near observed changes in ${room?.label}` : worker.nodeId === undefined ? `working near observed changes in ${worker.locationLabel}; room map at capacity` : `working near observed changes in ${worker.locationLabel}; worker area at capacity`
+          : worker.location === "control-room" ? placement.area === "room" ? `supervising from assigned control room in ${room?.label}` : `supervising from assigned control room in ${worker.locationLabel}; room map at capacity`
           : worker.location === "unobserved" ? "working; location not yet observed"
           : worker.location === "last-observed" && worker.locationLabel !== undefined ? `last observed near changes in ${worker.locationLabel}`
           : worker.paused ? "paused in resting area" : "ready in resting area";
@@ -140,10 +157,11 @@ export function FactoryScene({ topology, workers, omittedLocations = 0, onSelect
             transform={`translate(${placement.x} ${placement.y})`}
             role="img"
             aria-label={`${worker.name}, ${worker.role}, ${worker.activity}, ${location}`}
-            className="dfFactoryScene__worker"
+            className={worker.id === selectedWorkerId ? "dfFactoryScene__worker dfFactoryScene__worker--selected" : "dfFactoryScene__worker"}
             {...(onSelectWorker === undefined ? {} : { onClick: () => onSelectWorker(worker.id), style: { cursor: "pointer" } })}
           >
             <title>{`${worker.name} · ${location}`}</title>
+            {worker.id === selectedWorkerId ? <circle className="dfFactoryScene__selection" cx="0" cy="0" r="12" /> : null}
             <Frame name={frame} x={-8} y={-8} />
           </g>
         );

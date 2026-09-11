@@ -562,6 +562,21 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			break
 		}
 		payload, err = browserprotocol.EncodeAccountLinkResult(frame.ID, result)
+	case browserprotocol.AccountUpdate:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.UpdateAccount(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.AccountID != body.AccountID || result.Revision != body.ExpectedRevision+1 {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeAccountUpdateResult(frame.ID, result)
 	case browserprotocol.RemoteInvite:
 		if current.server.taskBackend == nil {
 			err = ErrUnauthorized

@@ -86,7 +86,6 @@ export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}
   const terminal = agentTerminal === undefined || controller === undefined ? undefined : (
     <TerminalPanel
       terminal={agentTerminal}
-      onClose={() => controller.clearAgentTerminal()}
     >
       <TerminalContent terminal={agentTerminal} controller={controller} />
     </TerminalPanel>
@@ -117,6 +116,7 @@ export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}
       onCloseHumanRequest={() => owner.current?.clearHumanRequest()}
       onLoadAccounts={() => { void owner.current?.loadAccounts(); }}
       onLinkAccount={(login, label) => { void owner.current?.linkAccount({ provider: login.provider, home: login.home, label }); }}
+      onUpdateAccount={(account, change) => { void owner.current?.updateAccount({ accountId: account.id, expectedRevision: account.revision, ...change }); }}
       onInviteRemote={() => { void owner.current?.inviteRemote(); }}
       onDismissRemoteInvite={() => owner.current?.dismissRemoteInvite()}
       terminalContent={terminal}
@@ -127,28 +127,14 @@ export function FactoryApp({ onStatusChange, browserPort }: FactoryAppProps = {}
 /** The selected agent's terminal is a sidebar, not a replacement screen. */
 export function TerminalPanel({
   terminal,
-  onClose,
   children,
 }: {
   terminal: FactoryTerminalView;
-  onClose: () => void;
   children: ReactNode;
 }) {
   return (
     <section className="dfFactoryConsole__terminalPanel" aria-label={`Agent console for ${terminal.agentName}`}>
-      <div className="dfFactoryConsole__terminalHeading">
-        <p className="dfFactoryConsole__terminalAgent">
-          {terminal.agentName}{terminal.taskTitle === undefined ? "" : ` · ${terminal.taskTitle}`}
-        </p>
-        <button
-          type="button"
-          disabled={terminal.phase === "closing" || terminal.phase === "closed"}
-          onClick={onClose}
-          title="close this agent console; running work continues"
-        >
-          CLOSE
-        </button>
-      </div>
+      {terminal.taskTitle === undefined ? null : <p className="dfFactoryConsole__terminalAgent">{terminal.taskTitle}</p>}
       {terminal.error === undefined ? null : (
         <p className="dfFactoryConsole__terminalError" role="alert">
           {terminal.phase === "ready" && !terminal.writable && terminal.error.code === "stale"
@@ -203,12 +189,7 @@ function AgentIdleTools({ terminal, controller }: { terminal: FactoryTerminalVie
 }
 
 function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView; controller: FactoryAppController }) {
-  const [instruction, setInstruction] = useState("");
   const pending = terminal.controlPending !== undefined;
-  const submit = async (action: "message" | "replace") => {
-    if (pending || !terminal.controlReady || instruction.trim() === "") return;
-    if (await controller.controlAgent(action, instruction)) setInstruction("");
-  };
   const unknown = terminal.controlStatus === "delivery_unknown" || terminal.controlError?.code === "connection";
   const refused = terminal.controlStatus === "rejected" || (terminal.controlError !== undefined && ["invalid_request", "unauthorized", "stale", "too_large", "rate_limited", "not_found", "unsupported"].includes(terminal.controlError.code));
   const status = terminal.controlStatus === "stopping"
@@ -223,14 +204,10 @@ function AgentSteering({ terminal, controller }: { terminal: FactoryTerminalView
   if (!terminal.controlReady) return <p className="dfFactoryConsole__instructionState">{terminal.finishing ? "FINISHING" : "STARTING"}</p>;
   return (
     <section className="dfFactoryConsole__steering" aria-label={`Controls for ${terminal.agentName}`}>
-      <label className="dfFactoryConsole__visuallyHidden" htmlFor={`df-steer-${terminal.agentId}`}>Message the current session for {terminal.agentName}</label>
-      <textarea id={`df-steer-${terminal.agentId}`} rows={2} value={instruction} disabled={pending} placeholder="Message the current session…" onChange={(event) => setInstruction(event.target.value)} />
       <div className="dfFactoryConsole__instructionActions">
         {status === undefined ? null : <span role={unknown || terminal.controlStatus === "rejected" ? "alert" : "status"}>{status}</span>}
-        <button type="button" disabled={pending || instruction.trim() === ""} onClick={() => { void submit("message"); }}>{pending ? "SENDING" : "MESSAGE"}</button>
         <button type="button" disabled={pending} onClick={() => { void controller.controlAgent("interrupt"); }}>INTERRUPT</button>
         <button type="button" disabled={pending} onClick={() => { void controller.controlAgent("stop"); }}>STOP CURRENT</button>
-        <button type="button" disabled={pending || instruction.trim() === ""} onClick={() => { void submit("replace"); }}>STOP CURRENT / START NEW</button>
       </div>
       <TaskHistory terminal={terminal} onRefresh={() => controller.loadTaskHistory()} onLoadConversation={() => controller.loadTaskDetail()} onLoadOlderConversation={() => controller.loadOlderTaskConversation()} />
     </section>

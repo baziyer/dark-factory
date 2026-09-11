@@ -138,7 +138,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount" | "updateAccount">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -718,6 +718,10 @@ export class FactoryAppController {
   /** Link one discovered login, then reread discovery so it shows as linked. */
   linkAccount(request: { provider: "claude_code" | "codex"; home: string; label: string }): Promise<void> {
     return this.#settings.linkAccount(request);
+  }
+
+  updateAccount(request: Parameters<BrowserSession["updateAccount"]>[0]): Promise<void> {
+    return this.#settings.updateAccount(request);
   }
 
   /** The mint is never retried: a failure is reported and the operator asks again. */

@@ -56,27 +56,15 @@ try {
   assert.ok(counters.terminals >= 1, "selected public terminal must construct xterm");
   assert.equal(counters.terminals - counters.disposes, 1, "one selected terminal must remain live before unmount");
 
-  const close = renderer.root.findAllByType("button").find((button) => button.props.children === "CLOSE");
-  assert.ok(close, "selected terminal must expose an explicit close action");
-  await act(async () => {
-    close.props.onClick();
-  });
-  await waitFor(() => counters.detaches === 1 && counters.terminals === counters.disposes, "terminal did not detach and unmount");
-  // Closing clears this workbench; selecting the persistent roster row opens
-  // one fresh terminal, and this teardown is not reported as a fault.
-  assert.equal(renderer.root.findAll((node) => node.props?.["aria-label"] === "Agent console for Strict Builder").length, 0);
-  assert.equal(renderer.root.findAll((node) => node.props?.role === "alert").length, 0, "a deliberate close raises no error");
-  assert.equal(counters.detaches, 1, "close must detach exactly one terminal observer");
-  assert.equal(counters.sessionCloses, 1, "terminal close must preserve the active browser session");
-  assert.equal(counters.terminals, counters.disposes, "closed terminal surface must unmount");
-
-  await open();
-  await waitFor(() => counters.acquires === 2 && counters.terminals - counters.disposes === 1, "terminal did not reopen");
-  assert.equal(counters.resolves, 2);
-  assert.equal(counters.opens, 2);
-  assert.equal(counters.attaches, 2);
-  assert.equal(counters.acquires, 2);
-  assert.equal(counters.terminals - counters.disposes, 1, "reopen must create one fresh terminal on the same session");
+  for (const label of ["CONFIG", "TERMINAL"]) {
+    const tab = renderer.root.findAllByType("button").find((button) => button.props.children === label);
+    assert.ok(tab);
+    await act(async () => { tab.props.onClick(); });
+  }
+  assert.equal(counters.opens, 1, "switching configuration preserves the terminal session");
+  assert.equal(counters.acquires, 1, "switching configuration preserves terminal input ownership");
+  assert.equal(counters.detaches, 0);
+  assert.equal(counters.terminals - counters.disposes, 1);
 
   await act(async () => { renderer.unmount(); });
   assert.equal(counters.terminals, counters.disposes, "unmount must dispose the selected xterm");

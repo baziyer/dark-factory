@@ -333,6 +333,18 @@
       "fixture": "account_link_result.json"
     },
     {
+      "type": "ACCOUNT_UPDATE",
+      "direction": "client",
+      "id": "required",
+      "fixture": "account_update.json"
+    },
+    {
+      "type": "ACCOUNT_UPDATE_RESULT",
+      "direction": "server",
+      "id": "required",
+      "fixture": "account_update_result.json"
+    },
+    {
       "type": "REMOTE_INVITE",
       "direction": "client",
       "id": "required",
