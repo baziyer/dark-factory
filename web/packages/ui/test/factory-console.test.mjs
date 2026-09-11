@@ -974,7 +974,7 @@ test("settings edits project limits as future runs with an explicit unlimited ch
   assert.match(markup, /UNLIMITED RUNS/);
   assert.match(markup, /value="0"/);
   assert.match(markup, /MAX SECONDS PER RUN \(0 = UNLIMITED\)/);
-  assert.match(markup, /UNATTENDED ISSUE INTAKE REQUIRES BOTH LIMITS/);
+  assert.match(markup, /AUTONOMOUS GITHUB ISSUE WORK REQUIRES BOTH LIMITS/);
 });
 
 test("settings rejects a blank per-run duration before saving", async () => {
