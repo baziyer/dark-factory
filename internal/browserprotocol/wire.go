@@ -1178,6 +1178,8 @@ func rejectNullMembers(kind MessageType, body []byte) error {
 		fields = []string{"session_id", "exit_code", "exit_signal", "aborted"}
 	case TypeAgentUpdate:
 		fields = []string{"appearance", "model", "reasoning_effort", "account_id", "paused", "idle_policy", "idle_after_seconds", "idle_instruction", "idle_run_budget"}
+	case TypeProjectLimits:
+		fields = []string{"run_budget", "max_run_seconds"}
 	case TypeTaskEnqueue:
 		fields = []string{"mode"}
 	case TypeTaskUpdate:

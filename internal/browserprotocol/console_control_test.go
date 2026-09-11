@@ -139,3 +139,23 @@ func TestRunPathsBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectLimitsRequireExplicitValues(t *testing.T) {
+	const prefix = `{"type":"PROJECT_LIMITS","id":"x","body":{"project_id":"02020202020202020202020202020202","expected_revision":"7"`
+	for name, fields := range map[string]string{
+		"both omitted":     "",
+		"budget omitted":   `,"max_run_seconds":900`,
+		"duration omitted": `,"run_budget":"12"`,
+		"budget null":      `,"run_budget":null,"max_run_seconds":900`,
+		"duration null":    `,"run_budget":"12","max_run_seconds":null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeClientControl([]byte(prefix + fields + `}}`)); err != ErrMalformed {
+				t.Fatalf("incomplete limits accepted: %v", err)
+			}
+		})
+	}
+	if _, err := DecodeClientControl([]byte(prefix + `,"run_budget":"0","max_run_seconds":0}}`)); err != nil {
+		t.Fatalf("explicit unlimited refused: %v", err)
+	}
+}
