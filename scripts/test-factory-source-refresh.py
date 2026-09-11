@@ -111,7 +111,7 @@ class SourceRefreshTest(unittest.TestCase):
             (worker / 'untracked').write_text('keep')
             (writer / 'base').write_text('two')
             subprocess.run(['git', '-C', str(writer), 'commit', '-am', 'two'], check=True, capture_output=True)
-            subprocess.run(['git', '-C', str(writer), 'push'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(writer), 'push', 'origin', 'HEAD:main'], check=True, capture_output=True)
             target = refresh.fetch_target(worker, 'main', os.environ.copy())
             self.assertNotEqual(before, target)
             self.assertEqual(before, subprocess.run(['git', '-C', str(worker), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip())
