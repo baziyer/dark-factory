@@ -3,9 +3,11 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"github.com/dark-factory-build/dark-factory/internal/browser"
+	"github.com/dark-factory-build/dark-factory/internal/install"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
 	"github.com/dark-factory-build/dark-factory/internal/relayhost"
 )
@@ -77,6 +79,9 @@ func (daemon *Daemon) DialRelay(ctx context.Context, relayOrigin, home string, b
 		return nil, browser.ErrUnauthorized
 	}
 	daemon.relay = runtime
+	// Alert subscriptions live beside this relay's node key, so they are
+	// bound to the one home that owns the relay.
+	daemon.push = newPushStore(filepath.Join(home, install.RelayDirectoryName))
 	daemon.browserMu.Unlock()
 	return runtime, nil
 }

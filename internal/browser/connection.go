@@ -603,6 +603,16 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			break
 		}
 		payload, err = browserprotocol.EncodeRemoteInviteResult(frame.ID, invitation)
+	case browserprotocol.PushSubscribe:
+		if current.server.taskBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		if backendErr := current.server.taskBackend.SubscribePush(ctx, current.principal.ClientID, body); backendErr != nil {
+			err = backendErr
+			break
+		}
+		payload, err = browserprotocol.EncodePushSubscribeResult(frame.ID, browserprotocol.PushSubscribeResult{})
 	case browserprotocol.TerminalAttach:
 		if current.attachment != nil || current.server.terminalBackend == nil {
 			err = ErrUnauthorized

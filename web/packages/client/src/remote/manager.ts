@@ -1,4 +1,4 @@
-import type { HumanRequestItem } from "../control.js";
+import type { HumanRequestItem, PushSubscribeBody } from "../control.js";
 import type { ProtocolError } from "../errors.js";
 import type { StateView } from "../state.js";
 import {
@@ -122,6 +122,36 @@ export class RemoteManager {
     this.#changed();
   }
 
+  /** The alert subscription this device holds, if it has turned alerts on. */
+  push(): PushSubscribeBody | undefined {
+    for (const entry of this.#entries.values()) if (entry.binding.push !== undefined) return { ...entry.binding.push };
+    return undefined;
+  }
+
+  /**
+   * Records this device's alert subscription on every binding and hands it to
+   * every factory that is connected now; the rest receive it as they connect.
+   * Undefined turns alerts off on this device, though a factory that already
+   * holds the subscription keeps pushing until the service refuses it.
+   */
+  async setPush(subscription: PushSubscribeBody | undefined): Promise<void> {
+    if (this.#closed) throw new SessionError("closed");
+    for (const entry of this.#entries.values()) {
+      if (subscription === undefined) delete entry.binding.push; else entry.binding.push = { ...subscription };
+      if (entry.binding.key !== undefined) await this.#store.put(entry.binding);
+      this.#sendPush(entry);
+    }
+    this.#changed();
+  }
+
+  #sendPush(entry: Entry): void {
+    const subscription = entry.binding.push;
+    if (subscription === undefined || entry.status !== "ready") return;
+    // A refusal is the factory's to make and nothing this device can repair:
+    // a daemon that predates alerts says unsupported and the session lives on.
+    void entry.client?.session?.subscribePush(subscription).catch(() => { /* reported by nothing; the next connection tries again */ });
+  }
+
   bindings(): ReadonlyArray<RemoteBinding> {
     return Object.freeze([...this.#entries.values()].map((entry) => ({ ...entry.binding })));
   }
@@ -173,6 +203,9 @@ export class RemoteManager {
   async pair(invitation: RemoteInvitation): Promise<RemoteBinding> {
     if (this.#closed) throw new SessionError("closed");
     const nodeId = invitation.node;
+    // A device that already asks to be woken asks every factory it pairs with,
+    // including the one it is pairing again: read before the old binding goes.
+    const push = this.push();
     const previous = this.#entries.get(nodeId);
     if (previous !== undefined) {
       this.#disconnect(previous);
@@ -187,6 +220,7 @@ export class RemoteManager {
       host: invitation.host,
       daemonId: invitation.daemon,
     };
+    if (push !== undefined) binding.push = push;
     const entry: Entry = { binding, status: "pairing", generation: 0 };
     this.#entries.set(nodeId, entry);
     const generation = ++entry.generation;
@@ -392,6 +426,7 @@ export class RemoteManager {
         entry.status = "ready";
         entry.error = undefined;
         entry.dial = undefined;
+        this.#sendPush(entry);
         // A pairing that reached the factory but never received the relay's
         // next ticket could not be used again, so it is refused here rather
         // than left waiting on a frame that is not coming.

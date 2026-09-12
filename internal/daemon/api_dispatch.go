@@ -35,7 +35,9 @@ type Daemon struct {
 	// relay is the optional outbound relay connector. It is a client of the
 	// browser listener above, not a second authority, so it shares that
 	// listener's lifecycle gate.
-	relay              *RelayRuntime
+	relay *RelayRuntime
+	// push holds device alert subscriptions once a relay home is open.
+	push               *pushStore
 	browserClientGates *browserClientGates
 
 	// topologies holds the last regenerable topology per project for a short
@@ -808,6 +810,11 @@ func (daemon *Daemon) requestHuman(ctx context.Context, call api.Call) api.Reply
 	}, at)
 	if err != nil {
 		return newErrorReply(remoteErrorCode(err))
+	}
+	// A replayed idempotency key returns the earlier question; only a question
+	// that opened just now wakes the phones.
+	if request.CreatedAt == at {
+		go daemon.notifyPush(context.WithoutCancel(ctx), pushClient)
 	}
 	return daemon.mutation(ctx, request.Revision)
 }

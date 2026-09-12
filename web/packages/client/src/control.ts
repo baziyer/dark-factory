@@ -135,6 +135,19 @@ export type TerminalExitBody = { session_id: string; exit_code: number; exit_sig
 export type TerminalResetBody = { session_id: string; floor: bigint; head: bigint };
 export type RemoteInviteBody = Record<string, never>;
 export type RemoteInviteResultBody = { link: string; expires_at_ms: bigint; svg: string };
+/** One device's Web Push subscription plus the VAPID key pair it minted for it, base64url without padding. */
+export type PushSubscribeBody = { endpoint: string; public_key: string; private_key: string };
+export type PushSubscribeResultBody = Record<string, never>;
+const MAX_PUSH_ENDPOINT_BYTES = 2048;
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+/** The push services behind every browser that can install the remote console; the daemon refuses any other host. */
+const PUSH_SERVICE_HOSTS = new Set(["web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"]);
+function pushServiceEndpoint(endpoint: string): boolean {
+  let url: URL;
+  try { url = new URL(endpoint); } catch { return false; }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.port !== "") return false;
+  return PUSH_SERVICE_HOSTS.has(url.hostname) || (url.hostname.endsWith(".notify.windows.com") && url.hostname.length > ".notify.windows.com".length);
+}
 
 /** The exact everything-before-the-members of a minted invitation link. */
 const REMOTE_INVITE_LINK_PREFIX = "https://app.darkfactory.build/remote#df_remote&";
@@ -187,6 +200,7 @@ export type ServerControlFrame = HelloFrame | PairResultFrame | AuthResultFrame 
   | { type: "ACCOUNT_UPDATE_RESULT"; id: string; body: AccountUpdateResultBody }
   | { type: "TERMINAL_TARGET"; id: string; body: TerminalTargetBody }
   | { type: "REMOTE_INVITE_RESULT"; id: string; body: RemoteInviteResultBody }
+  | { type: "PUSH_SUBSCRIBE_RESULT"; id: string; body: PushSubscribeResultBody }
   | TerminalServerControlFrame | ErrorFrame;
 export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame | StateWatchFrame | HumanRequestDetailGetFrame
   | { type: "HUMAN_REQUEST_REPLY"; id: string; body: HumanRequestReplyBody }
@@ -206,12 +220,13 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
   | { type: "ACCOUNT_UPDATE"; id: string; body: AccountUpdateBody }
   | { type: "TERMINAL_TARGET_GET"; id: string; body: TerminalTargetGetBody }
   | { type: "REMOTE_INVITE"; id: string; body: RemoteInviteBody }
+  | { type: "PUSH_SUBSCRIBE"; id: string; body: PushSubscribeBody }
   | TerminalControlFrame | ErrorFrame;
 type ControlBody = ClientControlFrame["body"] | ServerControlFrame["body"];
 
 const HEX_BYTES = { daemon_id: 16, boot_id: 16, connection_nonce: 32, challenge: 32, client_id: 16, public_key_sec1: 65, signature: 64 } as const;
-const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "PROJECT_LIMITS", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "ACCOUNT_UPDATE", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "ERROR"];
-const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "PROJECT_LIMITS_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "ACCOUNT_UPDATE_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "ERROR"];
+const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "PROJECT_LIMITS", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "ACCOUNT_UPDATE", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "PUSH_SUBSCRIBE", "ERROR"];
+const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "PROJECT_LIMITS_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "ACCOUNT_UPDATE_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "PUSH_SUBSCRIBE_RESULT", "ERROR"];
 
 export function encodeClientControl(frame: ClientControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "client"))); }
 export function encodePairProve(id: string, body: PairProveBody): string { return encodeClientControl({ type: "PAIR_PROVE", id, body }); }
@@ -235,6 +250,7 @@ export function encodeTerminalLeaseRelease(id: string, body: TerminalLeaseReleas
 export function encodeTerminalResize(id: string, body: TerminalResizeBody): string { return encodeClientControl({ type: "TERMINAL_RESIZE", id, body }); }
 export function encodeTerminalDetach(id: string, body: TerminalDetachBody): string { return encodeClientControl({ type: "TERMINAL_DETACH", id, body }); }
 export function encodeRemoteInvite(id: string, body: RemoteInviteBody): string { return encodeClientControl({ type: "REMOTE_INVITE", id, body }); }
+export function encodePushSubscribe(id: string, body: PushSubscribeBody): string { return encodeClientControl({ type: "PUSH_SUBSCRIBE", id, body }); }
 export function encodeClientError(body: ErrorBody, id?: string): string { return encodeClientControl({ type: "ERROR", ...(id === undefined ? {} : { id }), body }); }
 
 export function encodeServerControl(frame: ServerControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "server"))); }
@@ -261,6 +277,7 @@ export function encodeTerminalEOF(id: string, body: TerminalEOFBody): string { r
 export function encodeTerminalExit(id: string, body: TerminalExitBody): string { return encodeServerControl({ type: "TERMINAL_EXIT", id, body }); }
 export function encodeTerminalReset(id: string, body: TerminalResetBody): string { return encodeServerControl({ type: "TERMINAL_RESET", id, body }); }
 export function encodeRemoteInviteResult(id: string, body: RemoteInviteResultBody): string { return encodeServerControl({ type: "REMOTE_INVITE_RESULT", id, body }); }
+export function encodePushSubscribeResult(id: string, body: PushSubscribeResultBody): string { return encodeServerControl({ type: "PUSH_SUBSCRIBE_RESULT", id, body }); }
 export function encodeServerError(body: ErrorBody, id?: string): string { return encodeServerControl({ type: "ERROR", ...(id === undefined ? {} : { id }), body }); }
 export function decodeClientControl(data: string | Uint8Array): ClientControlFrame { return normalizeBoundary(() => decodeControl(data, "client") as ClientControlFrame); }
 export function decodeServerControl(data: string | Uint8Array): ServerControlFrame { return normalizeBoundary(() => decodeControl(data, "server") as ServerControlFrame); }
@@ -436,6 +453,8 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "TERMINAL_EXIT": requireKeys(body, ["session_id", "exit_code", "exit_signal", "aborted"], wire); if (typeof body.aborted !== "boolean") malformed(); { const exit_code = integer(body.exit_code, 0, Number.MAX_SAFE_INTEGER); const exit_signal = integer(body.exit_signal, 0, Number.MAX_SAFE_INTEGER); if (exit_signal !== 0 && exit_code !== 0) malformed(); return { session_id: dynamicID(body.session_id), exit_code, exit_signal, aborted: body.aborted }; }
     case "TERMINAL_RESET": requireKeys(body, ["session_id", "floor", "head"], wire); { const floor = decimal(body.floor, wire); const head = decimal(body.head, wire); if (floor > head) malformed(); return { session_id: dynamicID(body.session_id), floor, head }; }
     case "REMOTE_INVITE": requireKeys(body, [], wire); return {};
+    case "PUSH_SUBSCRIBE": requireKeys(body, ["endpoint", "public_key", "private_key"], wire); { const endpoint = boundedText(body.endpoint, 9, MAX_PUSH_ENDPOINT_BYTES); if (/[\u0000-\u001f\u007f]/.test(endpoint) || !pushServiceEndpoint(endpoint) || typeof body.public_key !== "string" || body.public_key.length !== 87 || !BASE64URL.test(body.public_key) || typeof body.private_key !== "string" || body.private_key.length === 0 || body.private_key.length > 512 || !BASE64URL.test(body.private_key)) malformed(); return { endpoint, public_key: body.public_key, private_key: body.private_key }; }
+    case "PUSH_SUBSCRIBE_RESULT": requireKeys(body, [], wire); return {};
     case "REMOTE_INVITE_RESULT": requireKeys(body, ["link", "expires_at_ms", "svg"], wire); { const link = boundedText(body.link, 1, MAX_REMOTE_INVITE_LINK_BYTES); const svg = boundedText(body.svg, 1, MAX_REMOTE_INVITE_SVG_BYTES); if (!link.startsWith(REMOTE_INVITE_LINK_PREFIX) || /[\u0000-\u001f\u007f]/.test(link) || !svg.startsWith("<svg")) malformed(); return { link, expires_at_ms: decimal(body.expires_at_ms, wire, true), svg }; }
     case "ERROR": requireKeys(body, ["code", "retryable"], wire); if (typeof body.code !== "string" || !(ERROR_CODES as readonly string[]).includes(body.code) || typeof body.retryable !== "boolean") malformed(); return { code: body.code as ErrorCode, retryable: body.retryable };
   }

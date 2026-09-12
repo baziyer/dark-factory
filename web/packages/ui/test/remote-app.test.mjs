@@ -84,10 +84,13 @@ function fakeSession(script = {}) {
  * lists cannot silently disagree.
  */
 function fakeManager(factories = [], sessions = new Map()) {
-  const calls = { start: 0, select: [], pair: [], forget: [], forgetDevice: 0, close: 0, options: [] };
+  const calls = { start: 0, select: [], pair: [], forget: [], forgetDevice: 0, close: 0, options: [], setPush: [] };
   const manager = {
     calls,
     sessions,
+    pushRecord: undefined,
+    push() { return manager.pushRecord; },
+    async setPush(subscription) { calls.setPush.push(subscription); manager.pushRecord = subscription; manager.onChange(); },
     factories: () => manager.list,
     list: factories,
     selectedId: factories[0]?.nodeId,
@@ -690,4 +693,33 @@ test("the remote stylesheet stays legible and thumb-sized on one phone column", 
 test("the remote console imports no terminal machinery at all", () => {
   const source = readFileSync(new URL("../src/remote/remote-app.tsx", import.meta.url), "utf8");
   assert.equal(/xterm|TerminalController|terminal-controller|openTerminal|dangerouslySetInnerHTML/i.test(source), false);
+});
+
+test("alerts turn on through the host's subscription and off with the device", async () => {
+  const manager = fakeManager([northFactory()]);
+  const subscription = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+  let attempts = 0;
+  const subscribePush = async () => { attempts += 1; if (attempts === 1) throw new Error("ALERTS WERE REFUSED"); return subscription; };
+  await withApp(props(manager, { subscribePush }), async (renderer) => {
+    assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*OFF/s);
+    await act(async () => { button(renderer, "dfRemote__alertsOn").props.onClick(); });
+    await settle();
+    assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS WERE REFUSED/);
+    assert.deepEqual(manager.calls.setPush, []);
+
+    await act(async () => { button(renderer, "dfRemote__alertsOn").props.onClick(); });
+    await settle();
+    assert.deepEqual(manager.calls.setPush, [subscription]);
+    assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*ON/s);
+    assert.equal(buttons(renderer, "dfRemote__alertsOn").length, 0, "one subscription per device");
+
+    // The destructive control sits last on the page, not first.
+    const all = allButtons(renderer);
+    assert.ok(classNames(all.at(-1).props.className).includes("dfRemote__forgetDevice"));
+  });
+
+  await withApp(props(fakeManager([])), (renderer) => {
+    assert.equal(buttons(renderer, "dfRemote__forgetDevice").length, 0, "nothing to forget on an empty device");
+    assert.match(textOf(renderer), /Add to Home Screen/);
+  });
 });

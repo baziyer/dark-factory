@@ -369,6 +369,18 @@
       "fixture": "remote_invite_result.json"
     },
     {
+      "type": "PUSH_SUBSCRIBE",
+      "direction": "client",
+      "id": "required",
+      "fixture": "push_subscribe.json"
+    },
+    {
+      "type": "PUSH_SUBSCRIBE_RESULT",
+      "direction": "server",
+      "id": "required",
+      "fixture": "push_subscribe_result.json"
+    },
+    {
       "type": "ERROR",
       "direction": "both",
       "id": "optional",

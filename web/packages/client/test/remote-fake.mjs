@@ -8,6 +8,7 @@ import {
   encodeAuthResult,
   encodeHello,
   encodePairResult,
+  encodeServerControl,
   encodeStateSnapshot,
 } from "../dist/src/index.js";
 
@@ -127,6 +128,7 @@ export class FakeFactory {
     if (frame.type === "PAIR_PROVE") this.#prove(socket, encodePairResult(frame.id, { client_id: this.clientId, capabilities: this.capabilities }));
     if (frame.type === "AUTH_PROVE") this.#prove(socket, encodeAuthResult(frame.id, { client_id: this.clientId, capabilities: this.capabilities }));
     if (frame.type === "STATE_GET") socket.emit(encodeStateSnapshot(frame.id, this.snapshot));
+    if (frame.type === "PUSH_SUBSCRIBE") socket.emit(encodeServerControl({ type: "PUSH_SUBSCRIBE_RESULT", id: frame.id, body: {} }));
   }
 
   /** The result untouched, then the next control ticket in its own frame. */

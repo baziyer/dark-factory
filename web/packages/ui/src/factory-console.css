@@ -954,7 +954,8 @@ summary.dfConsoleItem__summary { cursor: pointer; }
   background: var(--df-console-background);
   border: 1px solid var(--df-console-rule);
   font: inherit;
-  font-size: 0.9rem;
+  /* 16px: anything smaller makes iOS Safari zoom the page on focus. */
+  font-size: 1rem;
 }
 
 .dfRemote__link,

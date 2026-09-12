@@ -1930,3 +1930,30 @@ test("account update rejects a reply for the wrong account or revision", async (
     assert.equal(session.status, "closed");
   }
 });
+
+test("a push subscription correlates its own result and an old daemon's refusal costs nothing else", async () => {
+  const subscription = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+  const { session, socket } = await openHumanSession();
+  const pending = session.subscribePush(subscription);
+  const frame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(frame.type, "PUSH_SUBSCRIBE");
+  assert.deepEqual(frame.body, subscription);
+  socket.reply(encodeServerControl({ type: "PUSH_SUBSCRIBE_RESULT", id: frame.id, body: {} }));
+  assert.equal(await pending, undefined);
+
+  const refused = session.subscribePush(subscription);
+  const ask = decodeClientControl(socket.sent.at(-1));
+  socket.reply(encodeServerControl({ type: "ERROR", id: ask.id, body: { code: "unsupported", retryable: false } }));
+  await assert.rejects(refused, (error) => error instanceof SessionError && error.code === "unsupported");
+  assert.equal(session.status, "ready");
+
+  // The wire refuses what a push service would never hand out.
+  for (const bad of [
+    { ...subscription, endpoint: "http://web.push.apple.com/QGdfl/abc" },
+    { ...subscription, endpoint: "https://push.example/send/abc" },
+    { ...subscription, endpoint: "https://web.push.apple.com:8443/QGdfl/abc" },
+    { ...subscription, public_key: "not base64url!" },
+    { ...subscription, private_key: "" },
+  ]) await assert.rejects(session.subscribePush(bad));
+  session.close();
+});
