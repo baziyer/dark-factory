@@ -734,10 +734,28 @@ test("a subscription the browser no longer lets this site use reads as OFF", asy
       assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*OFF/s);
       assert.equal(buttons(renderer, "dfRemote__alertsOn").length, 1, "the button comes back so alerts can be turned on again");
     });
+    // Revoked while the app was in the background: the same mount reads OFF
+    // as soon as the page comes back to the foreground.
     globalThis.Notification = { permission: "granted" };
-    await withApp(props(manager), (renderer) => {
-      assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*ON/s);
-    });
+    const listeners = new Map();
+    const previousDocument = globalThis.document;
+    globalThis.document = {
+      addEventListener: (type, listener) => listeners.set(type, listener),
+      removeEventListener: (type) => listeners.delete(type),
+    };
+    try {
+      await withApp(props(manager), async (renderer) => {
+        assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*ON/s);
+        globalThis.Notification = { permission: "denied" };
+        await act(async () => { listeners.get("visibilitychange")(); });
+        await settle();
+        assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*OFF/s);
+        assert.equal(buttons(renderer, "dfRemote__alertsOn").length, 1);
+      });
+      assert.equal(listeners.size, 0, "the listener leaves with the mount");
+    } finally {
+      if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    }
   } finally {
     if (previous === undefined) delete globalThis.Notification; else globalThis.Notification = previous;
   }

@@ -137,6 +137,15 @@ export function RemoteApp(props: RemoteAppProps = {}) {
   }, [props.navigator]);
 
   useEffect(() => {
+    // Permission is read at render; a revocation made while the app was in
+    // the background shows the moment it is brought back.
+    const page = (globalThis as { document?: Pick<Document, "addEventListener" | "removeEventListener"> }).document;
+    if (page?.addEventListener === undefined) return;
+    page.addEventListener("visibilitychange", bump);
+    return () => page.removeEventListener("visibilitychange", bump);
+  }, []);
+
+  useEffect(() => {
     const where = props.location ?? window.location;
     const past = props.history ?? window.history;
     const build = props.managerFactory ?? createRemoteManager;
