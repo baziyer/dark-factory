@@ -1,5 +1,6 @@
 import { malformed, normalizeBoundary, ProtocolError } from "./errors.js";
 import {
+  CONTROL_MANIFEST,
   CAPABILITIES,
   CONTROL_TYPES,
   ERROR_CODES,
@@ -225,8 +226,9 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
 type ControlBody = ClientControlFrame["body"] | ServerControlFrame["body"];
 
 const HEX_BYTES = { daemon_id: 16, boot_id: 16, connection_nonce: 32, challenge: 32, client_id: 16, public_key_sec1: 65, signature: 64 } as const;
-const CLIENT_TYPES: readonly ControlType[] = ["PAIR_PROVE", "AUTH_PROVE", "STATE_GET", "STATE_WATCH", "HUMAN_REQUEST_DETAIL_GET", "HUMAN_REQUEST_REPLY", "HUMAN_REQUEST_CANCEL_RUN", "TASK_ENQUEUE", "AGENT_CONTROL", "TASK_HISTORY_GET", "TASK_DETAIL_GET", "TASK_LIST_GET", "AGENT_UPDATE", "PROJECT_LIMITS", "TASK_UPDATE", "TOPOLOGY_GET", "RUN_PATHS_GET", "ACCOUNTS_DISCOVER", "ACCOUNT_LINK", "ACCOUNT_UPDATE", "TERMINAL_TARGET_GET", "TERMINAL_ATTACH", "TERMINAL_ACK", "TERMINAL_LEASE_ACQUIRE", "TERMINAL_LEASE_RENEW", "TERMINAL_LEASE_RELEASE", "TERMINAL_RESIZE", "TERMINAL_DETACH", "REMOTE_INVITE", "PUSH_SUBSCRIBE", "ERROR"];
-const SERVER_TYPES: readonly ControlType[] = ["HELLO", "PAIR_RESULT", "AUTH_RESULT", "STATE_SNAPSHOT", "STATE_CHANGED", "HUMAN_REQUEST_DETAIL", "HUMAN_REQUEST_REPLY_RESULT", "HUMAN_REQUEST_CANCEL_RUN_RESULT", "TASK_ENQUEUE_RESULT", "AGENT_CONTROL_RESULT", "TASK_HISTORY", "TASK_DETAIL", "TASK_LIST", "AGENT_UPDATE_RESULT", "PROJECT_LIMITS_RESULT", "TASK_UPDATE_RESULT", "TOPOLOGY", "RUN_PATHS", "ACCOUNTS", "ACCOUNT_LINK_RESULT", "ACCOUNT_UPDATE_RESULT", "TERMINAL_TARGET", "TERMINAL_ATTACHED", "TERMINAL_LEASE_RESULT", "TERMINAL_RESIZED", "TERMINAL_DETACHED", "TERMINAL_INPUT_RESULT", "TERMINAL_EOF", "TERMINAL_EXIT", "TERMINAL_RESET", "REMOTE_INVITE_RESULT", "PUSH_SUBSCRIBE_RESULT", "ERROR"];
+// Direction comes from the one manifest; "both" sits on each side.
+const CLIENT_TYPES: readonly ControlType[] = CONTROL_MANIFEST.filter((entry) => entry.direction !== "server").map((entry) => entry.type);
+const SERVER_TYPES: readonly ControlType[] = CONTROL_MANIFEST.filter((entry) => entry.direction !== "client").map((entry) => entry.type);
 
 export function encodeClientControl(frame: ClientControlFrame): string { return normalizeBoundary(() => encode(frame, validateControl(frame, "client"))); }
 export function encodePairProve(id: string, body: PairProveBody): string { return encodeClientControl({ type: "PAIR_PROVE", id, body }); }

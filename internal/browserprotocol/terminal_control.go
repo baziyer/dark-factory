@@ -203,50 +203,7 @@ type TerminalReset struct {
 }
 
 func validTerminalControl(kind MessageType, body any) error {
-	switch value := body.(type) {
-	case *HumanRequestReply:
-		return validTerminalControl(kind, *value)
-	case *HumanRequestReplyResult:
-		return validTerminalControl(kind, *value)
-	case *HumanRequestCancelRun:
-		return validTerminalControl(kind, *value)
-	case *HumanRequestCancelRunResult:
-		return validTerminalControl(kind, *value)
-	case *TerminalAttach:
-		return validTerminalControl(kind, *value)
-	case *TerminalTargetGet:
-		return validTerminalControl(kind, *value)
-	case *TerminalTarget:
-		return validTerminalControl(kind, *value)
-	case *TerminalAttached:
-		return validTerminalControl(kind, *value)
-	case *TerminalAck:
-		return validTerminalControl(kind, *value)
-	case *TerminalLeaseAcquire:
-		return validTerminalControl(kind, *value)
-	case *TerminalLeaseRenew:
-		return validTerminalControl(kind, *value)
-	case *TerminalLeaseRelease:
-		return validTerminalControl(kind, *value)
-	case *TerminalLeaseResult:
-		return validTerminalControl(kind, *value)
-	case *TerminalResize:
-		return validTerminalControl(kind, *value)
-	case *TerminalResized:
-		return validTerminalControl(kind, *value)
-	case *TerminalDetach:
-		return validTerminalControl(kind, *value)
-	case *TerminalDetached:
-		return validTerminalControl(kind, *value)
-	case *TerminalInputResult:
-		return validTerminalControl(kind, *value)
-	case *TerminalEOF:
-		return validTerminalControl(kind, *value)
-	case *TerminalExit:
-		return validTerminalControl(kind, *value)
-	case *TerminalReset:
-		return validTerminalControl(kind, *value)
-	}
+	body = indirect(body)
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	id := func(s string) bool {
 		value, err := fixedHex("id", s, 16)

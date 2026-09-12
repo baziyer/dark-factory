@@ -491,7 +491,7 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 	if err := validateBody(envelope.Type, body); err != nil {
 		return ControlFrame{}, ErrMalformed
 	}
-	return ControlFrame{Type: envelope.Type, ID: id, Body: dereferenceBody(body)}, nil
+	return ControlFrame{Type: envelope.Type, ID: id, Body: indirect(body)}, nil
 }
 
 func decodeID(raw json.RawMessage) (string, bool, bool) {
@@ -559,162 +559,19 @@ func typeAllowed(role senderRole, kind MessageType) bool {
 		kind == TypeAccounts || kind == TypeAccountLinkResult || kind == TypeAccountUpdateResult)
 }
 
-func dereferenceBody(body any) any {
-	switch value := body.(type) {
-	case *Hello:
-		return *value
-	case *PairProve:
-		return *value
-	case *PairResult:
-		return *value
-	case *AuthProve:
-		return *value
-	case *AuthResult:
-		return *value
-	case *StateGet:
-		return *value
-	case *StateSnapshot:
-		return *value
-	case *StateWatch:
-		return *value
-	case *StateChanged:
-		return *value
-	case *HumanRequestDetailGet:
-		return *value
-	case *HumanRequestDetail:
-		return *value
-	case *HumanRequestReply:
-		return *value
-	case *HumanRequestReplyResult:
-		return *value
-	case *HumanRequestCancelRun:
-		return *value
-	case *HumanRequestCancelRunResult:
-		return *value
-	case *AgentControl:
-		return *value
-	case *AgentControlResult:
-		return *value
-	case *TaskHistoryGet:
-		return *value
-	case *TaskHistory:
-		return *value
-	case *TaskListGet:
-		return *value
-	case *TaskList:
-		return *value
-	case *TaskDetailGet:
-		return *value
-	case *TaskDetail:
-		return *value
-	case *TaskEnqueue:
-		return *value
-	case *TaskEnqueueResult:
-		return *value
-	case *AgentUpdate:
-		return *value
-	case *AgentUpdateResult:
-		return *value
-	case *ProjectLimits:
-		return *value
-	case *ProjectLimitsResult:
-		return *value
-	case *TaskUpdate:
-		return *value
-	case *TaskUpdateResult:
-		return *value
-	case *TopologyGet:
-		return *value
-	case *Topology:
-		return *value
-	case *RunPathsGet:
-		return *value
-	case *RunPaths:
-		return *value
-	case *AccountsDiscover:
-		return *value
-	case *Accounts:
-		return *value
-	case *AccountLink:
-		return *value
-	case *AccountLinkResult:
-		return *value
-	case *AccountUpdate:
-		return *value
-	case *AccountUpdateResult:
-		return *value
-	case *TerminalTargetGet:
-		return *value
-	case *TerminalTarget:
-		return *value
-	case *TerminalAttach:
-		return *value
-	case *TerminalAttached:
-		return *value
-	case *TerminalAck:
-		return *value
-	case *TerminalLeaseAcquire:
-		return *value
-	case *TerminalLeaseRenew:
-		return *value
-	case *TerminalLeaseRelease:
-		return *value
-	case *TerminalLeaseResult:
-		return *value
-	case *TerminalResize:
-		return *value
-	case *TerminalResized:
-		return *value
-	case *TerminalDetach:
-		return *value
-	case *TerminalDetached:
-		return *value
-	case *TerminalInputResult:
-		return *value
-	case *TerminalEOF:
-		return *value
-	case *TerminalExit:
-		return *value
-	case *TerminalReset:
-		return *value
-	case *RemoteInvite:
-		return *value
-	case *RemoteInviteResult:
-		return *value
-	case *PushSubscribe:
-		return *value
-	case *PushSubscribeResult:
-		return *value
-	case *Error:
-		return *value
-	default:
-		panic("browser protocol: unhandled body")
+// indirect returns the value a decoded body pointer holds; a value passes
+// through, so validators accept either form.
+func indirect(body any) any {
+	if value := reflect.ValueOf(body); value.Kind() == reflect.Pointer && !value.IsNil() {
+		return value.Elem().Interface()
 	}
+	return body
 }
 
 func unmarshalObject(data []byte, target any) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return fmt.Errorf("%w: object required", ErrMalformed)
-	}
-	if err := validateJSONShape(trimmed, reflect.TypeOf(target)); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(trimmed))
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("%w: %v", ErrMalformed, err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return fmt.Errorf("%w: trailing JSON", ErrMalformed)
-	}
-	return nil
-}
-
-func unmarshalArray(data []byte, target any) error {
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
-		return fmt.Errorf("%w: array required", ErrMalformed)
 	}
 	if err := validateJSONShape(trimmed, reflect.TypeOf(target)); err != nil {
 		return err
@@ -835,115 +692,72 @@ func validateID(id string, kind MessageType) error {
 }
 
 func validateBody(kind MessageType, body any) error {
+	body = indirect(body)
 	switch kind {
 	case TypeHello:
 		value, ok := body.(Hello)
 		if !ok {
-			if pointer, ok := body.(*Hello); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: HELLO body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: HELLO body type", ErrMalformed)
 		}
 		return validateHello(value)
 	case TypePairProve:
 		value, ok := body.(PairProve)
 		if !ok {
-			if pointer, ok := body.(*PairProve); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: PAIR_PROVE body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: PAIR_PROVE body type", ErrMalformed)
 		}
 		return validatePairProve(value)
 	case TypePairResult:
 		value, ok := body.(PairResult)
 		if !ok {
-			if pointer, ok := body.(*PairResult); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: PAIR_RESULT body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: PAIR_RESULT body type", ErrMalformed)
 		}
 		return validatePairResult(value)
 	case TypeAuthProve:
 		value, ok := body.(AuthProve)
 		if !ok {
-			if pointer, ok := body.(*AuthProve); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: AUTH_PROVE body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: AUTH_PROVE body type", ErrMalformed)
 		}
 		return validateAuthProve(value)
 	case TypeAuthResult:
 		value, ok := body.(AuthResult)
 		if !ok {
-			if pointer, ok := body.(*AuthResult); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: AUTH_RESULT body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: AUTH_RESULT body type", ErrMalformed)
 		}
 		return validateAuthResult(value)
 	case TypeStateGet:
 		value, ok := body.(StateGet)
 		if !ok {
-			if pointer, ok := body.(*StateGet); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: STATE_GET body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: STATE_GET body type", ErrMalformed)
 		}
 		return validateStateGet(value)
 	case TypeStateSnapshot:
 		value, ok := body.(StateSnapshot)
 		if !ok {
-			if pointer, ok := body.(*StateSnapshot); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: STATE_SNAPSHOT body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: STATE_SNAPSHOT body type", ErrMalformed)
 		}
 		return validateStateSnapshot(value)
 	case TypeStateWatch:
 		value, ok := body.(StateWatch)
 		if !ok {
-			if pointer, ok := body.(*StateWatch); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: STATE_WATCH body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: STATE_WATCH body type", ErrMalformed)
 		}
 		return validateStateWatch(value)
 	case TypeStateChanged:
 		value, ok := body.(StateChanged)
 		if !ok {
-			if pointer, ok := body.(*StateChanged); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: STATE_CHANGED body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: STATE_CHANGED body type", ErrMalformed)
 		}
 		return validateStateChanged(value)
 	case TypeHumanRequestDetailGet:
 		value, ok := body.(HumanRequestDetailGet)
 		if !ok {
-			if pointer, ok := body.(*HumanRequestDetailGet); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: HUMAN_REQUEST_DETAIL_GET body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: HUMAN_REQUEST_DETAIL_GET body type", ErrMalformed)
 		}
 		return validateHumanRequestDetailGet(value)
 	case TypeHumanRequestDetail:
 		value, ok := body.(HumanRequestDetail)
 		if !ok {
-			if pointer, ok := body.(*HumanRequestDetail); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: HUMAN_REQUEST_DETAIL body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: HUMAN_REQUEST_DETAIL body type", ErrMalformed)
 		}
 		return validateHumanRequestDetail(value)
 	case TypeHumanRequestReply:
@@ -996,11 +810,7 @@ func validateBody(kind MessageType, body any) error {
 	case TypeError:
 		value, ok := body.(Error)
 		if !ok {
-			if pointer, ok := body.(*Error); ok {
-				value = *pointer
-			} else {
-				return fmt.Errorf("%w: ERROR body type", ErrMalformed)
-			}
+			return fmt.Errorf("%w: ERROR body type", ErrMalformed)
 		}
 		return validateError(value)
 	default:

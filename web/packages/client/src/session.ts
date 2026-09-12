@@ -602,15 +602,7 @@ export class BrowserSession {
     if (this.#closed) return;
     this.#closed = true;
     this.#pending.clear();
-    this.#closeTargetPending(new SessionError("closed"));
-    this.#closeTaskPending(new SessionError("closed"));
-    this.#closeAgentControlPending(new SessionError("closed"));
-    this.#closeTaskHistoryPending(new SessionError("closed"));
-    this.#closeTaskDetailPending(new SessionError("closed"));
-    this.#closeConsolePending(new SessionError("closed"));
-    this.#closeInvitePending(new SessionError("closed"));
-    this.#closeAccountPending(new SessionError("closed"));
-    this.#closeHumanPending(new SessionError("closed"));
+    this.#closePending(new SessionError("closed"));
     for (const handle of this.#terminalHandles) handle.terminate(new SessionError("closed"));
     this.#terminalHandles.clear();
     this.#discardState();
@@ -1046,15 +1038,7 @@ export class BrowserSession {
     if (this.#pairing && !(normalized instanceof ProtocolError) && (normalized.code === "connection" || normalized.code === "closed")) normalized = new SessionError("pairing_uncertain");
     this.#closed = true;
     this.#pending.clear();
-    this.#closeTargetPending(normalized);
-    this.#closeTaskPending(normalized);
-    this.#closeAgentControlPending(normalized);
-    this.#closeTaskHistoryPending(normalized);
-    this.#closeTaskDetailPending(normalized);
-    this.#closeConsolePending(normalized);
-    this.#closeInvitePending(normalized);
-    this.#closeAccountPending(normalized);
-    this.#closeHumanPending(normalized);
+    this.#closePending(normalized);
     for (const handle of this.#terminalHandles) handle.terminate(normalized);
     this.#terminalHandles.clear();
     this.#discardState();
@@ -1124,36 +1108,19 @@ export class BrowserSession {
     return result;
   }
 
-  #closeHumanPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#humanPending.values()) pending.reject(error);
-    this.#humanPending.clear();
-  }
 
-  #closeTargetPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#targetPending.values()) pending.reject(error);
-    this.#targetPending.clear();
-  }
 
-  #closeTaskPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#taskPending.values()) pending.reject(error);
-    this.#taskPending.clear();
-  }
 
-  #closeAgentControlPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#agentControlPending.values()) pending.reject(error);
-    this.#agentControlPending.clear();
-  }
 
-  #closeTaskHistoryPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#taskHistoryPending.values()) pending.reject(error);
-    this.#taskHistoryPending.clear();
-  }
 
-  #closeTaskDetailPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#taskDetailPending.values()) pending.reject(error);
-    this.#taskDetailPending.clear();
-  }
 
+  /** Every request still waiting on a result learns the session is gone, once. */
+  #closePending(error: SessionError | ProtocolError): void {
+    for (const pending of [this.#targetPending, this.#taskPending, this.#agentControlPending, this.#taskHistoryPending, this.#taskDetailPending, this.#consolePending, this.#invitePending, this.#pushPending, this.#accountPending, this.#humanPending]) {
+      for (const entry of pending.values()) entry.reject(error);
+      pending.clear();
+    }
+  }
   /** One shape for the console request/result pairs. */
   #consoleRequest<T>(kind: ConsolePending["kind"], entityId: string, expectedRevision: bigint, prefix: string, encode: (id: string) => string): Promise<T> {
     try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
@@ -1184,22 +1151,8 @@ export class BrowserSession {
     pending.resolve(Object.freeze({ projectId: frame.body.project_id, digest: frame.body.digest, sourceRevision: frame.body.source_revision, nodes: Object.freeze(frame.body.nodes.map((node) => Object.freeze({ ...node }))) }) as never);
   }
 
-  #closeConsolePending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#consolePending.values()) pending.reject(error);
-    this.#consolePending.clear();
-  }
 
-  #closeInvitePending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#invitePending.values()) pending.reject(error);
-    this.#invitePending.clear();
-    for (const pending of this.#pushPending.values()) pending.reject(error);
-    this.#pushPending.clear();
-  }
 
-  #closeAccountPending(error: SessionError | ProtocolError): void {
-    for (const pending of this.#accountPending.values()) pending.reject(error);
-    this.#accountPending.clear();
-  }
 
   /** One shape for account requests; updates also correlate the returned revision. */
   #accountRequest<T>(kind: AccountPending["kind"], capability: number, prefix: string, encode: (id: string) => string, correlation?: Pick<AccountPending, "accountId" | "expectedRevision">): Promise<T> {

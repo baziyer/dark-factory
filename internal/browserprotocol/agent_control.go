@@ -121,16 +121,9 @@ func validAgentAction(action string) bool {
 	return action == "message" || action == "interrupt" || action == "stop" || action == "replace"
 }
 func validAgentControl(kind MessageType, body any) error {
+	body = indirect(body)
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	switch v := body.(type) {
-	case *AgentControl:
-		return validAgentControl(kind, *v)
-	case *AgentControlResult:
-		return validAgentControl(kind, *v)
-	case *TaskListGet:
-		return validAgentControl(kind, *v)
-	case *TaskList:
-		return validAgentControl(kind, *v)
 	case TaskListGet:
 		if validateDynamicID(v.AgentID) != nil || (v.BeforeUpdatedAt == nil) != (v.BeforeTaskID == "") || v.BeforeTaskID != "" && validateDynamicID(v.BeforeTaskID) != nil {
 			return bad()
@@ -146,14 +139,6 @@ func validAgentControl(kind MessageType, body any) error {
 			}
 			seen[task.ID] = true
 		}
-	case *TaskHistoryGet:
-		return validAgentControl(kind, *v)
-	case *TaskDetailGet:
-		return validAgentControl(kind, *v)
-	case *TaskDetail:
-		return validAgentControl(kind, *v)
-	case *TaskHistory:
-		return validAgentControl(kind, *v)
 	case AgentControl:
 		if validateDynamicID(v.OperationID) != nil || validateDynamicID(v.TaskID) != nil || validateDynamicID(v.RunID) != nil || v.ExpectedTaskRevision == 0 || v.ExpectedRunRevision == 0 || !validAgentAction(v.Action) {
 			return bad()

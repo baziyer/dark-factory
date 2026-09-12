@@ -31,12 +31,7 @@ func EncodeTaskEnqueueResult(id string, value TaskEnqueueResult) ([]byte, error)
 }
 
 func validTaskControl(kind MessageType, body any) error {
-	if value, ok := body.(*TaskEnqueue); ok {
-		return validTaskControl(kind, *value)
-	}
-	if value, ok := body.(*TaskEnqueueResult); ok {
-		return validTaskControl(kind, *value)
-	}
+	body = indirect(body)
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	id := func(value string) bool {
 		decoded, err := fixedHex("id", value, 16)

@@ -192,40 +192,9 @@ func EncodeAccountUpdateResult(id string, value AccountUpdateResult) ([]byte, er
 }
 
 func validConsoleControl(kind MessageType, body any) error {
+	body = indirect(body)
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	switch value := body.(type) {
-	case *AgentUpdate:
-		return validConsoleControl(kind, *value)
-	case *AgentUpdateResult:
-		return validConsoleControl(kind, *value)
-	case *ProjectLimits:
-		return validConsoleControl(kind, *value)
-	case *ProjectLimitsResult:
-		return validConsoleControl(kind, *value)
-	case *TaskUpdate:
-		return validConsoleControl(kind, *value)
-	case *TaskUpdateResult:
-		return validConsoleControl(kind, *value)
-	case *TopologyGet:
-		return validConsoleControl(kind, *value)
-	case *Topology:
-		return validConsoleControl(kind, *value)
-	case *RunPathsGet:
-		return validConsoleControl(kind, *value)
-	case *RunPaths:
-		return validConsoleControl(kind, *value)
-	case *AccountsDiscover:
-		return validConsoleControl(kind, *value)
-	case *Accounts:
-		return validConsoleControl(kind, *value)
-	case *AccountLink:
-		return validConsoleControl(kind, *value)
-	case *AccountLinkResult:
-		return validConsoleControl(kind, *value)
-	case *AccountUpdate:
-		return validConsoleControl(kind, *value)
-	case *AccountUpdateResult:
-		return validConsoleControl(kind, *value)
 	case AgentUpdate:
 		if validateDynamicID(value.AgentID) != nil || value.ExpectedRevision == 0 ||
 			value.Appearance != nil && validateSpriteAppearance(*value.Appearance) != nil ||
