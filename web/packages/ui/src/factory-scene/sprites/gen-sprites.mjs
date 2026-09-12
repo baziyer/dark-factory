@@ -72,32 +72,40 @@ const hair = [
 ];
 const outfits = [
   grid(`
-    .ouuo.
-    opuupo
-    ououuo
-    ououuo
-    .oooo.
+    ........
+    ..o..o..
+    .ouppuo.
+    ouoppouo
+    ouuppuuo
+    ouuppuuo
+    ouo..ouo
   `),
   grid(`
-    .ommo.
-    oummuo
-    ouuuuo
-    ouppuo
-    .oooo.
+    ........
+    ........
+    .oummuo.
+    opuppupo
+    opuuuupo
+    ouuuuuuo
+    .ouuuuo.
   `),
   grid(`
-    .ouuo.
-    ouoouo
-    ouuuuo
-    ououuo
-    .oooo.
+    ........
+    ........
+    ..ouuo..
+    .ouoouo.
+    .ouuuuo.
+    .ouuuuo.
+    ..oooo..
   `),
   grid(`
-    .ommo.
-    ouppuo
-    ouppuo
-    oummuo
-    .oooo.
+    .ou..uo.
+    ouu..uuo
+    ouummuuo
+    .ouuuuo.
+    oupuupuo
+    ouummuuo
+    .oooooo.
   `),
 ];
 // Stable slots: revise a part in place rather than reorder identities.
@@ -297,15 +305,16 @@ const armPosition = (activity, index) => index === 0 ? [activity === 'waiting' |
 for (const [skinIndex, tone] of skinTones.entries()) for (const activity of activities) add(`person.skin.${skinIndex}.${activity}`, pixels => {
   const colour = rows => rows.map(row => row.replace(/[ab]/g, key => key === 'a' ? tone.skin : tone.shadow));
   draw(pixels, colour(head), 5, 2);
-  arms(activity).forEach((part, index) => draw(pixels, keep(colour(part), [tone.skin, tone.shadow]), ...armPosition(activity, index)));
+  arms(activity).forEach((part, index) => draw(pixels, keep(colour(part).map(row => row.replaceAll('u', tone.skin)), [tone.skin, tone.shadow]), ...armPosition(activity, index)));
 });
 for (const [outfitIndex, outfit] of outfits.entries()) for (const [colourIndex, colour] of clothesColours.entries()) for (const activity of activities) add(`person.outfit.${outfitIndex}.${colourIndex}.${activity}`, pixels => {
-  draw(pixels, tint(outfit, colour.colour), 5, 8);
-  draw(pixels, legs, 4, 13);
+  draw(pixels, tint(outfit, colour.colour), 4, 6);
+  draw(pixels, outfitIndex === 1 ? legs.map(row => row.replaceAll('m', colour.colour)) : legs, 4, outfitIndex === 1 ? 12 : 13);
   if (activity === 'busy') draw(pixels, keyboard, 2, 12);
   arms(activity).forEach((part, index) => {
     const [x, y] = armPosition(activity, index);
-    // Hands belong to the skin layer beneath the clothes.
+    if (outfitIndex === 2) part = part.map((row, dy) => y + dy === 9 ? row : row.replaceAll('u', 'a'));
+    // Hands and short sleeves reveal the skin layer beneath the clothes.
     part.forEach((row, dy) => [...row].forEach((key, dx) => {
       if (key === 'a' || key === 'b') pixels[y + dy][x + dx] = '.';
     }));
@@ -335,13 +344,21 @@ const portrait = (activity, appearance = {}) => {
 };
 for (const activity of activities) {
   for (let colour = 0; colour < clothesColours.length; colour++) {
-    assert.equal(new Set(outfits.map((_, index) => JSON.stringify(portrait(activity, { outfit: index, clothes_colour: colour })))).size, outfits.length, `Indistinguishable outfits: ${activity}/${colour}`);
+    const dressed = outfits.map((_, outfit) => portrait(activity, { outfit, clothes_colour: colour }).flat());
+    for (let first = 0; first < dressed.length; first++) for (let second = first + 1; second < dressed.length; second++) {
+      const difference = dressed[first].filter((pixel, index) => pixel !== dressed[second][index]).length;
+      assert(difference >= 8, `Clothing needs more than trim differences: ${activity}/${colour}/${first}/${second}: ${difference} pixels`);
+    }
   }
   for (const [group, options] of Object.entries(optionGroups)) {
     assert.equal(new Set(options.map((_, index) => JSON.stringify(portrait(activity, { [group]: index })))).size, options.length, `Indistinguishable ${group}: ${activity}`);
   }
   for (const [skin, tone] of skinTones.entries()) {
     const pixels = portrait(activity, { skin });
+    if (activity === 'idle') {
+      assert.equal(portrait(activity, { skin, outfit: 2 })[10][4], tone.skin, 'Shirt must expose forearms');
+      assert.equal(pixels[10][4], clothesColours[0].colour, 'Jacket must retain long sleeves');
+    }
     arms(activity).forEach((part, index) => {
       const [x, y] = armPosition(activity, index);
       part.forEach((row, dy) => [...row].forEach((key, dx) => {
