@@ -1,6 +1,7 @@
 package browserprotocol
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strings"
@@ -51,10 +52,10 @@ var pushServiceHosts = map[string]bool{
 	"updates.push.services.mozilla.com": true,
 }
 
-// PushServiceEndpoint reports whether a subscription endpoint belongs to a
+// pushServiceEndpoint reports whether a subscription endpoint belongs to a
 // known push service: https, one of the listed hosts or an Edge tenant, no
 // credentials, no explicit port.
-func PushServiceEndpoint(endpoint string) bool {
+func pushServiceEndpoint(endpoint string) bool {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" || parsed.Host != parsed.Hostname() {
 		return false
@@ -92,28 +93,12 @@ func base64URL(value string, min, max int) bool {
 	if len(value) < min || len(value) > max {
 		return false
 	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
-			return false
-		}
-	}
-	return true
+	_, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil
 }
 
 func validRemoteControl(kind MessageType, body any) error {
-	if value, ok := body.(*RemoteInvite); ok {
-		return validRemoteControl(kind, *value)
-	}
-	if value, ok := body.(*RemoteInviteResult); ok {
-		return validRemoteControl(kind, *value)
-	}
-	if value, ok := body.(*PushSubscribe); ok {
-		return validRemoteControl(kind, *value)
-	}
-	if value, ok := body.(*PushSubscribeResult); ok {
-		return validRemoteControl(kind, *value)
-	}
+	body = indirect(body)
 	bad := func() error { return fmt.Errorf("%w: invalid %s", ErrMalformed, kind) }
 	printable := func(value string) bool {
 		if !utf8.ValidString(value) {
@@ -135,7 +120,7 @@ func validRemoteControl(kind MessageType, body any) error {
 	case PushSubscribe:
 		// 87 characters is exactly one uncompressed P-256 point; a PKCS#8
 		// P-256 private key exports to 138 bytes, bounded loosely.
-		if len(value.Endpoint) > MaxPushEndpointBytes || !printable(value.Endpoint) || !PushServiceEndpoint(value.Endpoint) ||
+		if len(value.Endpoint) > MaxPushEndpointBytes || !printable(value.Endpoint) || !pushServiceEndpoint(value.Endpoint) ||
 			!base64URL(value.PublicKey, 87, 87) || !base64URL(value.PrivateKey, 1, 512) {
 			return bad()
 		}
