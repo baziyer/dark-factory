@@ -39,6 +39,8 @@ export type FactoryConsoleProps = FactoryAppSnapshot & {
   onCloseHumanRequest?: () => void;
   onInviteRemote?: () => void;
   onDismissRemoteInvite?: () => void;
+  onLoadDevices?: () => void;
+  onRevokeDevice?: (device: { clientId: string; expectedRevision: bigint }) => void;
   onLoadAccounts?: () => void;
   onLinkAccount?: (login: DiscoveredAccount, label: string) => void;
   onUpdateAccount?: (account: AccountItem, change: { label?: string; remove?: boolean }) => void;
@@ -120,6 +122,11 @@ export function FactoryConsole({
   remoteInviteError,
   onInviteRemote,
   onDismissRemoteInvite,
+  devices,
+  devicesError,
+  ownClientId,
+  onLoadDevices,
+  onRevokeDevice,
   accounts,
   accountsPending,
   accountsError,
@@ -259,7 +266,7 @@ export function FactoryConsole({
           edit={edit}
           onSaveProjectLimits={onSaveProjectLimits}
           pairing={pairing ?? (!remoteInviteAllowed ? undefined : (
-            <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} />
+            <RemoteInvitePanel invite={remoteInvite} error={remoteInviteError} onInvite={onInviteRemote} onDismiss={onDismissRemoteInvite} devices={devices} devicesError={devicesError} ownClientId={ownClientId} onLoadDevices={onLoadDevices} onRevokeDevice={onRevokeDevice} />
           ))}
           onClose={onToggleSettings}
         />

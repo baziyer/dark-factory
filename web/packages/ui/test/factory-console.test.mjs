@@ -1457,3 +1457,47 @@ test("overseer supervision names worker events and a seconds cooldown", () => {
   for (const text of ["SUPERVISION", "WHEN WORK CHANGES", "supervise worker activity", "COOLDOWN SECONDS", "initial inspection, then worker events"]) assert.match(markup, new RegExp(text));
   assert.match(markup, new RegExp(`id="df-idle-after-${agent.id}"[^>]*value="10"`));
 });
+
+test("PAIRED DEVICES lists what the factory granted and revokes any device but this one", async () => {
+  const own = "60".repeat(16);
+  const phone = "70".repeat(16);
+  const asked = [];
+  const revoked = [];
+  const props = {
+    status: "ready",
+    state: baseState(),
+    settingsOpen: true,
+    onToggleSettings: () => {},
+    remoteInviteAllowed: true,
+    ownClientId: own,
+    onLoadDevices: () => asked.push("asked"),
+    onRevokeDevice: (device) => revoked.push(device),
+    devices: { clients: [
+      { clientId: own, capabilities: 31, revision: 1n, createdAtMs: 1767225600000n },
+      { clientId: phone, capabilities: 7, revision: 3n, createdAtMs: 1767139200000n },
+    ], more: false },
+  };
+  let renderer;
+  await act(async () => { renderer = create(createElement(FactoryConsole, props)); });
+  // The list is an observation, so opening the panel is what asks for it.
+  assert.deepEqual(asked, ["asked"]);
+  const rows = renderer.root.findAllByProps({ className: "dfFactoryConsole__device" });
+  assert.equal(rows.length, 2);
+  const label = (row) => [].concat(row.findAllByType("span")[0].props.children).join("");
+  assert.equal(label(rows[0]), "BROWSER · THIS BROWSER");
+  assert.equal(label(rows[1]), "PHONE");
+  const buttons = () => renderer.root.findAllByType("button").filter((button) => ["REVOKE", "CONFIRM REVOKE", "KEEP"].includes(button.props.children));
+  assert.equal(buttons().length, 1, "only the phone can be revoked, never this console");
+  await act(async () => { buttons()[0].props.onClick(); });
+  assert.deepEqual(buttons().map((button) => button.props.children), ["CONFIRM REVOKE", "KEEP"]);
+  await act(async () => { buttons().find((button) => button.props.children === "KEEP").props.onClick(); });
+  assert.deepEqual(revoked, [], "KEEP revokes nothing");
+  await act(async () => { buttons()[0].props.onClick(); });
+  await act(async () => { buttons().find((button) => button.props.children === "CONFIRM REVOKE").props.onClick(); });
+  assert.deepEqual(revoked, [{ clientId: phone, expectedRevision: 3n }]);
+
+  const empty = render({ settingsOpen: true, onToggleSettings: () => {}, remoteInviteAllowed: true, devices: { clients: [], more: false } });
+  assert.match(empty, /PAIRED DEVICES/);
+  assert.match(empty, /nothing paired/);
+  assert.match(render({ settingsOpen: true, onToggleSettings: () => {}, remoteInviteAllowed: true, devicesError: "unauthorized" }), /DEVICES — UNAUTHORIZED/);
+});

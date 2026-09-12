@@ -114,6 +114,12 @@ export type AccountLinkBody = { provider: "claude_code" | "codex"; home: string;
 export type AccountLinkResultBody = { account_id: string; revision: bigint };
 export type AccountUpdateBody = { account_id: string; expected_revision: bigint; label?: string; remove?: boolean };
 export type AccountUpdateResultBody = { account_id: string; revision: bigint };
+export type BrowserClientsGetBody = Record<string, never>;
+/** One identity the factory granted: enough to recognise and revoke it, never its key. */
+export type BrowserClientItem = { client_id: string; capabilities: CapabilityMask; revision: bigint; created_at_ms: bigint };
+export type BrowserClientsBody = { clients: BrowserClientItem[]; more: boolean };
+export type BrowserClientRevokeBody = { client_id: string; expected_revision: bigint };
+export type BrowserClientRevokeResultBody = { client_id: string; revision: bigint };
 export type TerminalTargetGetBody = { agent_id: string; expected_agent_revision: bigint; expected_head: bigint };
 export type TerminalTargetDescriptor = { run_id: string; session_id: string; run_revision: bigint; session_revision: bigint };
 export type TerminalTargetBody = { agent_id: string; agent_revision: bigint; head: bigint; target: TerminalTargetDescriptor | null };
@@ -199,6 +205,8 @@ export type ServerControlFrame = HelloFrame | PairResultFrame | AuthResultFrame 
   | { type: "ACCOUNTS"; id: string; body: AccountsBody }
   | { type: "ACCOUNT_LINK_RESULT"; id: string; body: AccountLinkResultBody }
   | { type: "ACCOUNT_UPDATE_RESULT"; id: string; body: AccountUpdateResultBody }
+  | { type: "BROWSER_CLIENTS"; id: string; body: BrowserClientsBody }
+  | { type: "BROWSER_CLIENT_REVOKE_RESULT"; id: string; body: BrowserClientRevokeResultBody }
   | { type: "TERMINAL_TARGET"; id: string; body: TerminalTargetBody }
   | { type: "REMOTE_INVITE_RESULT"; id: string; body: RemoteInviteResultBody }
   | { type: "PUSH_SUBSCRIBE_RESULT"; id: string; body: PushSubscribeResultBody }
@@ -219,6 +227,8 @@ export type ClientControlFrame = PairProveFrame | AuthProveFrame | StateGetFrame
   | { type: "ACCOUNTS_DISCOVER"; id: string; body: AccountsDiscoverBody }
   | { type: "ACCOUNT_LINK"; id: string; body: AccountLinkBody }
   | { type: "ACCOUNT_UPDATE"; id: string; body: AccountUpdateBody }
+  | { type: "BROWSER_CLIENTS_GET"; id: string; body: BrowserClientsGetBody }
+  | { type: "BROWSER_CLIENT_REVOKE"; id: string; body: BrowserClientRevokeBody }
   | { type: "TERMINAL_TARGET_GET"; id: string; body: TerminalTargetGetBody }
   | { type: "REMOTE_INVITE"; id: string; body: RemoteInviteBody }
   | { type: "PUSH_SUBSCRIBE"; id: string; body: PushSubscribeBody }
@@ -438,6 +448,10 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "ACCOUNT_LINK_RESULT": requireKeys(body, ["account_id", "revision"], wire); return { account_id: dynamicID(body.account_id), revision: decimal(body.revision, wire, true) };
     case "ACCOUNT_UPDATE": requireKeys(body, ["account_id", "expected_revision"], wire, ["label", "remove"]); { const hasLabel = present(body, "label"); const hasRemove = present(body, "remove"); if (hasLabel === hasRemove || hasRemove && body.remove !== true) malformed(); return { account_id: dynamicID(body.account_id), expected_revision: decimal(body.expected_revision, wire, true), ...(hasLabel ? { label: boundedText(body.label, 1, MAX_AGENT_NAME_BYTES) } : { remove: true }) }; }
     case "ACCOUNT_UPDATE_RESULT": requireKeys(body, ["account_id", "revision"], wire); return { account_id: dynamicID(body.account_id), revision: decimal(body.revision, wire, true) };
+    case "BROWSER_CLIENTS_GET": requireKeys(body, [], wire); return {};
+    case "BROWSER_CLIENTS": requireKeys(body, ["clients", "more"], wire); { if (!Array.isArray(body.clients) || body.clients.length > MAX_ARRAY_ITEMS || typeof body.more !== "boolean") malformed(); return { clients: body.clients.map((item) => { if (!isObject(item)) malformed(); const client = item; requireKeys(client, ["client_id", "capabilities", "revision", "created_at_ms"], wire); return { client_id: dynamicID(client.client_id), capabilities: capabilities(client.capabilities), revision: decimal(client.revision, wire, true), created_at_ms: decimal(client.created_at_ms, wire) }; }), more: body.more }; }
+    case "BROWSER_CLIENT_REVOKE": requireKeys(body, ["client_id", "expected_revision"], wire); return { client_id: dynamicID(body.client_id), expected_revision: decimal(body.expected_revision, wire, true) };
+    case "BROWSER_CLIENT_REVOKE_RESULT": requireKeys(body, ["client_id", "revision"], wire); return { client_id: dynamicID(body.client_id), revision: decimal(body.revision, wire, true) };
     case "TERMINAL_TARGET_GET": requireKeys(body, ["agent_id", "expected_agent_revision", "expected_head"], wire); return { agent_id: dynamicID(body.agent_id), expected_agent_revision: decimal(body.expected_agent_revision, wire, true), expected_head: decimal(body.expected_head, wire) };
     case "TERMINAL_TARGET": requireKeys(body, ["agent_id", "agent_revision", "head", "target"], wire); { const target = body.target === null ? null : terminalTargetDescriptor(body.target, wire); return { agent_id: dynamicID(body.agent_id), agent_revision: decimal(body.agent_revision, wire, true), head: decimal(body.head, wire), target }; }
     case "TERMINAL_ATTACH": requireKeys(body, ["run_id", "session_id", "expected_run_revision", "expected_session_revision", "after_sequence"], wire); return { run_id: dynamicID(body.run_id), session_id: dynamicID(body.session_id), expected_run_revision: decimal(body.expected_run_revision, wire, true), expected_session_revision: decimal(body.expected_session_revision, wire, true), after_sequence: decimal(body.after_sequence, wire) };

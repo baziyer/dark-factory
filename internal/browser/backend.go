@@ -215,6 +215,10 @@ type ConsoleBackend interface {
 	DiscoverAccounts(context.Context, [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error)
 	LinkAccount(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AccountLink) (browserprotocol.AccountLinkResult, error)
 	UpdateAccount(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.AccountUpdate) (browserprotocol.AccountUpdateResult, error)
+	// ListBrowserClients and RevokeBrowserClient let an administrator see and
+	// withdraw the identities this factory has granted.
+	ListBrowserClients(context.Context, [browserprotocol.ClientIDSize]byte) (browserprotocol.BrowserClients, error)
+	RevokeBrowserClient(context.Context, [browserprotocol.ClientIDSize]byte, browserprotocol.BrowserClientRevoke) (browserprotocol.BrowserClientRevokeResult, error)
 }
 
 // TerminalBackend is the optional effect half of browser v1. Keeping it

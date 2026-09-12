@@ -77,6 +77,10 @@ const (
 	TypeAccountLinkResult           MessageType = "ACCOUNT_LINK_RESULT"
 	TypeAccountUpdate               MessageType = "ACCOUNT_UPDATE"
 	TypeAccountUpdateResult         MessageType = "ACCOUNT_UPDATE_RESULT"
+	TypeBrowserClientsGet           MessageType = "BROWSER_CLIENTS_GET"
+	TypeBrowserClients              MessageType = "BROWSER_CLIENTS"
+	TypeBrowserClientRevoke         MessageType = "BROWSER_CLIENT_REVOKE"
+	TypeBrowserClientRevokeResult   MessageType = "BROWSER_CLIENT_REVOKE_RESULT"
 	TypeTerminalTargetGet           MessageType = "TERMINAL_TARGET_GET"
 	TypeTerminalTarget              MessageType = "TERMINAL_TARGET"
 	TypeTerminalAttach              MessageType = "TERMINAL_ATTACH"
@@ -414,6 +418,14 @@ func decodeControl(data []byte, role senderRole) (ControlFrame, error) {
 		body = new(RunPaths)
 	case TypeAccountsDiscover:
 		body = new(AccountsDiscover)
+	case TypeBrowserClientsGet:
+		body = new(BrowserClientsGet)
+	case TypeBrowserClients:
+		body = new(BrowserClients)
+	case TypeBrowserClientRevoke:
+		body = new(BrowserClientRevoke)
+	case TypeBrowserClientRevokeResult:
+		body = new(BrowserClientRevokeResult)
 	case TypeAccounts:
 		body = new(Accounts)
 	case TypeAccountLink:
@@ -532,6 +544,7 @@ func idRequired(kind MessageType) bool {
 		TypeAgentUpdate, TypeAgentUpdateResult, TypeProjectLimits, TypeProjectLimitsResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
 		TypeRunPathsGet, TypeRunPaths,
 		TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult,
+		TypeBrowserClientsGet, TypeBrowserClients, TypeBrowserClientRevoke, TypeBrowserClientRevokeResult,
 		TypeTerminalTargetGet, TypeTerminalTarget,
 		TypeTerminalAttach, TypeTerminalAttached, TypeTerminalLeaseAcquire, TypeTerminalLeaseRenew, TypeTerminalLeaseRelease,
 		TypeTerminalLeaseResult, TypeTerminalResize, TypeTerminalResized, TypeTerminalDetach, TypeTerminalDetached,
@@ -551,12 +564,12 @@ func typeAllowed(role senderRole, kind MessageType) bool {
 		return kind == TypePairProve || kind == TypeAuthProve || kind == TypeStateGet ||
 			kind == TypeStateWatch || kind == TypeHumanRequestDetailGet || kind == TypeHumanRequestReply || kind == TypeHumanRequestCancelRun || kind == TypeTerminalTargetGet || kind == TypeTerminalAttach || kind == TypeTerminalAck || kind == TypeTerminalLeaseAcquire || kind == TypeTerminalLeaseRenew || kind == TypeTerminalLeaseRelease || kind == TypeTerminalResize || kind == TypeTerminalDetach || kind == TypeTaskEnqueue || kind == TypeRemoteInvite || kind == TypePushSubscribe ||
 			kind == TypeAgentControl || kind == TypeTaskHistoryGet || kind == TypeTaskDetailGet || kind == TypeTaskListGet || kind == TypeAgentUpdate || kind == TypeProjectLimits || kind == TypeTaskUpdate || kind == TypeTopologyGet || kind == TypeRunPathsGet ||
-			kind == TypeAccountsDiscover || kind == TypeAccountLink || kind == TypeAccountUpdate
+			kind == TypeAccountsDiscover || kind == TypeAccountLink || kind == TypeAccountUpdate || kind == TypeBrowserClientsGet || kind == TypeBrowserClientRevoke
 	}
 	return role == serverRole && (kind == TypeHello || kind == TypePairResult || kind == TypeAuthResult ||
 		kind == TypeStateSnapshot || kind == TypeStateChanged || kind == TypeHumanRequestDetail || kind == TypeHumanRequestReplyResult || kind == TypeHumanRequestCancelRunResult || kind == TypeTaskEnqueueResult || kind == TypeTerminalTarget || kind == TypeTerminalAttached || kind == TypeTerminalLeaseResult || kind == TypeTerminalResized || kind == TypeTerminalDetached || kind == TypeTerminalInputResult || kind == TypeTerminalEOF || kind == TypeTerminalExit || kind == TypeTerminalReset || kind == TypeRemoteInviteResult || kind == TypePushSubscribeResult ||
 		kind == TypeAgentControlResult || kind == TypeTaskHistory || kind == TypeTaskDetail || kind == TypeTaskList || kind == TypeAgentUpdateResult || kind == TypeProjectLimitsResult || kind == TypeTaskUpdateResult || kind == TypeTopology || kind == TypeRunPaths ||
-		kind == TypeAccounts || kind == TypeAccountLinkResult || kind == TypeAccountUpdateResult)
+		kind == TypeAccounts || kind == TypeAccountLinkResult || kind == TypeAccountUpdateResult || kind == TypeBrowserClients || kind == TypeBrowserClientRevokeResult)
 }
 
 // indirect returns the value a decoded body pointer holds; a value passes
@@ -773,7 +786,8 @@ func validateBody(kind MessageType, body any) error {
 	case TypeTaskEnqueue, TypeTaskEnqueueResult:
 		return validTaskControl(kind, body)
 	case TypeAgentUpdate, TypeAgentUpdateResult, TypeProjectLimits, TypeProjectLimitsResult, TypeTaskUpdate, TypeTaskUpdateResult, TypeTopologyGet, TypeTopology,
-		TypeRunPathsGet, TypeRunPaths, TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult:
+		TypeRunPathsGet, TypeRunPaths, TypeAccountsDiscover, TypeAccounts, TypeAccountLink, TypeAccountLinkResult, TypeAccountUpdate, TypeAccountUpdateResult,
+		TypeBrowserClientsGet, TypeBrowserClients, TypeBrowserClientRevoke, TypeBrowserClientRevokeResult:
 		return validConsoleControl(kind, body)
 	case TypeTerminalTargetGet, TypeTerminalTarget:
 		return validTerminalControl(kind, body)

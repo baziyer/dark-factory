@@ -22,6 +22,8 @@ type consoleDispatchBackend struct {
 	topology      browserprotocol.Topology
 	account       browserprotocol.AccountLinkResult
 	accountUpdate browserprotocol.AccountUpdateResult
+	clients       browserprotocol.BrowserClients
+	revoked       browserprotocol.BrowserClientRevoke
 	err           error
 	calls         int
 	walking       chan struct{} // when set, Topology and RunPaths block until it is closed, whatever the context says
@@ -122,6 +124,27 @@ func (backend *consoleDispatchBackend) setErr(err error) {
 	backend.mu.Lock()
 	backend.err = err
 	backend.mu.Unlock()
+}
+
+func (backend *consoleDispatchBackend) ListBrowserClients(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.BrowserClients, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.client = client
+	if backend.err != nil {
+		return browserprotocol.BrowserClients{}, backend.err
+	}
+	return backend.clients, nil
+}
+
+func (backend *consoleDispatchBackend) RevokeBrowserClient(_ context.Context, client [browserprotocol.ClientIDSize]byte, request browserprotocol.BrowserClientRevoke) (browserprotocol.BrowserClientRevokeResult, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.client = client
+	backend.revoked = request
+	if backend.err != nil {
+		return browserprotocol.BrowserClientRevokeResult{}, backend.err
+	}
+	return browserprotocol.BrowserClientRevokeResult{ClientID: request.ClientID, Revision: request.ExpectedRevision + 1}, nil
 }
 
 func (backend *consoleDispatchBackend) DiscoverAccounts(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.Accounts, error) {
@@ -452,5 +475,40 @@ func TestConsoleInvalidRequestKeepsTheConnectionTheTransportWouldClose(t *testin
 	// this deadline: a connection merely left idle would expire here instead.
 	if _, _, err := closing.Read(ctx); err == nil || ctx.Err() != nil {
 		t.Fatalf("a repeated request id left the connection open: err=%v ctx=%v", err, ctx.Err())
+	}
+}
+
+func TestBrowserClientsListAndRevokeDispatchAndCorrelate(t *testing.T) {
+	backend := newConsoleDispatchBackend()
+	backend.clients = browserprotocol.BrowserClients{Clients: []browserprotocol.BrowserClientItem{{ClientID: strings.Repeat("70", 16), Capabilities: 7, Revision: 1, CreatedAtMS: 1767139200000}}, More: false}
+	server := startTaskServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+
+	list, err := browserprotocol.EncodeBrowserClientsGet("clients", browserprotocol.BrowserClientsGet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientFrame(t, connection, list)
+	frame := readServerFrame(t, connection)
+	if frame.Type != browserprotocol.TypeBrowserClients || frame.ID != "clients" || len(frame.Body.(browserprotocol.BrowserClients).Clients) != 1 {
+		t.Fatalf("clients = %+v", frame)
+	}
+
+	revoke, err := browserprotocol.EncodeBrowserClientRevoke("revoke", browserprotocol.BrowserClientRevoke{ClientID: strings.Repeat("70", 16), ExpectedRevision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClientFrame(t, connection, revoke)
+	frame = readServerFrame(t, connection)
+	result, ok := frame.Body.(browserprotocol.BrowserClientRevokeResult)
+	if !ok || frame.ID != "revoke" || result.ClientID != strings.Repeat("70", 16) || result.Revision != 2 {
+		t.Fatalf("revoke result = %+v", frame)
+	}
+	backend.mu.Lock()
+	got := backend.revoked
+	backend.mu.Unlock()
+	if got.ClientID != strings.Repeat("70", 16) || got.ExpectedRevision != 1 {
+		t.Fatalf("backend saw %+v", got)
 	}
 }

@@ -1,5 +1,6 @@
 import {
   CAPABILITIES,
+  type BrowserClientsView,
   type BrowserSession,
   type DiscoveredAccountView,
 } from "@dark-factory/client";
@@ -12,7 +13,7 @@ export type FactoryRemoteInvite = Readonly<{
   expiresAtMs: bigint;
 }>;
 
-type SettingsSession = Pick<BrowserSession, "discoverAccounts" | "linkAccount" | "updateAccount" | "inviteRemote" | "capabilities">;
+type SettingsSession = Pick<BrowserSession, "discoverAccounts" | "linkAccount" | "updateAccount" | "inviteRemote" | "listBrowserClients" | "revokeBrowserClient" | "capabilities" | "clientId">;
 
 type SettingsOwner = Readonly<{
   session(): SettingsSession | undefined;
@@ -32,6 +33,9 @@ export class FactorySettingsCoordinator {
   #accounts: readonly DiscoveredAccountView[] | undefined;
   #accountsPending = false;
   #accountsError: string | undefined;
+  #devices: BrowserClientsView | undefined;
+  #devicesPending = false;
+  #devicesError: string | undefined;
 
   constructor(owner: SettingsOwner) {
     this.#owner = owner;
@@ -45,6 +49,10 @@ export class FactorySettingsCoordinator {
   get accounts(): readonly DiscoveredAccountView[] | undefined { return this.#accounts; }
   get accountsPending(): boolean { return this.#accountsPending; }
   get accountsError(): string | undefined { return this.#accountsError; }
+  /** The identities the factory has granted, once SETTINGS has asked. */
+  get devices(): BrowserClientsView | undefined { return this.#devices; }
+  get devicesError(): string | undefined { return this.#devicesError; }
+  get ownClientId(): string | undefined { return this.#owner.session()?.clientId; }
 
   clearRemoteInvite(): void {
     this.#remoteInvite = undefined;
@@ -100,6 +108,46 @@ export class FactorySettingsCoordinator {
     }
     this.#owner.publish();
     await this.loadAccounts();
+  }
+
+  async loadDevices(): Promise<void> {
+    const session = this.#owner.session();
+    if (!this.#owner.ready() || session === undefined || this.#devicesPending) return;
+    const generation = this.#owner.generation();
+    this.#devicesPending = true;
+    try {
+      this.#devices = await session.listBrowserClients();
+      if (!this.#owner.current(generation)) return;
+      this.#devicesError = undefined;
+    } catch (error) {
+      if (!this.#owner.current(generation)) return;
+      this.#devicesError = this.#owner.errorCode(error);
+    } finally {
+      if (this.#owner.current(generation)) this.#devicesPending = false;
+    }
+    this.#owner.publish();
+  }
+
+  /** Withdraws one identity, then rereads the list so it is gone from it. */
+  async revokeDevice(request: { clientId: string; expectedRevision: bigint }): Promise<void> {
+    const session = this.#owner.session();
+    if (!this.#owner.ready() || session === undefined || this.#devicesPending) return;
+    const generation = this.#owner.generation();
+    this.#devicesPending = true;
+    try {
+      await session.revokeBrowserClient(request);
+      if (!this.#owner.current(generation)) return;
+      this.#devicesError = undefined;
+    } catch (error) {
+      if (!this.#owner.current(generation)) return;
+      this.#devicesError = this.#owner.errorCode(error);
+      this.#devicesPending = false;
+      this.#owner.publish();
+      return;
+    } finally {
+      if (this.#owner.current(generation)) this.#devicesPending = false;
+    }
+    await this.loadDevices();
   }
 
   async inviteRemote(): Promise<void> {

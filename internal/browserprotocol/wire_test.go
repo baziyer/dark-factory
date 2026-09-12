@@ -153,6 +153,14 @@ func encodeDecoded(frame ControlFrame) ([]byte, error) {
 		return encodeControl(TypeAccountUpdate, frame.ID, value)
 	case AccountUpdateResult:
 		return EncodeAccountUpdateResult(frame.ID, value)
+	case BrowserClientsGet:
+		return EncodeBrowserClientsGet(frame.ID, value)
+	case BrowserClients:
+		return EncodeBrowserClients(frame.ID, value)
+	case BrowserClientRevoke:
+		return EncodeBrowserClientRevoke(frame.ID, value)
+	case BrowserClientRevokeResult:
+		return EncodeBrowserClientRevokeResult(frame.ID, value)
 	case AgentUpdateResult:
 		return EncodeAgentUpdateResult(frame.ID, value)
 	case TaskUpdate:
@@ -585,7 +593,7 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 	}
 	// The manifest carries a stable name, not a generation: the contract is
 	// unversioned by owner decision on 4 September 2026.
-	if manifest.Name != "dark-factory/browser" || len(manifest.Control) != 63 || len(manifest.Terminal.Opcodes) != 2 {
+	if manifest.Name != "dark-factory/browser" || len(manifest.Control) != 67 || len(manifest.Terminal.Opcodes) != 2 {
 		t.Fatalf("manifest registry incomplete: %+v", manifest)
 	}
 	capabilityNames := []string{"observe", "private_human_request_detail", "human_actions", "terminal_input", "administration"}
@@ -663,6 +671,10 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 		{"ACCOUNT_LINK_RESULT", "server", "required", "account_link_result.json"},
 		{"ACCOUNT_UPDATE", "client", "required", "account_update.json"},
 		{"ACCOUNT_UPDATE_RESULT", "server", "required", "account_update_result.json"},
+		{"BROWSER_CLIENTS_GET", "client", "required", "browser_clients_get.json"},
+		{"BROWSER_CLIENTS", "server", "required", "browser_clients.json"},
+		{"BROWSER_CLIENT_REVOKE", "client", "required", "browser_client_revoke.json"},
+		{"BROWSER_CLIENT_REVOKE_RESULT", "server", "required", "browser_client_revoke_result.json"},
 		{"REMOTE_INVITE", "client", "required", "remote_invite.json"},
 		{"REMOTE_INVITE_RESULT", "server", "required", "remote_invite_result.json"},
 		{"PUSH_SUBSCRIBE", "client", "required", "push_subscribe.json"},
@@ -748,7 +760,7 @@ func TestManifestMatchesImplementedRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedFiles := map[string]bool{"agent_control.json": true, "agent_control_result.json": true, "task_history_get.json": true, "task_history.json": true, "task_list_get.json": true, "task_list.json": true, "task_detail_get.json": true, "task_detail.json": true, "transcript.json": true, "hello.json": true, "pair_prove.json": true, "pair_result.json": true, "auth_prove.json": true, "auth_result.json": true, "state_get.json": true, "state_snapshot.json": true, "state_watch.json": true, "state_changed.json": true, "human_request_detail_get.json": true, "human_request_detail.json": true, "error.json": true, "terminal_input.hex": true, "terminal_output.hex": true, "human_request_reply.json": true, "human_request_reply_result.json": true, "human_request_cancel_run.json": true, "human_request_cancel_run_result.json": true, "task_enqueue.json": true, "task_enqueue_result.json": true, "terminal_target_get.json": true, "terminal_target.json": true, "terminal_attach.json": true, "terminal_attached.json": true, "terminal_ack.json": true, "terminal_lease_acquire.json": true, "terminal_lease_renew.json": true, "terminal_lease_release.json": true, "terminal_lease_result.json": true, "terminal_resize.json": true, "terminal_resized.json": true, "terminal_detach.json": true, "terminal_detached.json": true, "terminal_input_result.json": true, "terminal_eof.json": true, "terminal_exit.json": true, "terminal_reset.json": true, "agent_update.json": true, "agent_update_result.json": true, "project_limits.json": true, "project_limits_result.json": true, "task_update.json": true, "task_update_result.json": true, "topology_get.json": true, "topology.json": true, "remote_invite.json": true, "remote_invite_result.json": true, "push_subscribe.json": true, "push_subscribe_result.json": true, "run_paths_get.json": true, "run_paths.json": true, "accounts_discover.json": true, "accounts.json": true, "account_link.json": true, "account_link_result.json": true, "account_update.json": true, "account_update_result.json": true}
+	expectedFiles := map[string]bool{"agent_control.json": true, "agent_control_result.json": true, "task_history_get.json": true, "task_history.json": true, "task_list_get.json": true, "task_list.json": true, "task_detail_get.json": true, "task_detail.json": true, "transcript.json": true, "hello.json": true, "pair_prove.json": true, "pair_result.json": true, "auth_prove.json": true, "auth_result.json": true, "state_get.json": true, "state_snapshot.json": true, "state_watch.json": true, "state_changed.json": true, "human_request_detail_get.json": true, "human_request_detail.json": true, "error.json": true, "terminal_input.hex": true, "terminal_output.hex": true, "human_request_reply.json": true, "human_request_reply_result.json": true, "human_request_cancel_run.json": true, "human_request_cancel_run_result.json": true, "task_enqueue.json": true, "task_enqueue_result.json": true, "terminal_target_get.json": true, "terminal_target.json": true, "terminal_attach.json": true, "terminal_attached.json": true, "terminal_ack.json": true, "terminal_lease_acquire.json": true, "terminal_lease_renew.json": true, "terminal_lease_release.json": true, "terminal_lease_result.json": true, "terminal_resize.json": true, "terminal_resized.json": true, "terminal_detach.json": true, "terminal_detached.json": true, "terminal_input_result.json": true, "terminal_eof.json": true, "terminal_exit.json": true, "terminal_reset.json": true, "agent_update.json": true, "agent_update_result.json": true, "project_limits.json": true, "project_limits_result.json": true, "task_update.json": true, "task_update_result.json": true, "topology_get.json": true, "topology.json": true, "remote_invite.json": true, "remote_invite_result.json": true, "push_subscribe.json": true, "push_subscribe_result.json": true, "run_paths_get.json": true, "run_paths.json": true, "accounts_discover.json": true, "accounts.json": true, "account_link.json": true, "account_link_result.json": true, "account_update.json": true, "account_update_result.json": true, "browser_clients_get.json": true, "browser_clients.json": true, "browser_client_revoke.json": true, "browser_client_revoke_result.json": true}
 	if len(entries) != len(expectedFiles) {
 		t.Fatalf("fixture count = %d, want %d", len(entries), len(expectedFiles))
 	}

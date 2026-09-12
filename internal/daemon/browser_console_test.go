@@ -1,7 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
 	"os"
 	"path/filepath"
@@ -521,5 +525,62 @@ func TestBrowserAccountsUnlinkUnused(t *testing.T) {
 	accounts, err := fixture.store.ListAccounts(ctx)
 	if err != nil || len(accounts) != 0 {
 		t.Fatalf("accounts after unlink = %d, err=%v", len(accounts), err)
+	}
+}
+
+// Listing and revoking identities is administration, never turned on itself,
+// and revocation goes through the daemon so live sessions end with it.
+func TestBrowserClientsListNewestFirstAndRevokeOthersOnly(t *testing.T) {
+	fixture := newConsoleFixture(t, kernel.BrowserCapabilityKnownMask, consoleRoot(t))
+	ctx := context.Background()
+	self := rawBrowserClient(fixture.client.ID)
+	challenge := bytes.Repeat([]byte{0x77}, browserprotocol.ChallengeSize)
+	if _, err := fixture.store.CreateBrowserPairingChallenge(ctx, kernel.HashBrowserChallenge(challenge), fixture.backend.boot, adapterOrigin, kernel.BrowserCapabilityObserve|kernel.BrowserCapabilityHumanActions, adapterTime(t, 13), adapterTime(t, 14)); err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phoneID, err := kernel.BrowserClientIDFromBytes(bytes.Repeat([]byte{0x77}, kernel.IDBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	phone, err := fixture.store.RedeemBrowserPairingChallenge(ctx, kernel.HashBrowserChallenge(challenge), fixture.backend.boot, adapterOrigin, phoneID, elliptic.Marshal(elliptic.P256(), key.X, key.Y), adapterTime(t, 13))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := fixture.backend.ListBrowserClients(ctx, self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's own client was granted at the daemon's clock, the phone
+	// earlier: newest first puts the console ahead of the phone.
+	if len(listed.Clients) != 2 || bool(listed.More) || listed.Clients[0].ClientID != fixture.client.ID.String() || listed.Clients[1].ClientID != phone.ID.String() || listed.Clients[1].Capabilities != 5 {
+		t.Fatalf("clients = %+v", listed)
+	}
+
+	if _, err := fixture.backend.RevokeBrowserClient(ctx, self, browserprotocol.BrowserClientRevoke{ClientID: fixture.client.ID.String(), ExpectedRevision: 1}); !errors.Is(err, browser.ErrInvalidRequest) {
+		t.Fatalf("self revocation = %v", err)
+	}
+	if _, err := fixture.backend.RevokeBrowserClient(ctx, self, browserprotocol.BrowserClientRevoke{ClientID: phone.ID.String(), ExpectedRevision: 9}); !errors.Is(err, browser.ErrStale) {
+		t.Fatalf("stale revocation = %v", err)
+	}
+	result, err := fixture.backend.RevokeBrowserClient(ctx, self, browserprotocol.BrowserClientRevoke{ClientID: phone.ID.String(), ExpectedRevision: 1})
+	if err != nil || result.ClientID != phone.ID.String() || result.Revision != 2 {
+		t.Fatalf("revocation = %+v, %v", result, err)
+	}
+	listed, err = fixture.backend.ListBrowserClients(ctx, self)
+	if err != nil || len(listed.Clients) != 1 || listed.Clients[0].ClientID != fixture.client.ID.String() {
+		t.Fatalf("after revocation clients = %+v, %v", listed, err)
+	}
+
+	observer := newConsoleFixture(t, kernel.BrowserCapabilityKnownMask&^kernel.BrowserCapabilityAdministration, consoleRoot(t))
+	if _, err := observer.backend.ListBrowserClients(ctx, rawBrowserClient(observer.client.ID)); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("list without administration = %v", err)
+	}
+	if _, err := observer.backend.RevokeBrowserClient(ctx, rawBrowserClient(observer.client.ID), browserprotocol.BrowserClientRevoke{ClientID: phone.ID.String(), ExpectedRevision: 2}); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("revoke without administration = %v", err)
 	}
 }

@@ -140,6 +140,38 @@ type AccountUpdateResult struct {
 	Revision  Decimal `json:"revision"`
 }
 
+// BrowserClientsGet asks for the browser identities this factory has granted
+// and not revoked. Administration only: the list names every device that can
+// reach the factory.
+type BrowserClientsGet struct{}
+
+// BrowserClientItem is one granted identity: enough to recognise and revoke
+// it, never its key or fingerprint.
+type BrowserClientItem struct {
+	ClientID     string       `json:"client_id"`
+	Capabilities Capabilities `json:"capabilities"`
+	Revision     Decimal      `json:"revision"`
+	CreatedAtMS  Decimal      `json:"created_at_ms"`
+}
+
+// BrowserClients lists the newest identities first; More says the bound cut
+// the list short.
+type BrowserClients struct {
+	Clients []BrowserClientItem `json:"clients"`
+	More    Bool                `json:"more"`
+}
+
+// BrowserClientRevoke withdraws one identity at an exact revision.
+type BrowserClientRevoke struct {
+	ClientID         string  `json:"client_id"`
+	ExpectedRevision Decimal `json:"expected_revision"`
+}
+
+type BrowserClientRevokeResult struct {
+	ClientID string  `json:"client_id"`
+	Revision Decimal `json:"revision"`
+}
+
 type TopologyNode struct {
 	ID         string `json:"id"`
 	ParentID   string `json:"parent_id"`
@@ -189,6 +221,22 @@ func EncodeAccountLinkResult(id string, value AccountLinkResult) ([]byte, error)
 
 func EncodeAccountUpdateResult(id string, value AccountUpdateResult) ([]byte, error) {
 	return encodeControl(TypeAccountUpdateResult, id, value)
+}
+
+func EncodeBrowserClientsGet(id string, value BrowserClientsGet) ([]byte, error) {
+	return encodeControl(TypeBrowserClientsGet, id, value)
+}
+
+func EncodeBrowserClients(id string, value BrowserClients) ([]byte, error) {
+	return encodeControl(TypeBrowserClients, id, value)
+}
+
+func EncodeBrowserClientRevoke(id string, value BrowserClientRevoke) ([]byte, error) {
+	return encodeControl(TypeBrowserClientRevoke, id, value)
+}
+
+func EncodeBrowserClientRevokeResult(id string, value BrowserClientRevokeResult) ([]byte, error) {
+	return encodeControl(TypeBrowserClientRevokeResult, id, value)
 }
 
 func validConsoleControl(kind MessageType, body any) error {
@@ -291,6 +339,24 @@ func validConsoleControl(kind MessageType, body any) error {
 		}
 	case AccountUpdateResult:
 		if validateDynamicID(value.AccountID) != nil || value.Revision == 0 {
+			return bad()
+		}
+	case BrowserClientsGet:
+	case BrowserClients:
+		if value.Clients == nil || len(value.Clients) > MaxJSONArray {
+			return bad()
+		}
+		for _, client := range value.Clients {
+			if validateDynamicID(client.ClientID) != nil || validateCapabilities(client.Capabilities) != nil || client.Revision == 0 {
+				return bad()
+			}
+		}
+	case BrowserClientRevoke:
+		if validateDynamicID(value.ClientID) != nil || value.ExpectedRevision == 0 {
+			return bad()
+		}
+	case BrowserClientRevokeResult:
+		if validateDynamicID(value.ClientID) != nil || value.Revision == 0 {
 			return bad()
 		}
 	default:
