@@ -723,3 +723,22 @@ test("alerts turn on through the host's subscription and off with the device", a
     assert.match(textOf(renderer), /Add to Home Screen/);
   });
 });
+
+test("a subscription the browser no longer lets this site use reads as OFF", async () => {
+  const manager = fakeManager([northFactory()]);
+  manager.pushRecord = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+  const previous = globalThis.Notification;
+  globalThis.Notification = { permission: "denied" };
+  try {
+    await withApp(props(manager), (renderer) => {
+      assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*OFF/s);
+      assert.equal(buttons(renderer, "dfRemote__alertsOn").length, 1, "the button comes back so alerts can be turned on again");
+    });
+    globalThis.Notification = { permission: "granted" };
+    await withApp(props(manager), (renderer) => {
+      assert.match(sectionText(renderer, "dfRemote__alerts"), /ALERTS.*ON/s);
+    });
+  } finally {
+    if (previous === undefined) delete globalThis.Notification; else globalThis.Notification = previous;
+  }
+});

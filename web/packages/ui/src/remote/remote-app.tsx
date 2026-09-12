@@ -174,6 +174,9 @@ export function RemoteApp(props: RemoteAppProps = {}) {
   const selectedId = owner?.selected();
   const selected = factories.find((factory) => factory.nodeId === selectedId) ?? factories[0];
   const working = detail !== undefined && busy(detail);
+  // A stored subscription is only alerts if the browser still lets this site
+  // notify; a permission revoked in settings puts the button back.
+  const alertsOn = owner?.push() !== undefined && ((globalThis as { Notification?: { permission?: string } }).Notification?.permission ?? "granted") === "granted";
   const byNode = new Map(factories.map((factory) => [factory.nodeId, factory] as const));
   const actionable = (nodeId: string) => remoteActionable(byNode.get(nodeId)?.status, online);
 
@@ -449,10 +452,10 @@ export function RemoteApp(props: RemoteAppProps = {}) {
           <section className="dfFactoryConsole__section dfRemote__alerts" aria-label="Alerts">
             <div className="dfFactoryConsole__sectionHeading">
               <h2>ALERTS</h2>
-              <span>{owner?.push() === undefined ? "OFF" : "ON"}</span>
+              <span>{alertsOn ? "ON" : "OFF"}</span>
             </div>
             {alerts.phase === "failed" ? <p className="dfRemote__pairError" role="alert">{alerts.copy}</p> : null}
-            {owner?.push() === undefined ? (
+            {!alertsOn ? (
               <>
                 <p className="dfRemote__prose">Get a notification on this device when a factory needs you.</p>
                 <button type="button" className="dfRemote__alertsOn" disabled={!online || alerts.phase === "working"} onClick={enableAlerts}>
