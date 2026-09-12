@@ -265,3 +265,46 @@ func TestSecondRelayDialLeavesTheSubscriptionsWithTheLiveRelay(t *testing.T) {
 		t.Fatal("a refused relay dial moved the subscriptions to its home")
 	}
 }
+
+func TestPushStoresOnOneFileSerialise(t *testing.T) {
+	directory := t.TempDir()
+	first, second := newPushStore(directory), newPushStore(directory)
+	_, public, private := devicePushKeys(t)
+	subscribe := func(path string) browserprotocol.PushSubscribe {
+		return browserprotocol.PushSubscribe{Endpoint: "https://web.push.apple.com/QGdfl/" + path, PublicKey: public, PrivateKey: private}
+	}
+	// The first store is mid-update, holding its loaded snapshot, when the
+	// second store writes; the second must wait, or the first's save would
+	// erase it.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- first.update(func(subscriptions map[string]browserprotocol.PushSubscribe) {
+			close(entered)
+			<-release
+			subscriptions["one"] = subscribe("one")
+		})
+	}()
+	<-entered
+	written := make(chan error, 1)
+	go func() {
+		written <- second.update(func(subscriptions map[string]browserprotocol.PushSubscribe) { subscriptions["two"] = subscribe("two") })
+	}()
+	select {
+	case err := <-written:
+		t.Fatalf("the second store wrote while the first held its snapshot: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	stored, err := second.load()
+	if err != nil || len(stored) != 2 {
+		t.Fatalf("stored = %+v, %v", stored, err)
+	}
+}

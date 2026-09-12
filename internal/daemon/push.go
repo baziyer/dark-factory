@@ -35,8 +35,16 @@ const pushSubscriptionsFileName = "push-subscriptions.json"
 // next time a push would have gone to it.
 type pushStore struct {
 	path string
-	mu   sync.Mutex
 }
+
+// pushFileMu serialises every read-modify-write of a subscriptions file in
+// this process. A relay closed and dialled again on the same home makes a
+// second pushStore for the same file, and a notification still in flight on
+// the first must not save its stale snapshot over what the second stored.
+//
+// ponytail: one process-wide lock; a per-path lock table if a daemon ever
+// serves more than one home at once.
+var pushFileMu sync.Mutex
 
 func newPushStore(relayDirectory string) *pushStore {
 	return &pushStore{path: filepath.Join(relayDirectory, pushSubscriptionsFileName)}
@@ -75,8 +83,8 @@ func (store *pushStore) update(change func(map[string]browserprotocol.PushSubscr
 	if store == nil {
 		return fmt.Errorf("%w: push is not enabled", kernel.ErrNotFound)
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	pushFileMu.Lock()
+	defer pushFileMu.Unlock()
 	subscriptions, err := store.load()
 	if err != nil {
 		return err
