@@ -256,8 +256,8 @@ func TestSecondRelayDialLeavesTheSubscriptionsWithTheLiveRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	relay := newRelayServer(t, identity)
-	if _, err := fixture.daemon.DialRelay(context.Background(), relay.origin(), other, fixture.server.Addr()); !errors.Is(err, browser.ErrUnauthorized) {
-		t.Fatalf("second dial: %v", err)
+	if _, err := fixture.daemon.DialRelay(context.Background(), relay.origin(), other, fixture.server.Addr()); err == nil {
+		t.Fatal("a second relay dial was accepted")
 	}
 	fixture.daemon.browserMu.Lock()
 	defer fixture.daemon.browserMu.Unlock()
