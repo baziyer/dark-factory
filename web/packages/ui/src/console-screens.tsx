@@ -129,7 +129,6 @@ export function FactoryFloor({
   lastRunPaths,
   selectedAgentId,
   onSelectAgent,
-  onEditAppearance,
 }: {
   state: StateView | undefined;
   topologies: ReadonlyMap<string, TopologyView> | undefined;
@@ -137,7 +136,6 @@ export function FactoryFloor({
   lastRunPaths?: ReadonlyMap<string, RunPathSample>;
   selectedAgentId?: string;
   onSelectAgent?: (agent: AgentItem) => void;
-  onEditAppearance?: (agent: AgentItem) => void;
 }) {
   const scene = floorScene(state, topologies, runPaths, lastRunPaths);
   return <div className="dfFactoryFloor">
@@ -150,7 +148,6 @@ export function FactoryFloor({
         const agent = state.agents.get(workerID);
         if (agent !== undefined) onSelectAgent(agent);
       }}
-      onEditWorker={onEditAppearance === undefined || state === undefined ? undefined : (workerID) => { const agent = state.agents.get(workerID); if (agent !== undefined) onEditAppearance(agent); }}
     />
   </div>;
 }

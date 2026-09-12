@@ -27,7 +27,6 @@ export type FactorySceneProps = Readonly<{
   selectedWorkerId?: string;
   /** Pointer convenience only; the AGENTS list is the keyboard path. */
   onSelectWorker?: (workerId: string) => void;
-  onEditWorker?: (workerId: string) => void;
 }>;
 
 export type AgentSpriteProps = Readonly<{
@@ -56,7 +55,7 @@ export function AgentSprite({ agent, activity }: AgentSpriteProps) {
 }
 
 /** A disposable SVG projection of topology and current factory state. */
-export function FactoryScene({ topology, workers, omittedLocations = 0, selectedWorkerId, onSelectWorker, onEditWorker }: FactorySceneProps) {
+export function FactoryScene({ topology, workers, omittedLocations = 0, selectedWorkerId, onSelectWorker }: FactorySceneProps) {
   const layout = layoutScene(topology, workers.filter((worker) => worker.location !== "working" && worker.location !== "control-room" && worker.location !== "unobserved").length);
   const placements = placeWorkers(layout, workers);
   const nodes = new Map(topology.nodes.map((node) => [node.id, node]));
@@ -162,10 +161,6 @@ export function FactoryScene({ topology, workers, omittedLocations = 0, selected
               {worker.id === selectedWorkerId ? <circle className="dfFactoryScene__selection" cx="0" cy="0" r="12" /> : null}
               {frames.map((frame) => <Frame key={frame} name={frame} x={-8} y={-8} />)}
             </g>
-            {onEditWorker === undefined ? null : <g className="dfFactoryScene__edit" role="button" tabIndex={0} aria-label={`Edit appearance for ${worker.name}`} onClick={(event) => { event.stopPropagation(); onEditWorker(worker.id); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onEditWorker(worker.id); } }}>
-              <rect x="5" y="-14" width="10" height="10" rx="2" />
-              <path d="M8 -7.5 12.5 -12 14 -10.5 9.5 -6 7 -5Z M11.5 -11 13 -9.5" />
-            </g>}
           </g>
         );
       })}
