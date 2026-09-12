@@ -8,6 +8,7 @@ import {
   parseInvitation,
   type HumanRequestDetail,
   type HumanRequestItem,
+  type PushSubscribeBody,
   type RemoteFactoryView,
   type RemoteInvitation,
   type RemoteManager,
@@ -41,7 +42,32 @@ export type RemoteAppProps = {
   location?: Pick<Location, "hash" | "pathname" | "search" | "origin">;
   history?: Pick<History, "replaceState" | "state">;
   navigator?: Pick<Navigator, "onLine">;
+  /** Turns this device's push subscription on; the browser implementation when the host supplies none. */
+  subscribePush?: () => Promise<PushSubscribeBody>;
 };
+
+const ALERTS_NEED_INSTALL = "On iPhone, add this page to the Home Screen first: Share, then Add to Home Screen, and open Dark Factory from there.";
+const ALERTS_REFUSED = "ALERTS WERE REFUSED BY THIS BROWSER. ALLOW NOTIFICATIONS FOR THIS SITE TO TURN THEM ON.";
+
+/**
+ * The browser half of alerts: permission, then one push subscription made with
+ * a key pair this device mints. The device keeps the private key too, because
+ * every factory it pairs with must be able to sign for the one subscription a
+ * push service will give it.
+ */
+async function browserPushSubscription(): Promise<PushSubscribeBody> {
+  if (!("PushManager" in globalThis) || globalThis.navigator?.serviceWorker === undefined) throw new Error(ALERTS_NEED_INSTALL);
+  if (await Notification.requestPermission() !== "granted") throw new Error(ALERTS_REFUSED);
+  const registration = await navigator.serviceWorker.ready;
+  const stale = await registration.pushManager.getSubscription();
+  if (stale !== null) await stale.unsubscribe();
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+  const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const privateKey = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+  const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: publicKey });
+  const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  return { endpoint: subscription.endpoint, public_key: encode(publicKey), private_key: encode(privateKey) };
+}
 
 type Pairing =
   | Readonly<{ phase: "idle" }>
@@ -79,6 +105,7 @@ export function RemoteApp(props: RemoteAppProps = {}) {
   const [detail, setDetailState] = useState<Detail | undefined>(undefined);
   const [confirm, setConfirm] = useState<Confirm | undefined>(undefined);
   const [cancelPhrase, setCancelPhrase] = useState<string | undefined>(undefined);
+  const [alerts, setAlerts] = useState<{ phase: "idle" | "working" | "failed"; copy?: string }>({ phase: "idle" });
   const [online, setOnline] = useState(() => (props.navigator ?? globalThis.navigator)?.onLine !== false);
   const manager = useRef<RemoteManager | undefined>(undefined);
   const token = useRef(0);
@@ -285,6 +312,24 @@ export function RemoteApp(props: RemoteAppProps = {}) {
     })();
   };
 
+  const enableAlerts = () => {
+    const target = manager.current;
+    if (target === undefined || alerts.phase === "working") return;
+    setAlerts({ phase: "working" });
+    void (async () => {
+      try {
+        const subscription = await (props.subscribePush ?? browserPushSubscription)();
+        if (manager.current !== target) return;
+        await target.setPush(subscription);
+        setAlerts({ phase: "idle" });
+      } catch (error) {
+        if (manager.current !== target) return;
+        setAlerts({ phase: "failed", copy: error instanceof Error && error.message.length > 0 ? error.message : ALERTS_REFUSED });
+      }
+      bump();
+    })();
+  };
+
   const forgetDevice = () => {
     setConfirm(undefined);
     putDetail(undefined);
@@ -302,16 +347,6 @@ export function RemoteApp(props: RemoteAppProps = {}) {
             <p className="dfFactoryConsole__eyebrow">REMOTE</p>
             <h1>FACTORIES</h1>
           </div>
-          <ConfirmAction
-            className="dfRemote__forgetDevice"
-            label="FORGET THIS DEVICE"
-            confirmLabel="FORGET EVERYTHING"
-            open={confirm?.kind === "device"}
-            disabled={factories.length === 0}
-            onOpen={() => setConfirm({ kind: "device" })}
-            onKeep={() => setConfirm(undefined)}
-            onConfirm={forgetDevice}
-          />
         </header>
 
         {online ? null : (
@@ -381,6 +416,7 @@ export function RemoteApp(props: RemoteAppProps = {}) {
               You can also paste that link above. The link works once and only on the device that
               opens it.
             </p>
+            <p className="dfRemote__prose">{ALERTS_NEED_INSTALL}</p>
           </section>
         ) : (
           <nav className="dfRemote__switcher" aria-label="Factories on this device">
@@ -407,6 +443,26 @@ export function RemoteApp(props: RemoteAppProps = {}) {
               })}
             </ul>
           </nav>
+        )}
+
+        {factories.length === 0 ? null : (
+          <section className="dfFactoryConsole__section dfRemote__alerts" aria-label="Alerts">
+            <div className="dfFactoryConsole__sectionHeading">
+              <h2>ALERTS</h2>
+              <span>{owner?.push() === undefined ? "OFF" : "ON"}</span>
+            </div>
+            {alerts.phase === "failed" ? <p className="dfRemote__pairError" role="alert">{alerts.copy}</p> : null}
+            {owner?.push() === undefined ? (
+              <>
+                <p className="dfRemote__prose">Get a notification on this device when a factory needs you.</p>
+                <button type="button" className="dfRemote__alertsOn" disabled={!online || alerts.phase === "working"} onClick={enableAlerts}>
+                  {alerts.phase === "working" ? "TURNING ON…" : "ENABLE ALERTS"}
+                </button>
+              </>
+            ) : (
+              <p className="dfRemote__prose">This device is woken when any paired factory needs you.</p>
+            )}
+          </section>
         )}
 
         {factories.length === 0 ? null : (
@@ -545,6 +601,21 @@ export function RemoteApp(props: RemoteAppProps = {}) {
             onKeepFactory={() => setConfirm(undefined)}
             onForget={() => forget(selected.nodeId)}
           />
+        )}
+
+        {factories.length === 0 ? null : (
+          <footer className="dfRemote__factoryFooter">
+            <ConfirmAction
+              className="dfRemote__forgetDevice"
+              label="FORGET THIS DEVICE"
+              confirmLabel="FORGET EVERYTHING"
+              open={confirm?.kind === "device"}
+              disabled={false}
+              onOpen={() => setConfirm({ kind: "device" })}
+              onKeep={() => setConfirm(undefined)}
+              onConfirm={forgetDevice}
+            />
+          </footer>
         )}
       </main>
     </div>

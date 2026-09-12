@@ -521,7 +521,37 @@ test("the manager exposes the client's own one-shot APIs and adds no retry of it
   }
   assert.deepEqual(
     Object.getOwnPropertyNames(Object.getPrototypeOf(manager)).filter((name) => name !== "constructor").sort(),
-    ["bindings", "client", "close", "factories", "forget", "forgetDevice", "needsYou", "pair", "select", "selected", "start"],
+    ["bindings", "client", "close", "factories", "forget", "forgetDevice", "needsYou", "pair", "push", "select", "selected", "setPush", "start"],
   );
+  manager.close();
+});
+
+const PUSH = { endpoint: "https://push.example/send/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+
+test("one alert subscription reaches every factory: the connected ones now, later pairings as they connect", async () => {
+  const { relay, store, manager } = bench();
+  const north = relay.add(new FakeFactory({ node: nodeId("a"), clientId: "55".repeat(16) }));
+  await manager.pair(invitation(north));
+  await settle();
+  assert.equal(manager.push(), undefined);
+  assert.equal(types(north.sockets.at(-1)).includes("PUSH_SUBSCRIBE"), false, "nothing is sent before the device asks");
+
+  await manager.setPush(PUSH);
+  await settle();
+  assert.deepEqual(manager.push(), PUSH);
+  assert.deepEqual((await row(store, north.node)).push, PUSH, "the subscription is durable on the binding");
+  assert.equal(types(north.sockets.at(-1)).filter((type) => type === "PUSH_SUBSCRIBE").length, 1);
+
+  // A factory paired after the fact inherits the device's subscription and is
+  // told on its first ready connection, without the device asking again.
+  const south = relay.add(new FakeFactory({ node: nodeId("b"), clientId: "66".repeat(16), daemonId: "33".repeat(16) }));
+  await manager.pair(invitation(south));
+  await settle();
+  assert.deepEqual((await row(store, south.node)).push, PUSH);
+  assert.equal(types(south.sockets.at(-1)).filter((type) => type === "PUSH_SUBSCRIBE").length, 1);
+
+  await manager.setPush(undefined);
+  assert.equal(manager.push(), undefined);
+  assert.equal((await row(store, north.node)).push, undefined);
   manager.close();
 });

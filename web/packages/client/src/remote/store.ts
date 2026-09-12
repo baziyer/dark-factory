@@ -1,4 +1,5 @@
 import type { CapabilityMask } from "../manifest.js";
+import type { PushSubscribeBody } from "../control.js";
 import { SessionError } from "../session.js";
 import { loopbackHost, relayOrigin } from "./invitation.js";
 
@@ -19,6 +20,8 @@ export type RemoteBinding = {
   key?: CryptoKey;
   capabilities?: CapabilityMask;
   relayTicket?: string;
+  /** This device's alert subscription, kept on every binding so a factory paired later gets it too. */
+  push?: PushSubscribeBody;
 };
 
 export interface RemoteStore {
@@ -123,6 +126,7 @@ function validate(binding: RemoteBinding): void {
   relayOrigin(binding.relayOrigin);
   loopbackHost(binding.host);
   if (binding.key !== undefined && binding.key.extractable) throw new SessionError("invalid_request");
+  if (binding.push !== undefined && (typeof binding.push.endpoint !== "string" || typeof binding.push.public_key !== "string" || typeof binding.push.private_key !== "string")) throw new SessionError("invalid_request");
 }
 
 function copy(binding: RemoteBinding): RemoteBinding {

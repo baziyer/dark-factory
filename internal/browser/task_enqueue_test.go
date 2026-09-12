@@ -19,6 +19,7 @@ type taskDispatchBackend struct {
 	calls   int
 
 	invitation  browserprotocol.RemoteInviteResult
+	push        browserprotocol.PushSubscribe
 	inviteCalls int
 }
 
@@ -35,6 +36,14 @@ func (backend *taskDispatchBackend) EnqueueTask(_ context.Context, client [brows
 	backend.client = client
 	backend.request = request
 	return backend.result, backend.err
+}
+
+func (backend *taskDispatchBackend) SubscribePush(_ context.Context, client [browserprotocol.ClientIDSize]byte, subscription browserprotocol.PushSubscribe) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.client = client
+	backend.push = subscription
+	return backend.err
 }
 
 func (backend *taskDispatchBackend) RemoteInvite(_ context.Context, client [browserprotocol.ClientIDSize]byte) (browserprotocol.RemoteInviteResult, error) {
@@ -174,4 +183,27 @@ func TestRemoteInviteDispatchesAndCorrelatesTheMintedInvitation(t *testing.T) {
 		writeClientFrame(t, connection, payload)
 		assertError(t, readServerFrame(t, connection), browserprotocol.ErrorUnauthorized)
 	})
+}
+
+func TestPushSubscribeDispatchesAndCorrelatesItsResult(t *testing.T) {
+	subscription := browserprotocol.PushSubscribe{Endpoint: "https://push.example/send/abc", PublicKey: "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU", PrivateKey: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAQ"}
+	payload, err := browserprotocol.EncodePushSubscribe("push", subscription)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := newTaskDispatchBackend()
+	server := startTaskServer(t, backend)
+	connection, _ := dialServer(t, server, testOrigin)
+	authenticate(t, connection)
+	writeClientFrame(t, connection, payload)
+	frame := readServerFrame(t, connection)
+	if frame.Type != browserprotocol.TypePushSubscribeResult || frame.ID != "push" {
+		t.Fatalf("push result = %+v", frame)
+	}
+	backend.mu.Lock()
+	got := backend.push
+	backend.mu.Unlock()
+	if got != subscription {
+		t.Fatalf("stored subscription = %+v", got)
+	}
 }

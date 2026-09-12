@@ -3,9 +3,11 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"github.com/dark-factory-build/dark-factory/internal/browser"
+	"github.com/dark-factory-build/dark-factory/internal/install"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
 	"github.com/dark-factory-build/dark-factory/internal/relayhost"
 )
@@ -71,6 +73,7 @@ func (daemon *Daemon) DialRelay(ctx context.Context, relayOrigin, home string, b
 	}
 	runtime := &RelayRuntime{daemon: daemon, connector: connector, identity: identity, relayOrigin: relayOrigin, browserAddress: browserAddress}
 	daemon.browserMu.Lock()
+	daemon.push = newPushStore(filepath.Join(home, install.RelayDirectoryName))
 	if daemon.browserClosing || daemon.relay != nil {
 		daemon.browserMu.Unlock()
 		_ = connector.Close()

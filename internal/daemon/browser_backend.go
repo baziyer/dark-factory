@@ -527,6 +527,34 @@ func validTopologyText(value string, minimum, maximum int) bool {
 	return len(value) >= minimum && len(value) <= maximum && utf8.ValidString(value)
 }
 
+// SubscribePush stores one device's alert subscription under its own client
+// identity. Observing is enough: a device may only ever ask to be woken.
+func (backend *browserBackend) SubscribePush(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, subscription browserprotocol.PushSubscribe) error {
+	clientID, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityObserve)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := parsePushKeys(subscription); err != nil {
+		return browser.ErrInvalidRequest
+	}
+	if backend.owner == nil {
+		return browser.ErrUnauthorized
+	}
+	backend.owner.browserMu.Lock()
+	store := backend.owner.push
+	backend.owner.browserMu.Unlock()
+	if store == nil {
+		return browser.ErrUnauthorized
+	}
+	if err := store.update(func(subscriptions map[string]browserprotocol.PushSubscribe) {
+		subscriptions[clientID.String()] = subscription
+	}); err != nil {
+		return mapBrowserError(err)
+	}
+	return nil
+}
+
 // RemoteInvite mints one remote pairing invitation for a paired operator, plus
 // its scannable code. The mint is never retried; a failure is reported and the
 // operator asks again.

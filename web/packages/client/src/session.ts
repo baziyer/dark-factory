@@ -7,6 +7,7 @@ import {
   encodeHumanRequestReply,
   encodeAgentControl,
   encodePairProve,
+  encodePushSubscribe,
   encodeRemoteInvite,
   encodeStateGet,
   encodeStateWatch,
@@ -29,6 +30,7 @@ import {
   type HumanRequestCancelRunResultBody,
   type HumanRequestReplyResultBody,
   type PairResultFrame,
+  type PushSubscribeBody,
   type RemoteInviteResultBody,
   type ServerControlFrame,
   type StateChangedFrame,
@@ -182,6 +184,7 @@ export type TopologyView = Readonly<{ projectId: string; digest: string; sourceR
 export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: readonly string[] }>;
 export type TaskListView = Readonly<{ agentId: string; head: bigint; total: bigint; tasks: readonly TaskItem[]; hasMore: boolean }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
+type PushPending = { resolve: () => void; reject: (error: unknown) => void };
 type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT"; accountId?: string; expectedRevision?: bigint; resolve: (value: never) => void; reject: (error: unknown) => void };
 
 /** One provider login found on the daemon's machine, linked or not. */
@@ -268,6 +271,7 @@ export class BrowserSession {
   #taskDetailPending = new Map<string, TaskDetailPending>();
   #consolePending = new Map<string, ConsolePending>();
   #invitePending = new Map<string, InvitePending>();
+  #pushPending = new Map<string, PushPending>();
   #accountPending = new Map<string, AccountPending>();
   #humanDetails = new WeakSet<HumanRequestDetail>();
   #humanCancelRuns = new WeakMap<HumanRequestCancelRunDescriptor, { detail: HumanRequestDetail; runId: string }>();
@@ -468,6 +472,21 @@ export class BrowserSession {
     let payload: string;
     try { payload = encodeRemoteInvite(id, {}); } catch (error) { return Promise.reject(error); }
     const result = new Promise<RemoteInvite>((resolve, reject) => this.#invitePending.set(id, { resolve, reject }));
+    try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
+    return result;
+  }
+
+  /** Hands the factory this device's alert subscription. Observing is all it
+   * takes: a device may only ask to be woken. A daemon that predates alerts
+   * answers ERROR unsupported, which rejects this promise and nothing else. */
+  subscribePush(subscription: PushSubscribeBody): Promise<void> {
+    try { this.#ensureLive(); } catch (error) { return Promise.reject(error); }
+    if (!this.#authenticated) return Promise.reject(new SessionError("unauthorized"));
+    if (this.#pushPending.size >= MAX_ARRAY_ITEMS) return Promise.reject(new SessionError("rate_limited"));
+    const id = this.#nextID("push-subscribe");
+    let payload: string;
+    try { payload = encodePushSubscribe(id, subscription); } catch (error) { return Promise.reject(error); }
+    const result = new Promise<void>((resolve, reject) => this.#pushPending.set(id, { resolve, reject }));
     try { this.#send(payload); } catch { this.#fail(new SessionError("connection")); }
     return result;
   }
@@ -777,6 +796,13 @@ export class BrowserSession {
       this.#inviteResult(frame.body, frame.id);
       return;
     }
+    if (frame.type === "PUSH_SUBSCRIBE_RESULT") {
+      const pending = this.#pushPending.get(frame.id);
+      if (pending === undefined) throw new ProtocolError("malformed");
+      this.#pushPending.delete(frame.id);
+      pending.resolve();
+      return;
+    }
     if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT" || frame.type === "ACCOUNT_UPDATE_RESULT") {
       this.#accountResult(frame);
       return;
@@ -897,6 +923,12 @@ export class BrowserSession {
       if (invite !== undefined) {
         this.#invitePending.delete(id);
         invite.reject(new SessionError(frame.body.code, frame.body.retryable));
+        return;
+      }
+      const push = this.#pushPending.get(id);
+      if (push !== undefined) {
+        this.#pushPending.delete(id);
+        push.reject(new SessionError(frame.body.code, frame.body.retryable));
         return;
       }
       const account = this.#accountPending.get(id);
@@ -1160,6 +1192,8 @@ export class BrowserSession {
   #closeInvitePending(error: SessionError | ProtocolError): void {
     for (const pending of this.#invitePending.values()) pending.reject(error);
     this.#invitePending.clear();
+    for (const pending of this.#pushPending.values()) pending.reject(error);
+    this.#pushPending.clear();
   }
 
   #closeAccountPending(error: SessionError | ProtocolError): void {

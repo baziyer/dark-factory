@@ -98,6 +98,8 @@ export const CONTROL_MANIFEST = [
   { type: "ACCOUNT_UPDATE_RESULT", direction: "server", id: "required", fixture: "account_update_result.json" },
   { type: "REMOTE_INVITE", direction: "client", id: "required", fixture: "remote_invite.json" },
   { type: "REMOTE_INVITE_RESULT", direction: "server", id: "required", fixture: "remote_invite_result.json" },
+  { type: "PUSH_SUBSCRIBE", direction: "client", id: "required", fixture: "push_subscribe.json" },
+  { type: "PUSH_SUBSCRIBE_RESULT", direction: "server", id: "required", fixture: "push_subscribe_result.json" },
   { type: "ERROR", direction: "both", id: "optional", fixture: "error.json" },
   { type: "AGENT_CONTROL", direction: "client", id: "required", fixture: "agent_control.json" },
   { type: "AGENT_CONTROL_RESULT", direction: "server", id: "required", fixture: "agent_control_result.json" },
