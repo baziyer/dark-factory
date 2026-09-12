@@ -592,6 +592,32 @@ func (current *connection) dispatch(frame browserprotocol.ControlFrame) bool {
 			return false
 		}
 		payload, err = browserprotocol.EncodeAccountUpdateResult(frame.ID, result)
+	case browserprotocol.BrowserClientsGet:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.ListBrowserClients(ctx, current.principal.ClientID)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		payload, err = browserprotocol.EncodeBrowserClients(frame.ID, result)
+	case browserprotocol.BrowserClientRevoke:
+		if current.server.consoleBackend == nil {
+			err = ErrUnauthorized
+			break
+		}
+		result, backendErr := current.server.consoleBackend.RevokeBrowserClient(ctx, current.principal.ClientID, body)
+		if backendErr != nil {
+			err = backendErr
+			break
+		}
+		if result.ClientID != body.ClientID || result.Revision != body.ExpectedRevision+1 {
+			current.sendError(frame.ID, browserprotocol.ErrorInternal, false)
+			return false
+		}
+		payload, err = browserprotocol.EncodeBrowserClientRevokeResult(frame.ID, result)
 	case browserprotocol.RemoteInvite:
 		if current.server.taskBackend == nil {
 			err = ErrUnauthorized

@@ -58,6 +58,9 @@ function harness(overrides = {}) {
     updateAccount: overrides.updateAccount ?? (async () => ({ accountId: "00".repeat(16), revision: 2n })),
     linkAccount: overrides.linkAccount ?? (async () => ({ accountId: "00".repeat(16), revision: 1n })),
     inviteRemote: overrides.inviteRemote ?? (async () => remoteInvite),
+    listBrowserClients: overrides.listBrowserClients ?? (async () => ({ clients: [], more: false })),
+    revokeBrowserClient: overrides.revokeBrowserClient ?? (async () => { throw new SessionError("not_found"); }),
+    clientId: overrides.clientId ?? "60".repeat(16),
     capabilities: overrides.capabilities ?? 15,
   };
   const client = {
@@ -998,4 +1001,29 @@ test("a structure arriving during a run-paths round is asked as soon as the roun
   await settle();
   await settle();
   assert.deepEqual(hidden, [runningAgentID]);
+});
+
+test("paired devices are listed on request, revoked once, then reread", async () => {
+  const listed = [];
+  const revoked = [];
+  const phone = { clientId: "70".repeat(16), capabilities: 7, revision: 1n, createdAtMs: 1767139200000n };
+  const context = harness({
+    listBrowserClients: async () => { listed.push(true); return { clients: listed.length === 1 ? [phone] : [], more: false }; },
+    revokeBrowserClient: async (request) => { revoked.push(request); return { clientId: request.clientId, revision: request.expectedRevision + 1n }; },
+  });
+  context.controller.start();
+  context.emitStatus("ready");
+  assert.equal(context.latest().ownClientId, "60".repeat(16));
+  await context.controller.loadDevices();
+  assert.deepEqual(context.latest().devices, { clients: [phone], more: false });
+  await context.controller.revokeDevice({ clientId: phone.clientId, expectedRevision: 1n });
+  assert.deepEqual(revoked, [{ clientId: phone.clientId, expectedRevision: 1n }]);
+  assert.equal(listed.length, 2, "a revocation rereads the list");
+  assert.deepEqual(context.latest().devices, { clients: [], more: false });
+
+  const failing = harness({ revokeBrowserClient: async () => { throw new SessionError("stale"); } });
+  failing.controller.start();
+  failing.emitStatus("ready");
+  await failing.controller.revokeDevice({ clientId: phone.clientId, expectedRevision: 1n });
+  assert.equal(failing.latest().devicesError, "stale");
 });

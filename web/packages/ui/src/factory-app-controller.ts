@@ -1,4 +1,5 @@
 import {
+  type BrowserClientsView,
   MAX_TERMINAL_PAYLOAD,
   MAX_TASK_INSTRUCTION_BYTES,
   ProtocolError,
@@ -128,6 +129,10 @@ export type FactoryAppSnapshot = Readonly<{
   remoteInviteAllowed?: boolean;
   remoteInvite?: FactoryRemoteInvite;
   remoteInviteError?: string;
+  /** The identities the factory has granted, once SETTINGS asks; this console's own is marked by id. */
+  devices?: BrowserClientsView;
+  devicesError?: string;
+  ownClientId?: string;
   /** The provider logins on the daemon's machine, once SETTINGS asks. */
   accounts?: readonly DiscoveredAccountView[];
   accountsPending?: boolean;
@@ -141,7 +146,7 @@ export type FactoryAppStatus =
 type HumanSession = Pick<BrowserSession, "getHumanRequestDetail" | "replyHumanRequest" | "cancelHumanRequest">;
 type TerminalSession = Pick<BrowserSession, "resolveAgentTerminal" | "openTerminal" | "close">;
 type AgentTaskSession = Pick<BrowserSession, "enqueueAgentTask" | "controlAgent" | "getTaskHistory" | "getTaskDetail" | "resolveAgentTerminal">;
-type ConsoleSession = Pick<BrowserSession, "updateAgent" | "setProjectLimits" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount" | "updateAccount">;
+type ConsoleSession = Pick<BrowserSession, "updateAgent" | "setProjectLimits" | "updateTask" | "getTopology" | "getRunPaths" | "getTaskList" | "discoverAccounts" | "linkAccount" | "updateAccount" | "listBrowserClients" | "revokeBrowserClient" | "clientId">;
 type RemoteInviteSession = Pick<BrowserSession, "inviteRemote" | "capabilities">;
 type ControlledClient = Pick<BrowserClient, "connect" | "close"> & { readonly session?: HumanSession & TerminalSession & AgentTaskSession & ConsoleSession & RemoteInviteSession };
 type ClientFactory = (options: BrowserSessionOptions) => ControlledClient;
@@ -767,6 +772,10 @@ export class FactoryAppController {
   updateAccount(request: Parameters<BrowserSession["updateAccount"]>[0]): Promise<void> {
     return this.#settings.updateAccount(request);
   }
+
+  loadDevices(): Promise<void> { return this.#settings.loadDevices(); }
+
+  revokeDevice(request: { clientId: string; expectedRevision: bigint }): Promise<void> { return this.#settings.revokeDevice(request); }
 
   /** The mint is never retried: a failure is reported and the operator asks again. */
   inviteRemote(): Promise<void> { return this.#settings.inviteRemote(); }
@@ -1487,6 +1496,9 @@ export class FactoryAppController {
       remoteInviteAllowed: this.#settings.remoteInviteAllowed,
       remoteInvite: this.#settings.remoteInvite,
       remoteInviteError: this.#settings.remoteInviteError,
+      devices: this.#settings.devices,
+      devicesError: this.#settings.devicesError,
+      ownClientId: this.#settings.ownClientId,
       accounts: this.#settings.accounts,
       accountsPending: this.#settings.accountsPending,
       accountsError: this.#settings.accountsError,

@@ -443,6 +443,11 @@
   font-size: 0.75rem;
 }
 
+.dfFactoryConsole__pairPhone .dfFactoryConsole__sectionHeading { width: 100%; margin-top: 0.5rem; }
+.dfFactoryConsole__devices { display: grid; gap: 0.4rem; width: 100%; margin: 0; padding: 0; list-style: none; }
+.dfFactoryConsole__device { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; }
+.dfFactoryConsole__deviceSince { color: var(--df-console-muted); }
+
 @media (max-width: 720px) {
   .dfFactoryConsole__header,
   .dfFactoryConsole__sectionHeading { align-items: flex-start; flex-direction: column; }

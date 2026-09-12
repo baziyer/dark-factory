@@ -1957,3 +1957,27 @@ test("a push subscription correlates its own result and an old daemon's refusal 
   ]) await assert.rejects(session.subscribePush(bad));
   session.close();
 });
+
+test("paired identities list newest first and revoke at an exact revision, never the session's own", async () => {
+  const { session, socket } = await openHumanSession();
+  const other = "70".repeat(16);
+  const pending = session.listBrowserClients();
+  const ask = decodeClientControl(socket.sent.at(-1));
+  assert.equal(ask.type, "BROWSER_CLIENTS_GET");
+  socket.reply(encodeServerControl({ type: "BROWSER_CLIENTS", id: ask.id, body: { clients: [{ client_id: other, capabilities: 7, revision: 1n, created_at_ms: 1767139200000n }], more: false } }));
+  const listed = await pending;
+  assert.deepEqual(listed, { clients: [{ clientId: other, capabilities: 7, revision: 1n, createdAtMs: 1767139200000n }], more: false });
+  assert.equal(Object.isFrozen(listed.clients), true);
+
+  const revoke = session.revokeBrowserClient({ clientId: other, expectedRevision: 1n });
+  const frame = decodeClientControl(socket.sent.at(-1));
+  assert.equal(frame.type, "BROWSER_CLIENT_REVOKE");
+  assert.deepEqual(frame.body, { client_id: other, expected_revision: 1n });
+  // A result that does not advance exactly one revision is a protocol fault.
+  socket.reply(encodeServerControl({ type: "BROWSER_CLIENT_REVOKE_RESULT", id: frame.id, body: { client_id: other, revision: 2n } }));
+  assert.deepEqual(await revoke, { clientId: other, revision: 2n });
+
+  await assert.rejects(session.revokeBrowserClient({ clientId: session.clientId, expectedRevision: 1n }), (error) => error instanceof SessionError && error.code === "invalid_request");
+  await assert.rejects(session.revokeBrowserClient({ clientId: other, expectedRevision: 0n }), (error) => error instanceof SessionError && error.code === "invalid_request");
+  session.close();
+});

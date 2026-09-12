@@ -185,7 +185,11 @@ export type RunPathsView = Readonly<{ agentId: string; runId: string; paths: rea
 export type TaskListView = Readonly<{ agentId: string; head: bigint; total: bigint; tasks: readonly TaskItem[]; hasMore: boolean }>;
 type InvitePending = { resolve: (value: RemoteInvite) => void; reject: (error: unknown) => void };
 type PushPending = { resolve: () => void; reject: (error: unknown) => void };
-type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT"; accountId?: string; expectedRevision?: bigint; resolve: (value: never) => void; reject: (error: unknown) => void };
+type AccountPending = { kind: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT" | "BROWSER_CLIENTS" | "BROWSER_CLIENT_REVOKE_RESULT"; accountId?: string; expectedRevision?: bigint; resolve: (value: never) => void; reject: (error: unknown) => void };
+
+/** One identity the factory has granted and not revoked. */
+export type BrowserClientView = Readonly<{ clientId: string; capabilities: CapabilityMask; revision: bigint; createdAtMs: bigint }>;
+export type BrowserClientsView = Readonly<{ clients: readonly BrowserClientView[]; more: boolean }>;
 
 /** One provider login found on the daemon's machine, linked or not. */
 export type DiscoveredAccountView = AccountsBody["accounts"][number];
@@ -456,6 +460,17 @@ export class BrowserSession {
     if (request.accountId === "" || !validDynamicID(request.accountId) || request.expectedRevision < 1n || request.expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
     if ((this.#capabilities & CAPABILITIES.administration) === 0) return Promise.reject(new SessionError("unauthorized"));
     return this.#accountRequest("ACCOUNT_UPDATE_RESULT", CAPABILITIES.administration, "account-update", (id) => encodeClientControl({ type: "ACCOUNT_UPDATE", id, body: { account_id: request.accountId, expected_revision: request.expectedRevision, ...(request.label === undefined ? { remove: true } : { label: request.label }) } }), { accountId: request.accountId, expectedRevision: request.expectedRevision });
+  }
+
+  /** The identities this factory has granted, newest first; administration only. */
+  listBrowserClients(): Promise<BrowserClientsView> {
+    return this.#accountRequest("BROWSER_CLIENTS", CAPABILITIES.administration, "browser-clients", (id) => encodeClientControl({ type: "BROWSER_CLIENTS_GET", id, body: {} }));
+  }
+
+  /** Withdraws one other identity at an exact revision; its live sessions end with it. */
+  revokeBrowserClient(request: { clientId: string; expectedRevision: bigint }): Promise<Readonly<{ clientId: string; revision: bigint }>> {
+    if (!validDynamicID(request.clientId) || request.clientId === this.#clientId || request.expectedRevision < 1n || request.expectedRevision > MAX_SQLITE_INTEGER) return Promise.reject(new SessionError("invalid_request"));
+    return this.#accountRequest("BROWSER_CLIENT_REVOKE_RESULT", CAPABILITIES.administration, "browser-client-revoke", (id) => encodeClientControl({ type: "BROWSER_CLIENT_REVOKE", id, body: { client_id: request.clientId, expected_revision: request.expectedRevision } }), { accountId: request.clientId, expectedRevision: request.expectedRevision });
   }
 
   /** Mints one remote pairing invitation. The mint is never retried: a failed
@@ -795,7 +810,7 @@ export class BrowserSession {
       pending.resolve();
       return;
     }
-    if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT" || frame.type === "ACCOUNT_UPDATE_RESULT") {
+    if (frame.type === "ACCOUNTS" || frame.type === "ACCOUNT_LINK_RESULT" || frame.type === "ACCOUNT_UPDATE_RESULT" || frame.type === "BROWSER_CLIENTS" || frame.type === "BROWSER_CLIENT_REVOKE_RESULT") {
       this.#accountResult(frame);
       return;
     }
@@ -1168,9 +1183,16 @@ export class BrowserSession {
     return result;
   }
 
-  #accountResult(frame: Extract<ServerControlFrame, { type: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT" }>): void {
+  #accountResult(frame: Extract<ServerControlFrame, { type: "ACCOUNTS" | "ACCOUNT_LINK_RESULT" | "ACCOUNT_UPDATE_RESULT" | "BROWSER_CLIENTS" | "BROWSER_CLIENT_REVOKE_RESULT" }>): void {
     const pending = this.#accountPending.get(frame.id);
     if (pending === undefined || pending.kind !== frame.type) throw new ProtocolError("malformed");
+    if (frame.type === "BROWSER_CLIENTS") { this.#accountPending.delete(frame.id); pending.resolve(Object.freeze({ clients: Object.freeze(frame.body.clients.map((client) => Object.freeze({ clientId: client.client_id, capabilities: client.capabilities, revision: client.revision, createdAtMs: client.created_at_ms }))), more: frame.body.more }) as never); return; }
+    if (frame.type === "BROWSER_CLIENT_REVOKE_RESULT") {
+      if (pending.accountId !== frame.body.client_id || pending.expectedRevision === undefined || frame.body.revision !== pending.expectedRevision + 1n) throw new ProtocolError("malformed");
+      this.#accountPending.delete(frame.id);
+      pending.resolve(Object.freeze({ clientId: frame.body.client_id, revision: frame.body.revision }) as never);
+      return;
+    }
     if (frame.type === "ACCOUNTS") { this.#accountPending.delete(frame.id); pending.resolve(Object.freeze(frame.body.accounts.map((account) => Object.freeze({ ...account }))) as never); return; }
     if (frame.type === "ACCOUNT_UPDATE_RESULT" && (pending.accountId !== frame.body.account_id || pending.expectedRevision === undefined || frame.body.revision !== pending.expectedRevision + 1n)) throw new ProtocolError("malformed");
     this.#accountPending.delete(frame.id);

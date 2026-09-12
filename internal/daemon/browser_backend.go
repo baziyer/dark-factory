@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -714,6 +715,76 @@ func (backend *browserBackend) LinkAccount(ctx context.Context, rawClient [brows
 		return browserprotocol.AccountLinkResult{}, consoleUpdateError(err)
 	}
 	return browserprotocol.AccountLinkResult{AccountID: account.ID.String(), Revision: decimalRevision(account.Revision)}, nil
+}
+
+// ListBrowserClients projects every identity this factory has granted and
+// not revoked, newest first, bounded to what one frame carries. Nothing here
+// is a key or a fingerprint.
+func (backend *browserBackend) ListBrowserClients(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte) (browserprotocol.BrowserClients, error) {
+	_, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
+	if err != nil {
+		return browserprotocol.BrowserClients{}, err
+	}
+	defer release()
+	var active []kernel.BrowserClientSummary
+	var after *kernel.BrowserClientID
+	for {
+		page, err := backend.store.ListBrowserClients(ctx, after)
+		if err != nil {
+			return browserprotocol.BrowserClients{}, mapBrowserError(err)
+		}
+		for _, item := range page.Items {
+			if item.RevokedAt == nil {
+				active = append(active, item)
+			}
+		}
+		if page.NextAfter == nil {
+			break
+		}
+		after = page.NextAfter
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Int64() > active[j].CreatedAt.Int64() })
+	result := browserprotocol.BrowserClients{Clients: []browserprotocol.BrowserClientItem{}}
+	for _, item := range active {
+		if len(result.Clients) == browserprotocol.MaxJSONArray {
+			result.More = true
+			break
+		}
+		result.Clients = append(result.Clients, browserprotocol.BrowserClientItem{
+			ClientID:     item.ID.String(),
+			Capabilities: browserprotocol.Capabilities(item.CapabilityMask),
+			Revision:     decimalRevision(item.Revision),
+			CreatedAtMS:  browserprotocol.Decimal(item.CreatedAt.Int64()),
+		})
+	}
+	return result, nil
+}
+
+// RevokeBrowserClient withdraws another identity through the daemon's own
+// revocation, which also ends that identity's live sessions. An identity
+// never revokes itself: the console it drives would vanish under it.
+func (backend *browserBackend) RevokeBrowserClient(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.BrowserClientRevoke) (browserprotocol.BrowserClientRevokeResult, error) {
+	self, release, _, err := backend.authorize(ctx, rawClient, kernel.BrowserCapabilityAdministration)
+	if err != nil {
+		return browserprotocol.BrowserClientRevokeResult{}, err
+	}
+	defer release()
+	id, err := browserID(request.ClientID, kernel.BrowserClientIDFromBytes)
+	if err != nil || id == self {
+		return browserprotocol.BrowserClientRevokeResult{}, browser.ErrInvalidRequest
+	}
+	expected, err := kernel.NewRevision(int64(request.ExpectedRevision))
+	if err != nil {
+		return browserprotocol.BrowserClientRevokeResult{}, browser.ErrStale
+	}
+	if backend.owner == nil {
+		return browserprotocol.BrowserClientRevokeResult{}, browser.ErrUnauthorized
+	}
+	client, err := backend.owner.RevokeBrowserClient(ctx, id, expected)
+	if err != nil {
+		return browserprotocol.BrowserClientRevokeResult{}, consoleUpdateError(err)
+	}
+	return browserprotocol.BrowserClientRevokeResult{ClientID: client.ID.String(), Revision: decimalRevision(client.Revision)}, nil
 }
 
 func (backend *browserBackend) UpdateAccount(ctx context.Context, rawClient [browserprotocol.ClientIDSize]byte, request browserprotocol.AccountUpdate) (browserprotocol.AccountUpdateResult, error) {

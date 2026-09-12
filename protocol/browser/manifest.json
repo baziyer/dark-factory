@@ -357,6 +357,30 @@
       "fixture": "account_update_result.json"
     },
     {
+      "type": "BROWSER_CLIENTS_GET",
+      "direction": "client",
+      "id": "required",
+      "fixture": "browser_clients_get.json"
+    },
+    {
+      "type": "BROWSER_CLIENTS",
+      "direction": "server",
+      "id": "required",
+      "fixture": "browser_clients.json"
+    },
+    {
+      "type": "BROWSER_CLIENT_REVOKE",
+      "direction": "client",
+      "id": "required",
+      "fixture": "browser_client_revoke.json"
+    },
+    {
+      "type": "BROWSER_CLIENT_REVOKE_RESULT",
+      "direction": "server",
+      "id": "required",
+      "fixture": "browser_client_revoke_result.json"
+    },
+    {
       "type": "REMOTE_INVITE",
       "direction": "client",
       "id": "required",
