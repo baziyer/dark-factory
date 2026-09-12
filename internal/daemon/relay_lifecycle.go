@@ -73,13 +73,15 @@ func (daemon *Daemon) DialRelay(ctx context.Context, relayOrigin, home string, b
 	}
 	runtime := &RelayRuntime{daemon: daemon, connector: connector, identity: identity, relayOrigin: relayOrigin, browserAddress: browserAddress}
 	daemon.browserMu.Lock()
-	daemon.push = newPushStore(filepath.Join(home, install.RelayDirectoryName))
 	if daemon.browserClosing || daemon.relay != nil {
 		daemon.browserMu.Unlock()
 		_ = connector.Close()
 		return nil, browser.ErrUnauthorized
 	}
 	daemon.relay = runtime
+	// Alert subscriptions live beside this relay's node key, so they are
+	// bound to the one home that owns the relay.
+	daemon.push = newPushStore(filepath.Join(home, install.RelayDirectoryName))
 	daemon.browserMu.Unlock()
 	return runtime, nil
 }

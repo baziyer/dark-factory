@@ -697,7 +697,7 @@ test("the remote console imports no terminal machinery at all", () => {
 
 test("alerts turn on through the host's subscription and off with the device", async () => {
   const manager = fakeManager([northFactory()]);
-  const subscription = { endpoint: "https://push.example/send/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+  const subscription = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
   let attempts = 0;
   const subscribePush = async () => { attempts += 1; if (attempts === 1) throw new Error("ALERTS WERE REFUSED"); return subscription; };
   await withApp(props(manager, { subscribePush }), async (renderer) => {

@@ -186,7 +186,7 @@ func TestRemoteInviteDispatchesAndCorrelatesTheMintedInvitation(t *testing.T) {
 }
 
 func TestPushSubscribeDispatchesAndCorrelatesItsResult(t *testing.T) {
-	subscription := browserprotocol.PushSubscribe{Endpoint: "https://push.example/send/abc", PublicKey: "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU", PrivateKey: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAQ"}
+	subscription := browserprotocol.PushSubscribe{Endpoint: "https://web.push.apple.com/QGdfl/abc", PublicKey: "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU", PrivateKey: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAQ"}
 	payload, err := browserprotocol.EncodePushSubscribe("push", subscription)
 	if err != nil {
 		t.Fatal(err)

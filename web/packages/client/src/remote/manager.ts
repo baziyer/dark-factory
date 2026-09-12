@@ -203,6 +203,9 @@ export class RemoteManager {
   async pair(invitation: RemoteInvitation): Promise<RemoteBinding> {
     if (this.#closed) throw new SessionError("closed");
     const nodeId = invitation.node;
+    // A device that already asks to be woken asks every factory it pairs with,
+    // including the one it is pairing again: read before the old binding goes.
+    const push = this.push();
     const previous = this.#entries.get(nodeId);
     if (previous !== undefined) {
       this.#disconnect(previous);
@@ -217,8 +220,6 @@ export class RemoteManager {
       host: invitation.host,
       daemonId: invitation.daemon,
     };
-    // A device that already asks to be woken asks every factory it pairs with.
-    const push = this.push();
     if (push !== undefined) binding.push = push;
     const entry: Entry = { binding, status: "pairing", generation: 0 };
     this.#entries.set(nodeId, entry);

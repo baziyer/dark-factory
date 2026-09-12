@@ -1235,3 +1235,25 @@ func TestTerminalInputResultStatusAndCountContract(t *testing.T) {
 		}
 	}
 }
+
+func TestPushSubscribeAdmitsOnlyKnownPushServices(t *testing.T) {
+	for endpoint, want := range map[string]bool{
+		"https://web.push.apple.com/QGdfl/abc":                   true,
+		"https://fcm.googleapis.com/fcm/send/abc":                true,
+		"https://updates.push.services.mozilla.com/wpush/v2/abc": true,
+		"https://wns2-par02p.notify.windows.com/w/?token=abc":    true,
+		"https://notify.windows.com/w/?token=abc":                false,
+		"https://push.example/send/abc":                          false,
+		"http://web.push.apple.com/QGdfl/abc":                    false,
+		"https://web.push.apple.com:8443/QGdfl/abc":              false,
+		"https://user:secret@web.push.apple.com/QGdfl/abc":       false,
+		"https://web.push.apple.com.attacker.example/QGdfl/abc":  false,
+		"https://127.0.0.1/send/abc":                             false,
+	} {
+		body := PushSubscribe{Endpoint: endpoint, PublicKey: "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU", PrivateKey: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAQ"}
+		_, err := EncodePushSubscribe("push", body)
+		if (err == nil) != want {
+			t.Fatalf("%s: err=%v, want admitted=%v", endpoint, err, want)
+		}
+	}
+}

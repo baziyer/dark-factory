@@ -140,6 +140,14 @@ export type PushSubscribeBody = { endpoint: string; public_key: string; private_
 export type PushSubscribeResultBody = Record<string, never>;
 const MAX_PUSH_ENDPOINT_BYTES = 2048;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
+/** The push services behind every browser that can install the remote console; the daemon refuses any other host. */
+const PUSH_SERVICE_HOSTS = new Set(["web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"]);
+function pushServiceEndpoint(endpoint: string): boolean {
+  let url: URL;
+  try { url = new URL(endpoint); } catch { return false; }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.port !== "") return false;
+  return PUSH_SERVICE_HOSTS.has(url.hostname) || (url.hostname.endsWith(".notify.windows.com") && url.hostname.length > ".notify.windows.com".length);
+}
 
 /** The exact everything-before-the-members of a minted invitation link. */
 const REMOTE_INVITE_LINK_PREFIX = "https://app.darkfactory.build/remote#df_remote&";
@@ -445,7 +453,7 @@ function validateBody(type: ControlType, body: unknown, wire: boolean): ControlB
     case "TERMINAL_EXIT": requireKeys(body, ["session_id", "exit_code", "exit_signal", "aborted"], wire); if (typeof body.aborted !== "boolean") malformed(); { const exit_code = integer(body.exit_code, 0, Number.MAX_SAFE_INTEGER); const exit_signal = integer(body.exit_signal, 0, Number.MAX_SAFE_INTEGER); if (exit_signal !== 0 && exit_code !== 0) malformed(); return { session_id: dynamicID(body.session_id), exit_code, exit_signal, aborted: body.aborted }; }
     case "TERMINAL_RESET": requireKeys(body, ["session_id", "floor", "head"], wire); { const floor = decimal(body.floor, wire); const head = decimal(body.head, wire); if (floor > head) malformed(); return { session_id: dynamicID(body.session_id), floor, head }; }
     case "REMOTE_INVITE": requireKeys(body, [], wire); return {};
-    case "PUSH_SUBSCRIBE": requireKeys(body, ["endpoint", "public_key", "private_key"], wire); { const endpoint = boundedText(body.endpoint, 9, MAX_PUSH_ENDPOINT_BYTES); if (!endpoint.startsWith("https://") || /[\u0000-\u001f\u007f]/.test(endpoint) || typeof body.public_key !== "string" || body.public_key.length !== 87 || !BASE64URL.test(body.public_key) || typeof body.private_key !== "string" || body.private_key.length === 0 || body.private_key.length > 512 || !BASE64URL.test(body.private_key)) malformed(); return { endpoint, public_key: body.public_key, private_key: body.private_key }; }
+    case "PUSH_SUBSCRIBE": requireKeys(body, ["endpoint", "public_key", "private_key"], wire); { const endpoint = boundedText(body.endpoint, 9, MAX_PUSH_ENDPOINT_BYTES); if (/[\u0000-\u001f\u007f]/.test(endpoint) || !pushServiceEndpoint(endpoint) || typeof body.public_key !== "string" || body.public_key.length !== 87 || !BASE64URL.test(body.public_key) || typeof body.private_key !== "string" || body.private_key.length === 0 || body.private_key.length > 512 || !BASE64URL.test(body.private_key)) malformed(); return { endpoint, public_key: body.public_key, private_key: body.private_key }; }
     case "PUSH_SUBSCRIBE_RESULT": requireKeys(body, [], wire); return {};
     case "REMOTE_INVITE_RESULT": requireKeys(body, ["link", "expires_at_ms", "svg"], wire); { const link = boundedText(body.link, 1, MAX_REMOTE_INVITE_LINK_BYTES); const svg = boundedText(body.svg, 1, MAX_REMOTE_INVITE_SVG_BYTES); if (!link.startsWith(REMOTE_INVITE_LINK_PREFIX) || /[\u0000-\u001f\u007f]/.test(link) || !svg.startsWith("<svg")) malformed(); return { link, expires_at_ms: decimal(body.expires_at_ms, wire, true), svg }; }
     case "ERROR": requireKeys(body, ["code", "retryable"], wire); if (typeof body.code !== "string" || !(ERROR_CODES as readonly string[]).includes(body.code) || typeof body.retryable !== "boolean") malformed(); return { code: body.code as ErrorCode, retryable: body.retryable };

@@ -2,6 +2,7 @@ package browserprotocol
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -37,6 +38,30 @@ func EncodeRemoteInviteResult(id string, value RemoteInviteResult) ([]byte, erro
 // MaxPushEndpointBytes bounds a push service URL; the services in use issue
 // URLs a few hundred bytes long.
 const MaxPushEndpointBytes = 2048
+
+// pushServiceHosts are the only origins a factory will ever POST a push to.
+// A subscription names the endpoint, and any observing client may register
+// one, so without this list the verb would be a daemon-side request to an
+// address of the client's choosing. These are the push services behind every
+// browser that can install the remote console; Edge's is per-tenant under one
+// suffix.
+var pushServiceHosts = map[string]bool{
+	"web.push.apple.com":                true,
+	"fcm.googleapis.com":                true,
+	"updates.push.services.mozilla.com": true,
+}
+
+// PushServiceEndpoint reports whether a subscription endpoint belongs to a
+// known push service: https, one of the listed hosts or an Edge tenant, no
+// credentials, no explicit port.
+func PushServiceEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" || parsed.Host != parsed.Hostname() {
+		return false
+	}
+	host := parsed.Hostname()
+	return pushServiceHosts[host] || strings.HasSuffix(host, ".notify.windows.com") && len(host) > len(".notify.windows.com")
+}
 
 // PushSubscribe hands the factory one device's Web Push subscription and the
 // VAPID key pair the device generated for it. The device owns the key so one
@@ -110,7 +135,7 @@ func validRemoteControl(kind MessageType, body any) error {
 	case PushSubscribe:
 		// 87 characters is exactly one uncompressed P-256 point; a PKCS#8
 		// P-256 private key exports to 138 bytes, bounded loosely.
-		if len(value.Endpoint) > MaxPushEndpointBytes || !strings.HasPrefix(value.Endpoint, "https://") || !printable(value.Endpoint) ||
+		if len(value.Endpoint) > MaxPushEndpointBytes || !printable(value.Endpoint) || !PushServiceEndpoint(value.Endpoint) ||
 			!base64URL(value.PublicKey, 87, 87) || !base64URL(value.PrivateKey, 1, 512) {
 			return bad()
 		}

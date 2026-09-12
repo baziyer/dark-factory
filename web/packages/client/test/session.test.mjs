@@ -1932,7 +1932,7 @@ test("account update rejects a reply for the wrong account or revision", async (
 });
 
 test("a push subscription correlates its own result and an old daemon's refusal costs nothing else", async () => {
-  const subscription = { endpoint: "https://push.example/send/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+  const subscription = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
   const { session, socket } = await openHumanSession();
   const pending = session.subscribePush(subscription);
   const frame = decodeClientControl(socket.sent.at(-1));
@@ -1949,7 +1949,9 @@ test("a push subscription correlates its own result and an old daemon's refusal 
 
   // The wire refuses what a push service would never hand out.
   for (const bad of [
-    { ...subscription, endpoint: "http://push.example/send/abc" },
+    { ...subscription, endpoint: "http://web.push.apple.com/QGdfl/abc" },
+    { ...subscription, endpoint: "https://push.example/send/abc" },
+    { ...subscription, endpoint: "https://web.push.apple.com:8443/QGdfl/abc" },
     { ...subscription, public_key: "not base64url!" },
     { ...subscription, private_key: "" },
   ]) await assert.rejects(session.subscribePush(bad));

@@ -24,6 +24,7 @@ import (
 	"github.com/dark-factory-build/dark-factory/internal/browser"
 	"github.com/dark-factory-build/dark-factory/internal/browserprotocol"
 	"github.com/dark-factory-build/dark-factory/internal/kernel"
+	"github.com/dark-factory-build/dark-factory/internal/relayhost"
 )
 
 // devicePushKeys is what a phone hands over: the raw public point its
@@ -206,7 +207,7 @@ func TestBrowserSubscribePushStoresOneSubscriptionPerClient(t *testing.T) {
 	fixture.pair(t)
 	ctx := context.Background()
 	_, public, private := devicePushKeys(t)
-	subscription := browserprotocol.PushSubscribe{Endpoint: "https://push.example/send/abc", PublicKey: public, PrivateKey: private}
+	subscription := browserprotocol.PushSubscribe{Endpoint: "https://web.push.apple.com/QGdfl/abc", PublicKey: public, PrivateKey: private}
 
 	if err := fixture.backend.SubscribePush(ctx, rawBrowserClient(fixture.client.ID), subscription); err != nil {
 		t.Fatal(err)
@@ -231,11 +232,36 @@ func TestBrowserSubscribePushStoresOneSubscriptionPerClient(t *testing.T) {
 		t.Fatalf("mismatched keys: %v", err)
 	}
 	// Re-registering replaces, so a device that re-subscribed is not pushed twice.
-	replacement := browserprotocol.PushSubscribe{Endpoint: "https://push.example/send/def", PublicKey: public, PrivateKey: private}
+	replacement := browserprotocol.PushSubscribe{Endpoint: "https://web.push.apple.com/QGdfl/def", PublicKey: public, PrivateKey: private}
 	if err := fixture.backend.SubscribePush(ctx, rawBrowserClient(fixture.client.ID), replacement); err != nil {
 		t.Fatal(err)
 	}
 	if stored, err = store.load(); err != nil || len(stored) != 1 || stored[fixture.client.ID.String()] != replacement {
 		t.Fatalf("stored = %+v, %v", stored, err)
+	}
+}
+
+func TestSecondRelayDialLeavesTheSubscriptionsWithTheLiveRelay(t *testing.T) {
+	fixture := newAdapterFixture(t, webCapabilities)
+	dialRelayFixture(t, fixture)
+	fixture.daemon.browserMu.Lock()
+	first := fixture.daemon.push
+	fixture.daemon.browserMu.Unlock()
+	if first == nil {
+		t.Fatal("the first relay dial installs the push store")
+	}
+	other := t.TempDir()
+	identity, err := relayhost.LoadOrCreate(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newRelayServer(t, identity)
+	if _, err := fixture.daemon.DialRelay(context.Background(), relay.origin(), other, fixture.server.Addr()); !errors.Is(err, browser.ErrUnauthorized) {
+		t.Fatalf("second dial: %v", err)
+	}
+	fixture.daemon.browserMu.Lock()
+	defer fixture.daemon.browserMu.Unlock()
+	if fixture.daemon.push != first {
+		t.Fatal("a refused relay dial moved the subscriptions to its home")
 	}
 }

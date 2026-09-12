@@ -526,7 +526,7 @@ test("the manager exposes the client's own one-shot APIs and adds no retry of it
   manager.close();
 });
 
-const PUSH = { endpoint: "https://push.example/send/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
+const PUSH = { endpoint: "https://web.push.apple.com/QGdfl/abc", public_key: "B" + "a".repeat(86), private_key: "MIGH" };
 
 test("one alert subscription reaches every factory: the connected ones now, later pairings as they connect", async () => {
   const { relay, store, manager } = bench();
@@ -553,5 +553,20 @@ test("one alert subscription reaches every factory: the connected ones now, late
   await manager.setPush(undefined);
   assert.equal(manager.push(), undefined);
   assert.equal((await row(store, north.node)).push, undefined);
+  manager.close();
+});
+
+test("pairing the only factory again keeps the device's alert subscription", async () => {
+  const { relay, store, manager } = bench();
+  const north = relay.add(new FakeFactory({ node: nodeId("a"), clientId: "55".repeat(16) }));
+  await manager.pair(invitation(north));
+  await manager.setPush(PUSH);
+  await settle();
+  const again = relay.add(new FakeFactory({ node: nodeId("a"), clientId: "56".repeat(16) }));
+  await manager.pair(invitation(again));
+  await settle();
+  assert.deepEqual(manager.push(), PUSH);
+  assert.deepEqual((await row(store, north.node)).push, PUSH);
+  assert.equal(types(again.sockets.at(-1)).filter((type) => type === "PUSH_SUBSCRIBE").length, 1, "the re-paired factory is told once it is ready");
   manager.close();
 });
