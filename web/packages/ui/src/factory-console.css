@@ -799,12 +799,6 @@ summary.dfConsoleItem__summary { cursor: pointer; }
 .dfFactoryScene__room--empty > use { opacity: 0.45; }
 .dfFactoryFloor { overflow-x: auto; }
 .dfFactoryScene__worker { transition: transform 180ms ease-out; }
-.dfFactoryScene__edit { opacity: 0; pointer-events: none; cursor: pointer; }
-.dfFactoryScene__edit rect { fill: #101f2b; stroke: var(--df-console-accent); stroke-width: 0.75; }
-.dfFactoryScene__edit path { fill: var(--df-console-accent); stroke: var(--df-console-accent); stroke-width: 0.6; }
-.dfFactoryScene__worker:hover .dfFactoryScene__edit,
-.dfFactoryScene__worker--selected .dfFactoryScene__edit,
-.dfFactoryScene__edit:focus { opacity: 1; pointer-events: auto; }
 
 @media (prefers-reduced-motion: reduce) {
   .dfFactoryScene__worker { transition: none; }

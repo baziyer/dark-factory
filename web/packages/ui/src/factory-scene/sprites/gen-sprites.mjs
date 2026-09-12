@@ -37,7 +37,7 @@ const keep = (rows, keys) => rows.map(row => [...row].map(key => keys.includes(k
 const head = grid(`
   .oooo.
   oaaaao
-  oaoaoo
+  oaooao
   oaaaao
   .obbo.
   ..ba..
@@ -45,57 +45,58 @@ const head = grid(`
 const hair = [
   grid(`
     ..oooo..
-    .ohhhho.
-    .ohwwho.
-    ..h.....
+    .ouuuuo.
+    .ouuuuo.
+    ..u.....
   `),
   grid(`
     .oooooo.
-    .oppppo.
-    .opphho.
-    ..p...h.
+    .ouumuo.
+    .ouu.uo.
+    ..u...u.
   `),
   grid(`
     ..oo.oo.
-    .ohhohho
-    ohwhhhho
-    .h....h.
+    .ouuouuo
+    ouuuuuuo
+    .u....u.
   `),
   grid(`
     ..oooo..
-    .owwwwo.
-    .owwwwo.
-    ow....o.
-    owo.....
+    .ouuuuo.
+    .ouuuuo.
+    ..u...uo
+    ......uo
+    ......uo
   `),
 ];
 const outfits = [
   grid(`
-    .occo.
-    ocpcco
-    occcco
-    ocwmco
+    .ouuo.
+    opuupo
+    ououuo
+    ououuo
     .oooo.
   `),
   grid(`
-    .osso.
-    osmsmo
-    omssmo
-    ommmmo
+    .ommo.
+    oummuo
+    ouuuuo
+    ouppuo
     .oooo.
   `),
   grid(`
-    .oppo.
-    opoppo
-    oppppo
-    opwwpo
+    .ouuo.
+    ouoouo
+    ouuuuo
+    ououuo
     .oooo.
   `),
   grid(`
-    .ollo.
-    olpllo
-    olsslo
-    ollllo
+    .ommo.
+    ouppuo
+    ouppuo
+    oummuo
     .oooo.
   `),
 ];
@@ -137,8 +138,7 @@ const relaxedArm = grid(`
   oo
 `);
 const foldedArms = grid(`
-  ouuuuuuo
-  oabbaaoo
+  ouabbaao
   .oooooo.
 `);
 const raisedArm = grid(`
@@ -150,15 +150,11 @@ const raisedArm = grid(`
   .ou
   ..o
 `);
-const typingArms = [grid(`
-  ouu...uo
-  .oa..oao
-  ..aooa..
-`), grid(`
-  ouu...uo
-  .ouaaauo
-  ..ooooo.
-`)];
+const typingArms = grid(`
+  ou....uo
+  oa....ao
+  ..aaaa..
+`);
 const keyboard = grid(`
   .oooooo.
   olslsllo
@@ -167,8 +163,8 @@ const keyboard = grid(`
 const clipboard = grid(`
   .ss.
   oppo
+  osso
   opmo
-  oppo
   oooo
 `);
 const hat = grid(`
@@ -184,22 +180,22 @@ const alert = grid(`
 `);
 const faceFeatures = [
   { name: 'none', label: 'None', part: [] },
-  { name: 'glasses', label: 'Glasses', part: grid(`ssoss`), y: 4 },
-  { name: 'beard', label: 'Beard', part: grid(`.hhh.\nhhhhh`), y: 6 },
-  { name: 'moustache', label: 'Moustache', part: grid(`hhhhh`), y: 5 },
+  { name: 'glasses', label: 'Glasses', part: grid(`sosos`), x: 5, y: 4 },
+  { name: 'beard', label: 'Beard', part: grid(`hhhh\n.hh.`), y: 6 },
+  { name: 'moustache', label: 'Moustache', part: grid(`hhh`), y: 5 },
 ];
 const tools = [
   { name: 'none', label: 'None', part: [], x: 0, y: 0 },
   { name: 'clipboard', label: 'Clipboard', part: clipboard, x: 11, y: 9 },
-  { name: 'wrench', label: 'Wrench', part: grid(`.ss\n.s.\noso\n.o.\n.o.`), x: 12, y: 8 },
-  { name: 'mug', label: 'Mug', part: grid(`oooo\nommo\noooo`), x: 11, y: 11 },
-  { name: 'tablet', label: 'Tablet', part: grid(`oooo\nommo\nommo\noooo`), x: 11, y: 10 },
+  { name: 'wrench', label: 'Wrench', part: grid(`s.s\n.s.\n.s.\n.s.\noso`), x: 12, y: 8 },
+  { name: 'mug', label: 'Mug', part: grid(`pppoo\nppp.o\npppoo\nooo..`), x: 11, y: 10 },
+  { name: 'tablet', label: 'Tablet', part: grid(`oooo\notto\nokto\nooso`), x: 11, y: 10 },
 ];
 const headwear = [
   { name: 'none', label: 'None', part: [], x: 0, y: 0 },
   { name: 'hard-hat', label: 'Hard hat', part: hat, x: 4, y: 0 },
-  { name: 'cap', label: 'Cap', part: grid(`.oooooo.\n.otttto.\noooooooo`), x: 4, y: 0 },
-  { name: 'headset', label: 'Headset', part: grid(`oo....oo\no......o\n.......o\n......oo`), x: 4, y: 2 },
+  { name: 'cap', label: 'Cap', part: grid(`..oooo..\n.otttto.\notttttoo\n.oottttt`), x: 4, y: 0 },
+  { name: 'headset', label: 'Headset', part: grid(`..ssssss..\n.s......s.\n.s......s.\nss......ss\nst......ts\n........so\n......sss.`), x: 3, y: 0 },
 ];
 const skinTones = [
   { name: 'light', label: 'Light', skin: 'p', shadow: 'a' },
@@ -296,24 +292,31 @@ const sprites = new Map();
 const providers = { claude_code: 'c', codex: 't', shell: 's' };
 const activities = ['busy', 'waiting', 'needs-you', 'idle'];
 const add = (name, build) => { const pixels = blank(); build(pixels); sprites.set(name, pixels); };
-const arms = activity => activity === 'waiting' ? [foldedArms] : activity === 'busy' ? [typingArms[0]] : activity === 'needs-you' ? [relaxedArm, mirror(relaxedArm), raisedArm] : [relaxedArm, mirror(relaxedArm)];
-const armPosition = (activity, index) => index === 0 ? [activity === 'waiting' || activity === 'busy' ? 4 : 3, 9] : index === 1 ? [11, 9] : [2, 4];
+const arms = activity => activity === 'waiting' ? [foldedArms] : activity === 'busy' ? [typingArms] : activity === 'needs-you' ? [relaxedArm, mirror(relaxedArm), raisedArm] : [relaxedArm, mirror(relaxedArm)];
+const armPosition = (activity, index) => index === 0 ? [activity === 'waiting' || activity === 'busy' ? 4 : 3, activity === 'waiting' ? 11 : 9] : index === 1 ? [11, 9] : [2, 4];
 for (const [skinIndex, tone] of skinTones.entries()) for (const activity of activities) add(`person.skin.${skinIndex}.${activity}`, pixels => {
   const colour = rows => rows.map(row => row.replace(/[ab]/g, key => key === 'a' ? tone.skin : tone.shadow));
   draw(pixels, colour(head), 5, 2);
   arms(activity).forEach((part, index) => draw(pixels, keep(colour(part), [tone.skin, tone.shadow]), ...armPosition(activity, index)));
 });
 for (const [outfitIndex, outfit] of outfits.entries()) for (const [colourIndex, colour] of clothesColours.entries()) for (const activity of activities) add(`person.outfit.${outfitIndex}.${colourIndex}.${activity}`, pixels => {
-  draw(pixels, tint(outfit.map(row => row.replace(/[cpslmw]/g, 'u')), colour.colour), 5, 8);
+  draw(pixels, tint(outfit, colour.colour), 5, 8);
   draw(pixels, legs, 4, 13);
-  if (activity === 'busy') draw(pixels, keyboard, 7, 12);
-  arms(activity).forEach((part, index) => draw(pixels, keep(tint(part, colour.colour), ['o', colour.colour]), ...armPosition(activity, index)));
+  if (activity === 'busy') draw(pixels, keyboard, 2, 12);
+  arms(activity).forEach((part, index) => {
+    const [x, y] = armPosition(activity, index);
+    // Hands belong to the skin layer beneath the clothes.
+    part.forEach((row, dy) => [...row].forEach((key, dx) => {
+      if (key === 'a' || key === 'b') pixels[y + dy][x + dx] = '.';
+    }));
+    draw(pixels, keep(tint(part, colour.colour), ['o', colour.colour]), x, y);
+  });
 });
-for (const [hairIndex, style] of hair.entries()) for (const [colourIndex, colour] of hairColours.entries()) for (const activity of activities) add(`person.hair.${hairIndex}.${colourIndex}.${activity}`, pixels => draw(pixels, tint(style.map(row => row.replace(/[hwp]/g, 'u')), colour.colour), 4, 1));
-for (const [featureIndex, feature] of faceFeatures.entries()) for (const activity of activities) add(`person.face.${featureIndex}.${activity}`, pixels => draw(pixels, feature.part, 6, feature.y ?? 4));
+for (const [hairIndex, style] of hair.entries()) for (const [colourIndex, colour] of hairColours.entries()) for (const activity of activities) add(`person.hair.${hairIndex}.${colourIndex}.${activity}`, pixels => draw(pixels, tint(style, colour.colour), 4, 1));
+for (const [featureIndex, feature] of faceFeatures.entries()) for (const activity of activities) add(`person.face.${featureIndex}.${activity}`, pixels => draw(pixels, feature.part, feature.x ?? 6, feature.y ?? 4));
 for (const [shoeIndex, colour] of shoes.entries()) for (const activity of activities) add(`person.shoes.${shoeIndex}.${activity}`, pixels => draw(pixels, tint(shoe, colour.colour), 4, 13));
 for (const [toolIndex, tool] of tools.entries()) for (const activity of activities) add(`person.tool.${toolIndex}.${activity}`, pixels => {
-  if (activity !== 'busy') draw(pixels, tool.part, tool.x, tool.y);
+  draw(pixels, tool.part, tool.x, tool.y);
 });
 for (const [hatIndex, item] of headwear.entries()) for (const activity of activities) add(`person.headwear.${hatIndex}.${activity}`, pixels => draw(pixels, item.part, item.x, item.y));
 for (const role of ['worker', 'overseer']) for (const [provider, colour] of Object.entries(providers)) for (const activity of activities) add(`person.system.${role}.${provider}.${activity}`, pixels => {
@@ -321,6 +324,32 @@ for (const role of ['worker', 'overseer']) for (const [provider, colour] of Obje
   if (role === 'overseer') draw(pixels, ['yy'], 7, 8);
   if (activity === 'needs-you') draw(pixels, alert, 13, 0);
 });
+// Compare finished portraits: transparent layer differences can disappear in composition.
+const portrait = (activity, appearance = {}) => {
+  const v = { skin: 1, hair: 0, hair_colour: 1, face: 0, outfit: 0, clothes_colour: 0, shoes: 0, tool: 0, headwear: 0, ...appearance };
+  const pixels = blank();
+  for (const name of [`skin.${v.skin}`, `outfit.${v.outfit}.${v.clothes_colour}`, `hair.${v.hair}.${v.hair_colour}`, `face.${v.face}`, `shoes.${v.shoes}`, `tool.${v.tool}`, `headwear.${v.headwear}`, 'system.worker.codex']) {
+    draw(pixels, sprites.get(`person.${name}.${activity}`).map(row => row.join('')));
+  }
+  return pixels;
+};
+for (const activity of activities) {
+  for (let colour = 0; colour < clothesColours.length; colour++) {
+    assert.equal(new Set(outfits.map((_, index) => JSON.stringify(portrait(activity, { outfit: index, clothes_colour: colour })))).size, outfits.length, `Indistinguishable outfits: ${activity}/${colour}`);
+  }
+  for (const [group, options] of Object.entries(optionGroups)) {
+    assert.equal(new Set(options.map((_, index) => JSON.stringify(portrait(activity, { [group]: index })))).size, options.length, `Indistinguishable ${group}: ${activity}`);
+  }
+  for (const [skin, tone] of skinTones.entries()) {
+    const pixels = portrait(activity, { skin });
+    arms(activity).forEach((part, index) => {
+      const [x, y] = armPosition(activity, index);
+      part.forEach((row, dy) => [...row].forEach((key, dx) => {
+        if (key === 'a' || key === 'b') assert.equal(pixels[y + dy][x + dx], key === 'a' ? tone.skin : tone.shadow, `Hidden hand: ${activity}/${skin}`);
+      }));
+    });
+  }
+}
 function tile(name, rows) {
   const pixels = blank();
   draw(pixels, rows);

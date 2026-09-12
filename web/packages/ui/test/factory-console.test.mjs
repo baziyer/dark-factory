@@ -1028,6 +1028,16 @@ test("SETTINGS opens and closes as a native modal, over whatever sidebar is open
   }
 });
 
+test("only the selected agent portrait offers appearance editing in either view", () => {
+  for (const view of VIEWS) {
+    const props = { view, onSelectAgent: () => {}, onEditAppearance: () => {}, topologies: fixtureTopologies };
+    assert.equal((render(props).match(/aria-label="Edit appearance for /g) ?? []).length, 0);
+    const markup = render({ ...props, selectedAgent: agentSelection() });
+    assert.equal((markup.match(/aria-label="Edit appearance for /g) ?? []).length, 1);
+    assert.match(markup, /class="dfAgentSpriteEdit" aria-label="Edit appearance for Builder One"/);
+  }
+});
+
 test("one sprite editor previews categories and saves one atomic appearance", async () => {
   const previousAct = globalThis.IS_REACT_ACT_ENVIRONMENT;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;

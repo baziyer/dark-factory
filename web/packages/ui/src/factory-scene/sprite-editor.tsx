@@ -16,7 +16,7 @@ export function SpriteEditor({ agent, pending, error, onSave, onClose }: {
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [draft, setDraft] = useState(() => resolvedAppearance(agent));
-  const [activity, setActivity] = useState<(typeof activities)[number]>("waiting");
+  const [activity, setActivity] = useState<(typeof activities)[number]>("idle");
   const [submitting, setSubmitting] = useState(false);
   useEffect(() => { dialog.current?.showModal(); }, []);
   const close = () => dialog.current?.close();
